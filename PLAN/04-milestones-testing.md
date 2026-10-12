@@ -12,6 +12,7 @@
 | **M3 OOP 完整**(1.5周) | PLAN/01 §11 OOP 示例全量可跑 + 命名空间全套（PLAN/01 §8：`namespace`/`use`(as)/`use function`/`use const`、限定名解析对齐 PHP） | class/iface/trait/enum/静态/构造器提升 + spl_autoload_register | 接口多实现+trait 冲突 as+enum match+静态晚期绑定 全部输出预期；命名空间限定名解析专测 | ~2500 |
 | **M4 协程+无感I/O**(1.5周) | — | 透明 I/O 全表 + HTTPS(mbedtls+cacert 内嵌) + Async\ API | 02 §6 异步示例全输出正确；3 并发 fetch 耗时≈max；sleep CPU 0%；死锁检测 | ~1800 |
 | **M5 Worker**(1周) | — | Worker API + 克隆协议 + serialize/unserialize | 02 §6 线程示例：4 worker 满载时主线程 IO 正常；ping-pong 1000 消息有序；stop 退出码 0 | ~1200 |
+| **M5.5 FFI**(0.5~1周) | — | FFI::cdef（C 声明子集解析）+ libffi 调用 + FFI\CData（new/memcpy/free）；DLL 打包器为后置可选项（PLAN/03 §6.1） | 系统库绑定零配置可用（user32/msvcrt）；struct 传参/返回；FFI\CData 读写与 owned 释放；阻塞性调用走 Worker 的文档示例（02 §4.5） | ~1500 |
 | **M6 打包+stdlib**(1周) | — | stdlib 全量 + phpc + test runner | 02 §6 打包示例；单 exe 零依赖；json/sprintf/date 正确；tests/run.cmd 全绿 | ~1500(含 PHP 800) |
 
 总计约 **1.3 万行 C + 800 行 PHP**，单人 6~8 周。每里程碑 `tests\run.cmd` 全绿后进下一阶段，验收 CLI 实际输出贴给用户确认。
@@ -24,6 +25,7 @@
   - `tests/oop/`：trait 冲突矩阵（as/insteadof）、enum、接口、静态晚期绑定
   - `tests/async/`：并发时序断言、取消传播、Channel 背压、死锁检测
   - `tests/worker/`：消息序、克隆协议、退出协议、嵌套 worker
+  - `tests/ffi/`：系统库绑定（GetTickCount/msvcrt 数学）、struct 传参/返回、CData 读写与 owned 释放、cdef 拒绝预处理指令
   - `tests/lib/`：json/sprintf/date 对拍（与 php-src 输出逐例比对）
   - `tests/bench/`：fib(28)、10^6 次 push，记录时长做回归基线
   - `tests/php-compat/`：**php-src 对拍层**——从 `Zend/tests`（5316 个 .phpt）+ `tests/`（867 个）抽 operators/array/heredoc/grammar/named_params 子集转换为一例一文件 EXPECT 格式，与真实 PHP 输出逐例比对；断言协议借鉴 `run-tests.php` 的 EXPECT/EXPECTF
@@ -48,6 +50,6 @@
 
 ## 4. 执行顺序
 
-M0 → M1 → M2 → M3 → M4 → M5 → M6 串行推进。
+M0 → M1 → M2 → M3 → M4 → M5 → M5.5 → M6 串行推进。
 
 每阶段结束动作：① `tests\run.cmd` 全绿 ② 跑验收示例 ③ 把实际 CLI 输出展示给用户 ④ 用户确认后进下一阶段。

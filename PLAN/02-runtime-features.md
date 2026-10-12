@@ -112,6 +112,20 @@ class Worker {
 
 **后置**（M7+）：pcre2 vendor 后 `preg_*` 全套、内置 SQLite（libsqlite3 vendor，`Sqlite\Db` 对象 + 协程化）、HTTP server（`Http\Server`）、REPL
 
+## 4.5 FFI（M5.5，txiki mod_ffi 路线）
+
+**定位三层，与单二进制正交**：
+1. **系统库绑定**：user32/kernel32/ws2_32/msvcrt（Linux libc/libm）每台机器自带 → `FFI::cdef('...', 'user32.dll')` 零配置天然兼容单 exe
+2. **要内嵌的库走 vendor 静态链接**（项目先例 mbedtls/cacert/libuv），做成内部类而非让用户 FFI
+3. **第三方 DLL**：exe+dll 同发即可；可选 `tphp build --with` 打包器（后置特性，见 PLAN/03 §6.1——解到 exe 同级 runtime/lib，不用 %TEMP%）
+
+- **API**：`FFI::cdef($code, $lib = null)` / `FFI::new($type[, bool owned = true])` / `FFI::memcpy($dst, $src, $n)` / `FFI::free($ptr)` / `FFI::sizeof`；`FFI\CData` 对象（属性/下标读写、作为调用参数/返回值）
+- **cdef 子集**：函数声明、基本类型、指针、平铺 struct/enum、简单 typedef；**拒预处理指令**（#include/#define 不解析——cdef 字符串里出现即 ValueError）；不带完整类型系统与 preload（php-src 全套 bison 解析器 ~1.1 万行，过重不学）
+- **实现**：libffi vendor 进 deps（txiki mod_ffi 同款，1623 行先例）+ LoadLibrary/GetProcAddress（Windows）/ dlopen（Linux/macOS 后置）
+- **内存策略**：FFI::new 记 owned 标志，CData 对象被 GC 回收时若 owned 则释放原生内存；FFI::free 显式提前释放；非 owned（取自 struct 字段/返回值的视图）不重复释放
+- **与并发**：FFI 调用是阻塞 native 调用（不挂起调度器、事件循环停摆）——CPU 密集/长阻塞调用放 Worker 线程（M5），文档示例承载此约定
+- **参考**：txiki.js src/mod_ffi.c（libffi + Pointer/External）、php-src ext/ffi（API 语义对齐目标，实现不照搬）
+
 ## 5. CLI
 
 ```

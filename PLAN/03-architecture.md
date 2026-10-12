@@ -124,6 +124,20 @@ lib\*.php --(tools/phpc.c，与 src 共享 lex/parse/compile 编译单元)-->
 运行期 require 'json' → 查表 → 反序列化为 TFunc/TVal
 ```
 
+### 6.1 原生资产打包器（可选特性，后置——与 phpc 正交）
+
+phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包走 PE 资源段，**两条管线互不感知**，FFI 层因此零改动：
+
+- 构建：`tphp build app.php --with vendor\ --with ext\bar.dll -o app.exe`
+  `--with` 接受**文件或目录**（可重复）：目录递归收全部非 .php 文件（.php 默认排除并警告——PHP 分发走 phpc，保持正交），**保留相对目录结构**（以参数目录为锚点：`vendor\ssl\foo.dll` → zip 内 `ssl/foo.dll`）；单文件落 zip 根
+  tools/pack.c（UpdateResource API，~150 行）：x64 架构校验 → 生成 manifest.json（每条目 relpath/sha1/size）→ miniz 打 zip（deps 现成，含目录树）→ 注入单个 RCDATA 资源 `TPHP_BUNDLE`
+- 运行期（main.c 启动最早期、VM 之前，~150 行）：
+  `FindResource("TPHP_BUNDLE")` 无 → 零开销正常启动；有 → 逐条目：目标已存在且 sha1 一致跳过 / 不符则原子释放（逐级 mkdir → 写 .tmp → rename，**原封不动还原目录树**）→ `SetDllDirectory(exe_dir\runtime\lib)`
+- **解压位置：exe 同级 runtime/lib，不用 %TEMP%**（幂等快启、可审计、删目录即卸载；%TEMP% 有杀软误报/反复重解/多副本冲突——.NET single-file 默认 exe+依赖目录为业界佐证）；只读目录回落 `%LOCALAPPDATA%\tphp\<exe名>\lib`，仍失败则运行时报错
+- **FFI 搜索链统一**：exe 目录 → runtime/lib（SetDllDirectory 已加）→ PATH → 系统目录——系统库零配置直接命中、嵌入库首启释放后命中、随行 DLL（未嵌入放 exe 旁）走 exe 目录，三种来源一条链
+- 防护：zip-slip（relpath 归一化后必须仍在受控根内——拒绝 `..`/绝对路径/盘符）；释放前逐条目 sha1 校验（防资源被篡改注入）
+- 后置不做：.php 之外的排除规则细化（--exclude）、DLL 版本冲突仲裁、Linux ELF section 方案、自动下载依赖（--with 始终显式）
+
 对应 txiki 的 js→esbuild→tjsc→C 数组管线；区别是无需 esbuild（PHP 无模块打包问题，require 语义直接编）。
 
 ## 7. 构建脚本要点
