@@ -117,9 +117,13 @@ static Token lex_html(Lex *lx) {
             else if (lx->pos + 1 < lx->end && lx->pos[0] == '\r' && lx->pos[1] == '\n') { lx->pos += 2; lx->line++; }
             return lex_next(lx);
         }
-        lx->pos = p + 3;
-        lx->in_html = false;
-        return tok_simple(KW_ECHO, line); /* <?= == echo */
+        if (p + 3 <= lx->end && memcmp(p, "<?=", 3) == 0) {
+            lx->pos = p + 3;
+            lx->in_html = false;
+            return tok_simple(KW_ECHO, line); /* <?= == echo */
+        }
+        /* start == end: HTML mode reached EOF (file ends after inline HTML) */
+        return tok_simple(L_EOF, line);
     }
     size_t len = (size_t)(p - start);
     lx->pos = p;
@@ -324,9 +328,9 @@ static Token lex_heredoc(Lex *lx) {
         p++;
     }
     while (p < lx->end && (*p == ' ' || *p == '\t')) p++;
-    if (p >= lx->end || *p != '\n')
-        lex_error(lx, "Heredoc body must start on a new line");
-    p++;
+    if (p + 1 < lx->end && *p == '\r' && p[1] == '\n') p += 2;
+    else if (p < lx->end && *p == '\n') p++;
+    else lex_error(lx, "Heredoc body must start on a new line");
     /* scan body lines for the closing marker */
     const char *body_start = p;
     const char *body_end = NULL;
@@ -358,7 +362,7 @@ static Token lex_heredoc(Lex *lx) {
         while (r < body_end && *r != '\n') clean[n++] = *r++;
         if (r < body_end) { clean[n++] = '\n'; r++; }
     }
-    if (n && clean[n - 1] == '\n') n--;
+    if (n && clean[n - 1] == '\n') { n--; if (n && clean[n - 1] == '\r') n--; }
     if (interp) {
         lex_interp_body(lx, clean, clean + n, true, false, &t);
         /* ownership of `clean` moves into the parts' expr.src pointers

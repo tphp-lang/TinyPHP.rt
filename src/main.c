@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <uv.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 /* compile.c */
 Program *tphp_compile(AStmtList *ast, const char *file);
@@ -73,6 +77,11 @@ static int run_source(const char *src, const char *name, bool dump) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* binary stdout: PHP CLI parity — echo "\n" must emit LF, not CRLF.
+     * Otherwise source bytes containing CRLF get doubled (\r\r\n) on write. */
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     if (argc < 2) {
         print_usage(stderr);
         return (int)TPHP_E_ARGS;
