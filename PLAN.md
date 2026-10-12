@@ -44,6 +44,7 @@
 | [PLAN/02-runtime-features.md](PLAN/02-runtime-features.md) | 运行时功能有哪些：透明异步 I/O 覆盖表、Async\ 完整 API、Worker 线程 API、stdlib 三层清单、CLI、**功能验收代码示例** |
 | [PLAN/03-architecture.md](PLAN/03-architecture.md) | 实现架构：目录结构、核心数据结构、opcode 64 个、异步/线程/打包的 VM 层落地、构建脚本 |
 | [PLAN/04-milestones-testing.md](PLAN/04-milestones-testing.md) | 里程碑 M0~M6（每阶段绑定语法+功能范围与验收标准）、测试策略、风险与规避 |
+| [PLAN/05-extension-guide.md](PLAN/05-extension-guide.md) | **贡献者规范**：内置扩展（builtin/内部类）开发模式、核心约定红线、错误处理与安全标准、工作流与上线检查清单 |
 
 ## 技术栈与环境
 
