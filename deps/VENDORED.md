@@ -1,0 +1,3 @@
+vendored dependency snapshots
+libuv:  master@eb497c582f5c0887add4d4658c7801e4ef412e10
+mimalloc: master@31d034d94cdb8e22f7d7ed55967f581a2d6e831d

@@ -1,0 +1,41 @@
+<?php
+// EXPECT: bool(true)
+var_dump(1 === 1);
+// EXPECT: bool(false)
+var_dump(1 === "1");
+// EXPECT: bool(false)
+var_dump(null === false);
+// EXPECT: bool(true)
+var_dump(null === null);
+// EXPECT: bool(true)
+var_dump([] === []);
+// EXPECT: int(-1)
+var_dump(1 <=> 2);
+// EXPECT: int(0)
+var_dump(2 <=> 2);
+// EXPECT: int(1)
+var_dump(3 <=> 2);
+// EXPECT: int(-1)
+var_dump("a" <=> "b");
+// EXPECT: int(1)
+var_dump([1, 2] <=> [1]);
+// EXPECT: int(-1)
+var_dump([1] <=> [1, 2]);
+// EXPECT: bool(false)
+var_dump(1 !== 1);
+// EXPECT: bool(true)
+var_dump(1 !== "1");
+// EXPECT: bool(true)
+var_dump("10" > "9");
+// EXPECT: bool(true)
+var_dump("10x" < "9");
+// EXPECT: bool(true)
+var_dump("a" > "B");
+// EXPECT: bool(true)
+var_dump(2 >= 2);
+// EXPECT: bool(true)
+var_dump(2 <= 2);
+// EXPECT: bool(false)
+var_dump(3 <= 2);
+// EXPECT: bool(true)
+var_dump("b" >= "a");

@@ -1,0 +1,17 @@
+# ---- build artifacts ----
+/build/*
+!/build/cacert.pem
+*.o
+*.exe
+*.obj
+*.a
+*.lib
+
+# ---- debug / scratch output ----
+*.log
+*-err.txt
+*-out.txt
+*.rsp
+
+# ---- tooling / workspace ----
+.workbuddy/
