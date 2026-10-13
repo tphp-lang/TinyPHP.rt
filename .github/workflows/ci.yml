@@ -29,7 +29,6 @@ jobs:
         run: |
           which clang
           clang --version
-          # build.cmd is a Windows batch; inherit msys2 CLANG64 PATH
           cmd.exe //c build.cmd
 
       - name: Test
@@ -50,6 +49,13 @@ jobs:
         run: |
           ./build/tphp.exe -v
           ./build/tphp.exe test tests/lib
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tphp-windows-x86_64
+          path: build/tphp.exe
+          if-no-files-found: error
 
   # ---------- Linux x86_64 ----------
   linux-x86_64:
@@ -85,6 +91,13 @@ jobs:
           ./build/tphp -v
           ./build/tphp test tests/lib
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tphp-linux-x86_64
+          path: build/tphp
+          if-no-files-found: error
+
   # ---------- Linux aarch64 ----------
   linux-aarch64:
     name: Linux aarch64
@@ -119,7 +132,14 @@ jobs:
           ./build/tphp -v
           ./build/tphp test tests/lib
 
-  # ---------- macOS aarch64 (Apple Silicon, native) + x86_64 cross ----------
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tphp-linux-aarch64
+          path: build/tphp
+          if-no-files-found: error
+
+  # ---------- macOS aarch64 (Apple Silicon, native) ----------
   macos-aarch64:
     name: macOS aarch64
     runs-on: macos-latest
@@ -153,7 +173,14 @@ jobs:
           ./build/tphp -v
           ./build/tphp test tests/lib
 
-  # ---------- macOS x86_64: cross-compile on arm64 runner (no x64 runners) ----------
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tphp-macos-aarch64
+          path: build/tphp
+          if-no-files-found: error
+
+  # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   macos-x86_64:
     name: macOS x86_64 (cross)
     runs-on: macos-latest
@@ -173,7 +200,6 @@ jobs:
       - name: Verify binary arch
         run: |
           file build/tphp
-          # must be x86_64
           file build/tphp | grep -q x86_64
 
       - name: Test (Rosetta 2)
@@ -184,3 +210,10 @@ jobs:
         run: |
           ./build/tphp -v
           ./build/tphp test tests/lib
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tphp-macos-x86_64
+          path: build/tphp
+          if-no-files-found: error
