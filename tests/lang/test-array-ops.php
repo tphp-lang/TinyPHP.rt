@@ -1,8 +1,14 @@
 <?php
+// EXPECT: STEP0
+// EXPECT: STEP1
+// EXPECT: STEP2
+// EXPECT: array(4) {
+echo "STEP0\n";
 $a = [1, 2, 3];
+echo "STEP1\n";
 $a[] = 4;
 $a[1] = "two";
-// EXPECT: array(4) {
+echo "STEP2\n";
 // EXPECT:   [0]=>
 // EXPECT:   int(1)
 // EXPECT:   [1]=>
