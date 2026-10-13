@@ -75,8 +75,12 @@ mkdir -p build "$OBJ"
 
 # ---- [1/6] libuv ----
 echo "[1/6] compiling libuv..."
-UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c signal.c stream.c tcp.c thread.c tty.c udp.c posix-hrtime.c posix-poll.c"
 # libuv >=1.45: common sources live in src/ root (threadpool/timer/idna/inet/...)
+UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c signal.c stream.c tcp.c thread.c tty.c udp.c"
+# NOTE: posix-poll.c / posix-hrtime.c are fallbacks for platforms WITHOUT a
+# native backend (uv/posix.h poll_fds fields). Linux uses linux.c (epoll),
+# Darwin uses darwin.c (kqueue); compiling the fallbacks would duplicate
+# uv__platform_loop_init/uv__hrtime and reference missing poll_fds fields.
 UV_COMMON="fs-poll.c idna.c inet.c random.c strscpy.c strtok.c thread-common.c threadpool.c timer.c uv-common.c uv-data-getter-setters.c version.c"
 # libuv on Linux needs GNU extensions (cpu_set_t etc). gnu11 + _GNU_SOURCE
 # before any system header; -include guard covers feature-macro races.
