@@ -99,7 +99,9 @@ case "$TOS" in
     LDLIBS="-lpthread -ldl -lrt -lm"
     ;;
   Darwin)
-    UV_UNIX="$UV_UNIX_BASE proctitle.c bsd-ifaddrs.c kqueue.c random-getentropy.c darwin-proctitle.c darwin.c fsevents.c"
+    # random.c's __APPLE__ branch calls uv__random_devurandom as fallback
+    # (getentropy failure path); must compile random-devurandom.c too.
+    UV_UNIX="$UV_UNIX_BASE proctitle.c bsd-ifaddrs.c kqueue.c random-getentropy.c random-devurandom.c darwin-proctitle.c darwin.c fsevents.c"
     UV_DEFS="-D_DARWIN_UNLIMITED_SELECT=1 -D_DARWIN_USE_64_BIT_INODE=1"
     LDLIBS="-lm -framework CoreFoundation -framework CoreServices"
     ;;
