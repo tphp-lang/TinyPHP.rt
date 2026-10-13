@@ -4,6 +4,36 @@
 
 ## 语言特性
 
+### 类型系统
+
+运行时值类型（`TVal` 标签）：
+
+| 类型 | 说明 |
+|---|---|
+| `null` | |
+| `bool` | `true` / `false`（内部 T_TRUE/T_FALSE） |
+| `int` | **int64**；溢出自动转 float（对齐 PHP） |
+| `float` | **float64** |
+| `string` | 不可变、NUL 结尾（便于 C 互操作） |
+| `array` | 有序哈希（list/dict 双语义）；键规范化：`"8"`→int 8，`"08"`/`"8.5"`/超 int64 留字符串 |
+| `object` | 用户类实例 / 异常对象 |
+| `closure` | 用户闭包 + builtin 一等包装 |
+| `enum case` | 单元/带值枚举 |
+| resource | **无独立 resource 类型**；文件/套接字句柄封装为对象（如 TStream） |
+
+类型**声明**（编译期解析 + **运行期校验**，非 AOT 约束）：
+
+- 标量：`int` `float` `string` `bool` `void`
+- 可空：`?int`（等价 `int|null`）
+- 联合：`int|string`、`array|null` 等
+- 容器：`array` `iterable` `mixed`
+- OOP：`static` `self` `parent`、类名、`enum` 名
+- **不支持**（后置）：交叉类型 `A&B`、DNF `(A&B)|C`
+
+动态特性全部保留：`$fn()`、`new $cls`、`$obj->$m()`、`$obj->{'prop'}` 等——类型只在调用/赋值点校验。
+
+### 语法与语义
+
 - 过程式 + 完整 OOP：`class` / `interface` / `trait` / `enum`（含 backing value、`match`）
 - 命名空间：`namespace`、`use` / `use as` / `use function` / `use const`
 - 函数：顶层/嵌套、闭包 `function() use`、箭头 `fn()`、命名参数、变参 `...`、默认值、first-class callable `$f(...)`
