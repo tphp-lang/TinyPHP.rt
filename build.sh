@@ -43,20 +43,23 @@ if [ "$TARCH" != "$HOST_ARCH" ]; then
 fi
 INC="-Isrc -Ideps/libuv/include -Ideps/libuv/src -Ideps/mimalloc/include -Ideps/mimalloc/src -Ideps/mbedtls/include -Ideps/mbedtls/library -Ideps/miniz"
 
-# libffi: vendored headers if present, else pkg-config, else system -lffi
-# cross-compile: skip pkg-config libs (brew is host-arch only); use SDK -lffi
+# libffi: vendored headers OK (arch-independent); libs must be host-arch
+# (never deps/libffi/lib/libffi.a: mingw COFF, see link step)
 FFI_CFLAGS=""
 FFI_LIBS=""
 if [ -d deps/libffi/include ]; then
   INC="$INC -Ideps/libffi/include"
-elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libffi; then
-  FFI_CFLAGS=$(pkg-config --cflags libffi)
+fi
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libffi; then
+  if [ -z "$FFI_CFLAGS" ]; then
+    FFI_CFLAGS=$(pkg-config --cflags libffi)
+    INC="$INC $FFI_CFLAGS"
+  fi
   if [ "$CROSS" = 0 ]; then
     FFI_LIBS=$(pkg-config --libs libffi)
   fi
-  INC="$INC $FFI_CFLAGS"
 fi
-if [ "$CROSS" = 1 ] && [ -z "$FFI_LIBS" ]; then
+if [ -z "$FFI_LIBS" ]; then
   FFI_LIBS="-lffi"
 fi
 
@@ -153,14 +156,14 @@ done
 
 # ---- [6/6] link ----
 echo "[6/6] linking..."
-# libffi: vendored static lib if present (Windows layout), else pkg-config/system
-if [ -f deps/libffi/lib/libffi.a ]; then
-  FFI_LIB="deps/libffi/lib/libffi.a"
-elif [ -n "$FFI_LIBS" ]; then
+# Unix NEVER links deps/libffi/lib/libffi.a (mingw COFF; Darwin ld rejects it).
+# Always system libffi: pkg-config or -lffi.
+if [ -n "$FFI_LIBS" ]; then
   FFI_LIB="$FFI_LIBS"
 else
   FFI_LIB="-lffi"
 fi
+echo "  link ffi: $FFI_LIB"
 $CC "$OBJ"/*.o $FFI_LIB -o "$OUT" $LDLIBS
 
 echo "Build OK: $OUT"
