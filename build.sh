@@ -75,7 +75,9 @@ mkdir -p build "$OBJ"
 
 # ---- [1/6] libuv ----
 echo "[1/6] compiling libuv..."
-UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c random-devurandom.c signal.c stream.c tcp.c thread.c tty.c udp.c"
+UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c signal.c stream.c tcp.c thread.c tty.c udp.c posix-hrtime.c posix-poll.c"
+# libuv >=1.45: common sources live in src/ root (threadpool/timer/idna/inet/...)
+UV_COMMON="fs-poll.c idna.c inet.c random.c strscpy.c strtok.c thread-common.c threadpool.c timer.c uv-common.c uv-data-getter-setters.c version.c"
 # libuv on Linux needs GNU extensions (cpu_set_t etc). gnu11 + _GNU_SOURCE
 # before any system header; -include guard covers feature-macro races.
 UV_CFLAGS="-O2 -g -fno-omit-frame-pointer -std=gnu11"
@@ -85,14 +87,14 @@ echo '#endif' >> "$OBJ/uv_force.h"
 
 case "$TOS" in
   Linux)
-    UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-getrandom.c random-sysctl-linux.c"
+    UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-devurandom.c random-getrandom.c random-sysctl-linux.c sysinfo-loadavg.c sysinfo-memory.c"
     UV_DEFS="-D_GNU_SOURCE -D_DEFAULT_SOURCE"
     LDLIBS="-lpthread -ldl -lrt -lm"
     ;;
   Darwin)
     UV_UNIX="$UV_UNIX_BASE proctitle.c bsd-ifaddrs.c kqueue.c random-getentropy.c darwin-proctitle.c darwin.c fsevents.c"
     UV_DEFS="-D_DARWIN_UNLIMITED_SELECT=1 -D_DARWIN_USE_64_BIT_INODE=1"
-    LDLIBS="-lm"
+    LDLIBS="-lm -framework CoreFoundation -framework CoreServices"
     ;;
   *)
     echo "build.sh: unsupported OS: $TOS" >&2
@@ -107,6 +109,10 @@ for f in $UV_UNIX; do
   fi
   $CC -w $UV_CFLAGS $UV_DEFS -include "$OBJ/uv_force.h" $INC \
       -c "deps/libuv/src/unix/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
+done
+for f in $UV_COMMON; do
+  $CC -w $UV_CFLAGS $UV_DEFS -include "$OBJ/uv_force.h" $INC \
+      -c "deps/libuv/src/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
 done
 
 # ---- [2/6] mimalloc ----
@@ -146,7 +152,9 @@ echo "[4/6] compiling mbedtls + miniz..."
 for f in deps/mbedtls/library/*.c; do
   $CC -w $CFLAGS $INC -c "$f" -o "$OBJ/mb_$(basename "$f" .c).o"
 done
-$CC -w $CFLAGS $INC -c deps/miniz/miniz.c -o "$OBJ/miniz.o"
+# _DEFAULT_SOURCE: glibc exposes ftello/fseeko (MZ_FTELL64/MZ_FSEEK64) only
+# under POSIX feature macros; macOS libc declares them by default
+$CC -w $CFLAGS -D_DEFAULT_SOURCE $INC -c deps/miniz/miniz.c -o "$OBJ/miniz.o"
 
 # ---- [5/6] tphp sources ----
 echo "[5/6] compiling tphp sources..."
