@@ -78,6 +78,25 @@ foreach ($dir in @("lang", "oop", "async", "worker", "ffi", "lib", "bench", "php
                     Write-Host ("  line {0}: expected [{1}] got [{2}]" -f ($i + 1), $e, $g)
                 }
             }
+            # crash diagnostics: separate compile vs execute
+            if ($exit -ne 0 -and $exit -ne $wantExit) {
+                $dumpOk = $true
+                $dumpOut = @(& $tphp --dump-opcodes $_.FullName 2>&1 | ForEach-Object { "$_" })
+                $dumpExit = $LASTEXITCODE
+                if ($dumpExit -ne 0) {
+                    $dumpOk = $false
+                    Write-Host "  DIAG compile --dump-opcodes exit=$dumpExit"
+                    $dumpOut | Select-Object -First 10 | ForEach-Object { Write-Host "  D: $_" }
+                } else {
+                    Write-Host "  DIAG compile OK (opcodes dumped); crash is at execute"
+                }
+                # rerun with stderr visible
+                $errOut = @(& $tphp run $_.FullName 2>&1 | ForEach-Object { "$_" })
+                if ($errOut) {
+                    Write-Host "  DIAG run stderr/out:"
+                    $errOut | Select-Object -First 10 | ForEach-Object { Write-Host "  R: $_" }
+                }
+            }
         }
     }
 }
