@@ -91,7 +91,10 @@ echo '#endif' >> "$OBJ/uv_force.h"
 
 case "$TOS" in
   Linux)
-    UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-devurandom.c random-getrandom.c random-sysctl-linux.c sysinfo-loadavg.c sysinfo-memory.c"
+    # linux.c already provides uv_loadavg / uv_get_*_memory / uv__hrtime /
+    # uv__platform_loop_init. Do NOT add sysinfo-loadavg/memory.c (fallbacks
+    # for other platforms; they would be duplicate symbol definitions).
+    UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-devurandom.c random-getrandom.c random-sysctl-linux.c"
     UV_DEFS="-D_GNU_SOURCE -D_DEFAULT_SOURCE"
     LDLIBS="-lpthread -ldl -lrt -lm"
     ;;
