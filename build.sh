@@ -2,6 +2,7 @@
 # TinyPHP.rt build script (Linux / macOS, clang or gcc). ASCII only.
 # Usage: ./build.sh
 # Supports: linux x86_64/aarch64, darwin x86_64/arm64.
+# Cross-compile: TARGET_ARCH=x86_64 ./build.sh   (e.g. arm64 mac runner -> x86_64)
 set -e
 
 # ---- toolchain ----
@@ -13,33 +14,59 @@ fi
 
 OUT=build/tphp
 OBJ=build/obj
-TARCH=$(uname -m)
+TARCH=${TARGET_ARCH:-$(uname -m)}
 TOS=$(uname -s)
+# portable lowercase (sh/dash has no ${var,,})
+TOS_LC=$(printf '%s' "$TOS" | tr 'A-Z' 'a-z')
 
 echo "tphp build: os=$TOS arch=$TARCH cc=$CC"
 
 # ---- flags ----
 CFLAGS="-O2 -std=c11 -g -fno-omit-frame-pointer"
 CFLAGS_US="-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE -DTPHP_USE_MIMALLOC"
+# cross-compile: add -arch to clang (macOS) when TARGET_ARCH differs from host
+HOST_ARCH=$(uname -m)
+CROSS=0
+if [ "$TARCH" != "$HOST_ARCH" ]; then
+  case "$TOS" in
+    Darwin)
+      CFLAGS="$CFLAGS -arch $TARCH"
+      CFLAGS_US="$CFLAGS_US -arch $TARCH"
+      CROSS=1
+      ;;
+    *)
+      echo "build.sh: cross-compile on $TOS not supported (only Darwin -arch)" >&2
+      exit 1
+      ;;
+  esac
+  echo "tphp build: cross-compile $HOST_ARCH -> $TARCH"
+fi
 INC="-Isrc -Ideps/libuv/include -Ideps/libuv/src -Ideps/mimalloc/include -Ideps/mimalloc/src -Ideps/mbedtls/include -Ideps/mbedtls/library -Ideps/miniz"
 
 # libffi: vendored headers if present, else pkg-config, else system -lffi
+# cross-compile: skip pkg-config libs (brew is host-arch only); use SDK -lffi
 FFI_CFLAGS=""
 FFI_LIBS=""
 if [ -d deps/libffi/include ]; then
   INC="$INC -Ideps/libffi/include"
 elif command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libffi; then
   FFI_CFLAGS=$(pkg-config --cflags libffi)
-  FFI_LIBS=$(pkg-config --libs libffi)
+  if [ "$CROSS" = 0 ]; then
+    FFI_LIBS=$(pkg-config --libs libffi)
+  fi
   INC="$INC $FFI_CFLAGS"
 fi
+if [ "$CROSS" = 1 ] && [ -z "$FFI_LIBS" ]; then
+  FFI_LIBS="-lffi"
+fi
 
-# normalize arch: arm64 -> aarch64 for target string
+# normalize arch: arm64 -> aarch64 for target string (Linux); keep arm64 on Darwin
 case "$TARCH" in
-  arm64) TARCH_N=aarch64 ;;
+  arm64) TARCH_N=arm64 ;;
+  aarch64) TARCH_N=aarch64 ;;
   *) TARCH_N=$TARCH ;;
 esac
-DEFS="-DTPHP_TARGET=\"${TARCH_N}-${TOS,,}\""
+DEFS="-DTPHP_TARGET=\"${TARCH_N}-${TOS_LC}\""
 
 mkdir -p build "$OBJ"
 

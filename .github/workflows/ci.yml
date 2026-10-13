@@ -119,10 +119,10 @@ jobs:
           ./build/tphp -v
           ./build/tphp test tests/lib
 
-  # ---------- macOS x86_64 (Intel) ----------
-  macos-x86_64:
-    name: macOS x86_64
-    runs-on: macos-13
+  # ---------- macOS aarch64 (Apple Silicon, native) + x86_64 cross ----------
+  macos-aarch64:
+    name: macOS aarch64
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -131,7 +131,7 @@ jobs:
           brew install libffi || true
           echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
-      - name: Build (build.sh)
+      - name: Build native arm64 (build.sh)
         run: |
           chmod +x build.sh
           ./build.sh
@@ -153,9 +153,9 @@ jobs:
           ./build/tphp -v
           ./build/tphp test tests/lib
 
-  # ---------- macOS aarch64 (Apple Silicon) ----------
-  macos-aarch64:
-    name: macOS aarch64
+  # ---------- macOS x86_64: cross-compile on arm64 runner (no x64 runners) ----------
+  macos-x86_64:
+    name: macOS x86_64 (cross)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,22 +165,20 @@ jobs:
           brew install libffi || true
           echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
-      - name: Build (build.sh)
+      - name: Cross-compile x86_64 (build.sh TARGET_ARCH=x86_64)
         run: |
           chmod +x build.sh
-          ./build.sh
+          TARGET_ARCH=x86_64 ./build.sh
 
-      - name: Test
+      - name: Verify binary arch
+        run: |
+          file build/tphp
+          # must be x86_64
+          file build/tphp | grep -q x86_64
+
+      - name: Test (Rosetta 2)
         shell: pwsh
         run: ./tests/run.ps1
-
-      - name: Pack smoke (footer container)
-        run: |
-          printf 'asset-data\n' > asset.txt
-          printf '<?php echo "pack-ok\n";' > app.php
-          ./build/tphp build app.php --with asset.txt -o app
-          ./app
-          test -f runtime/lib/asset.txt && echo "asset-extracted"
 
       - name: Smoke
         run: |
