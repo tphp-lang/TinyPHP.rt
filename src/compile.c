@@ -630,8 +630,10 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
         Loc mid = LOC_TMP(tmp_new(c));
         emit(c, OP_FETCH_DIM_R, b, i, mid, e->line);
         WBList *w = tm_malloc(sizeof *w);
+        memset(w, 0, sizeof *w);   /* MUST zero: is_prop/is_sprop garbage
+                                    * made emit_writebacks deref wild
+                                    * pointers (Linux-only SIGSEGV) */
         w->base = b; w->idx = i; w->val = mid;
-        w->is_global = false; w->gname = NULL;
         w->next = *wb;
         *wb = w;
         return mid;
