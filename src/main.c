@@ -170,7 +170,9 @@ static int run_one_test(const char *self_exe, const char *path,
         while (*p == ' ') p++;
         if (strncmp(p, "EXPECT:", 7) == 0) {
             p += 7;
-            while (*p == ' ') p++;
+            /* skip at most ONE separator space (match run.ps1 \s?);
+             * keep indentation so "  [0]=>" survives */
+            if (*p == ' ') p++;
             if (n_exp >= cap_exp) {
                 cap_exp = cap_exp ? cap_exp * 2 : 16;
                 expected = realloc(expected, sizeof(char *) * (size_t)cap_exp);
