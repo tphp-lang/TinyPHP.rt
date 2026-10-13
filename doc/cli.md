@@ -10,11 +10,12 @@ tphp <command> [args...]
 ```bash
 tphp run <file.php> [args...]    # 运行 PHP 脚本
 tphp <file.php>                  # 隐式 run（路径不以 - 开头）
-tphp -e '<php code>'             # 执行代码串
+tphp -e '<php code>'             # 执行代码串（无 <? 标签时自动补 <?php）
 ```
 
 ### 调试
 ```bash
+tphp --debug ...                 # 在其余命令前加：stderr 打印编译阶段诊断（DIAG:*）
 tphp --dump-opcodes <file.php>   # 反汇编编译产物（lex/parse/compile 后 dump，不执行）
 tphp -v, --version               # 版本 + 目标三元组 + libuv 版本
 tphp -h, --help                  # 帮助
@@ -59,6 +60,16 @@ tphp build app.php --with vendor/ --with bar.dll -o app
 | Windows | PE RCDATA `TPHP_BUNDLE` + `TPHP_MAIN` |
 | Linux | ELF section `.tphp_bundle`（objcopy，失败回落 footer） |
 | macOS | 文件尾 footer（`[zip][u64 size][TPHPBND1]`） |
+
+## Windows 编码（中文）
+
+- 启动时设置控制台输出代码页为 UTF-8（`SetConsoleOutputCP`），PHP 源码与 `echo` 输出统一 UTF-8，重定向到文件/管道时输出原始 UTF-8 字节
+- 命令行参数按 UTF-8 解析（`-e` 代码串、脚本路径里的中文不依赖系统 ANSI 代码页）
+- **PowerShell 5.1 会吃掉 `-e` 参数里成对的双引号**（系统行为，`php` CLI 同样中招）：
+  - ✗ `tphp -e 'echo "你好";'` → 实际收到 `echo 你好;` → `Undefined constant "你好"`
+  - ✓ `tphp -e "echo '你好';"`（PHP 用单引号）
+  - ✓ `tphp -e 'echo \"你好\";'`（转义双引号）
+  - pwsh 7.3+ 修正了参数传递，可直接写双引号
 
 ## 环境变量
 

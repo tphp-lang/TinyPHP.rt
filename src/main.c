@@ -48,8 +48,9 @@ static void print_usage(FILE *out) {
         "\n"
         "Usage:\n"
         "  tphp run <file.php> [args...]   run a PHP script\n"
-        "  tphp -e '<php code>'            execute a code string\n"
+        "  tphp -e '<php code>'            execute a code string (<?php implied)\n"
         "  tphp --dump-opcodes <file>      dump compiled opcodes\n"
+        "  --debug                         compile-stage diagnostics on stderr\n"
         "  tphp test <dir>                 run EXPECT tests in directory\n"
         "  tphp phpc <dir> -o <out.c>      pack lib\\*.php into bundle_data.c\n"
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
@@ -60,11 +61,53 @@ static void print_usage(FILE *out) {
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #include <direct.h>
 #else
 #include <dirent.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+
+/* --debug 时才打印编译阶段诊断（默认静默，避免误导用户） */
+static bool g_debug = false;
+
+#ifdef _WIN32
+/* 命令行 UTF-16 → UTF-8 argv：否则 -e/路径里的中文先被系统 ANSI 代码页破坏 */
+static void win_argv_to_utf8(int *pargc, char ***pargv) {
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) return;
+    char **nav = (char **)calloc((size_t)wargc + 1, sizeof(char *));
+    if (!nav) { LocalFree(wargv); return; }
+    for (int i = 0; i < wargc; i++) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        if (n <= 0) { nav[i] = (char *)calloc(1, 1); continue; }
+        nav[i] = (char *)malloc((size_t)n);
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nav[i], n, NULL, NULL);
+    }
+    LocalFree(wargv);
+    *pargc = wargc;
+    *pargv = nav;
+}
+
+/* UTF-8 → ACP：仅用于 system()/cmd.exe 这类 ANSI 边界 */
+static void u8_to_acp(const char *s, char *out, size_t cap) {
+    wchar_t w[1024];
+    out[0] = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, w, 1024)) return;
+    WideCharToMultiByte(CP_ACP, 0, w, -1, out, (int)cap, NULL, NULL);
+}
+
+/* 路径按 UTF-8 解释（Windows 走宽字符，中文路径不破） */
+static FILE *fopen_u8(const char *path, const char *mode) {
+    wchar_t wp[1024], wm[16];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wp, 1024)) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, 0, mode, -1, wm, 16)) return NULL;
+    return _wfopen(wp, wm);
+}
+#else
+#define fopen_u8(path, mode) fopen((path), (mode))
 #endif
 
 /* ---- M6-e: tphp test <dir> ----
@@ -96,18 +139,23 @@ static bool name_is_test(const char *fn) {
 
 static void scan_tests(const char *dir, TestList *t) {
 #ifdef _WIN32
-    char pattern[512];
-    snprintf(pattern, sizeof pattern, "%s\\*.php", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
+    wchar_t wdir[768], pattern[800];
+    if (!MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 768)) return;
+    _snwprintf(pattern, 800, L"%s\\*.php", wdir);
+    pattern[799] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (!name_is_test(fd.cFileName)) continue;
-        char path[512];
-        snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
+        char name[520];
+        if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
+                                 name, sizeof name, NULL, NULL)) continue;
+        if (!name_is_test(name)) continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s\\%s", dir, name);
         tl_add(t, path);
-    } while (FindNextFileA(h, &fd));
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
     DIR *d = opendir(dir);
@@ -126,18 +174,23 @@ static void scan_tests(const char *dir, TestList *t) {
 /* 运行一个测试文件：捕获 stdout 到临时文件，与 EXPECT 比对 */
 static int run_one_test(const char *self_exe, const char *path,
                         char *fail_reason, size_t reason_cap) {
-    char cmd[1024];
+    char cmd[2048];
     char tmp_out[] = "tphp_test_out_XXXXXX";
 #ifdef _WIN32
+    /* system()/cmd.exe 走 ANSI：exe 与测试路径转 ACP 后拼命令行 */
+    char exe_a[1024], path_a[1024];
+    u8_to_acp(self_exe, exe_a, sizeof exe_a);
+    u8_to_acp(path, path_a, sizeof path_a);
     int tfd = -1;
     /* 简化：用固定临时名（单进程 test 足够） */
     snprintf(tmp_out, sizeof tmp_out, "build\\_ttest_out.txt");
     snprintf(cmd, sizeof cmd, "\"%s\" run \"%s\" > \"%s\" 2>NUL",
-             self_exe, path, tmp_out);
+             exe_a, path_a, tmp_out);
     int rc = system(cmd);
     /* Windows system() 返回退出码左移 8 */
     int exit_code = (rc >> 8) & 0xFF;
     if (rc == -1) exit_code = -1;
+    (void)tfd;
 #else
     snprintf(tmp_out, sizeof tmp_out, "/tmp/tphp_test_out_XXXXXX");
     int tfd = mkstemp(tmp_out);
@@ -150,7 +203,7 @@ static int run_one_test(const char *self_exe, const char *path,
 #endif
 
     /* 读 EXPECT 与输出 */
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = fopen_u8(path, "rb");
     if (!fp) {
         snprintf(fail_reason, reason_cap, "cannot open test");
         return -1;
@@ -368,7 +421,7 @@ static int run_phpc(const char *dir, const char *out_path) {
 }
 
 static char *read_file(const char *path) {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = fopen_u8(path, "rb");
     if (!fp) {
         fprintf(stderr, "tphp: could not open '%s'\n", path);
         return NULL;
@@ -390,16 +443,16 @@ static int run_source(const char *src, const char *name, bool dump) {
     tphp_async_init();            /* 内部类先于编译期类检查注册 */
     tphp_io_init();
     tphp_ffi_init();              /* M5.5 FFI 内部类 */
-    fprintf(stderr, "DIAG:init-ok\n");
+    if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
     AStmtList *ast = tphp_parse_script(src, name);
-    fprintf(stderr, "DIAG:parse-ok stmts=%d\n", ast ? ast->n : -1);
+    if (g_debug) fprintf(stderr, "DIAG:parse-ok stmts=%d\n", ast ? ast->n : -1);
     Program *prog = tphp_compile(ast, name);
-    fprintf(stderr, "DIAG:compile-ok funcs=%d\n", prog ? prog->n_funcs : -1);
+    if (g_debug) fprintf(stderr, "DIAG:compile-ok funcs=%d\n", prog ? prog->n_funcs : -1);
     tphp_prog_freeze(prog);       /* M5: 类表冻结 + ic 急解析（跨线程只读） */
-    fprintf(stderr, "DIAG:freeze-ok\n");
+    if (g_debug) fprintf(stderr, "DIAG:freeze-ok\n");
     if (dump) {
         tphp_dump_program(prog);
-        fprintf(stderr, "DIAG:dump-ok\n");
+        if (g_debug) fprintf(stderr, "DIAG:dump-ok\n");
         return 0;
     }
     int rc = tphp_vm_run(prog);   /* 0 = ok, 255 = uncaught exception */
@@ -412,10 +465,19 @@ int main(int argc, char **argv) {
     /* binary stdout: PHP CLI parity — echo "\n" must emit LF, not CRLF.
      * Otherwise source bytes containing CRLF get doubled (\r\r\n) on write. */
     _setmode(_fileno(stdout), _O_BINARY);
+    /* Windows 控制台默认 GBK(CP936)，而源码/输出是 UTF-8 → 切到 UTF-8 避免中文乱码。
+     * 无控制台时（重定向/CI）调用是 no-op，字节已原样写出。 */
+    SetConsoleOutputCP(CP_UTF8);
+    /* -e/路径里的中文先被 ANSI 破坏 → 命令行改按 UTF-8 解析 */
+    win_argv_to_utf8(&argc, &argv);
 #endif
     /* line-buffered stdout: when piped (tests/CI) each \n flushes, so a
      * later SIGSEGV still leaves the lines already printed visible */
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* --debug 可出现在任意位置，故先全量预扫（不消耗 argv） */
+    for (int di = 1; di < argc; di++)
+        if (strcmp(argv[di], "--debug") == 0) { g_debug = true; break; }
 
     /* M6.1: 启动最早期——释放内嵌原生资产 + 检测嵌入主脚本（跨平台） */
     char *embedded_main = NULL;
@@ -437,6 +499,8 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
+
+        if (strcmp(a, "--debug") == 0) continue;   /* 已在预扫处理 */
 
         if (strcmp(a, "-v") == 0 || strcmp(a, "--version") == 0) {
             printf("tphp %s (%s, libuv %s)\n", TPHP_VERSION, TPHP_TARGET,
@@ -471,9 +535,20 @@ int main(int argc, char **argv) {
             /* 复制自身 → out_exe 再注入 */
             char self[1024];
             self[0] = 0;
+            char out_acp[1024];
+            out_acp[0] = 0;
 #ifdef _WIN32
-            GetModuleFileNameA(NULL, self, MAX_PATH);
-            if (!CopyFileA(self, out_exe, FALSE)) {
+            /* pack.c 走 ANSI fopen：out_exe/--with 转 ACP（源码读入不受影响） */
+            u8_to_acp(out_exe, out_acp, sizeof out_acp);
+            for (int wi = 0; wi < nwith; wi++) {
+                char *w = (char *)malloc(1024);
+                u8_to_acp(withs[wi], w, 1024);
+                withs[wi] = w;
+            }
+            wchar_t wself[MAX_PATH], wout[MAX_PATH];
+            GetModuleFileNameW(NULL, wself, MAX_PATH);
+            MultiByteToWideChar(CP_UTF8, 0, out_exe, -1, wout, MAX_PATH);
+            if (!CopyFileW(wself, wout, FALSE)) {
                 fprintf(stderr, "tphp: cannot copy to '%s' (err %lu)\n",
                         out_exe, GetLastError());
                 free(php);
@@ -510,6 +585,7 @@ int main(int argc, char **argv) {
                 chmod(out_exe, 0755);
             }
 #endif
+            if (out_acp[0]) out_exe = out_acp;   /* pack.c 用 ACP 路径 */
             int rc = tphp_pack_exe(out_exe, php, strlen(php), withs, nwith);
             free(php);
             return rc == 0 ? (int)TPHP_OK : (int)TPHP_E_IO;
@@ -554,7 +630,21 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "tphp: '-e' requires a code string\n");
                 return (int)TPHP_E_ARGS;
             }
-            return run_source(argv[i + 1], "<eval>", false);
+            /* -r 风格：无 <? 标签时自动补 "<?php "（对齐文档示例与 php -r 直觉） */
+            const char *code = argv[i + 1];
+            while (*code == ' ' || *code == '\t' || *code == '\r' || *code == '\n') code++;
+            int rc;
+            if (strncmp(code, "<?", 2) == 0) {
+                rc = run_source(argv[i + 1], "<eval>", false);
+            } else {
+                size_t n = strlen(argv[i + 1]);
+                char *wrapped = (char *)malloc(n + 8);
+                memcpy(wrapped, "<?php ", 6);
+                memcpy(wrapped + 6, argv[i + 1], n + 1);
+                rc = run_source(wrapped, "<eval>", false);
+                free(wrapped);
+            }
+            return rc;
         }
         if (strcmp(a, "--dump-opcodes") == 0) {
             if (i + 1 >= argc) {
