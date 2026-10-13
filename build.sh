@@ -73,13 +73,17 @@ mkdir -p build "$OBJ"
 # ---- [1/6] libuv ----
 echo "[1/6] compiling libuv..."
 UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c random-devurandom.c signal.c stream.c tcp.c thread.c tty.c udp.c"
-# deps: no -std=c11 (strict ANSI hides cpu_set_t / GNU pthread extensions)
-UV_CFLAGS="-O2 -g -fno-omit-frame-pointer"
+# libuv on Linux needs GNU extensions (cpu_set_t etc). gnu11 + _GNU_SOURCE
+# before any system header; -include guard covers feature-macro races.
+UV_CFLAGS="-O2 -g -fno-omit-frame-pointer -std=gnu11"
+echo '#ifndef _GNU_SOURCE' > "$OBJ/uv_force.h"
+echo '#define _GNU_SOURCE 1' >> "$OBJ/uv_force.h"
+echo '#endif' >> "$OBJ/uv_force.h"
 
 case "$TOS" in
   Linux)
     UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-getrandom.c random-sysctl-linux.c"
-    UV_DEFS="-D_GNU_SOURCE"
+    UV_DEFS="-D_GNU_SOURCE -D_DEFAULT_SOURCE"
     LDLIBS="-lpthread -ldl -lrt -lm"
     ;;
   Darwin)
@@ -94,7 +98,12 @@ case "$TOS" in
 esac
 
 for f in $UV_UNIX; do
-  $CC -w $UV_CFLAGS $UV_DEFS $INC -c "deps/libuv/src/unix/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
+  # echo first file's command for CI diagnostics
+  if [ "$f" = "async.c" ]; then
+    echo "  UV cmd: $CC -w $UV_CFLAGS $UV_DEFS -include $OBJ/uv_force.h $INC -c deps/libuv/src/unix/$f"
+  fi
+  $CC -w $UV_CFLAGS $UV_DEFS -include "$OBJ/uv_force.h" $INC \
+      -c "deps/libuv/src/unix/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
 done
 
 # ---- [2/6] mimalloc ----

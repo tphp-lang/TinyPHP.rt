@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>   /* M6.2: portable atomics (replaces Win32 Interlocked*) */
 
 /* ---- serialize.c / vm.c ---- */
 TStr *tphp_serialize_val(struct VM *vm, TVal v);
@@ -158,7 +159,7 @@ typedef struct WHandle {
     uv_sem_t ready;              /* 子线程 mailbox 就绪握手（PLAN/03 §5） */
     char *entry_blob;            /* 入口闭包序列化 */
     uint32_t entry_len;
-    volatile LONG state;         /* 0 running / 1 stop_requested / 2 done */
+    atomic_int state;          /* 0 running / 1 stop_requested / 2 done */
     /* 父侧事件回调（仅父线程读写） */
     TVal on_message;             /* T_NULL = 无 */
 } WHandle;
@@ -303,7 +304,7 @@ static void worker_thread(void *arg) {
                                                h->entry_len, &pos);
     if (!clo) {
         fprintf(stderr, "PHP Warning: Worker: failed to rebuild entry\n");
-        InterlockedExchange(&h->state, 2);
+        atomic_store(&h->state, 2);
         wbox_close(&h->to_parent);
         return;
     }
@@ -312,7 +313,7 @@ static void worker_thread(void *arg) {
 
     tphp_vm_run_closure(h->prog, clo);
 
-    InterlockedExchange(&h->state, 2);
+    atomic_store(&h->state, 2);
     wbox_close(&h->to_parent);   /* 通知父线程：已退出 */
 }
 
@@ -421,7 +422,7 @@ static TVal nm_worker_stop(VM *vm, void *self, TVal *args, int n) {
     (void)args; (void)n;
     WHandle *h = worker_obj_handle(self);
     if (!h) return TV_NULL;
-    if (InterlockedExchange(&h->state, 1) == 2) return TV_NULL;  /* 已 done */
+    if (atomic_exchange(&h->state, 1) == 2) return TV_NULL;  /* 已 done */
     wbox_close(&h->to_child);
     uint32_t len;
     char *data;
