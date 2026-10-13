@@ -35,6 +35,7 @@
 | HTTPS/TLS | vendor mbedtls + `cacert.pem` 根证书内嵌 exe（M4；libuv 无 TLS，txiki cacert.c 同款） |
 | 分配器 | mimalloc vendor 垫在 malloc 层（默认开；与 ASAN 构建互斥，txiki 先例） |
 | 语义对拍 | 从 php-src `Zend/tests` 抽 .phpt 子集做对拍测试层（见 PLAN/04 §2） |
+| FFI | libffi vendor 进 deps（静态 .a + 头文件）；M5.5 已完成（含 dlopen/wchar/union/enum 常量） |
 
 ## 计划文档导航
 
@@ -48,14 +49,15 @@
 
 ## 技术栈与环境
 
-- C11 + clang 22（MinGW64/ucrt64），目标 Windows/Linux/macOS
-- 构建纯命令行脚本（不用 Make/CMake），`.cmd` 纯 ASCII
-- vendored：libuv（I/O）、mimalloc（malloc 层）、mbedtls + cacert（HTTPS，M4）、fcontext 汇编（抄 php-src `Zend/asm/` 6 个 .S）
+- C11 + clang（MinGW64/ucrt64 或 clang64），目标 Windows/Linux/macOS
+- 构建纯命令行脚本（不用 Make/CMake），`.cmd`/`.sh` 纯 ASCII
+- CI：GitHub Actions `.github/workflows/ci.yml`——Windows x86_64（msys2 clang64）、Linux x86_64/aarch64、macOS x86_64/arm64，build + tests/run.ps1 + smoke
+- vendored：libuv（I/O）、mimalloc（malloc 层）、mbedtls + cacert（HTTPS，M4）、fcontext 汇编（抄 php-src `Zend/asm/` 6 个 .S）、libffi（M5.5 FFI，静态库+头文件）
 - 仓库：`C:\project\tphp\TinyPHP.rt`，CLI 名 `tphp`
 
 ## 参考项目
 
-- [php-src](https://github.com/php/php-src) 本地：`C:\Users\kllxs\Desktop\php-src-php-8.5.7`
+- [php-src](https://github.com/php/php-src) 本地：`C:\Users\28249\Desktop\php-src-php-8.5.11`
 - [txiki.js](https://github.com/saghul/txiki.js) 本地：`C:\Users\28249\Desktop\txiki.js`
 
 ## 执行顺序

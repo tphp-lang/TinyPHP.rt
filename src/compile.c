@@ -23,6 +23,7 @@
 #include "ast.h"
 #include "lex.h"
 #include "class.h"
+#include "bundle.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2712,7 +2713,171 @@ static void pass_funcs(AStmtList *l, Program *p, const char *file) {
     }
 }
 
+/* ---- M6: require/include 编译期内联 ----
+ * S_INCLUDE 在编译入口展开：读文件 → parse → 语句列表原地替换。
+ * 路径相对当前文件目录；全部 require/include 按路径去重（防循环）。
+ * 非字面量路径 parse 阶段已拒绝。 */
+
+static char **s_inc_seen;
+static int s_n_inc_seen, s_cap_inc_seen;
+
+static char *dir_of(const char *path) {
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    const char *s = slash > bslash ? slash : bslash;
+    if (!s) return NULL;
+    size_t n = (size_t)(s - path);
+    char *d = tm_malloc(n + 1);
+    memcpy(d, path, n);
+    d[n] = 0;
+    return d;
+}
+
+static char *join_path(const char *dir, const char *rel) {
+    /* Windows 路径：用 '\\' 或 '/' 都可，统一 '/' */
+    if (!dir) {
+        char *r = tm_malloc(strlen(rel) + 1);
+        strcpy(r, rel);
+        return r;
+    }
+    size_t dl = strlen(dir), rl = strlen(rel);
+    char *r = tm_malloc(dl + 1 + rl + 1);
+    memcpy(r, dir, dl);
+    r[dl] = '/';
+    memcpy(r + dl + 1, rel, rl + 1);
+    return r;
+}
+
+static bool inc_seen(const char *path) {
+    for (int i = 0; i < s_n_inc_seen; i++)
+        if (strcmp(s_inc_seen[i], path) == 0) return true;
+    return false;
+}
+
+static void inc_mark(const char *path) {
+    if (s_n_inc_seen >= s_cap_inc_seen) {
+        s_cap_inc_seen = s_cap_inc_seen ? s_cap_inc_seen * 2 : 16;
+        s_inc_seen = tm_realloc(s_inc_seen, sizeof(char *) * (size_t)s_cap_inc_seen);
+    }
+    s_inc_seen[s_n_inc_seen] = tm_malloc(strlen(path) + 1);
+    strcpy(s_inc_seen[s_n_inc_seen], path);
+    s_n_inc_seen++;
+}
+
+static char *read_file_all(const char *path, size_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz < 0) { fclose(fp); return NULL; }
+    char *buf = tm_malloc((size_t)sz + 1);
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[got] = 0;
+    if (out_len) *out_len = got;
+    return buf;
+}
+
+/* 递归展开 stmts 中的 S_INCLUDE（顶层 + 控制流块内） */
+static void expand_includes(AStmtList *stmts, const char *cur_file);
+
+static void expand_list(AStmtList *l, const char *cur_file) {
+    if (!l) return;
+    expand_includes(l, cur_file);
+}
+
+static void expand_includes(AStmtList *stmts, const char *cur_file) {
+    if (!stmts || stmts->n == 0) return;
+    for (int i = 0; i < stmts->n; i++) {
+        AStmt *st = stmts->stmts[i];
+        switch (st->tag) {
+        case S_BLOCK: expand_list(st->u.stmts, cur_file); break;
+        case S_IF:
+            if (st->u.ifs) {
+                for (int b = 0; b < st->u.ifs->n; b++)
+                    expand_list(st->u.ifs->branches[b].body, cur_file);
+                expand_list(st->u.ifs->else_body, cur_file);
+            }
+            break;
+        case S_WHILE: case S_DOWHILE: expand_list(st->u.wh.body, cur_file); break;
+        case S_FOR: expand_list(st->u.fors->body, cur_file); break;
+        case S_FOREACH: expand_list(st->u.fe->body, cur_file); break;
+        case S_SWITCH:
+            if (st->u.sw)
+                for (int c = 0; c < st->u.sw->n; c++)
+                    expand_list(st->u.sw->cases[c].body, cur_file);
+            break;
+        case S_TRY:
+            if (st->u.trys) {
+                expand_list(st->u.trys->body, cur_file);
+                for (int c = 0; c < st->u.trys->n_catches; c++)
+                    expand_list(st->u.trys->catches[c]->body, cur_file);
+                expand_list(st->u.trys->finally, cur_file);
+            }
+            break;
+        default: break;
+        }
+    }
+    /* 展开顶层 S_INCLUDE：重建语句数组 */
+    int n_out = 0;
+    AStmt **out = NULL;
+    for (int i = 0; i < stmts->n; i++) {
+        AStmt *st = stmts->stmts[i];
+        if (st->tag != S_INCLUDE) {
+            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+            out[n_out++] = st;
+            continue;
+        }
+        const char *rel = tstr_val(st->u.inc.path);
+        /* M6: 先查内嵌 bundle 表（单 exe）；命中用内嵌源码 */
+        char bname[128];
+        tphp_bundle_name_of(rel, bname, sizeof bname);
+        const TBundle *bun = tphp_bundle_find(bname);
+        if (bun) {
+            if (inc_seen(bname)) continue;
+            inc_mark(bname);
+            AStmtList *inc = tphp_parse_script(bun->src, bun->name);
+            expand_includes(inc, bun->name);
+            for (int k = 0; k < inc->n; k++) {
+                out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+                out[n_out++] = inc->stmts[k];
+            }
+            tm_free(inc->stmts);
+            tm_free(inc);
+            continue;
+        }
+        char *dir = cur_file ? dir_of(cur_file) : NULL;
+        char *full = join_path(dir, rel);
+        if (dir) tm_free(dir);
+        /* 全部按路径去重（防循环 require；PHP 普通 require 可重复，
+         * M6 先去重更安全——lib 函数定义场景无影响） */
+        if (inc_seen(full)) { tm_free(full); continue; }
+        char *src = read_file_all(full, NULL);
+        if (!src)
+            tphp_fatal_src(cur_file ? cur_file : "<main>", st->line,
+                           "Failed opening required file '%s'", full);
+        inc_mark(full);
+        AStmtList *inc = tphp_parse_script(src, full);
+        expand_includes(inc, full);
+        tm_free(src);
+        tm_free(full);
+        for (int k = 0; k < inc->n; k++) {
+            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+            out[n_out++] = inc->stmts[k];
+        }
+        tm_free(inc->stmts);
+        tm_free(inc);
+    }
+    if (out) {
+        stmts->stmts = out;
+        stmts->n = n_out;
+    }
+}
+
 Program *tphp_compile(AStmtList *ast, const char *file) {
+    /* M6: 展开 require/include（字符串字面量） */
+    expand_includes(ast, file);
     Program *p = tm_malloc(sizeof *p);
     memset(p, 0, sizeof *p);
     p->file = file;

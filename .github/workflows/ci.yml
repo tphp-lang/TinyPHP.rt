@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- Windows x86_64 (msys2 clang64) ----------
+  windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: false
+          install: mingw-w64-clang-x86_64-clang
+
+      - name: Build (build.cmd)
+        shell: cmd
+        run: |
+          set PATH=C:\msys64\clang64\bin;%PATH%
+          build.cmd
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (PE resources)
+        shell: pwsh
+        run: |
+          Set-Content -Path asset.txt -Value "asset-data" -NoNewline
+          Set-Content -Path app.php -Value '<?php echo "pack-ok`n";' -NoNewline
+          ./build/tphp.exe build app.php --with asset.txt -o app.exe
+          ./app.exe
+          if (Test-Path runtime/lib/asset.txt) { "asset-extracted" }
+
+      - name: Smoke
+        shell: pwsh
+        run: |
+          ./build/tphp.exe -v
+          ./build/tphp.exe test tests/lib
+
+  # ---------- Linux x86_64 ----------
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang binutils libffi-dev
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (ELF section / footer)
+        run: |
+          printf 'asset-data\n' > asset.txt
+          printf '<?php echo "pack-ok\n";' > app.php
+          ./build/tphp build app.php --with asset.txt -o app
+          ./app
+          test -f runtime/lib/asset.txt && echo "asset-extracted"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- Linux aarch64 ----------
+  linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang binutils libffi-dev
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (ELF section / footer)
+        run: |
+          printf 'asset-data\n' > asset.txt
+          printf '<?php echo "pack-ok\n";' > app.php
+          ./build/tphp build app.php --with asset.txt -o app
+          ./app
+          test -f runtime/lib/asset.txt && echo "asset-extracted"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- macOS x86_64 (Intel) ----------
+  macos-x86_64:
+    name: macOS x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          brew install libffi || true
+          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (footer container)
+        run: |
+          printf 'asset-data\n' > asset.txt
+          printf '<?php echo "pack-ok\n";' > app.php
+          ./build/tphp build app.php --with asset.txt -o app
+          ./app
+          test -f runtime/lib/asset.txt && echo "asset-extracted"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- macOS aarch64 (Apple Silicon) ----------
+  macos-aarch64:
+    name: macOS aarch64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          brew install libffi || true
+          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (footer container)
+        run: |
+          printf 'asset-data\n' > asset.txt
+          printf '<?php echo "pack-ok\n";' > app.php
+          ./build/tphp build app.php --with asset.txt -o app
+          ./app
+          test -f runtime/lib/asset.txt && echo "asset-extracted"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib

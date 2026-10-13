@@ -10,7 +10,7 @@ set OBJ=build\obj
 rem ---- flags ----
 set CFLAGS=-O2 -std=c11 -g -fno-omit-frame-pointer
 set CFLAGS_US=-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE -DTPHP_USE_MIMALLOC
-set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library
+set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz
 set DEFS=-DTPHP_TARGET="\"x86_64-w64-windows-gnu\""
 
 if not exist build mkdir build
@@ -33,12 +33,25 @@ for %%f in (deps\asm\*_ms_pe_gas.S) do %CC% -w %CFLAGS% -c "%%f" -o "%OBJ%\asm_%
 echo [3/5] compiling mbedtls...
 for %%f in (deps\mbedtls\library\*.c) do %CC% -w %CFLAGS% %INC% -c "%%f" -o "%OBJ%\mb_%%~nf.o" || goto :fail
 
+echo [3b/5] compiling miniz...
+%CC% -w %CFLAGS% %INC% -c deps\miniz\miniz.c -o "%OBJ%\miniz.o" || goto :fail
+
 echo [4/5] compiling tphp sources...
 for %%f in (src\*.c) do %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~nf.o" || goto :fail
 
-echo [5/5] linking...
-%CC% %OBJ%\*.o -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv || goto :fail
+echo [5/6] linking...
+%CC% %OBJ%\*.o deps\libffi\lib\libffi.a -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv || goto :fail
 
+rem M6: two-stage - if lib\*.php exists, pack into bundle_data.c and relink
+if not exist lib goto :done
+dir /b lib\*.php >nul 2>&1
+if errorlevel 1 goto :done
+echo [6/6] packing lib\*.php into bundle_data.c...
+%OUT% phpc lib -o src\bundle_data.c || goto :fail
+%CC% %CFLAGS_US% %DEFS% %INC% -c src\bundle_data.c -o "%OBJ%\src_bundle_data.o" || goto :fail
+%CC% %OBJ%\*.o deps\libffi\lib\libffi.a -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv || goto :fail
+
+:done
 echo Build OK: %OUT%
 exit /b 0
 

@@ -1,24 +1,53 @@
 # TinyPHP.rt test runner
-# Tests: tests/lang/test-*.php and tests/oop/*.php with txiki-style `// EXPECT:` comments.
+# Tests: tests/*/test-*.php with txiki-style `// EXPECT:` comments.
 # Each EXPECT line is compared (exact) against the script's stdout lines.
+# Cross-platform: Windows (tphp.exe) and Unix (tphp) via pwsh/powershell.
 $ErrorActionPreference = "Continue"
-$tphp = Join-Path $PSScriptRoot "..\build\tphp.exe"
-if (-not (Test-Path $tphp)) {
-    Write-Host "tphp.exe not found at $tphp - run build.cmd first"
-    exit 1
+$root = Split-Path -Parent $PSScriptRoot
+$onWindows = ($env:OS -eq 'Windows_NT') -or ($IsWindows -eq $true)
+if ($onWindows) {
+    $tphp = Join-Path $root "build\tphp.exe"
+} else {
+    $tphp = Join-Path $root "build/tphp"
 }
+if (-not (Test-Path $tphp)) {
+    # cross-name fallback
+    $alt = if ($onWindows) { Join-Path $root "build/tphp" } else { Join-Path $root "build\tphp.exe" }
+    if (Test-Path $alt) { $tphp = $alt }
+    else {
+        Write-Host "tphp binary not found - run build.cmd / build.sh first"
+        exit 1
+    }
+}
+
+# Windows-only tests (msvcrt/user32/kernel32/lstrcmpW) — skipped on Linux/macOS
+$winOnly = @(
+    "test-ffi-simple-calls.php",
+    "test-ffi-system-libs.php",
+    "test-ffi-variadic.php",
+    "test-ffi-wchar.php",
+    "test-ffi-in-worker.php",
+    "m5.5-acceptance.php"
+)
 
 $pass = 0
 $fail = 0
+$skip = 0
 $failed = @()
 
-foreach ($dir in @("lang", "oop", "async", "worker")) {
-$files = Get-ChildItem -Path (Join-Path $PSScriptRoot $dir) -Filter "*.php" |
-    Sort-Object Name
-if ($dir -eq "lang") {
+foreach ($dir in @("lang", "oop", "async", "worker", "ffi", "lib", "bench", "php-compat")) {
+    $dirPath = Join-Path $PSScriptRoot $dir
+    if (-not (Test-Path $dirPath)) { continue }
+    $files = Get-ChildItem -Path $dirPath -Filter "*.php" -ErrorAction SilentlyContinue |
+        Sort-Object Name
+    # only test-*.php (helpers/non-tests excluded)
     $files = $files | Where-Object { $_.Name -like "test-*.php" }
-}
-foreach ($_ in $files) {
+    foreach ($_ in $files) {
+        if (-not $onWindows -and $winOnly -contains $_.Name) {
+            $skip++
+            Write-Host "SKIP $($_.Name) (windows-only)"
+            continue
+        }
         $expected = @()
         $wantExit = 0
         foreach ($line in Get-Content -Encoding UTF8 $_.FullName) {
@@ -54,6 +83,7 @@ foreach ($_ in $files) {
 }
 
 Write-Host ""
-Write-Host "$pass passed, $fail failed"
+if ($skip -gt 0) { Write-Host "$pass passed, $fail failed, $skip skipped" }
+else { Write-Host "$pass passed, $fail failed" }
 if ($fail -gt 0) { exit 1 }
 exit 0

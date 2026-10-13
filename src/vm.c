@@ -34,6 +34,7 @@
 #include "tphp.h"
 #include "class.h"
 #include "sched.h"
+#include "tffi.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,6 +272,13 @@ static TVal arr_key_at(TArr *a, uint32_t di) {
 /* shared core of ASSIGN_DIM / ARRAY_APPEND: slot(o1)[key(o2)] = value(tr) */
 static int32_t do_dim_write(VM *vm, TOp *op) {
     TVal *bp = opd(vm, op, 1);
+    /* M5.5: FFI\CData 指针/数组写（base 已是 CData 对象） */
+    if (bp->t == T_OBJ) {
+        TVal key = op->t2 != OPD_UNUSED ? rd(vm, op, 2) : TV_NULL;
+        TVal val = rdv(vm, op, 3);
+        if (tphp_ffi_assign_dim(vm, *bp, key, val))
+            return 1;
+    }
     if (bp->t == T_UNDEF) {
         TArr *a = tarr_new();
         *bp = TV_ARR(a);                       /* auto-vivification */
@@ -472,6 +480,14 @@ static int32_t op_fetch_dim_r(VM *vm, TOp *op) {
     if (op->t2 == OPD_UNUSED)
         vm_raise(vm, ex_class("Error"), op, "Cannot use [] for reading");
     TVal key = rd(vm, op, 2);
+    /* M5.5: FFI\CData 指针/数组下标 */
+    {
+        TVal fv;
+        if (tphp_ffi_fetch_dim(vm, base, key, &fv)) {
+            wtake(vm, op, fv);
+            return 1;
+        }
+    }
     if (base.t == T_ARR) {
         TArr *a = (TArr *)base.u.p;
         if (!tval_norm_key(&key))
@@ -1077,7 +1093,18 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     BuiltinFn clo_bfn = (rec->clo && rec->clo->bfn) ? (BuiltinFn)rec->clo->bfn : NULL;
     if (rec->is_builtin || clo_bfn) {
         TVal r;
-        if (rec->nm_fn && !clo_bfn) {
+        if (rec->ffi_fn && !clo_bfn) {
+            /* M5.5 FFI 符号调用：阻塞 native，不挂起 */
+            void *ffn = rec->ffi_fn;
+            TObj *ro = (TObj *)rec->this_obj;
+            rec->this_obj = NULL;
+            rec->ffi_fn = NULL;
+            r = tphp_ffi_call_fn(vm, ffn, args, rec->n_args);
+            if (ro) {
+                TVal rv = TV_OBJ(ro);
+                tval_release(&rv);
+            }
+        } else if (rec->nm_fn && !clo_bfn) {
             /* internal-class native method: receiver + args (NULL receiver
              * = static native, M5-c Worker::self) */
             NativeMethodFn nmf = (NativeMethodFn)rec->nm_fn;
@@ -1482,6 +1509,9 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
         tval_addref(objv);            /* frame slot 0 owns a reference */
         return 1;
     }
+    /* M5.5: FFI 对象上未声明的方法 → 按 cdef 符号分发 */
+    if (tphp_ffi_try_mcall(vm, o, mname, rec))
+        return 1;
     if (!m || !m->fn || m->is_abstract || m_hidden) {
         /* __call(name, args) fallback: defer to DO_FCALL where every
          * argument has been SENDed (packing here would see an empty area) */
@@ -1607,6 +1637,16 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Property assignment on non-object lands in M3");
     TObj *o = (TObj *)objv.u.p;
+    /* M5.5: FFI\CData 结构体字段写 */
+    if (tphp_ffi_assign_prop(vm, o, name, val)) {
+        if (op->tr != OPD_UNUSED) {
+            tval_addref(val);
+            TVal *d = &vm->x.frame->slots[op->ar];
+            tval_release(d);
+            d[0] = val;
+        }
+        return 1;
+    }
     int slot = tphp_class_find_prop(o->cls, tstr_val(name));
     if (slot >= 0 &&
         !tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
@@ -2171,6 +2211,14 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
     GCHead *h = (GCHead *)obj.u.p;
     if (h->kind == GC_KIND_OBJ) {
         TObj *o = (TObj *)h;
+        /* M5.5: FFI\CData 结构体字段 */
+        {
+            TVal fv;
+            if (tphp_ffi_fetch_prop(vm, o, name, &fv)) {
+                wtake(vm, op, fv);
+                return 1;
+            }
+        }
         int slot = tphp_class_find_prop(o->cls, tstr_val(name));
         if (slot < 0) {
             /* enum case introspection: ->value / ->name */

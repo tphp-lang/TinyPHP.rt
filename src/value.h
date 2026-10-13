@@ -165,6 +165,9 @@ typedef struct TClass {
     int16_t m_ctor, m_dtor, m_get, m_set, m_isset, m_unset,
             m_call, m_callstatic, m_tostring, m_invoke, m_clone, m_debuginfo,
             m_clonestate;
+    /* M5.5 FFI: native destructor for internal classes that own native
+     * resources (FFI\CData owned buffers). Called from tobj_free. */
+    void (*native_dtor)(struct TObj *o);
 } TClass;
 
 typedef struct TObj {

@@ -156,6 +156,8 @@ typedef enum {
      * S_NS_BEGIN may appear anywhere at statement level, S_NS_END restores */
     S_NS_BEGIN, S_NS_END,
     S_USE,           /* u.use: AUseList* */
+    /* M6: require/include 字符串字面量 → 编译期内联；非字面量 parse 报错 */
+    S_INCLUDE,       /* u.inc {path, is_require} */
 } ASTag;
 
 
@@ -250,6 +252,7 @@ struct AStmt {
         AClassDecl *cls;      /* S_CLASSDECL */
         TStr *name;           /* S_GOTO / S_LABEL / S_NS_BEGIN / S_NS_END */
         AUseList *use;        /* S_USE */
+        struct { TStr *path; bool is_require; } inc;  /* S_INCLUDE */
     } u;
 };
 

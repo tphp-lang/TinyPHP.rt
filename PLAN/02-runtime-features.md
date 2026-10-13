@@ -112,7 +112,7 @@ class Worker {
 
 **后置**（M7+）：pcre2 vendor 后 `preg_*` 全套、内置 SQLite（libsqlite3 vendor，`Sqlite\Db` 对象 + 协程化）、HTTP server（`Http\Server`）、REPL
 
-## 4.5 FFI（M5.5，txiki mod_ffi 路线）
+## 4.5 FFI（M5.5 ✅ 已完成，txiki mod_ffi 路线）
 
 **定位三层，与单二进制正交**：
 1. **系统库绑定**：user32/kernel32/ws2_32/msvcrt（Linux libc/libm）每台机器自带 → `FFI::cdef('...', 'user32.dll')` 零配置天然兼容单 exe

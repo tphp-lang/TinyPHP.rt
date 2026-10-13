@@ -116,6 +116,8 @@ void tclo_free(TClosure *c) {
 }
 
 void tobj_free(TObj *o) {
+    if (o->cls->native_dtor)
+        o->cls->native_dtor(o);   /* M5.5 FFI\CData owned-buffer release */
     for (int i = 0; i < o->cls->n_props; i++)
         tval_release(&o->props[i]);
     tm_free(o->props);

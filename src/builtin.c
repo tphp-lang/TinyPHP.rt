@@ -22,6 +22,12 @@ void tphp_fatal_src(const char *file, int line, const char *fmt, ...)
 
 TArr *tarr_new(void);
 
+/* json.c */
+TVal bi_json_encode(VM *vm, TVal *args, int n);
+TVal bi_json_decode(VM *vm, TVal *args, int n);
+TVal bi_json_last_error(VM *vm, TVal *args, int n);
+TVal bi_json_last_error_msg(VM *vm, TVal *args, int n);
+
 #define RAISE(vm, cls, ...) tphp_vm_raise(vm, cls, __VA_ARGS__)
 
 /* ---- output core (echo/print) ---- */
@@ -1323,6 +1329,825 @@ static TVal bi_mt_rand(VM *vm, TVal *args, int n) {
     return TV_INT(lo + rand() % span);
 }
 
+/* ---- M6-b: callable 数组函数 + 常用补齐 ---- */
+
+TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);
+
+static void need_callable(VM *vm, TVal *v, const char *fn, const char *arg) {
+    if (v->t == T_CLOSURE) return;
+    if (v->t == T_STR) return;   /* 函数名 */
+    RAISE(vm, "TypeError", "%s(): Argument %s must be callable, %s given",
+          fn, arg, type_name(v->t));
+}
+
+/* array_map(callable, array, ...): 各数组按最短对齐（PHP8 取最短） */
+static TVal bi_array_map(VM *vm, TVal *args, int n) {
+    if (n < 2)
+        RAISE(vm, "ArgumentCountError", "array_map() expects at least 2 arguments");
+    need_callable(vm, &args[0], "array_map", "#1 ($callback)");
+    TArr **srcs = tm_malloc(sizeof(TArr *) * (size_t)(n - 1));
+    uint32_t min_len = UINT32_MAX;
+    for (int i = 1; i < n; i++) {
+        if (args[i].t != T_ARR) {
+            tm_free(srcs);
+            RAISE(vm, "TypeError", "array_map(): Argument #%d must be array", i + 1);
+        }
+        TArr *a = (TArr *)args[i].u.p;
+        srcs[i - 1] = a;
+        if (a->n < min_len) min_len = a->n;
+    }
+    TArr *out = tarr_new();
+    for (uint32_t idx = 0; idx < min_len; idx++) {
+        TVal *els = tm_malloc(sizeof(TVal) * (size_t)(n - 1));
+        for (int i = 1; i < n; i++) {
+            /* 按插入序取第 idx 个 */
+            uint32_t seen = 0;
+            TVal el = TV_NULL;
+            for (uint32_t j = 0; j < srcs[i - 1]->dused; j++) {
+                if (srcs[i - 1]->data[j].t == T_UNDEF) continue;
+                if (seen == idx) { el = srcs[i - 1]->data[j]; break; }
+                seen++;
+            }
+            els[i - 1] = el;
+        }
+        TVal r = tphp_vm_call_callable(vm, args[0], els, n - 1);
+        tarr_append(out, r);
+        tm_free(els);
+    }
+    tm_free(srcs);
+    return TV_ARR(out);
+}
+
+/* array_filter(array, callable = null): 无回调时过滤 falsy */
+static TVal bi_array_filter(VM *vm, TVal *args, int n) {
+    if (n < 1 || n > 2)
+        RAISE(vm, "ArgumentCountError", "array_filter() expects 1 or 2 arguments");
+    need_arr(vm, &args[0], "array_filter", "#1 ($array)");
+    if (n >= 2) need_callable(vm, &args[1], "array_filter", "#2 ($callback)");
+    TArr *a = (TArr *)args[0].u.p;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        bool keep;
+        if (n >= 2) {
+            TVal arg = a->data[i];
+            TVal r = tphp_vm_call_callable(vm, args[1], &arg, 1);
+            keep = tval_to_bool(r);
+            tval_release(&r);
+        } else {
+            keep = tval_to_bool(a->data[i]);
+        }
+        if (keep) {
+            /* 保留原键 */
+            TVal key = TV_NULL;
+            for (uint32_t b = 0; b < a->bcap; b++)
+                if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                    key = a->buckets[b].key;
+                    break;
+                }
+            TVal v = a->data[i];
+            tval_addref(v);
+            if (key.t == T_NULL) tarr_append(out, v);
+            else {
+                tval_addref(key);
+                tarr_set(out, key, v);
+                tval_release(&key);
+            }
+        }
+    }
+    return TV_ARR(out);
+}
+
+/* array_reduce(array, callable, initial = null) */
+static TVal bi_array_reduce(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "array_reduce() expects 2 or 3 arguments");
+    need_arr(vm, &args[0], "array_reduce", "#1 ($array)");
+    need_callable(vm, &args[1], "array_reduce", "#2 ($callback)");
+    TArr *a = (TArr *)args[0].u.p;
+    TVal carry = n >= 3 ? args[2] : TV_NULL;
+    tval_addref(carry);
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal fargs[2] = { carry, a->data[i] };
+        TVal r = tphp_vm_call_callable(vm, args[1], fargs, 2);
+        tval_release(&carry);
+        carry = r;   /* 转移 */
+    }
+    return carry;
+}
+
+/* usort(array, callable): 按键重排（返回 true），比较函数 <0/0/>0 */
+static TVal bi_usort(VM *vm, TVal *args, int n) {
+    if (n != 2)
+        RAISE(vm, "ArgumentCountError", "usort() expects exactly 2 arguments");
+    need_arr(vm, &args[0], "usort", "#1 ( &$array )");
+    need_callable(vm, &args[1], "usort", "#2 ($callback)");
+    TArr *a = (TArr *)args[0].u.p;
+    uint32_t cnt = a->n;
+    if (cnt <= 1) return TV_TRUE;
+    /* 收集元素 */
+    TVal *items = tm_malloc(sizeof(TVal) * cnt);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        items[k++] = a->data[i];
+        tval_addref(items[k - 1]);
+    }
+    /* 插入排序（stable，小数组够用；大数组后续换 qsort） */
+    for (uint32_t i = 1; i < k; i++) {
+        TVal key = items[i];
+        uint32_t j = i;
+        while (j > 0) {
+            TVal pair[2] = { items[j - 1], key };
+            TVal r = tphp_vm_call_callable(vm, args[1], pair, 2);
+            int64_t c = tval_to_int(r);
+            tval_release(&r);
+            if (c <= 0) break;
+            items[j] = items[j - 1];
+            j--;
+        }
+        items[j] = key;
+    }
+    /* 清空原数组后按序写回（int 键 0..n-1） */
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t != T_UNDEF)
+            tval_release(&a->data[i]);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+    }
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t == T_STR)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    a->n = 0;
+    a->next_idx = 0;
+    a->free_head = UINT32_MAX;
+    a->dused = 0;
+    /* 重新填充 */
+    for (uint32_t i = 0; i < k; i++)
+        tarr_append(a, items[i]);   /* 所有权转移 */
+    tm_free(items);
+    return TV_TRUE;
+}
+
+/* array_flip(array): 键值互换 */
+static TVal bi_array_flip(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "array_flip() expects exactly 1 argument");
+    need_arr(vm, &args[0], "array_flip", "#1 ($array)");
+    TArr *a = (TArr *)args[0].u.p;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal key = TV_NULL;
+        for (uint32_t b = 0; b < a->bcap; b++)
+            if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                key = a->buckets[b].key;
+                break;
+            }
+        TVal v = a->data[i];
+        /* 值必须是 int/string 才能当键 */
+        if (v.t != T_INT && v.t != T_STR) continue;
+        tval_addref(v);          /* 新键 */
+        TVal fk = key.t == T_NULL ? TV_INT((int64_t)i) : key;
+        tval_addref(fk);
+        tarr_set(out, v, fk);
+        tval_release(&v);
+        tval_release(&fk);
+    }
+    return TV_ARR(out);
+}
+
+/* array_unique(array): 按值去重，保留首次出现 */
+static TVal bi_array_unique(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "array_unique() expects exactly 1 argument");
+    need_arr(vm, &args[0], "array_unique", "#1 ($array)");
+    TArr *a = (TArr *)args[0].u.p;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        bool dup = false;
+        for (uint32_t j = 0; j < out->dused; j++) {
+            if (out->data[j].t == T_UNDEF) continue;
+            if (tval_strict_eq(a->data[i], out->data[j])) { dup = true; break; }
+        }
+        if (!dup) {
+            TVal key = TV_NULL;
+            for (uint32_t b = 0; b < a->bcap; b++)
+                if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                    key = a->buckets[b].key;
+                    break;
+                }
+            TVal v = a->data[i];
+            tval_addref(v);
+            if (key.t == T_NULL) tarr_append(out, v);
+            else {
+                tval_addref(key);
+                tarr_set(out, key, v);
+                tval_release(&key);
+            }
+        }
+    }
+    return TV_ARR(out);
+}
+
+/* array_search(needle, haystack[, strict=false]) */
+static TVal bi_array_search(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "array_search() expects 2 or 3 arguments");
+    need_arr(vm, &args[1], "array_search", "#2 ($haystack)");
+    bool strict = n >= 3 ? tval_to_bool(args[2]) : false;
+    TArr *a = (TArr *)args[1].u.p;
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        bool hit = strict ? tval_strict_eq(args[0], a->data[i])
+                          : tval_loose_eq(args[0], a->data[i]);
+        if (hit) {
+            for (uint32_t b = 0; b < a->bcap; b++)
+                if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                    TVal k = a->buckets[b].key;
+                    tval_addref(k);
+                    return k;
+                }
+            return TV_INT((int64_t)i);
+        }
+    }
+    return TV_FALSE;
+}
+
+/* range(start, end[, step]) */
+static TVal bi_range(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "range() expects 2 or 3 arguments");
+    if (args[0].t == T_STR && args[1].t == T_STR) {
+        /* 字符串范围 a-z */
+        if (tstr_len((TStr *)args[0].u.p) != 1 || tstr_len((TStr *)args[1].u.p) != 1)
+            RAISE(vm, "TypeError", "range(): strings must be single characters");
+        char c0 = tstr_val((TStr *)args[0].u.p)[0];
+        char c1 = tstr_val((TStr *)args[1].u.p)[0];
+        int step = n >= 3 ? (int)tval_to_int(args[2]) : 1;
+        if (step == 0) RAISE(vm, "ValueError", "range(): step cannot be 0");
+        TArr *out = tarr_new();
+        if (step > 0) {
+            for (int c = c0; c <= c1; c += step) {
+                char s[2] = { (char)c, 0 };
+                tarr_append(out, TV_STR(tstr_new(s, 1)));
+            }
+        } else {
+            for (int c = c0; c >= c1; c += step) {
+                char s[2] = { (char)c, 0 };
+                tarr_append(out, TV_STR(tstr_new(s, 1)));
+            }
+        }
+        return TV_ARR(out);
+    }
+    double d0 = tval_to_float(args[0]);
+    double d1 = tval_to_float(args[1]);
+    double step = n >= 3 ? tval_to_float(args[2]) : 1.0;
+    if (step == 0.0) RAISE(vm, "ValueError", "range(): step cannot be 0");
+    bool all_int = args[0].t == T_INT && args[1].t == T_INT &&
+                   (n < 3 || args[2].t == T_INT);
+    TArr *out = tarr_new();
+    if (step > 0) {
+        for (double x = d0; x <= d1 + 1e-12; x += step) {
+            if (all_int) tarr_append(out, TV_INT((int64_t)x));
+            else tarr_append(out, TV_FLOAT(x));
+        }
+    } else {
+        for (double x = d0; x >= d1 - 1e-12; x += step) {
+            if (all_int) tarr_append(out, TV_INT((int64_t)x));
+            else tarr_append(out, TV_FLOAT(x));
+        }
+    }
+    return TV_ARR(out);
+}
+
+/* array_key_first / array_key_last */
+static TVal bi_array_key_first(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "array_key_first() expects exactly 1 argument");
+    need_arr(vm, &args[0], "array_key_first", "#1 ($array)");
+    TArr *a = (TArr *)args[0].u.p;
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        for (uint32_t b = 0; b < a->bcap; b++)
+            if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                TVal k = a->buckets[b].key;
+                tval_addref(k);
+                return k;
+            }
+    }
+    return TV_NULL;
+}
+static TVal bi_array_key_last(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "array_key_last() expects exactly 1 argument");
+    need_arr(vm, &args[0], "array_key_last", "#1 ($array)");
+    TArr *a = (TArr *)args[0].u.p;
+    for (uint32_t i = a->dused; i > 0; i--) {
+        uint32_t j = i - 1;
+        if (a->data[j].t == T_UNDEF) continue;
+        for (uint32_t b = 0; b < a->bcap; b++)
+            if (a->buckets[b].val_off == j && a->buckets[b].key.t != T_NULL) {
+                TVal k = a->buckets[b].key;
+                tval_addref(k);
+                return k;
+            }
+    }
+    return TV_NULL;
+}
+
+/* chr / ord */
+static TVal bi_chr(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "chr() expects exactly 1 argument");
+    int64_t c = need_int(vm, &args[0], "chr", "#1 ($codepoint)");
+    if (c < 0 || c > 255)
+        RAISE(vm, "ValueError", "chr(): Argument #1 ($codepoint) must be between 0 and 255");
+    char s[2] = { (char)c, 0 };
+    return TV_STR(tstr_new(s, 1));
+}
+static TVal bi_ord(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "ord() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "ord", "#1 ($string)");
+    if (s->len == 0) return TV_INT(0);
+    return TV_INT((unsigned char)s->c[0]);
+}
+
+/* call_user_func(callable, ...$args) */
+static TVal bi_call_user_func(VM *vm, TVal *args, int n) {
+    if (n < 1) RAISE(vm, "ArgumentCountError", "call_user_func() expects at least 1 argument");
+    need_callable(vm, &args[0], "call_user_func", "#1 ($callback)");
+    return tphp_vm_call_callable(vm, args[0], args + 1, n - 1);
+}
+
+/* call_user_func_array(callable, array) */
+static TVal bi_call_user_func_array(VM *vm, TVal *args, int n) {
+    if (n != 2) RAISE(vm, "ArgumentCountError", "call_user_func_array() expects exactly 2 arguments");
+    need_callable(vm, &args[0], "call_user_func_array", "#1 ($callback)");
+    need_arr(vm, &args[1], "call_user_func_array", "#2 ($args)");
+    TArr *a = (TArr *)args[1].u.p;
+    TVal *els = tm_malloc(sizeof(TVal) * (a->n ? a->n : 1));
+    int k = 0;
+    for (uint32_t i = 0; i < a->dused; i++)
+        if (a->data[i].t != T_UNDEF) els[k++] = a->data[i];
+    TVal r = tphp_vm_call_callable(vm, args[0], els, k);
+    tm_free(els);
+    return r;
+}
+
+/* is_callable(mixed) */
+static TVal bi_is_callable(VM *vm, TVal *args, int n) {
+    (void)vm;
+    if (n < 1) RAISE(vm, "ArgumentCountError", "is_callable() expects at least 1 argument");
+    TVal v = args[0];
+    if (v.t == T_CLOSURE) return TV_TRUE;
+    if (v.t == T_STR) {
+        TStr *s = (TStr *)v.u.p;
+        /* 粗判：内置名或已定义用户函数——这里只查内置表+简单启发 */
+        for (int i = 0; i < tphp_builtin_count; i++)
+            if (strcmp(tphp_builtins[i].name, s->c) == 0) return TV_TRUE;
+        /* 用户函数：留给 VM 的 resolve——简化返回 true（调用时再报错） */
+        return TV_TRUE;
+    }
+    return TV_FALSE;
+}
+
+/* time() */
+static TVal bi_time(VM *vm, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    return TV_INT((int64_t)time(NULL));
+}
+
+/* error_log($message): 写 stderr（CLI 对齐；bench 计时走这里，stdout 留 EXPECT） */
+static TVal bi_error_log(VM *vm, TVal *args, int n) {
+    if (n < 1)
+        RAISE(vm, "ArgumentCountError", "error_log() expects at least 1 argument");
+    TStr *s = tval_to_str(args[0]);
+    fwrite(tstr_val(s), 1, tstr_len(s), stderr);
+    fputc('\n', stderr);
+    tval_release(&(TVal){ .u.p = s, .t = T_STR });
+    return TV_NULL;
+}
+
+/* date(format[, timestamp=null]): 常用格式 Y/m/d/H/i/s/a/A/B/G/g/h/j/J/L/m/n/O/P/S/T/w/W/z/Z/U */
+static TVal bi_date(VM *vm, TVal *args, int n) {
+    if (n < 1 || n > 2)
+        RAISE(vm, "ArgumentCountError", "date() expects 1 or 2 arguments");
+    TStr *fmt = need_str(vm, &args[0], "date", "#1 ($format)");
+    time_t ts = n >= 2 ? (time_t)tval_to_int(args[1]) : time(NULL);
+    struct tm tmv;
+#ifdef _WIN32
+    gmtime_s(&tmv, &ts);   /* 默认 UTC，与 PHP date 默认一致 */
+#else
+    gmtime_r(&ts, &tmv);
+#endif
+    /* PHP date 默认用 UTC（无 date_default_timezone_set 时） */
+    char out[256];
+    size_t o = 0;
+    const char *p = tstr_val(fmt);
+    const char *pe = p + tstr_len(fmt);
+    while (p < pe && o < sizeof out - 8) {
+        /* PHP date() 格式符无需 % 前缀：Y m d H 等直接识别 */
+        char c = *p++;
+        switch (c) {
+        case 'Y': o += (size_t)snprintf(out + o, sizeof out - o, "%04d", tmv.tm_year + 1900); break;
+        case 'y': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", (tmv.tm_year + 1900) % 100); break;
+        case 'm': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", tmv.tm_mon + 1); break;
+        case 'n': o += (size_t)snprintf(out + o, sizeof out - o, "%d", tmv.tm_mon + 1); break;
+        case 'd': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", tmv.tm_mday); break;
+        case 'j': o += (size_t)snprintf(out + o, sizeof out - o, "%d", tmv.tm_mday); break;
+        case 'H': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", tmv.tm_hour); break;
+        case 'G': o += (size_t)snprintf(out + o, sizeof out - o, "%d", tmv.tm_hour); break;
+        case 'h': {
+            int h = tmv.tm_hour % 12; if (h == 0) h = 12;
+            o += (size_t)snprintf(out + o, sizeof out - o, "%02d", h);
+            break;
+        }
+        case 'g': {
+            int h = tmv.tm_hour % 12; if (h == 0) h = 12;
+            o += (size_t)snprintf(out + o, sizeof out - o, "%d", h);
+            break;
+        }
+        case 'i': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", tmv.tm_min); break;
+        case 's': o += (size_t)snprintf(out + o, sizeof out - o, "%02d", tmv.tm_sec); break;
+        case 'a': case 'A':
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s",
+                                  tmv.tm_hour < 12 ? (c == 'a' ? "am" : "AM") : (c == 'a' ? "pm" : "PM"));
+            break;
+        case 'B': { /* Swatch Beat */
+            int beat = (int)(((ts % 86400) + 3600) % 86400 * 1000 / 86400);
+            o += (size_t)snprintf(out + o, sizeof out - o, "%03d", beat);
+            break;
+        }
+        case 'D': {
+            static const char *wd[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s", wd[tmv.tm_wday]);
+            break;
+        }
+        case 'l': {
+            static const char *wd[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s", wd[tmv.tm_wday]);
+            break;
+        }
+        case 'M': {
+            static const char *mo[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s", mo[tmv.tm_mon]);
+            break;
+        }
+        case 'F': {
+            static const char *mo[] = {"January","February","March","April","May","June",
+                                       "July","August","September","October","November","December"};
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s", mo[tmv.tm_mon]);
+            break;
+        }
+        case 'w': o += (size_t)snprintf(out + o, sizeof out - o, "%d", tmv.tm_wday); break;
+        case 'z': o += (size_t)snprintf(out + o, sizeof out - o, "%d", tmv.tm_yday); break;
+        case 'U': o += (size_t)snprintf(out + o, sizeof out - o, "%lld", (long long)ts); break;
+        case 'T': o += (size_t)snprintf(out + o, sizeof out - o, "UTC"); break;
+        case 'P': o += (size_t)snprintf(out + o, sizeof out - o, "+00:00"); break;
+        case 'O': o += (size_t)snprintf(out + o, sizeof out - o, "+0000"); break;
+        case '\\': {
+            if (p < pe) out[o++] = *p++;
+            break;
+        }
+        default:
+            out[o++] = c;
+            break;
+        }
+    }
+    out[o] = 0;
+    return TV_STR(tstr_new(out, o));
+}
+
+/* mktime(hour, minute, second, month, day, year): UTC → unix ts */
+static TVal bi_mktime(VM *vm, TVal *args, int n) {
+    if (n != 6)
+        RAISE(vm, "ArgumentCountError", "mktime() expects exactly 6 arguments");
+    struct tm tmv;
+    memset(&tmv, 0, sizeof tmv);
+    tmv.tm_hour = (int)need_int(vm, &args[0], "mktime", "#1 ($hour)");
+    tmv.tm_min  = (int)need_int(vm, &args[1], "mktime", "#2 ($minute)");
+    tmv.tm_sec  = (int)need_int(vm, &args[2], "mktime", "#3 ($second)");
+    tmv.tm_mon  = (int)need_int(vm, &args[3], "mktime", "#4 ($month)") - 1;
+    tmv.tm_mday = (int)need_int(vm, &args[4], "mktime", "#5 ($day)");
+    tmv.tm_year = (int)need_int(vm, &args[5], "mktime", "#6 ($year)") - 1900;
+    tmv.tm_isdst = -1;
+#ifdef _WIN32
+    return TV_INT((int64_t)_mkgmtime(&tmv));
+#else {
+    time_t t = timegm(&tmv);
+    return TV_INT((int64_t)t);
+}
+#endif
+}
+
+/* checkdate(month, day, year) */
+static TVal bi_checkdate(VM *vm, TVal *args, int n) {
+    if (n != 3)
+        RAISE(vm, "ArgumentCountError", "checkdate() expects exactly 3 arguments");
+    int64_t mo = need_int(vm, &args[0], "checkdate", "#1 ($month)");
+    int64_t dy = need_int(vm, &args[1], "checkdate", "#2 ($day)");
+    int64_t yr = need_int(vm, &args[2], "checkdate", "#3 ($year)");
+    if (mo < 1 || mo > 12 || yr < 1 || yr > 32767 || dy < 1) return TV_FALSE;
+    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int dim = mdays[mo];
+    if (mo == 2 && ((yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0)) dim = 29;
+    return dy <= dim ? TV_TRUE : TV_FALSE;
+}
+
+/* ---- M6 补齐：数组/字符串常用 ---- */
+
+/* array_column(array, column_key[, index_key=null]) */
+static TVal bi_array_column(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "array_column() expects 2 or 3 arguments");
+    need_arr(vm, &args[0], "array_column", "#1 ($array)");
+    TArr *a = (TArr *)args[0].u.p;
+    TVal colk = args[1];
+    TVal idxk = n >= 3 ? args[2] : TV_NULL;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t != T_ARR) continue;
+        TArr *row = (TArr *)a->data[i].u.p;
+        TVal *pv = tarr_get(row, colk);
+        if (!pv) continue;
+        TVal val = *pv;
+        tval_addref(val);
+        if (idxk.t != T_NULL) {
+            TVal *ik = tarr_get(row, idxk);
+            if (ik) {
+                TVal key = *ik;
+                tval_addref(key);
+                tarr_set(out, key, val);
+                tval_release(&key);
+                continue;
+            }
+        }
+        tarr_append(out, val);
+    }
+    return TV_ARR(out);
+}
+
+/* array_combine(keys[], values[]) */
+static TVal bi_array_combine(VM *vm, TVal *args, int n) {
+    if (n != 2)
+        RAISE(vm, "ArgumentCountError", "array_combine() expects exactly 2 arguments");
+    need_arr(vm, &args[0], "array_combine", "#1 ($keys)");
+    need_arr(vm, &args[1], "array_combine", "#2 ($values)");
+    TArr *ka = (TArr *)args[0].u.p;
+    TArr *va = (TArr *)args[1].u.p;
+    if (ka->n != va->n)
+        RAISE(vm, "ValueError", "array_combine(): Argument #1 ($keys) and #2 ($values) must have the same number of elements");
+    TArr *out = tarr_new();
+    uint32_t vi = 0, ki = 0;
+    for (uint32_t i = 0; i < ka->dused && ki < ka->n; i++) {
+        if (ka->data[i].t == T_UNDEF) continue;
+        /* 找 values 第 ki 个 */
+        uint32_t seen = 0;
+        TVal v = TV_NULL;
+        for (uint32_t j = 0; j < va->dused; j++) {
+            if (va->data[j].t == T_UNDEF) continue;
+            if (seen == ki) { v = va->data[j]; break; }
+            seen++;
+        }
+        TVal key = ka->data[i];
+        tval_addref(key);
+        tval_addref(v);
+        tarr_set(out, key, v);
+        tval_release(&key);
+        ki++;
+        (void)vi;
+    }
+    return TV_ARR(out);
+}
+
+/* array_chunk(array, size[, preserve_keys=false]) */
+static TVal bi_array_chunk(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "array_chunk() expects 2 or 3 arguments");
+    need_arr(vm, &args[0], "array_chunk", "#1 ($array)");
+    int64_t sz = need_int(vm, &args[1], "array_chunk", "#2 ($length)");
+    if (sz < 1)
+        RAISE(vm, "ValueError", "array_chunk(): Argument #2 ($length) must be greater than 0");
+    bool preserve = n >= 3 ? tval_to_bool(args[2]) : false;
+    TArr *a = (TArr *)args[0].u.p;
+    TArr *out = tarr_new();
+    TArr *cur = NULL;
+    int64_t cnt = 0;
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        if (cnt % sz == 0) {
+            cur = tarr_new();
+            /* tarr_set/append 不 addref 值——out 持有 cur 的引用需手动 +1 */
+            tarr_append(out, TV_ARR(cur));
+            cur->h.rc++;   /* out 持有一份；本地指针也用 */
+        }
+        TVal key = TV_NULL;
+        for (uint32_t b = 0; b < a->bcap; b++)
+            if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
+                key = a->buckets[b].key;
+                break;
+            }
+        TVal v = a->data[i];
+        tval_addref(v);
+        if (preserve && key.t != T_NULL) {
+            tval_addref(key);
+            tarr_set(cur, key, v);
+            tval_release(&key);
+        } else {
+            tarr_append(cur, v);
+        }
+        cnt++;
+    }
+    return TV_ARR(out);
+}
+
+/* strtr(string, from, to) 或 strtr(string, replace_pairs[]) */
+static TVal bi_strtr(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 3)
+        RAISE(vm, "ArgumentCountError", "strtr() expects 2 or 3 arguments");
+    TStr *s = need_str(vm, &args[0], "strtr", "#1 ($string)");
+    if (n == 2) {
+        need_arr(vm, &args[1], "strtr", "#2 ($replace_pairs)");
+        /* 简化：从长到短替换 */
+        TArr *pairs = (TArr *)args[1].u.p;
+        /* 构造可变缓冲 */
+        size_t cap = s->len + 1;
+        char *buf = tm_malloc(cap);
+        memcpy(buf, s->c, s->len + 1);
+        size_t len = s->len;
+        /* 收集 pairs */
+        typedef struct { TStr *from, *to; } Pair;
+        int np = 0;
+        Pair *ps = tm_malloc(sizeof(Pair) * (pairs->n ? pairs->n : 1));
+        for (uint32_t i = 0; i < pairs->dused; i++) {
+            if (pairs->data[i].t == T_UNDEF) continue;
+            TVal key = TV_NULL;
+            for (uint32_t b = 0; b < pairs->bcap; b++)
+                if (pairs->buckets[b].val_off == i && pairs->buckets[b].key.t == T_STR) {
+                    key = pairs->buckets[b].key;
+                    break;
+                }
+            if (key.t != T_STR || (pairs->data[i].t != T_STR)) continue;
+            ps[np].from = (TStr *)key.u.p;
+            ps[np].to = (TStr *)pairs->data[i].u.p;
+            np++;
+        }
+        /* 简单冒泡按 from 长度降序 */
+        for (int i = 0; i < np; i++)
+            for (int j = i + 1; j < np; j++)
+                if (ps[j].from->len > ps[i].from->len) {
+                    Pair t = ps[i]; ps[i] = ps[j]; ps[j] = t;
+                }
+        /* 单遍扫描替换 */
+        size_t out_n = 0;
+        char *outb = tm_malloc(len * 4 + 16);   /* 最坏膨胀 */
+        size_t i = 0;
+        while (i < len) {
+            bool hit = false;
+            for (int k = 0; k < np; k++) {
+                if (ps[k].from->len == 0) continue;
+                if (i + ps[k].from->len <= len &&
+                    memcmp(buf + i, ps[k].from->c, ps[k].from->len) == 0) {
+                    memcpy(outb + out_n, ps[k].to->c, ps[k].to->len);
+                    out_n += ps[k].to->len;
+                    i += ps[k].from->len;
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) outb[out_n++] = buf[i++];
+        }
+        TStr *r = tstr_new(outb, out_n);
+        tm_free(buf);
+        tm_free(outb);
+        tm_free(ps);
+        return TV_STR(r);
+    }
+    /* 3 参数：from/to 字符映射 */
+    TStr *from = need_str(vm, &args[1], "strtr", "#2 ($from)");
+    TStr *to = need_str(vm, &args[2], "strtr", "#3 ($to)");
+    size_t fl = from->len < to->len ? from->len : to->len;
+    char *outb = tm_malloc(s->len + 1);
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->c[i];
+        char nc = c;
+        for (size_t k = 0; k < fl; k++)
+            if (from->c[k] == c) { nc = to->c[k]; break; }
+        outb[i] = nc;
+    }
+    outb[s->len] = 0;
+    TStr *r = tstr_new(outb, s->len);
+    tm_free(outb);
+    return TV_STR(r);
+}
+
+/* ucwords(string) */
+static TVal bi_ucwords(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "ucwords() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "ucwords", "#1 ($string)");
+    char *b = tm_malloc(s->len + 1);
+    memcpy(b, s->c, s->len + 1);
+    bool start = true;
+    for (size_t i = 0; i < s->len; i++) {
+        if (b[i] >= 'a' && b[i] <= 'z' && start) b[i] = (char)(b[i] - 32);
+        start = !(b[i] >= 'a' && b[i] <= 'z') && !(b[i] >= 'A' && b[i] <= 'Z') &&
+                !(b[i] >= '0' && b[i] <= '9');
+    }
+    TStr *r = tstr_new(b, s->len);
+    tm_free(b);
+    return TV_STR(r);
+}
+
+/* nl2br(string): \n → <br />\n（PHP 语义：标签在换行前） */
+static TVal bi_nl2br(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "nl2br() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "nl2br", "#1 ($string)");
+    size_t nl = 0;
+    for (size_t i = 0; i < s->len; i++) if (s->c[i] == '\n') nl++;
+    char *b = tm_malloc(s->len + nl * 6 + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        if (s->c[i] == '\n') {
+            memcpy(b + o, "<br />", 6);
+            o += 6;
+            b[o++] = '\n';
+        } else {
+            b[o++] = s->c[i];
+        }
+    }
+    TStr *r = tstr_new(b, o);
+    tm_free(b);
+    return TV_STR(r);
+}
+
+/* strip_tags(string) — 去掉 HTML 标签 */
+static TVal bi_strip_tags(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "strip_tags() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "strip_tags", "#1 ($string)");
+    char *b = tm_malloc(s->len + 1);
+    size_t o = 0;
+    bool in_tag = false;
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->c[i];
+        if (c == '<') { in_tag = true; continue; }
+        if (c == '>') { in_tag = false; continue; }
+        if (!in_tag) b[o++] = c;
+    }
+    TStr *r = tstr_new(b, o);
+    tm_free(b);
+    return TV_STR(r);
+}
+
+/* htmlspecialchars(string): & < > " ' → 实体 */
+static TVal bi_htmlspecialchars(VM *vm, TVal *args, int n) {
+    if (n != 1) RAISE(vm, "ArgumentCountError", "htmlspecialchars() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "htmlspecialchars", "#1 ($string)");
+    size_t cap = s->len * 6 + 1;
+    char *b = tm_malloc(cap);
+    size_t o = 0;
+    for (size_t i = 0; i < s->len; i++) {
+        char c = s->c[i];
+        const char *rep = NULL;
+        switch (c) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        case '\'': rep = "&#039;"; break;
+        default: b[o++] = c; break;
+        }
+        if (rep) {
+            size_t rl = strlen(rep);
+            memcpy(b + o, rep, rl);
+            o += rl;
+        }
+    }
+    TStr *r = tstr_new(b, o);
+    tm_free(b);
+    return TV_STR(r);
+}
+
+/* explode 已有；array_fill(start_index, count, value) */
+static TVal bi_array_fill(VM *vm, TVal *args, int n) {
+    if (n != 3)
+        RAISE(vm, "ArgumentCountError", "array_fill() expects exactly 3 arguments");
+    int64_t start = need_int(vm, &args[0], "array_fill", "#1 ($start_index)");
+    int64_t cnt = need_int(vm, &args[1], "array_fill", "#2 ($count)");
+    if (cnt < 0)
+        RAISE(vm, "ValueError", "array_fill(): Argument #2 ($count) must be greater than or equal to 0");
+    TArr *out = tarr_new();
+    TVal v = args[2];
+    tval_addref(v);
+    for (int64_t i = 0; i < cnt; i++) {
+        TVal key = TV_INT(start + i);
+        tval_addref(key);
+        tarr_set(out, key, v);
+        tval_release(&key);
+    }
+    tval_release(&v);
+    return TV_ARR(out);
+}
+
 /* ---- registry ---- */
 
 
@@ -1380,6 +2205,36 @@ const Builtin tphp_builtins[] = {
     { "array_sum", bi_array_sum },
     { "sort", bi_sort },
     { "rsort", bi_rsort },
+    /* M6-b: callable 数组 + 常用补齐 */
+    { "array_map", bi_array_map },
+    { "array_filter", bi_array_filter },
+    { "array_reduce", bi_array_reduce },
+    { "usort", bi_usort },
+    { "array_flip", bi_array_flip },
+    { "array_unique", bi_array_unique },
+    { "array_search", bi_array_search },
+    { "array_key_first", bi_array_key_first },
+    { "array_key_last", bi_array_key_last },
+    { "range", bi_range },
+    { "chr", bi_chr },
+    { "ord", bi_ord },
+    { "call_user_func", bi_call_user_func },
+    { "call_user_func_array", bi_call_user_func_array },
+    { "is_callable", bi_is_callable },
+    { "time", bi_time },
+    { "error_log", bi_error_log },
+    { "date", bi_date },
+    { "mktime", bi_mktime },
+    { "checkdate", bi_checkdate },
+    { "array_column", bi_array_column },
+    { "array_combine", bi_array_combine },
+    { "array_chunk", bi_array_chunk },
+    { "array_fill", bi_array_fill },
+    { "strtr", bi_strtr },
+    { "ucwords", bi_ucwords },
+    { "nl2br", bi_nl2br },
+    { "strip_tags", bi_strip_tags },
+    { "htmlspecialchars", bi_htmlspecialchars },
     /* strings */
     { "substr", bi_substr },
     { "str_replace", bi_str_replace },
@@ -1402,6 +2257,11 @@ const Builtin tphp_builtins[] = {
     { "str_contains", bi_str_contains },
     { "str_starts_with", bi_str_starts_with },
     { "str_ends_with", bi_str_ends_with },
+    /* M6-a: JSON（json.c） */
+    { "json_encode", bi_json_encode },
+    { "json_decode", bi_json_decode },
+    { "json_last_error", bi_json_last_error },
+    { "json_last_error_msg", bi_json_last_error_msg },
     /* math */
     { "round", bi_round },
     { "microtime", bi_microtime },

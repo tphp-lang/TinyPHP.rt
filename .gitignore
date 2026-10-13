@@ -6,6 +6,8 @@
 *.obj
 *.a
 *.lib
+# vendored static libs (needed for Windows build)
+!deps/libffi/lib/*.a
 
 # ---- debug / scratch output ----
 *.log
@@ -15,3 +17,4 @@
 
 # ---- tooling / workspace ----
 .workbuddy/
+.mimocode/

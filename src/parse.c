@@ -552,10 +552,9 @@ static AExpr *parse_static_access(Parser *p, TStr *name, int line) {
         member = p->tok.ident;
         advance(p);
     } else if (p->tok.kind == KW_SELF || p->tok.kind == KW_PARENT ||
-               p->tok.kind == KW_STATIC) {
-        /* keywords as member names: `Worker::self()` is a valid static
-         * method call in PHP (self/parent/static usable as identifiers
-         * after '::') */
+               p->tok.kind == KW_STATIC || p->tok.kind == KW_NEW) {
+        /* keywords as member names: `Worker::self()`, `FFI::new()` are
+         * valid static method calls in PHP */
         member = p->tok.ident;
         advance(p);
     } else {
@@ -627,8 +626,14 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
         }
         case P_OBJECT: {
             advance(p);
-            if (p->tok.kind != L_IDENT)
+            if (p->tok.kind != L_IDENT &&
+                p->tok.kind != KW_NEW &&
+                p->tok.kind != KW_SELF &&
+                p->tok.kind != KW_PARENT &&
+                p->tok.kind != KW_STATIC &&
+                p->tok.kind != KW_CLASS) {
                 p_error(p, "Object property access lands in M3");
+            }
             TStr *name = p->tok.ident;
             advance(p);
             if (p->tok.kind == P_LPAREN) {
@@ -1945,7 +1950,19 @@ static AStmt *parse_statement(Parser *p) {
         return s;
     }
     case KW_REQUIRE:
-    case KW_INCLUDE: p_error(p, "File inclusion lands in M3 (single-file scripts in M2)");
+    case KW_INCLUDE: {
+        /* M6: require/include —— 字符串字面量编译期内联；其他后置 */
+        bool is_req = p->tok.kind == KW_REQUIRE;
+        advance(p);
+        AExpr *e = parse_expr(p);
+        expect(p, P_SEMI, "Expected ';' after require/include");
+        if (e->tag != A_STR)
+            p_error(p, "require/include currently supports only string literal paths (M6)");
+        AStmt *s = as_new(S_INCLUDE, line);
+        s->u.inc.path = e->u.name;   /* A_STR 存在 u.name */
+        s->u.inc.is_require = is_req;
+        return s;
+    }
     case KW_LIST: {
         ADestructList *dl = parse_destruct_list(p, false);
         expect(p, P_ASSIGN, "Expected '=' after list(...)");

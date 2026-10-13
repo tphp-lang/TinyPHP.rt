@@ -1,0 +1,15 @@
+<?php
+// from php-src Zend/tests/024.phpt
+// EXPECT: false
+function wrong() {
+    throw new Exception();
+}
+
+echo match (false) {
+    '' => wrong(),
+    [] => wrong(),
+    0 => wrong(),
+    0.0 => wrong(),
+    false => "false\n",
+};
+

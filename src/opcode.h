@@ -147,6 +147,8 @@ typedef struct VMCallRec {
     BuiltinFn bf;
     void *nm_fn;         /* NativeMethodFn when calling an internal class
                             method (is_builtin is set for the DO_FCALL path) */
+    void *ffi_fn;        /* M5.5: FFIFunc* when calling through an FFI object
+                            ($ffi->symbol(...); is_builtin is set) */
     void *this_obj;      /* TObj* receiver when is_method */
     void *called_cls;    /* TClass*: static-call resolution for static:: */
     TVal getter_val;     /* precomputed exception-getter result */

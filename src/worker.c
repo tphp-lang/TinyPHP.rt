@@ -37,6 +37,7 @@ int   tphp_vm_run_closure(Program *prog, TClosure *clo);
 void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */
 void  tphp_async_init(void);             /* sched.c */
 void  tphp_io_init(void);                /* io.c */
+void  tphp_ffi_init(void);               /* ffi.c */
 /* mem.c */
 void  tm_free(void *p);
 void  gc_register(GCHead *h);
@@ -286,6 +287,7 @@ static void worker_thread(void *arg) {
     /* 独立 runtime 初始化（thread-local 全套） */
     tphp_worker_init();          /* 内部类（本线程） */
     tphp_async_init();
+    tphp_ffi_init();             /* M5.5：Worker 线程内也可用 FFI */
     tphp_io_init();
     tphp_class_tab_clone_thread();
     tphp_sched_loop_init();      /* async bind 前 loop 必须已初始化 */
