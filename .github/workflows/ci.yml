@@ -24,11 +24,13 @@ jobs:
           update: false
           install: mingw-w64-clang-x86_64-clang
 
-      - name: Build (build.cmd)
-        shell: cmd
+      - name: Build (build.cmd via msys2 CLANG64)
+        shell: msys2 {0}
         run: |
-          set PATH=C:\msys64\clang64\bin;%PATH%
-          build.cmd
+          which clang
+          clang --version
+          # build.cmd is a Windows batch; inherit msys2 CLANG64 PATH
+          cmd.exe //c build.cmd
 
       - name: Test
         shell: pwsh

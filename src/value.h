@@ -15,6 +15,18 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
+
+/* POSIX strcasecmp* on MSVC/UCRT (Windows SDK has no strncasecmp;
+ * mingw provides it natively, so only _MSC_VER-targeting clang needs this) */
+#if defined(_MSC_VER)
+#ifndef strncasecmp
+#define strncasecmp _strnicmp
+#endif
+#ifndef strcasecmp
+#define strcasecmp _stricmp
+#endif
+#endif
 
 /* ---- type tags ---- */
 typedef enum {
