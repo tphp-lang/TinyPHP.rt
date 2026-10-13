@@ -73,11 +73,13 @@ mkdir -p build "$OBJ"
 # ---- [1/6] libuv ----
 echo "[1/6] compiling libuv..."
 UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.c loop.c pipe.c poll.c process.c random-devurandom.c signal.c stream.c tcp.c thread.c tty.c udp.c"
+# deps: no -std=c11 (strict ANSI hides cpu_set_t / GNU pthread extensions)
+UV_CFLAGS="-O2 -g -fno-omit-frame-pointer"
 
 case "$TOS" in
   Linux)
     UV_UNIX="$UV_UNIX_BASE proctitle.c linux.c procfs-exepath.c random-getrandom.c random-sysctl-linux.c"
-    UV_DEFS="-D_GNU_SOURCE -D_POSIX_C_SOURCE=200112"
+    UV_DEFS="-D_GNU_SOURCE"
     LDLIBS="-lpthread -ldl -lrt -lm"
     ;;
   Darwin)
@@ -92,7 +94,7 @@ case "$TOS" in
 esac
 
 for f in $UV_UNIX; do
-  $CC -w $CFLAGS $UV_DEFS $INC -c "deps/libuv/src/unix/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
+  $CC -w $UV_CFLAGS $UV_DEFS $INC -c "deps/libuv/src/unix/$f" -o "$OBJ/uv_$(basename "$f" .c).o"
 done
 
 # ---- [2/6] mimalloc ----

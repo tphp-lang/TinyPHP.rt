@@ -1833,10 +1833,8 @@ static TVal bi_mktime(VM *vm, TVal *args, int n) {
     tmv.tm_isdst = -1;
 #ifdef _WIN32
     return TV_INT((int64_t)_mkgmtime(&tmv));
-#else {
-    time_t t = timegm(&tmv);
-    return TV_INT((int64_t)t);
-}
+#else
+    return TV_INT((int64_t)timegm(&tmv));
 #endif
 }
 
