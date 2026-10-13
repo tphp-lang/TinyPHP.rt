@@ -9,7 +9,7 @@
 #include "opcode.h"
 #include "tphp.h"
 #include "class.h"
-#include "sched.h"
+#include "tsched.h"
 #include "tio.h"
 #include <math.h>
 #include <stdio.h>

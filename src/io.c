@@ -17,7 +17,7 @@
 #include "value.h"
 #include "opcode.h"
 #include "class.h"
-#include "sched.h"
+#include "tsched.h"
 #include "tio.h"
 #include <uv.h>
 #include <stdio.h>

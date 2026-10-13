@@ -33,7 +33,7 @@
 #include "opcode.h"
 #include "tphp.h"
 #include "class.h"
-#include "sched.h"
+#include "tsched.h"
 #include "tffi.h"
 #include <stdarg.h>
 #include <stdio.h>

@@ -1,5 +1,8 @@
 /*
- * TinyPHP.rt - sched.h - M4 协程调度器（fiber + libuv 事件循环）
+ * TinyPHP.rt - tsched.h - M4 coroutine scheduler (fiber + libuv loop)
+ * NOTE: must NOT be named sched.h — pthread.h on Linux does
+ * #include <sched.h> which -Isrc would shadow with this header
+ * (same class of bug as io.h/tio.h and ffi.h/tffi.h).
  *
  * 把脚本变成 main 协程；Async\spawn 出的协程由调度器 fiber 驱动，
  * 全部完成后返回退出码。挂起（sleep/await/suspend/无感 I/O）都落在
