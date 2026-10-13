@@ -406,6 +406,9 @@ int main(int argc, char **argv) {
      * Otherwise source bytes containing CRLF get doubled (\r\r\n) on write. */
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    /* line-buffered stdout: when piped (tests/CI) each \n flushes, so a
+     * later SIGSEGV still leaves the lines already printed visible */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     /* M6.1: 启动最早期——释放内嵌原生资产 + 检测嵌入主脚本（跨平台） */
     char *embedded_main = NULL;

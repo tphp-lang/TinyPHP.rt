@@ -34,6 +34,7 @@ TVal bi_json_last_error_msg(VM *vm, TVal *args, int n);
 void tphp_echo_val(TVal v) {
     TStr *s = tval_to_str(v);
     fwrite(tstr_val(s), 1, tstr_len(s), stdout);
+    fflush(stdout);   /* crash-safety: flush so partial output is visible */
     tval_release(&(TVal){ .u.p = s, .t = T_STR });
 }
 
@@ -60,10 +61,14 @@ static void dump_array_body(TArr *a, int depth) {
         if (a->data[i].t == T_UNDEF) continue;
         TVal k = arr_key_at(a, i);
         dump_pad(depth * 2 + 2);
-        if (k.t == T_INT) printf("[%lld]=>\n", (long long)k.u.i);
-        else {
+        if (k.t == T_INT) {
+            printf("[%lld]=>\n", (long long)k.u.i);
+        } else if (k.t == T_STR) {
             TStr *ks = (TStr *)k.u.p;
             printf("[\"%s\"]=>\n", tstr_val(ks));
+        } else {
+            /* arr_key_at missed (inconsistent or racing hole): never NULL-deref */
+            printf("[?%d]=>\n", (int)i);
         }
         dump_val(a->data[i], depth + 1);
     }
@@ -156,6 +161,7 @@ static TVal bi_var_dump(VM *vm, TVal *args, int n) {
     (void)vm;
     for (int i = 0; i < n; i++)
         dump_val(args[i], 0);
+    fflush(stdout);   /* crash-safety: flush partial dump */
     return TV_NULL;
 }
 

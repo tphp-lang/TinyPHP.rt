@@ -215,11 +215,18 @@ TArr *tarr_cow(TArr *a) {
     b->dused = a->dused;
     if (a->dcap) {
         b->data = tm_malloc(sizeof(TVal) * a->dcap);
-        memcpy(b->data, a->data, sizeof(TVal) * a->dcap);
+        /* only copy the initialized prefix; zero the tail (memcpy of
+         * uninitialized bytes is UB and crashes under some clang/OS) */
+        memset(b->data, 0, sizeof(TVal) * a->dcap);
+        if (a->dused)
+            memcpy(b->data, a->data, sizeof(TVal) * a->dused);
         for (uint32_t i = 0; i < a->dused; i++) {
             if (b->data[i].t == T_UNDEF) continue;   /* free slot */
             tval_addref(b->data[i]);
         }
+        /* mark tail as T_UNDEF so dump/GC never see zeroed-as-scalar */
+        for (uint32_t i = a->dused; i < a->dcap; i++)
+            b->data[i].t = T_UNDEF;
     }
     if (a->buckets) {
         b->bcap = a->bcap;
