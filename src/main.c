@@ -388,11 +388,16 @@ static int run_source(const char *src, const char *name, bool dump) {
     tphp_async_init();            /* 内部类先于编译期类检查注册 */
     tphp_io_init();
     tphp_ffi_init();              /* M5.5 FFI 内部类 */
+    fprintf(stderr, "DIAG:init-ok\n");
     AStmtList *ast = tphp_parse_script(src, name);
+    fprintf(stderr, "DIAG:parse-ok stmts=%d\n", ast ? ast->n : -1);
     Program *prog = tphp_compile(ast, name);
+    fprintf(stderr, "DIAG:compile-ok funcs=%d\n", prog ? prog->n_funcs : -1);
     tphp_prog_freeze(prog);       /* M5: 类表冻结 + ic 急解析（跨线程只读） */
+    fprintf(stderr, "DIAG:freeze-ok\n");
     if (dump) {
         tphp_dump_program(prog);
+        fprintf(stderr, "DIAG:dump-ok\n");
         return 0;
     }
     int rc = tphp_vm_run(prog);   /* 0 = ok, 255 = uncaught exception */
