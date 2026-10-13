@@ -12,7 +12,7 @@
 - **单文件应用**：`tphp build app.php --with assets/ -o app`（Windows/Linux/macOS）
 - **PHP 8 语义**：过程式 + 完整 OOP、数组全语义、异常、命名空间
 
-当前版本 `0.0.1`，里程碑 **M0–M6 已完成**（语法/异步/Worker/FFI/stdlib/打包）。
+当前版本 `0.0.1`。内置函数与异步 API 清单见 **[doc/stdlib.md](doc/stdlib.md)**。
 
 ## 构建
 
@@ -72,6 +72,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 | 文档 | 内容 |
 |---|---|
 | [doc/overview.md](doc/overview.md) | 项目概览与定位 |
+| [doc/stdlib.md](doc/stdlib.md) | **内置功能与函数清单** |
 | [doc/build.md](doc/build.md) | 构建与 CI（5 平台） |
 | [doc/cli.md](doc/cli.md) | CLI：run / test / phpc / build |
 | [doc/architecture.md](doc/architecture.md) | 运行时架构 |
