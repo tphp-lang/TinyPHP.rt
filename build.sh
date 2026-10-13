@@ -27,11 +27,13 @@ CFLAGS_US="-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE -
 # cross-compile: add -arch to clang (macOS) when TARGET_ARCH differs from host
 HOST_ARCH=$(uname -m)
 CROSS=0
+ARCH_FLAG=""
 if [ "$TARCH" != "$HOST_ARCH" ]; then
   case "$TOS" in
     Darwin)
-      CFLAGS="$CFLAGS -arch $TARCH"
-      CFLAGS_US="$CFLAGS_US -arch $TARCH"
+      ARCH_FLAG="-arch $TARCH"
+      CFLAGS="$CFLAGS $ARCH_FLAG"
+      CFLAGS_US="$CFLAGS_US $ARCH_FLAG"
       CROSS=1
       ;;
     *)
@@ -84,7 +86,7 @@ UV_UNIX_BASE="async.c core.c dl.c fs.c getaddrinfo.c getnameinfo.c loop-watcher.
 UV_COMMON="fs-poll.c idna.c inet.c random.c strscpy.c strtok.c thread-common.c threadpool.c timer.c uv-common.c uv-data-getter-setters.c version.c"
 # libuv on Linux needs GNU extensions (cpu_set_t etc). gnu11 + _GNU_SOURCE
 # before any system header; -include guard covers feature-macro races.
-UV_CFLAGS="-O2 -g -fno-omit-frame-pointer -std=gnu11"
+UV_CFLAGS="-O2 -g -fno-omit-frame-pointer -std=gnu11 $ARCH_FLAG"
 echo '#ifndef _GNU_SOURCE' > "$OBJ/uv_force.h"
 echo '#define _GNU_SOURCE 1' >> "$OBJ/uv_force.h"
 echo '#endif' >> "$OBJ/uv_force.h"
@@ -180,7 +182,9 @@ if [ -n "$FFI_LIBS" ]; then
 else
   FFI_LIB="-lffi"
 fi
-echo "  link ffi: $FFI_LIB"
-$CC "$OBJ"/*.o $FFI_LIB -o "$OUT" $LDLIBS
+echo "  link ffi: $FFI_LIB arch: ${ARCH_FLAG:-default}"
+# ARCH_FLAG must be on the link too when cross-compiling (else ld defaults
+# to host arch and ignores the -arch-built objects: "Undefined: _main").
+$CC $ARCH_FLAG "$OBJ"/*.o $FFI_LIB -o "$OUT" $LDLIBS
 
 echo "Build OK: $OUT"
