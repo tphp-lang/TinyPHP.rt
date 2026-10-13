@@ -36,6 +36,7 @@
 #include "tsched.h"
 #include "tffi.h"
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2650,20 +2651,32 @@ void tphp_vm_unwind_current(void) {
     vm_unwind(&g_vm);
 }
 
-/* 预置内置常量（M4：I/O 相关；define() 运行期走 op_define_const） */
+/* 预置内置常量（M4：I/O 相关；define() 运行期走 op_define_const）。
+ * 字符串常量用 tstr_intern（program-lifetime，不入 GC 注册表）。 */
 static void vm_seed_consts(VM *vm) {
-    static const struct { const char *name; TVal v; } seeds[] = {
-        { "FILE_APPEND", { .u.i = 8,  .t = T_INT } },
-        { "LOCK_EX",     { .u.i = 2,  .t = T_INT } },
-        { "SEEK_SET",    { .u.i = 0,  .t = T_INT } },
-        { "SEEK_CUR",    { .u.i = 1,  .t = T_INT } },
-        { "SEEK_END",    { .u.i = 2,  .t = T_INT } },
+    static const struct { const char *name; const char *str; int64_t i; } seeds[] = {
+        { "FILE_APPEND", NULL, 8 },
+        { "LOCK_EX",     NULL, 2 },
+        { "SEEK_SET",    NULL, 0 },
+        { "SEEK_CUR",    NULL, 1 },
+        { "SEEK_END",    NULL, 2 },
+#ifdef _WIN32
+        { "PHP_EOL",     "\r\n", 0 },
+#else
+        { "PHP_EOL",     "\n",  0 },
+#endif
+        { "PHP_INT_MAX", NULL, INT64_MAX },
+        { "PHP_INT_MIN", NULL, INT64_MIN },
     };
     for (size_t i = 0; i < sizeof seeds / sizeof seeds[0]; i++) {
         if (vm->n_consts >= 256) return;
-        vm->consts[vm->n_consts].name = tstr_new(seeds[i].name,
-                                                 strlen(seeds[i].name));
-        vm->consts[vm->n_consts].v = seeds[i].v;
+        vm->consts[vm->n_consts].name = tstr_intern(seeds[i].name,
+                                                    strlen(seeds[i].name));
+        if (seeds[i].str)
+            vm->consts[vm->n_consts].v = TV_STR(tstr_intern(seeds[i].str,
+                                                            strlen(seeds[i].str)));
+        else
+            vm->consts[vm->n_consts].v = TV_INT(seeds[i].i);
         vm->n_consts++;
     }
 }
