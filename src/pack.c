@@ -349,7 +349,18 @@ static bool build_zip(PackList *list, const char *main_php, size_t main_len,
     snprintf(manifest + mlen, mcap - mlen, "]");
 
 #ifdef _WIN32
-    snprintf(tmp_path, tmp_cap, "build\\_pack_tmp.zip");
+    /* 系统临时目录（对齐 Unix /tmp）：不能假设 CWD 下有 build\ */
+    {
+        char tdir[MAX_PATH];
+        DWORD n = GetTempPathA((DWORD)sizeof tdir, tdir);
+        if (n == 0 || n >= sizeof tdir) {
+            fprintf(stderr, "tphp: cannot resolve temp directory\n");
+            free(manifest);
+            return false;
+        }
+        snprintf(tmp_path, tmp_cap, "%stphp_pack_%lu.zip", tdir,
+                 (unsigned long)GetCurrentProcessId());
+    }
 #else
     snprintf(tmp_path, tmp_cap, "/tmp/tphp_pack_%d.zip", (int)getpid());
 #endif
