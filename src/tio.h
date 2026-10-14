@@ -25,16 +25,19 @@ typedef struct TcpChunk {
 } TcpChunk;
 
 typedef struct TStreamCtx {
-    int fd;                /* 文件流 */
+    int fd;                /* 文件流（内存流为 -1） */
     uv_tcp_t *tcp;         /* TCP 流（is_tcp 时；close 时 uv_close+free） */
     bool is_tcp;
     bool is_server;        /* 监听 socket（accept 用，不可读写） */
     int open_flags;
-    int64_t cur_off;       /* 逻辑文件偏移（文件流） */
+    int64_t cur_off;       /* 逻辑文件偏移（文件流/内存流） */
     char rbuf[8192];       /* fgets 行缓冲（文件流） */
     int rbuf_len, rbuf_pos;
     bool eof;
     bool closed;
+    /* 内存流（bundle 资产，只读）：pack_read 的 malloc 缓冲，fclose 释放 */
+    char *mem;
+    size_t mem_len;
     /* TCP 流：uv_read_start 到达的数据排队，fread/fgets 消费 */
     TcpChunk *rcv_head, *rcv_tail;
     TCont *rcv_waiter;     /* 空队列挂起的读者（单等待者） */

@@ -19,6 +19,7 @@
 #include "class.h"
 #include "tsched.h"
 #include "tio.h"
+#include "pack.h"
 #include <uv.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,25 @@ static bool stream_live(VM *vm, TStreamCtx *s, const char *who) {
 
 static void io_warn(const char *what, const char *detail) {
     fprintf(stderr, "PHP Warning: %s: %s\n", what, detail);
+}
+
+/* ---- bundle 虚拟资产路径（ASSET_ROOT = "tphp://asset"）----
+ * 数据资产在内存 zip 里，不落盘；仅 DLL 类落盘（见 pack.c）。 */
+
+#define ASSET_PREFIX "tphp://asset/"
+#define ASSET_ROOT_S "tphp://asset"
+
+/* 虚拟路径 → zip 内 rel（"" = 根）；非虚拟路径返回 NULL */
+static const char *asset_rel(const char *path) {
+    size_t n = strlen(ASSET_PREFIX);
+    if (strncmp(path, ASSET_PREFIX, n) == 0) return path + n;
+    if (strcmp(path, ASSET_ROOT_S) == 0) return "";
+    return NULL;
+}
+
+static const char *asset_err(void) {
+    return tphp_pack_has_bundle() ? "no such file in bundle"
+                                  : "not a packed executable";
 }
 
 /* ---- 一次 uv_fs 操作 ---- */
@@ -266,6 +286,18 @@ TVal tphp_io_file_get_contents(VM *vm, TVal *args, int n) {
     const char *path = arg_str(vm, args, n, 0, "file_get_contents");
     char what[256];
     snprintf(what, sizeof what, "file_get_contents(%s)", path);
+    const char *rel = asset_rel(path);
+    if (rel) {
+        void *data = NULL;
+        size_t len = 0;
+        if (!tphp_pack_read(rel, &data, &len)) {
+            io_warn(what, asset_err());
+            return TV_FALSE;
+        }
+        TStr *s = tstr_new(data, len);
+        free(data);
+        return TV_STR(s);
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_open, path, UV_FS_O_RDONLY, 0);
@@ -291,6 +323,10 @@ TVal tphp_io_file_put_contents(VM *vm, TVal *args, int n) {
     if (n < 2)
         tphp_vm_raise(vm, "ArgumentCountError",
                       "file_put_contents() expects at least 2 arguments");
+    if (asset_rel(path)) {
+        io_warn("file_put_contents()", "bundle assets are read-only");
+        return TV_FALSE;
+    }
     bool append = false;
     if (n >= 3 && args[2].t == T_INT && (args[2].u.i & 8)) append = true;
     char what[256];
@@ -342,6 +378,27 @@ TVal tphp_io_fopen(VM *vm, TVal *args, int n) {
     if (!ok) {
         tphp_vm_raise(vm, "ValueError", "fopen(): Invalid mode \"%s\"", mode);
     }
+    const char *rel = asset_rel(path);
+    if (rel) {
+        if (flags & (UV_FS_O_WRONLY | UV_FS_O_RDWR | UV_FS_O_CREAT |
+                     UV_FS_O_APPEND | UV_FS_O_TRUNC)) {
+            io_warn("fopen()", "bundle assets are read-only");
+            return TV_FALSE;
+        }
+        void *data = NULL;
+        size_t len = 0;
+        if (!tphp_pack_read(rel, &data, &len)) {
+            fprintf(stderr, "PHP Warning: fopen(%s): failed to open stream: %s\n",
+                    path, asset_err());
+            return TV_FALSE;
+        }
+        int idx = stream_ctx_new(-1, flags);
+        g_streams[idx]->mem = data;
+        g_streams[idx]->mem_len = len;
+        TObj *o = tphp_obj_alloc(g_stream_cls);
+        o->props[0] = TV_INT(idx);
+        return TV_OBJ(o);
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_open, path, flags, 0644);
@@ -384,7 +441,19 @@ TVal tphp_io_fread(VM *vm, TVal *args, int n) {
         char chunk[65536];
         size_t want = sizeof chunk < (size_t)len - got ? sizeof chunk
                                                        : (size_t)len - got;
-        int64_t rd = fs_read_chunk(&op, s->fd, chunk, want, s->cur_off);
+        int64_t rd;
+        if (s->mem) {                 /* 内存流：直读 bundle 缓冲 */
+            if (s->cur_off >= (int64_t)s->mem_len) {
+                rd = 0;
+            } else {
+                size_t left = s->mem_len - (size_t)s->cur_off;
+                size_t cp = want < left ? want : left;
+                memcpy(chunk, s->mem + s->cur_off, cp);
+                rd = (int64_t)cp;
+            }
+        } else {
+            rd = fs_read_chunk(&op, s->fd, chunk, want, s->cur_off);
+        }
         if (rd < 0) {
             tm_free(buf);
             io_warn("fread", uv_strerror((int)rd));
@@ -417,6 +486,10 @@ TVal tphp_io_fwrite(VM *vm, TVal *args, int n) {
     if (s->is_tcp) return tcp_fwrite_impl(vm, s, data);
     if (s->is_server)
         tphp_vm_raise(vm, "Error", "fwrite(): cannot write to a server socket");
+    if (s->mem) {
+        io_warn("fwrite()", "bundle asset stream is read-only");
+        return TV_FALSE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     size_t total = tstr_len(data), done = 0;
@@ -458,6 +531,17 @@ TVal tphp_io_fgets(VM *vm, TVal *args, int n) {
             }
         }
         if (s->eof) break;
+        /* 补缓冲：内存流从 bundle 缓冲切块 */
+        if (s->mem) {
+            if (s->cur_off >= (int64_t)s->mem_len) { s->eof = true; break; }
+            size_t chunk = s->mem_len - (size_t)s->cur_off;
+            if (chunk > IO_RBUF) chunk = IO_RBUF;
+            memcpy(s->rbuf, s->mem + s->cur_off, chunk);
+            s->rbuf_len = (int)chunk;
+            s->rbuf_pos = 0;
+            s->cur_off += (int64_t)chunk;
+            continue;
+        }
         /* 补缓冲 */
         FsOp op;
         memset(&op, 0, sizeof op);
@@ -493,6 +577,12 @@ TVal tphp_io_fclose(VM *vm, TVal *args, int n) {
         tcp_close_impl(vm, s);       /* 异步 close + 挂起等待 */
         return TV_TRUE;
     }
+    if (s->mem) {                    /* 内存流：释放 bundle 缓冲，无 fd 可关 */
+        free(s->mem);
+        s->mem = NULL;
+        s->closed = true;
+        return TV_TRUE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_close, s->fd);
@@ -520,12 +610,16 @@ TVal tphp_io_fseek(VM *vm, TVal *args, int n) {
     if (whence == 1) {
         s->cur_off += off;
     } else if (whence == 2) {
-        /* SEEK_END：fstat 拿大小（FS_DO 已快照） */
-        FsOp op;
-        memset(&op, 0, sizeof op);
-        FS_DO(&op, uv_fs_fstat, s->fd);
-        if (op.result < 0) return TV_FALSE;
-        s->cur_off = op.stat_size + off;
+        if (s->mem) {                 /* 内存流：SEEK_END 用 mem_len */
+            s->cur_off = (int64_t)s->mem_len + off;
+        } else {
+            /* SEEK_END：fstat 拿大小（FS_DO 已快照） */
+            FsOp op;
+            memset(&op, 0, sizeof op);
+            FS_DO(&op, uv_fs_fstat, s->fd);
+            if (op.result < 0) return TV_FALSE;
+            s->cur_off = op.stat_size + off;
+        }
     } else {
         s->cur_off = off;
     }
@@ -537,6 +631,8 @@ TVal tphp_io_fseek(VM *vm, TVal *args, int n) {
 TVal tphp_io_file_exists(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "file_exists");
+    const char *rel = asset_rel(path);
+    if (rel) return tphp_pack_stat(rel, NULL) ? TV_TRUE : TV_FALSE;
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_stat, path);
@@ -546,6 +642,17 @@ TVal tphp_io_file_exists(VM *vm, TVal *args, int n) {
 TVal tphp_io_filesize(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "filesize");
+    const char *rel = asset_rel(path);
+    if (rel) {
+        size_t sz = 0;
+        if (!tphp_pack_stat(rel, &sz)) {
+            char what[256];
+            snprintf(what, sizeof what, "filesize(): stat failed for %s", path);
+            io_warn(what, asset_err());
+            return TV_FALSE;
+        }
+        return TV_INT((int64_t)sz);
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_stat, path);
@@ -562,6 +669,10 @@ TVal tphp_io_filesize(VM *vm, TVal *args, int n) {
 TVal tphp_io_unlink(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "unlink");
+    if (asset_rel(path)) {
+        io_warn("unlink()", "bundle assets are read-only");
+        return TV_FALSE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_unlink, path);
@@ -576,6 +687,10 @@ TVal tphp_io_rename(VM *vm, TVal *args, int n) {
     (void)n;
     const char *from = arg_str(vm, args, n, 0, "rename");
     const char *to = arg_str(vm, args, n, 1, "rename");
+    if (asset_rel(from) || asset_rel(to)) {
+        io_warn("rename()", "bundle assets are read-only");
+        return TV_FALSE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_rename, from, to);
@@ -589,6 +704,10 @@ TVal tphp_io_rename(VM *vm, TVal *args, int n) {
 TVal tphp_io_mkdir(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "mkdir");
+    if (asset_rel(path)) {
+        io_warn("mkdir()", "bundle assets are read-only");
+        return TV_FALSE;
+    }
     int mode = n >= 2 && args[1].t == T_INT ? (int)args[1].u.i : 0777;
     FsOp op;
     memset(&op, 0, sizeof op);
@@ -603,6 +722,10 @@ TVal tphp_io_mkdir(VM *vm, TVal *args, int n) {
 TVal tphp_io_rmdir(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "rmdir");
+    if (asset_rel(path)) {
+        io_warn("rmdir()", "bundle assets are read-only");
+        return TV_FALSE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_rmdir, path);
@@ -616,6 +739,30 @@ TVal tphp_io_rmdir(VM *vm, TVal *args, int n) {
 TVal tphp_io_scandir(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "scandir");
+    const char *rel = asset_rel(path);
+    if (rel) {
+        char what[256];
+        snprintf(what, sizeof what, "scandir(%s)", path);
+        if (!tphp_pack_has_bundle()) {
+            io_warn(what, "failed to open dir: not a packed executable");
+            return TV_FALSE;
+        }
+        char **names = NULL;
+        int cnt = tphp_pack_list(rel, &names);
+        if (cnt == 0 && rel[0]) {     /* 根恒存在；子目录需有条目 */
+            io_warn(what, "failed to open dir: no such dir in bundle");
+            return TV_FALSE;
+        }
+        TArr *arr = tarr_new();
+        tarr_append(arr, TV_STR(tstr_new(".", 1)));
+        tarr_append(arr, TV_STR(tstr_new("..", 2)));
+        for (int i = 0; i < cnt; i++) {
+            tarr_append(arr, TV_STR(tstr_new(names[i], strlen(names[i]))));
+            free(names[i]);
+        }
+        free(names);
+        return TV_ARR(arr);
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     op.want_names = true;

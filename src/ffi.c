@@ -17,6 +17,7 @@
 #include "opcode.h"
 #include "class.h"
 #include "tffi.h"
+#include "pack.h"
 #include <ffi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -972,23 +973,40 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
     return t;
 }
 
+/* 打包 DLL 解析：清单命中的相对路径 → 指纹缓存内等效绝对路径（目录结构
+ * 与包内一致，依赖链可同级解析）。未打包/系统库名 → 原样加载。
+ * Windows 一律宽字符（UTF-8 输入）；命中的绝对路径加
+ * LOAD_WITH_ALTERED_SEARCH_PATH 让依赖优先在 DLL 自身目录查找。 */
+static void *ffi_lib_open(const char *libname) {
+    const char *root = tphp_pack_dll_root();
+    char joined[2048];
+    const char *use = libname;
+    bool resolved = false;
+    if (root && libname[0] && tphp_pack_stat(libname, NULL)) {
+        snprintf(joined, sizeof joined, "%s/%s", root, libname);
+        use = joined;
+        resolved = true;
+    }
+#ifdef _WIN32
+    wchar_t wu[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, use, -1, wu, 1024)) return NULL;
+    if (resolved)
+        return LoadLibraryExW(wu, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    return LoadLibraryW(wu);
+#else
+    return dlopen(use, RTLD_LAZY | RTLD_LOCAL);
+#endif
+}
+
 static FFIScope *scope_new(const char *code, const char *libname) {
     check_no_preproc(code);
     FFIScope *sc = tm_malloc(sizeof *sc);
     memset(sc, 0, sizeof *sc);
-#ifdef _WIN32
     if (libname && libname[0]) {
-        sc->lib = (void *)LoadLibraryA(libname);
+        sc->lib = ffi_lib_open(libname);
         if (!sc->lib)
             tphp_raise("ValueError", "FFI::cdef(): failed to load library \"%s\"", libname);
     }
-#else
-    if (libname && libname[0]) {
-        sc->lib = dlopen(libname, RTLD_LAZY | RTLD_LOCAL);
-        if (!sc->lib)
-            tphp_raise("ValueError", "FFI::cdef(): failed to load library \"%s\"", libname);
-    }
-#endif
     CParser cp = { .s = code, .p = code, .end = code + strlen(code) };
     cnext(&cp);
     parse_toplevel(&cp, sc);

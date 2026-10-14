@@ -39,10 +39,12 @@ jobs:
         shell: pwsh
         run: |
           Set-Content -Path asset.txt -Value "asset-data" -NoNewline
-          Set-Content -Path app.php -Value '<?php echo "pack-ok`n";' -NoNewline
+          Set-Content -Path app.php -Value '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' -NoNewline
           ./build/tphp.exe build app.php --with asset.txt -o app.exe
-          ./app.exe
-          if (Test-Path runtime/lib/asset.txt) { "asset-extracted" }
+          $out = ./app.exe
+          if ("$out" -notmatch 'asset-data') { throw "packed asset not readable" }
+          if (Test-Path runtime/lib) { throw "data asset must not hit disk" }
+          "asset-in-memory"
 
       - name: Smoke
         shell: pwsh
@@ -80,11 +82,13 @@ jobs:
 
       - name: Pack smoke (ELF section / footer)
         run: |
-          printf 'asset-data\n' > asset.txt
-          printf '<?php echo "pack-ok\n";' > app.php
+          printf '%s' 'asset-data' > asset.txt
+          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
           ./build/tphp build app.php --with asset.txt -o app
-          ./app
-          test -f runtime/lib/asset.txt && echo "asset-extracted"
+          ./app > out.txt
+          grep -q 'asset-data' out.txt
+          test ! -d runtime/lib
+          echo "asset-in-memory"
 
       - name: Smoke
         run: |
@@ -121,11 +125,13 @@ jobs:
 
       - name: Pack smoke (ELF section / footer)
         run: |
-          printf 'asset-data\n' > asset.txt
-          printf '<?php echo "pack-ok\n";' > app.php
+          printf '%s' 'asset-data' > asset.txt
+          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
           ./build/tphp build app.php --with asset.txt -o app
-          ./app
-          test -f runtime/lib/asset.txt && echo "asset-extracted"
+          ./app > out.txt
+          grep -q 'asset-data' out.txt
+          test ! -d runtime/lib
+          echo "asset-in-memory"
 
       - name: Smoke
         run: |
@@ -162,11 +168,13 @@ jobs:
 
       - name: Pack smoke (footer container)
         run: |
-          printf 'asset-data\n' > asset.txt
-          printf '<?php echo "pack-ok\n";' > app.php
+          printf '%s' 'asset-data' > asset.txt
+          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
           ./build/tphp build app.php --with asset.txt -o app
-          ./app
-          test -f runtime/lib/asset.txt && echo "asset-extracted"
+          ./app > out.txt
+          grep -q 'asset-data' out.txt
+          test ! -d runtime/lib
+          echo "asset-in-memory"
 
       - name: Smoke
         run: |

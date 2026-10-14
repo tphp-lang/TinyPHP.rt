@@ -535,16 +535,7 @@ int main(int argc, char **argv) {
             /* 复制自身 → out_exe 再注入 */
             char self[1024];
             self[0] = 0;
-            char out_acp[1024];
-            out_acp[0] = 0;
 #ifdef _WIN32
-            /* pack.c 走 ANSI fopen：out_exe/--with 转 ACP（源码读入不受影响） */
-            u8_to_acp(out_exe, out_acp, sizeof out_acp);
-            for (int wi = 0; wi < nwith; wi++) {
-                char *w = (char *)malloc(1024);
-                u8_to_acp(withs[wi], w, 1024);
-                withs[wi] = w;
-            }
             wchar_t wself[MAX_PATH], wout[MAX_PATH];
             GetModuleFileNameW(NULL, wself, MAX_PATH);
             MultiByteToWideChar(CP_UTF8, 0, out_exe, -1, wout, MAX_PATH);
@@ -585,7 +576,6 @@ int main(int argc, char **argv) {
                 chmod(out_exe, 0755);
             }
 #endif
-            if (out_acp[0]) out_exe = out_acp;   /* pack.c 用 ACP 路径 */
             int rc = tphp_pack_exe(out_exe, php, strlen(php), withs, nwith);
             free(php);
             return rc == 0 ? (int)TPHP_OK : (int)TPHP_E_IO;

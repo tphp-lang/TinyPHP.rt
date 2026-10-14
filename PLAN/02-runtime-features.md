@@ -117,7 +117,7 @@ class Worker {
 **定位三层，与单二进制正交**：
 1. **系统库绑定**：user32/kernel32/ws2_32/msvcrt（Linux libc/libm）每台机器自带 → `FFI::cdef('...', 'user32.dll')` 零配置天然兼容单 exe
 2. **要内嵌的库走 vendor 静态链接**（项目先例 mbedtls/cacert/libuv），做成内部类而非让用户 FFI
-3. **第三方 DLL**：exe+dll 同发即可；可选 `tphp build --with` 打包器（后置特性，见 PLAN/03 §6.1——解到 exe 同级 runtime/lib，不用 %TEMP%）
+3. **第三方 DLL**：exe+dll 同发即可；可选 `tphp build --with` 打包器（见 PLAN/03 §6.1——数据资产内存直读，`.dll/.so/.dylib` 按等效路径提取到 exe 同级）
 
 - **API**：`FFI::cdef($code, $lib = null)` / `FFI::new($type[, bool owned = true])` / `FFI::memcpy($dst, $src, $n)` / `FFI::free($ptr)` / `FFI::sizeof`；`FFI\CData` 对象（属性/下标读写、作为调用参数/返回值）
 - **cdef 子集**：函数声明、基本类型、指针、平铺 struct/enum、简单 typedef；**拒预处理指令**（#include/#define 不解析——cdef 字符串里出现即 ValueError）；不带完整类型系统与 preload（php-src 全套 bison 解析器 ~1.1 万行，过重不学）

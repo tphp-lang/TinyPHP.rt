@@ -129,19 +129,24 @@ lib\*.php --(tools/phpc.c，与 src 共享 lex/parse/compile 编译单元)-->
 phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包与 phpc **正交**，FFI 层零改动：
 
 - 构建：`tphp build app.php --with vendor\ --with ext\bar.dll -o app`
-  `--with` 接受**文件或目录**（可重复）：目录递归收全部非 .php 文件（.php 默认排除并警告），**保留相对目录结构**；单文件落 zip 根
-  miniz 打 zip + manifest.json（relpath/sha1/size）
+  `--with` 接受**文件或目录**（可重复）：目录递归收全部非 .php 文件（.php 默认排除并警告），
+  **路径原样进包**（保留目录前缀：`--with vendor\ssl\foo.dll` → zip 内 `vendor/ssl/foo.dll`；
+  绝对路径退回文件名/目录内部相对）
+  miniz 打 zip + manifest.json（relpath/sha1/size/type；type 按后缀分类：`.dll/.so/.dylib` → `dll`，其余 `data`）
   嵌入方式：
   - **Windows**：PE RCDATA `TPHP_BUNDLE`（zip）+ `TPHP_MAIN`（脚本源码）
   - **Linux**：ELF section `.tphp_bundle`（objcopy 注入；失败回落 footer）
   - **macOS**：文件尾 footer 容器 `[zip][u64 le size][magic "TPHPBND1"]`
   - Unix 主脚本：zip 内 `__main.php`
 - 运行期（main 最早期）：
-  查找嵌入 zip → 逐条目 sha1 校验 → 原子释放（mkdir -p → .tmp → rename）到 `<exedir>/runtime/lib`
+  zip **常驻内存**（Bun 式）：数据资产由 io 层经 `ASSET_ROOT`（`tphp://asset/`）前缀
+  直读内存 zip，**不落盘**；manifest 中 `type=dll`（`.dll/.so/.dylib`）按**等效相对路径**
+  提取到 **exe 同级**（`<exedir>/<relpath>`；磁盘已存在且 sha1 与清单一致则跳过，
+  否则校验 zip 侧 sha1 后原子写 .tmp → rename）；FFI 用包内相对路径命中清单 →
+  `<exedir>/<relpath>` 绝对加载（`LOAD_WITH_ALTERED_SEARCH_PATH`，依赖走应用目录默认搜索）
   无嵌入 → 零开销正常启动；有嵌入主脚本且无 CLI 参数 → 执行
-  Windows：`SetDllDirectory(runtime\lib)`；只读回落 `%LOCALAPPDATA%\tphp\<exe名>\lib`
-  防护：zip-slip（拒绝 `..`/绝对路径/盘符）；释放前 sha1 校验
-- CI 对每个平台跑 Pack smoke（build → 运行 → 断言 asset 释放）
+  防护：zip-slip（拒绝 `..`/绝对路径/盘符）；DLL 提取 sha1 校验
+- CI 对每个平台跑 Pack smoke（build → 读 `ASSET_ROOT` 断言 → 断言数据不落盘）
 
 ## 7. 构建脚本要点
 

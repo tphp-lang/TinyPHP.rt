@@ -50,10 +50,23 @@ tphp build app.php --with vendor/ --with bar.dll -o app
 
 - **`--with`**：文件或目录（可重复）
   - 目录递归收**非 .php** 文件（.php 排除并警告——PHP 走 phpc）
-  - 保留相对目录（以参数目录为锚点：`vendor\ssl\foo.dll` → zip 内 `ssl/foo.dll`）
-  - 单文件落 zip 根
+  - **路径原样进包**（保留目录前缀：`--with vendor\ssl\foo.dll` → zip 内
+    `vendor/ssl/foo.dll`；`--with vendor` → `vendor/…`）
+  - 绝对路径无法表达包内等效名：单文件退回文件名、目录退回目录内部相对
 - 产物含嵌入 zip + 主脚本；**无参数运行**时自动执行主脚本
-- 运行期把资产释放到 `<exedir>/runtime/lib`（sha1 校验、原子 rename、zip-slip 防护）
+- **数据资产不落盘**（Bun 式内存直读）：zip 常驻内存，`ASSET_ROOT`（值 `tphp://asset`）
+  前缀由 io 层直接读包内文件——`file_get_contents` / `fopen` / `file_exists` /
+  `filesize` / `scandir` 均支持，只读：
+  ```php
+  echo file_get_contents(ASSET_ROOT . "/config.json");
+  ```
+- **`.dll` / `.so` / `.dylib` 按等效相对路径落盘到 exe 同级**：manifest `type=dll`
+  条目提取为 `<exedir>/<包内相对路径>`（如 exe 旁 `vendor/foo.dll`）；磁盘已存在且
+  sha1 与清单一致则跳过，否则校验后原子写入。FFI 里直接用包内相对路径即可加载：
+  ```php
+  $ffi = FFI::cdef("int point_sum(int,int);", "ext/foo.dll");
+  ```
+- 防护：zip-slip（拒绝 `..`/绝对路径/盘符）；DLL 提取前 sha1 校验
 
 | 平台 | 嵌入方式 |
 |---|---|

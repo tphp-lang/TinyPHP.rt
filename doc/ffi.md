@@ -86,7 +86,7 @@ $w->stop();
 
 | 平台 | 库查找 |
 |---|---|
-| Windows | 指定 DLL → kernel32/user32/msvcrt 等回退 → 主模块；`tphp build` 释放后 `SetDllDirectory(runtime/lib)` |
+| Windows | 指定 DLL → kernel32/user32/msvcrt 等回退 → 主模块；打包内相对路径命中清单 → exe 同级等效绝对路径加载（`LOAD_WITH_ALTERED_SEARCH_PATH`，依赖走应用目录默认搜索） |
 | Linux/macOS | 指定 `.so`/`.dylib` → `RTLD_DEFAULT` |
 
 ## 测试

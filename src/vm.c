@@ -2667,6 +2667,9 @@ static void vm_seed_consts(VM *vm) {
 #endif
         { "PHP_INT_MAX", NULL, INT64_MAX },
         { "PHP_INT_MIN", NULL, INT64_MIN },
+        /* 打包应用资源根（io 层 tphp://asset/ 前缀直读内存 zip）；
+         * 未打包时读取会得到 "not a packed executable" 警告 */
+        { "ASSET_ROOT",  "tphp://asset", 0 },
     };
     for (size_t i = 0; i < sizeof seeds / sizeof seeds[0]; i++) {
         if (vm->n_consts >= 256) return;
