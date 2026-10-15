@@ -463,6 +463,23 @@ static void bind_traits(TClass *cls) {
             add_prop(cls, t->props[pi]);
         for (int pi = 0; pi < t->n_sprops; pi++)
             add_sprop(cls, t->sprops[pi]);
+        /* P2-B: trait constants. If the class (or an earlier parent/trait)
+         * already defines the name, the existing entry wins — PHP 8.3
+         * fatals on a real collision, approximated here (see TODO P3). */
+        for (int ci = 0; ci < t->n_consts; ci++) {
+            bool exists = false;
+            for (int i = 0; i < cls->n_consts; i++)
+                if (tstr_case_eq(tstr_val(cls->cnames[i]),
+                                 tstr_val(t->cnames[ci]))) { exists = true; break; }
+            if (exists) continue;
+            cls->cnames = tm_realloc(cls->cnames,
+                sizeof(TStr *) * (size_t)(cls->n_consts + 1));
+            cls->cvals = tm_realloc(cls->cvals,
+                sizeof(TVal) * (size_t)(cls->n_consts + 1));
+            cls->cnames[cls->n_consts] = t->cnames[ci];
+            tval_addref(t->cvals[ci]);
+            cls->cvals[cls->n_consts++] = t->cvals[ci];
+        }
     }
     /* adaptation bookkeeping is compile-lifetime; drop the references */
     cls->n_trait_names = 0;
