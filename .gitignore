@@ -16,5 +16,4 @@
 *.rsp
 
 # ---- tooling / workspace ----
-.workbuddy/
 .mimocode/
