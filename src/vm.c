@@ -860,7 +860,31 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
     rec->dst_kind = op->tr;
     rec->dst_slot = op->ar;
     if (fv.t == T_CLOSURE) {
-        rec->clo = (TClosure *)fv.u.p;
+        TClosure *clo = (TClosure *)fv.u.p;
+        if (clo->fn == NULL && (clo->h.flags & GC_FLAG_MFCC)) {
+            /* bound method closure (P2-A $obj->m(...)): dispatch as a
+             * method call on the captured receiver. Visibility check is
+             * not re-applied here (known simplification, see TODO). */
+            TObj *o = (TObj *)clo->captures[0].u.p;
+            TStr *mname = (TStr *)clo->captures[1].u.p;
+            char mlc[128];
+            { const char *s = tstr_val(mname);
+              size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+              mlc[k] = 0; }
+            tphp_class_ensure_flat(o->cls);
+            TMethod *m = tphp_class_find_method(o->cls, mlc);
+            if (!m || !m->fn || m->is_abstract)
+                vm_raise(vm, ex_class("Error"), op,
+                         "Method %s::%s() is not callable",
+                         tstr_val(o->cls->name), tstr_val(mname));
+            rec->is_method = true;
+            rec->this_obj = o;
+            tval_addref(clo->captures[0]);   /* frame slot 0 owns a reference */
+            rec->uf = m->fn;
+            return 1;
+        }
+        rec->clo = clo;
         return 1;
     }
     if (fv.t == T_OBJ) {
@@ -2490,6 +2514,26 @@ static TStr *vm_tostring_hook(TVal v) {
 
 /* expr::class: objects -> the class FQ name; class-name strings pass
  * through unchanged (PHP 8.0 $obj::class / 8.2 Status::Active::class) */
+static int32_t op_fcc_method(VM *vm, TOp *op) {
+    /* P2-A $obj->m(...): bound method closure — TClosure with fn=NULL,
+     * receiver + method name in captures, GC_FLAG_MFCC set; op_init_dyn
+     * dispatches it like a method call */
+    TVal ov = rdv(vm, op, 1);
+    if (ov.t != T_OBJ)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot create a first-class method callable from a non-object");
+    TObj *o = (TObj *)ov.u.p;
+    TStr *mname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TVal caps[2];
+    caps[0] = ov;
+    caps[1] = TV_STR(mname);
+    tval_addref(caps[1]);
+    TClosure *clo = tclo_alloc(NULL, caps, 2);
+    clo->h.flags |= GC_FLAG_MFCC;
+    wtake(vm, op, TV_CLO(clo));
+    return 1;
+}
+
 static int32_t op_get_class(VM *vm, TOp *op) {
     TVal v = rdv(vm, op, 1);
     if (v.t == T_STR) {
@@ -2843,7 +2887,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_fcc_dyn),
     H(op_init_mcall), H(op_new_user), H(op_assign_prop), H(op_isset_prop),
     H(op_init_smcall), H(op_fetch_cconst), H(op_instanceof), H(op_get_class),
-    H(op_assign_sprop), H(op_unset_prop), H(op_clone),
+    H(op_assign_sprop), H(op_unset_prop), H(op_clone), H(op_fcc_method),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -2868,7 +2912,7 @@ const char *tphp_op_name(uint8_t op) {
         "FCC_DYN",
         "INIT_MCALL", "NEW_USER", "ASSIGN_PROP", "ISSET_PROP",
         "INIT_SMCALL", "FETCH_CCONST", "INSTANCEOF", "GET_CLASS",
-        "ASSIGN_SPROP", "UNSET_PROP", "CLONE",
+        "ASSIGN_SPROP", "UNSET_PROP", "CLONE", "FCC_METHOD",
     };
     return op < OP_MAX ? names[op] : "?";
 }
@@ -3220,6 +3264,67 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     }
     if (bfn) {                       /* first-class builtin wrapper */
         return bfn(vm, args, n);
+    }
+    if (clo && clo->fn == NULL && (clo->h.flags & GC_FLAG_MFCC)) {
+        /* P2-A bound method closure ($obj->m(...)): run as a method frame
+         * on the captured receiver ($this in slot 0, RECV moves params) */
+        TObj *o = (TObj *)clo->captures[0].u.p;
+        TStr *mname = (TStr *)clo->captures[1].u.p;
+        char mlc[128];
+        { const char *s = tstr_val(mname);
+          size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+              mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+          mlc[k] = 0; }
+        tphp_class_ensure_flat(o->cls);
+        TMethod *m = tphp_class_find_method(o->cls, mlc);
+        if (!m || !m->fn || m->is_abstract)
+            vm_raise(vm, ex_class("Error"), NULL,
+                     "Method %s::%s() is not callable",
+                     tstr_val(o->cls->name), tstr_val(mname));
+        TFunc *fn = m->fn;
+        if (vm->x.n_args + n > VM_MAX_ARGS)
+            vm_raise(vm, ex_class("Error"), NULL, "Too many arguments");
+        uint32_t base = (uint32_t)vm->x.n_args;
+        int nq = (fn->is_variadic || n < fn->n_params) ? n : fn->n_params;
+        for (int i = 0; i < n; i++) {
+            vm->x.args[base + (uint32_t)i] = args[i];
+            tval_addref(args[i]);
+        }
+        vm->x.n_args = (int)base + nq;
+        for (int i = nq; i < n; i++)          /* extras: nobody consumes them */
+            if (vm->x.args[base + (uint32_t)i].t != T_UNDEF) {
+                tval_release(&vm->x.args[base + (uint32_t)i]);
+                vm->x.args[base + (uint32_t)i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+            }
+        VMCallRec *rec = call_push(vm, &g_magic_stub);
+        rec->is_thunk = true;
+        rec->uf = fn;
+        rec->args_base = base;
+        VMFrame *f = tm_malloc(sizeof *f);
+        f->fn = fn;
+        f->pc = 0;
+        f->prev = vm->x.frame;
+        f->args_base = base;
+        f->n_args_sent = (uint16_t)nq;
+        f->n_calls_at_entry = vm->x.n_calls;
+        uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
+        f->slots = tm_malloc(sizeof(TVal) * nslots);
+        for (uint32_t i = 0; i < nslots; i++)
+            f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+        f->slots[0] = TV_OBJ(o);              /* $this (own ref: addref, the
+                                                 closure's ref is separate) */
+        tval_addref(clo->captures[0]);
+        f->called_cls = o->cls;
+        vm->x.n_args = (int)base;
+        vm->x.frame = f;
+        while (vm->x.frame == f) {
+            TOp *cop = &f->fn->ops[f->pc];
+            int32_t d = ((OpHandler)cop->handler)(vm, cop);
+            if (d) f->pc += (uint32_t)d;
+        }
+        if (vm->x.exception)
+            longjmp(vm->x.unwind, 1);
+        return vm->x.thunk_ret;
     }
     TFunc *fn = clo ? clo->fn : uf;
     if (vm->x.n_args + n > VM_MAX_ARGS)

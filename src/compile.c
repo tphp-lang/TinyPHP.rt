@@ -1459,9 +1459,15 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         return dst;
     }
     case A_FIRSTCLASS_DYN: {
-        if (e->u.e->tag == A_PROP)
-            tphp_fatal_src(c->file, e->line,
-                           "Method first-class callables land in M3");
+        if (e->u.e->tag == A_PROP) {
+            /* P2-A: $obj->m(...) -> bound method closure (receiver +
+             * method name captured; op_init_dyn dispatches it) */
+            Loc obj = compile_expr(c, e->u.e->u.prop.obj, LOC_NONE);
+            Loc dst = tmp_dst(c, want);
+            emit(c, OP_FCC_METHOD, obj, LOC_CONST(lit_str(c, e->u.e->u.prop.name)),
+                 dst, e->line);
+            return dst;
+        }
         Loc sv = compile_expr(c, e->u.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         emit(c, OP_FCC_DYN, sv, LOC_NONE, dst, e->line);

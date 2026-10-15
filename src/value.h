@@ -49,7 +49,7 @@ void   tm_free(void *p);
 enum { GC_COLOR_UNMARKED = 0, GC_COLOR_BLACK, GC_COLOR_DEAD };
 enum { GC_KIND_STR = 1, GC_KIND_ARR = 2, GC_KIND_CLO = 3, GC_KIND_EX = 4,
        GC_KIND_OBJ = 5 };
-enum { GC_FLAG_INTERNED = 1, GC_FLAG_DTORED = 2 };
+enum { GC_FLAG_INTERNED = 1, GC_FLAG_DTORED = 2, GC_FLAG_MFCC = 4 };
 
 typedef struct GCHead {
     uint32_t rc;

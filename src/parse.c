@@ -638,6 +638,27 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             TStr *name = p->tok.ident;
             advance(p);
             if (p->tok.kind == P_LPAREN) {
+                /* P2-A first-class callable: ->m(...) with a bare `...`
+                 * produces a bound method closure expression */
+                Lex saved = p->lx;
+                Token saved_tok = p->tok;
+                advance(p);
+                bool is_fcc = false;
+                if (p->tok.kind == P_ELLIPSIS) {
+                    advance(p);
+                    is_fcc = (p->tok.kind == P_RPAREN);
+                }
+                if (is_fcc) {
+                    advance(p);
+                    AExpr *pr = ae_new(A_PROP, line);
+                    pr->u.prop.obj = e;
+                    pr->u.prop.name = name;
+                    AExpr *fc = ae_new(A_FIRSTCLASS_DYN, line);
+                    fc->u.e = pr;
+                    return fc;
+                }
+                p->lx = saved;
+                p->tok = saved_tok;
                 AArgList *args = parse_arg_list(p);
                 AExpr *m = ae_new(A_METHODCALL, line);
                 m->u.mcall.obj = e;

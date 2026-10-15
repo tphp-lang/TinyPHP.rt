@@ -50,6 +50,8 @@ typedef enum {
     OP_ASSIGN_SPROP,   /* static property write: a1=kind, a2=lit key, tr=val */
     OP_UNSET_PROP,     /* unset($obj->prop): slot -> UNDEF, else __unset */
     OP_CLONE,          /* clone $obj: shallow copy + __clone hook */
+    OP_FCC_METHOD,     /* P2-A $obj->m(...): bound method closure
+                          (o1 = receiver, ar = method-name lit) */
     OP_MAX,
 } Opcode;
 
