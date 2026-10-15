@@ -633,10 +633,16 @@ static void bind_traits(TClass *cls) {
             }
             if (!replaced) add_method(cls, m);
         }
-        for (int pi = 0; pi < t->n_props; pi++)
-            add_prop(cls, t->props[pi]);
-        for (int pi = 0; pi < t->n_sprops; pi++)
-            add_sprop(cls, t->sprops[pi]);
+        for (int pi = 0; pi < t->n_props; pi++) {
+            TProp p = t->props[pi];
+            p.decl = cls;   /* trait 属性归使用类（readonly 写入作用域同） */
+            add_prop(cls, p);
+        }
+        for (int pi = 0; pi < t->n_sprops; pi++) {
+            TProp p = t->sprops[pi];
+            p.decl = cls;   /* trait 静态属性 = 类自有（PHP：每个使用类各一份） */
+            add_sprop(cls, p);
+        }
         /* P2-B: trait constants. If the class (or an earlier parent/trait)
          * already defines the name, the existing entry wins — PHP 8.3
          * fatals on a real collision, approximated here (see TODO P3). */

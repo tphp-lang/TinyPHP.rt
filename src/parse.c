@@ -33,7 +33,7 @@ static AExpr *parse_ternary(Parser *p);
 static AStmt *parse_statement(Parser *p);
 static AExpr *parse_static_access(Parser *p, TStr *name, int line);
 static TStr **parse_name_list(Parser *p, int *out_n);
-static AClassBody *parse_class_body(Parser *p, int kind);
+static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name);
 
 /* ---- small helpers ---- */
 static void p_error(Parser *p, const char *msg) {
@@ -502,7 +502,7 @@ static AExpr *parse_primary(Parser *p) {
             cd->line = line;
             if (accept(p, KW_EXTENDS)) cd->parent = parse_qual_name(p, NULL);
             if (accept(p, KW_IMPLEMENTS)) cd->ifaces = parse_name_list(p, &cd->n_ifaces);
-            cd->body = parse_class_body(p, CK_CLASS);
+            cd->body = parse_class_body(p, CK_CLASS, NULL);
             AExpr *e = ae_new(A_NEW, line);
             e->u.newx.name = NULL;
             e->u.newx.args = args;
@@ -633,7 +633,7 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 p->tok.kind != KW_PARENT &&
                 p->tok.kind != KW_STATIC &&
                 p->tok.kind != KW_CLASS) {
-                p_error(p, "Object property access lands in M3");
+                p_error(p, "Variable property access ($obj->$name) is not supported");
             }
             TStr *name = p->tok.ident;
             advance(p);
@@ -694,7 +694,7 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 p->tok.kind != KW_SELF &&
                 p->tok.kind != KW_PARENT &&
                 p->tok.kind != KW_STATIC) {
-                p_error(p, "Object property access lands in M3");
+                p_error(p, "Variable property access ($obj->$name) is not supported");
             }
             TStr *name = p->tok.ident;
             advance(p);
@@ -717,30 +717,30 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
         }
         case P_DOUBLE_COLON: {
             /* static access after a primary that bypassed postfix
-             * (self::m()/parent::K/Static::m()/static::m()), and the
-             * trailing `::class` after any value (Status::Active::class) */
+             * (self::m()/parent::K/Static::m()/static::m()), the P2-B
+             * $obj::$prop / $className::$prop, and the trailing `::class`
+             * after any value (Status::Active::class) */
             TStr *cls = NULL;
-            if (e->tag == A_CONSTREF) {
-                cls = e->u.name;
-            } else if (p->tok.kind == L_VAR) {
-                /* P2-B: $obj::$staticProp (read / assign target) */
-                const char *vn = tstr_val(p->tok.ident);
-                size_t vn_len = tstr_len(p->tok.ident);
-                char sbuf[160];
-                sbuf[0] = '$';
-                size_t cl = vn_len < sizeof sbuf - 2 ? vn_len : sizeof sbuf - 2;
-                memcpy(sbuf + 1, vn, cl);
-                sbuf[cl + 1] = 0;
-                TStr *member = tstr_intern(sbuf, cl + 1);
-                advance(p);
-                AExpr *os = ae_new(A_OBJSTATIC, line);
-                os->u.prop.obj = e;
-                os->u.prop.name = member;
-                e = os;
-                break;
-            } else {
+            if (e->tag != A_CONSTREF) {
+                advance(p);   /* 消费 '::'——此前 L_VAR 判断在消费前，永假 */
+                if (p->tok.kind == L_VAR) {
+                    /* P2-B: $obj::$staticProp（读/赋值目标） */
+                    const char *vn = tstr_val(p->tok.ident);
+                    size_t vn_len = tstr_len(p->tok.ident);
+                    char sbuf[160];
+                    sbuf[0] = '$';
+                    size_t cl = vn_len < sizeof sbuf - 2 ? vn_len : sizeof sbuf - 2;
+                    memcpy(sbuf + 1, vn, cl);
+                    sbuf[cl + 1] = 0;
+                    TStr *member = tstr_intern(sbuf, cl + 1);
+                    advance(p);
+                    AExpr *os = ae_new(A_OBJSTATIC, line);
+                    os->u.prop.obj = e;
+                    os->u.prop.name = member;
+                    e = os;
+                    break;
+                }
                 /* only `::class` may follow a value: Status::Active::class */
-                advance(p);
                 if (p->tok.kind != KW_CLASS)
                     p_error(p, "Only '::class' may follow an expression");
                 advance(p);
@@ -749,6 +749,7 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 e = gc;
                 break;
             }
+            cls = e->u.name;
             advance(p);
             TStr *member;
             if (p->tok.kind == KW_CLASS) {
@@ -1088,6 +1089,7 @@ static bool is_lvalue(AExpr *e) {
     /* self::$x / C::$x / $obj::$x（静态属性成员带 '$' 前缀）——P1-1：
      * 此前静态属性直接赋值全部报 "Cannot assign to this expression" */
     if (e->tag == A_STATICGET && tstr_val(e->u.scall.member)[0] == '$') return true;
+    if (e->tag == A_OBJSTATIC) return true;   /* P2-B: $obj::$x */
     return false;
 }
 
@@ -1290,16 +1292,40 @@ static TStr *parse_type_decl(Parser *p) {
     return tstr_intern(buf, n);
 }
 
+/* PHP 8.4 asymmetric visibility: `private(set)` / `protected(set)` 后缀
+ * （vis 关键字已消费，当前 token 为 '('）。 */
+static bool accept_set_suffix(Parser *p) {
+    if (p->tok.kind != P_LPAREN) return false;
+    advance(p);
+    if (!(p->tok.kind == L_IDENT && tstr_len(p->tok.ident) == 3 &&
+          (tstr_val(p->tok.ident)[0] | 32) == 's' &&
+          (tstr_val(p->tok.ident)[1] | 32) == 'e' &&
+          (tstr_val(p->tok.ident)[2] | 32) == 't'))
+        p_error(p, "Expected 'set' inside visibility(...)");
+    advance(p);
+    expect(p, P_RPAREN, "Expected ')' after set");
+    return true;
+}
+
 /* shared parameter list (named functions, closures, arrows) */
 static void parse_params(Parser *p, AFunc *f) {
     while (p->tok.kind != P_RPAREN) {
         /* constructor promotion: visibility prefix before the type/param */
         int pvis = -1;
+        int pset = 0;
         bool pro_readonly = false;
         for (;;) {
-            if (p->tok.kind == KW_PUBLIC) { advance(p); pvis = CVIS_PUBLIC; }
-            else if (p->tok.kind == KW_PROTECTED) { advance(p); pvis = CVIS_PROTECTED; }
-            else if (p->tok.kind == KW_PRIVATE) { advance(p); pvis = CVIS_PRIVATE; }
+            if (p->tok.kind == KW_PUBLIC) {
+                advance(p);
+                if (p->tok.kind == P_LPAREN)
+                    p_error(p, "Cannot use public(set)");
+                pvis = CVIS_PUBLIC;
+            } else if (p->tok.kind == KW_PROTECTED || p->tok.kind == KW_PRIVATE) {
+                int v = p->tok.kind == KW_PRIVATE ? CVIS_PRIVATE : CVIS_PROTECTED;
+                advance(p);
+                if (accept_set_suffix(p)) pset = v;
+                else pvis = v;
+            }
             else if (p->tok.kind == KW_READONLY) { advance(p); pro_readonly = true; }
             else break;
         }
@@ -1311,8 +1337,9 @@ static void parse_params(Parser *p, AFunc *f) {
         par->type = ptype;
         par->default_val = NULL;
         par->is_variadic = variadic;
-        par->is_promoted = pvis >= 0 || pro_readonly;
+        par->is_promoted = pvis >= 0 || pro_readonly || pset > 0;
         par->vis = pvis >= 0 ? pvis : CVIS_PUBLIC;
+        par->set_vis = pset;
         par->is_readonly = pro_readonly;
         if ((pvis >= 0 || pro_readonly) && variadic)
             p_error(p, "Cannot promote a variadic parameter");
@@ -1325,7 +1352,7 @@ static void parse_params(Parser *p, AFunc *f) {
 }
 
 /* ============ class declarations (M3) ============ */
-static AClassBody *parse_class_body(Parser *p, int kind);
+static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name);
 
 static TStr **parse_name_list(Parser *p, int *out_n) {
     TStr **names = NULL; int n = 0;
@@ -1338,19 +1365,26 @@ static TStr **parse_name_list(Parser *p, int *out_n) {
     return names;
 }
 
-static AClassMember *parse_class_member(Parser *p, int kind) {
+static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
     int line = p->tok.line;
     AClassMember *m = tm_malloc(sizeof(AClassMember));
     memset(m, 0, sizeof *m);
     m->line = line;
     m->vis = CVIS_PUBLIC;
-    (void)kind;
 
     /* visibility / modifier prefix loop */
     for (;;) {
-        if (p->tok.kind == KW_PUBLIC) { advance(p); m->vis = CVIS_PUBLIC; }
-        else if (p->tok.kind == KW_PROTECTED) { advance(p); m->vis = CVIS_PROTECTED; }
-        else if (p->tok.kind == KW_PRIVATE) { advance(p); m->vis = CVIS_PRIVATE; }
+        if (p->tok.kind == KW_PUBLIC) {
+            advance(p);
+            if (p->tok.kind == P_LPAREN)
+                p_error(p, "Cannot use public(set)");
+            m->vis = CVIS_PUBLIC;
+        } else if (p->tok.kind == KW_PROTECTED || p->tok.kind == KW_PRIVATE) {
+            int v = p->tok.kind == KW_PRIVATE ? CVIS_PRIVATE : CVIS_PROTECTED;
+            advance(p);
+            if (accept_set_suffix(p)) m->set_vis = (uint8_t)v;
+            else m->vis = (uint8_t)v;
+        }
         else if (p->tok.kind == KW_STATIC) { advance(p); m->is_static = true; }
         else if (p->tok.kind == KW_ABSTRACT) { advance(p); m->is_abstract = true; }
         else if (p->tok.kind == KW_FINAL) { advance(p); m->is_final = true; }
@@ -1372,6 +1406,14 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
         if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
         m->tag = CM_METHOD;
         m->func = f;
+        if (kind == CK_INTERFACE && m->vis != CVIS_PUBLIC) {
+            /* P3: PHP "Access type for interface method I::f() must be public" */
+            char buf[256];
+            snprintf(buf, sizeof buf,
+                     "Access type for interface method %s::%s() must be public",
+                     cls_name ? tstr_val(cls_name) : "?", tstr_val(f->name));
+            p_error(p, buf);
+        }
         if (p->tok.kind == P_LBRACE) {
             if (m->is_abstract) p_error(p, "Abstract method cannot have a body");
             if (kind == CK_INTERFACE)    /* P3: 接口方法不允许有方法体 */
@@ -1479,7 +1521,7 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
     return NULL;
 }
 
-static AClassBody *parse_class_body(Parser *p, int kind) {
+static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name) {
     expect(p, P_LBRACE, "Expected '{' for class body");
     AClassBody *b = tm_malloc(sizeof(AClassBody));
     b->items = NULL; b->n = 0;
@@ -1503,7 +1545,7 @@ static AClassBody *parse_class_body(Parser *p, int kind) {
             b->items[b->n++] = m;
             continue;
         }
-        AClassMember *m = parse_class_member(p, kind);
+        AClassMember *m = parse_class_member(p, kind, cls_name);
         b->items = tm_realloc(b->items, sizeof(AClassMember *) * (size_t)(b->n + 1));
         b->items[b->n++] = m;
     }
@@ -1545,7 +1587,7 @@ static AStmt *parse_class_decl(Parser *p, uint8_t flags, int kind, int line) {
         if (accept(p, KW_IMPLEMENTS))
             cd->ifaces = parse_name_list(p, &cd->n_ifaces);
     }
-    cd->body = parse_class_body(p, kind);
+    cd->body = parse_class_body(p, kind, cd->name);
     AStmt *s = as_new(S_CLASSDECL, line);
     s->u.cls = cd;
     return s;

@@ -52,8 +52,9 @@ typedef enum {
     OP_CLONE,          /* clone $obj: shallow copy + __clone hook */
     OP_FCC_METHOD,     /* P2-A $obj->m(...): bound method closure
                           (o1 = receiver, ar = method-name lit) */
-    OP_FETCH_OSPROP,   /* $obj::$prop read: o1=obj, a2=lit "$name" */
-    OP_ASSIGN_OSPROP,  /* $obj::$prop = v: o1=obj, a2=lit "$name", tr=val */
+    OP_FETCH_OSPROP,   /* $obj::$prop read: o1=base(obj|str), a2=lit "$name" */
+    OP_ASSIGN_OSPROP,  /* $obj::$prop = v: o1=base, a2=lit "$name", rd3=val */
+    OP_ISSET_OSPROP,   /* isset($obj::$prop): o1=base, a2=lit "$name" */
     OP_MAX,
 } Opcode;
 

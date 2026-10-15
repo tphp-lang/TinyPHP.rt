@@ -74,6 +74,7 @@ typedef struct AParam {
     bool is_variadic;     /* ...$args (last param only) */
     bool is_promoted;     /* constructor property promotion (M3) */
     int vis;              /* CVIS_* when promoted */
+    int set_vis;          /* PHP 8.4 private(set)/protected(set)；0 = 无 */
     bool is_readonly;     /* promoted readonly */
 } AParam;
 typedef struct AFunc {
@@ -210,6 +211,7 @@ typedef struct AClassMember {
     int tag;
     int line;
     uint8_t vis;
+    uint8_t set_vis;      /* PHP 8.4 private(set)/protected(set)；0 = 无 */
     bool is_static, is_abstract, is_final, is_readonly;
     AFunc *func;
     struct { TStr *name; TStr *type; AExpr *def; } prop;   /* type: P1-1 */

@@ -1138,7 +1138,9 @@ static TVal bi_str_pad(VM *vm, TVal *args, int n) {
     int64_t len = need_int(vm, &args[1], "str_pad", "#2 ($length)");
     TStr *pad = n >= 3 ? need_str(vm, &args[2], "str_pad", "#3 ($pad_string)")
                        : (TStr *)tstr_intern(" ", 1);
-    if ((int64_t)s->len >= len || pad->len == 0) return args[0];
+    if (pad->len == 0)
+        RAISE(vm, "ValueError", "str_pad(): Argument #3 ($pad_string) must not be empty");
+    if ((int64_t)s->len >= len) return args[0];
     if (len > 256 * 1024 * 1024)
         RAISE(vm, "ValueError", "str_pad(): result too large");
     TStr *out = tstr_alloc_raw((uint32_t)len, false);
@@ -1260,7 +1262,7 @@ static TVal bi_number_format(VM *vm, TVal *args, int n) {
         if (remain > 0 && remain % 3 == 0 && ts[0]) out[oi++] = ts[0];
     }
     if (dot) {
-        out[oi++] = dp[0];
+        if (dp[0]) out[oi++] = dp[0];   /* 空分隔符：跳过（PHP 对拍） */
         strcpy(out + oi, dot + 1);
         oi += strlen(dot + 1);
     } else {

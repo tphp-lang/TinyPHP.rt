@@ -133,6 +133,7 @@ typedef struct TProp {
     TStr *type;            /* declared type, normalized; NULL = untyped (P1-1) */
     struct TClass *decl;   /* 声明类（readonly 写入作用域判定用；P3） */
     uint8_t visibility;
+    uint8_t set_visibility; /* PHP 8.4 asymmetric visibility；0 = 同 visibility */
     bool is_static;
     bool is_readonly;
     TVal defval;           /* T_UNDEF = required (constructor must set) */

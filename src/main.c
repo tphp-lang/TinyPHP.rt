@@ -186,14 +186,15 @@ static int run_one_test(const char *self_exe, const char *path,
     u8_to_acp(self_exe, exe_a, sizeof exe_a);
     u8_to_acp(path, path_a, sizeof path_a);
     int tfd = -1;
-    /* 简化：用固定临时名（单进程 test 足够） */
+    /* 简化：用固定临时名（单进程 test 足够）。
+     * 开头必须加 '@'：命令串以引号开头会触发 cmd /c 的旧引号剥离规则
+     * （去掉首引号 + 字符串里最后一个引号），导致子命令损坏、重定向不落盘。 */
     snprintf(tmp_out, sizeof tmp_out, "build\\_ttest_out.txt");
-    snprintf(cmd, sizeof cmd, "\"%s\" run \"%s\" > \"%s\" 2>NUL",
+    snprintf(cmd, sizeof cmd, "@\"%s\" run \"%s\" > \"%s\" 2>NUL",
              exe_a, path_a, tmp_out);
     int rc = system(cmd);
-    /* Windows system() 返回退出码左移 8 */
-    int exit_code = (rc >> 8) & 0xFF;
-    if (rc == -1) exit_code = -1;
+    /* Windows system() 直接返回子进程 ERRORLEVEL（非 wait 编码） */
+    int exit_code = rc == -1 ? -1 : (rc & 0xFF);
     (void)tfd;
 #else
     snprintf(tmp_out, sizeof tmp_out, "/tmp/tphp_test_out_XXXXXX");
@@ -308,7 +309,7 @@ static int run_test_dir(const char *self_exe, const char *dir) {
         const char *base = strrchr(t.paths[i], '/');
         if (!base) base = strrchr(t.paths[i], '\\');
         base = base ? base + 1 : t.paths[i];
-        if (ok) {
+        if (ok == 1) {
             pass++;
             printf("PASS %s\n", base);
         } else {

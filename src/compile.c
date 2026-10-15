@@ -190,11 +190,11 @@ typedef struct Ctx {
     struct FinCtx *fin;
 } Ctx;
 
-/* a `return` inside a try body jumps to a per-return copy of the finally
- * block; after the copy, RETURN restores the stashed value from val_tmp */
+/* a `return` inside a try/catch body jumps to a per-return copy of the
+ * finally block; after the copy, RETURN restores the stashed value from
+ * val_tmp */
 typedef struct FinCtx {
     struct { int jmp_pc; int val_tmp; } *pend; int n_pend, cap_pend;
-    bool no_return;    /* compiling a catch body under this finally */
     struct FinCtx *prev;
 } FinCtx;
 
@@ -548,6 +548,7 @@ typedef struct WBList {
     bool is_global;
     bool is_prop;            /* base is $obj->prop (ASSIGN_PROP writeback) */
     bool is_sprop;           /* base is C::$prop (ASSIGN_SPROP writeback) */
+    bool is_osprop;          /* base is $obj::$prop (ASSIGN_OSPROP writeback) */
     int skind;               /* static-prop class kind (0/1/2/3) */
     TStr *gname;
     TStr *pname;
@@ -642,6 +643,22 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
         *wb = w;
         return mid;
     }
+    if (e->tag == A_OBJSTATIC) {
+        /* $obj::$prop[...] = v : fetch the static prop into a tmp, mutate
+         * the dim, write back through ASSIGN_OSPROP */
+        Loc b = compile_expr(c, e->u.prop.obj, LOC_NONE);
+        Loc mid = LOC_TMP(tmp_new(c));
+        emit(c, OP_FETCH_OSPROP, b, LOC_CONST(lit_str(c, e->u.prop.name)),
+             mid, e->line);
+        WBList *w = tm_malloc(sizeof *w);
+        memset(w, 0, sizeof *w);
+        w->base = b; w->val = mid;
+        w->is_osprop = true;
+        w->pname = e->u.prop.name;
+        w->next = *wb;
+        *wb = w;
+        return mid;
+    }
     if (e->tag == A_DIM) {
         Loc b = compile_lvalue_base(c, e->u.dim.base, wb, e->line);
         Loc i = LOC_NONE;
@@ -669,6 +686,9 @@ static void emit_writebacks(Ctx *c, WBList *wb, int line) {
         else if (wb->is_sprop)
             emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = wb->skind },
                  LOC_CONST(lit_str(c, wb->skey)), wb->val, line);
+        else if (wb->is_osprop)
+            emit(c, OP_ASSIGN_OSPROP, wb->base, LOC_CONST(lit_str(c, wb->pname)),
+                 wb->val, line);
         else if (wb->is_prop)
             emit(c, OP_ASSIGN_PROP, wb->base, LOC_CONST(lit_str(c, wb->pname)),
                  wb->val, line);
@@ -1281,6 +1301,19 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                  LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), mid, t->line);
             return dst;
         }
+        if (t->tag == A_OBJSTATIC) {
+            /* $obj::$prop++ : fetch, RMW in place, write back via ASSIGN_OSPROP */
+            Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+            Loc mid = LOC_TMP(tmp_new(c));
+            emit(c, OP_FETCH_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
+                 mid, t->line);
+            Loc dst = tmp_dst(c, want);
+            emit(c, is_inc ? OP_INC : OP_DEC, mid, LOC_NONE, dst, t->line);
+            c->fn->ops[c->fn->n_ops - 1].ext = prefix ? 1 : 0;
+            emit(c, OP_ASSIGN_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
+                 mid, t->line);
+            return dst;
+        }
         tphp_fatal_src(c->file, t->line, "Cannot increment/decrement this expression");
     }
     case A_ISSET: {
@@ -1305,6 +1338,12 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                 r = LOC_TMP(tmp_new(c));
                 emit(c, OP_ISSET_PROP, obj, LOC_CONST(lit_str(c, a->u.prop.name)),
                      r, a->line);
+            } else if (a->tag == A_OBJSTATIC) {
+                /* P2-B: isset($obj::$x) —— 未声明/不可见静默 false（对齐 PHP） */
+                Loc base = compile_expr(c, a->u.prop.obj, LOC_NONE);
+                r = LOC_TMP(tmp_new(c));
+                emit(c, OP_ISSET_OSPROP, base,
+                     LOC_CONST(lit_str(c, a->u.prop.name)), r, a->line);
             } else {
                 tphp_fatal_src(c->file, a->line, "isset() requires a variable");
             }
@@ -1328,6 +1367,25 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             r = compile_var_read_silent(c, a->u.name, a->line);
         } else if (a->tag == A_DIM) {
             r = compile_dim_read(c, a, true, LOC_NONE);
+        } else if (a->tag == A_OBJSTATIC) {
+            /* empty($obj::$x)：isset 静默语义 + 真值取反（对齐 PHP：
+             * 未声明/不可见/未初始化 → empty=true，不抛错） */
+            Loc base = compile_expr(c, a->u.prop.obj, LOC_NONE);
+            Loc t = LOC_TMP(tmp_new(c));
+            emit(c, OP_ISSET_OSPROP, base,
+                 LOC_CONST(lit_str(c, a->u.prop.name)), t, a->line);
+            int jset = emit(c, OP_JMPNZ, t, LOC_NONE, LOC_NONE, a->line);
+            emit(c, OP_CONST, LOC_CONST(lit_bool(c, true)), LOC_NONE, dst, e->line);
+            int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            patch_jump(c, jset, (uint32_t)cur_pc(c));
+            Loc v = LOC_TMP(tmp_new(c));
+            emit(c, OP_FETCH_OSPROP, base,
+                 LOC_CONST(lit_str(c, a->u.prop.name)), v, a->line);
+            int tb2 = tmp_new(c);
+            emit(c, OP_BOOL_VAL, v, LOC_NONE, LOC_TMP(tb2), a->line);
+            emit(c, OP_BOOL_NOT, LOC_TMP(tb2), LOC_NONE, dst, e->line);
+            patch_jump(c, jend, (uint32_t)cur_pc(c));
+            return dst;
         } else {
             /* PHP: empty(expr) == !expr for any expression */
             r = compile_expr(c, a, LOC_NONE);
@@ -1992,12 +2050,9 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         break;
     }
     case S_RETURN:
-        if (c->fin && c->fin->no_return)
-            tphp_fatal_src(c->file, s->line,
-                "return inside catch combined with finally lands in M3");
         if (c->fin) {
-            /* return inside a try body: stash value, jump to a per-return
-             * copy of the finally block which then RETURNs the value */
+            /* return inside a try or catch body: stash value, jump to a
+             * per-return copy of the finally block which then RETURNs */
             int vt = tmp_new(c);
             if (s->u.e) {
                 Loc v = compile_expr(c, s->u.e, LOC_NONE);
@@ -2141,24 +2196,21 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             break;
         }
 
-        /* try/catch/finally. Returns inside the try body run a per-return
-         * copy of the finally block before RETURNing (pend trampolines).
-         * A return inside a catch body combined with finally is rejected
-         * at load time (rare pattern; full fast_call scheme lands in M3). */
+        /* try/catch/finally. Returns inside the try OR a catch body run a
+         * per-return copy of the finally block before RETURNing (pend
+         * trampolines). Catch-body trampolines are emitted after the
+         * handlers; single-level only — a return targeting an *inner*
+         * finally still skips enclosing outer finallys (fast_call 级多层
+         * 展开仍是已知缺口)。 */
+        int try_np = fin.n_pend;   /* try-body returns（trampoline 先发） */
         int *pend_jmps = tm_malloc(sizeof(int) * (size_t)(fin.n_pend ? fin.n_pend : 1));
         /* normal-path finally copy + end-of-block exit */
         uint32_t normal_entry = (uint32_t)cur_pc(c);
         (void)normal_entry;
         compile_stmt_list(c, tr->finally);            /* normal-path copy */
-        int j_norm_end = -1;
-        if (c->is_main) {
-            j_norm_end = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
-        } else {
-            /* body completed without return: implicit `return null` */
-            int nt = tmp_new(c);
-            emit(c, OP_CONST, LOC_CONST(lit_null(c)), LOC_NONE, LOC_TMP(nt), s->line);
-            emit(c, OP_RETURN, LOC_TMP(nt), LOC_NONE, LOC_NONE, s->line);
-        }
+        /* 正常路径继续 try 之后的语句（PHP 对拍）；函数无显式 return 时
+         * 由函数末尾的隐式 RETURN null 收尾（见 compile_func） */
+        int j_norm_end = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
         /* per-return trampolines: copy of finally + RETURN(val_tmp) */
         for (int p = 0; p < fin.n_pend; p++)
             pend_jmps[p] = -1;
@@ -2169,6 +2221,10 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             emit(c, OP_RETURN, LOC_TMP(fin.pend[p].val_tmp), LOC_NONE, LOC_NONE, s->line);
         }
         int j_end1 = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
+        /* catch 体区间（finally 拷贝之前）——体上抛出的异常先跑 finally 再传播 */
+        uint32_t *cbody_s = tm_malloc(sizeof(uint32_t) * (size_t)(tr->n_catches ? tr->n_catches : 1));
+        uint32_t *cbody_e = tm_malloc(sizeof(uint32_t) * (size_t)(tr->n_catches ? tr->n_catches : 1));
+        int n_cbody = 0;
         for (int i = 0; i < tr->n_catches; i++) {
             ACatch *ct = tr->catches[i];
             uint32_t handler_pc = (uint32_t)cur_pc(c);
@@ -2177,11 +2233,11 @@ static void compile_stmt(Ctx *c, AStmt *s) {
                 slot = get_var(c, ct->var);
                 emit(c, OP_BIND_EX, LOC_NONE, LOC_NONE, LOC_CV(slot), s->line);
             }
-            if (has_fin) c->fin->no_return = true;
-            compile_stmt_list(c, ct->body);
-            if (has_fin) c->fin->no_return = false;
-            if (fin.n_pend || true)
-                compile_stmt_list(c, tr->finally);    /* catch-path copy */
+            compile_stmt_list(c, ct->body);   /* return 走 pend（下方补发 trampoline） */
+            cbody_s[n_cbody] = handler_pc;
+            cbody_e[n_cbody] = (uint32_t)cur_pc(c);
+            n_cbody++;
+            compile_stmt_list(c, tr->finally);    /* catch-path copy */
             catch_jmps[n_cjmp++] = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
             TFunc *fn = c->fn;
             fn->ex = tm_realloc(fn->ex, sizeof(TExEntry) * (size_t)(fn->n_ex + 1));
@@ -2202,6 +2258,15 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             ent->has_var = ct->var ? 1 : 0;
             ent->catch_slot = slot >= 0 ? (uint16_t)slot : 0;
         }
+        /* catch-body return trampolines: copy of finally + RETURN(val_tmp) */
+        int n_cpend = fin.n_pend - try_np;
+        uint32_t *cpentry = tm_malloc(sizeof(uint32_t) *
+                                      (size_t)(n_cpend ? n_cpend : 1));
+        for (int p = try_np; p < fin.n_pend; p++) {
+            cpentry[p - try_np] = (uint32_t)cur_pc(c);
+            compile_stmt_list(c, tr->finally);        /* copy #p */
+            emit(c, OP_RETURN, LOC_TMP(fin.pend[p].val_tmp), LOC_NONE, LOC_NONE, s->line);
+        }
         if (tr->finally) {
             uint32_t fin3 = (uint32_t)cur_pc(c);
             compile_stmt_list(c, tr->finally);        /* exception-path copy */
@@ -2220,17 +2285,38 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             ent->n_catches = 1;
             ent->has_var = 0;
             ent->catch_slot = 0;
+            /* catch 体抛异常：同一份 finally+RETHROW 拷贝，保护区为各 catch 体 */
+            for (int i = 0; i < n_cbody; i++) {
+                TFunc *fn2 = c->fn;
+                fn2->ex = tm_realloc(fn2->ex, sizeof(TExEntry) * (size_t)(fn2->n_ex + 1));
+                TExEntry *e2 = &fn2->ex[fn2->n_ex++];
+                e2->start_pc = cbody_s[i]; e2->end_pc = cbody_e[i] + 1;
+                e2->handler_pc = fin3;
+                uint16_t *c2 = tm_malloc(sizeof(uint16_t));
+                c2[0] = (uint16_t)(ci >= 0 ? ci : 0xFFFF);
+                e2->catch_cls = c2;
+                const TStr **n2 = tm_malloc(sizeof(TStr *));
+                n2[0] = tstr_intern("Throwable", 9);
+                e2->catch_nm = n2;
+                e2->n_catches = 1;
+                e2->has_var = 0;
+                e2->catch_slot = 0;
+            }
         }
+        tm_free(cbody_s);
+        tm_free(cbody_e);
         uint32_t Lend = (uint32_t)cur_pc(c);
-        if (c->is_main)
-            patch_jump(c, j_norm_end, Lend);
+        patch_jump(c, j_norm_end, Lend);
         patch_jump(c, j_end1, Lend);
         for (int i = 0; i < n_cjmp; i++) patch_jump(c, catch_jmps[i], Lend);
-        for (int p = 0; p < fin.n_pend; p++)
+        for (int p = 0; p < try_np; p++)
             patch_jump(c, fin.pend[p].jmp_pc, pentry[p]);
+        for (int p = try_np; p < fin.n_pend; p++)
+            patch_jump(c, fin.pend[p].jmp_pc, cpentry[p - try_np]);
         tm_free(catch_jmps);
         tm_free(pend_jmps);
         tm_free(pentry);
+        tm_free(cpentry);
         if (fin.pend) tm_free(fin.pend);
         c->fin = fin.prev;
         break;
@@ -2787,6 +2873,8 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                     prop.type = par->type;        /* P1-1: 提升参数类型 → 属性校验 */
                     prop.decl = cls;              /* P3: readonly 作用域判定 */
                     prop.visibility = (uint8_t)par->vis;
+                    prop.set_visibility = (uint8_t)(par->set_vis ? par->set_vis
+                                                                 : par->vis);
                     prop.is_readonly = par->is_readonly;
                     prop.defval = (TVal){ .u.i = 0, .t = T_UNDEF };
                     /* readonly class：提升的实例属性同样必须带类型 */
@@ -2843,6 +2931,8 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             prop.type = mem->prop.type;   /* P1-1: 运行期赋值校验 */
             prop.decl = cls;              /* P3: readonly 写入作用域判定 */
             prop.visibility = mem->vis;
+            /* PHP 8.4 asymmetric visibility：写入可见性；未声明则同读 */
+            prop.set_visibility = mem->set_vis ? mem->set_vis : mem->vis;
             prop.is_static = mem->is_static;
             prop.is_readonly = mem->is_readonly;
             prop.defval = (TVal){ .u.i = 0, .t = T_UNDEF };

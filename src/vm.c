@@ -91,6 +91,19 @@ static const TExClass *ex_class(const char *name) {
     return &EX_ERROR;
 }
 
+/* 值的类型名（错误措辞用；对拍 php-src "Value of type int is not callable"） */
+static const char *val_type_name(TVal v) {
+    switch (v.t) {
+    case T_NULL: return "null";
+    case T_FALSE: case T_TRUE: return "bool";
+    case T_INT: return "int";
+    case T_FLOAT: return "float";
+    case T_STR: return "string";
+    case T_ARR: return "array";
+    default: return "object";
+    }
+}
+
 /* ---- P2-B: 类常量惰性求值的环检测 ----
  * const A = self::B; const B = self::A; → 求值栈查重。异常 unwind 时
  * 复位（vm_unwind 入口调用），catch-and-retry 后可重新求值（对齐 PHP）。 */
@@ -1010,7 +1023,8 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
         return 1;
     }
     if (fv.t != T_STR)
-        vm_raise(vm, ex_class("TypeError"), op, "Function name must be a string");
+        vm_raise(vm, ex_class("Error"), op,
+                 "Value of type %s is not callable", val_type_name(fv));
     TStr *name = (TStr *)fv.u.p;
     {
         /* P2-B: 'Cls::m' string callable — split on the LAST separator
@@ -1838,6 +1852,27 @@ static TClass *frame_scope_cls(VM *vm) {
     return (TClass *)f->called_cls;
 }
 
+/* PHP 8.4 asymmetric visibility 写入作用域（对拍）：
+ * private(set)：仅声明类本身；protected(set)：声明类及其子类。
+ * （不复用 tphp_vis_ok——其 private 放行整个子类链，与 private(set) 语义不同） */
+static bool asym_set_ok(uint8_t set_vis, TClass *owner, TClass *from) {
+    if (set_vis == CVIS_PRIVATE) return from == owner;
+    if (set_vis == CVIS_PROTECTED) {
+        for (TClass *c = from; c; c = c->parent)
+            if (c == owner) return true;
+        return false;
+    }
+    return true;
+}
+
+/* "global scope" / "scope Sub"（写进 asymmetric 措辞；buf 供后者暂存） */
+static const char *asym_scope(VM *vm, char *buf, size_t cap) {
+    TClass *from = frame_scope_cls(vm);
+    if (!from) return "global scope";
+    snprintf(buf, cap, "scope %s", tstr_val(from->name));
+    return buf;
+}
+
 /* exception getters callable as methods (M2 sugar): getMessage() etc */
 static bool ex_getter(const char *n, TExObj *x, TVal *out) {
     if (lc_eq(n, "getMessage"))   { *out = TV_STR(x->message); tval_addref(*out); return true; }
@@ -2117,7 +2152,8 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
     TVal val = rdv(vm, op, 3);    /* o3: operands are obj, name-lit, value */
     if (objv.t != T_OBJ || ((GCHead *)objv.u.p)->kind != GC_KIND_OBJ)
         vm_raise(vm, ex_class("Error"), op,
-                 "Property assignment on non-object lands in M3");
+                 "Attempt to assign property \"%s\" on %s", tstr_val(name),
+                 val_type_name(objv));
     TObj *o = (TObj *)objv.u.p;
     /* M5.5: FFI\CData 结构体字段写 */
     if (tphp_ffi_assign_prop(vm, o, name, val)) {
@@ -2130,6 +2166,21 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         return 1;
     }
     int slot = tphp_class_find_prop(o->cls, tstr_val(name));
+    if (slot >= 0) {
+        /* PHP 8.4 asymmetric visibility：显式 (set) 与读可见性不同时，
+         * 写入按 set 可见性判定，失败直接 Error（不回退 __set） */
+        TProp *ap = &o->cls->props[slot];
+        if (ap->set_visibility && ap->set_visibility != ap->visibility) {
+            TClass *owner = ap->decl ? ap->decl : o->cls;
+            if (!asym_set_ok(ap->set_visibility, owner, frame_scope_cls(vm))) {
+                char sb[160];
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot modify %s(set) property %s::$%s from %s",
+                         vis_name(ap->set_visibility), tstr_val(owner->name),
+                         tstr_val(name), asym_scope(vm, sb, sizeof sb));
+            }
+        }
+    }
     if (slot >= 0 &&
         !tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
         /* invisible from this scope: __set fallback, else error */
@@ -2454,6 +2505,14 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
     return 1;
 }
 
+/* 静态属性存储路由（PHP 继承共享语义）：未重声明的继承条目 TProp.decl 指向
+ * 声明类 → 读写声明类的运行时槽（A::$x 与子类实例视图共享）；重声明条目
+ * decl=子类 → 自有槽。 */
+static TVal *sprop_slot(TClass *cls, TProp *sp) {
+    TClass *owner = sp->decl ? sp->decl : cls;
+    return &tphp_class_sprop_vals(owner)[sp->slot];
+}
+
 static int32_t op_fetch_cconst(VM *vm, TOp *op) {
     int kind = (int)op->a1;
     TStr *key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
@@ -2504,7 +2563,7 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
                      "Cannot access %s property %s::$%s",
                      vis_name(sp->visibility), tstr_val(cls->name),
                      tstr_val(cname) + 1);
-        TVal r = tphp_class_sprop_vals(cls)[sp->slot];
+        TVal r = sprop_slot(cls, sp)[0];
         tval_addref(r);
         wtake(vm, op, r);
         return 1;
@@ -2585,6 +2644,17 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Access to undeclared static property %s::$%s",
                  tstr_val(cls->name), tstr_val(pname) + 1);
+    /* PHP 8.4 asymmetric visibility：静态属性写入按 set 可见性（不回退） */
+    if (sp->set_visibility && sp->set_visibility != sp->visibility) {
+        TClass *owner = sp->decl ? sp->decl : cls;
+        if (!asym_set_ok(sp->set_visibility, owner, frame_scope_cls(vm))) {
+            char sb[160];
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot modify %s(set) property %s::$%s from %s",
+                     vis_name(sp->set_visibility), tstr_val(owner->name),
+                     tstr_val(pname) + 1, asym_scope(vm, sb, sizeof sb));
+        }
+    }
     if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot access %s property %s::$%s",
@@ -2602,7 +2672,7 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
                      tstr_val(sp->type));
     }
     tval_addref(val);
-    TVal *slot = &tphp_class_sprop_vals(cls)[sp->slot];
+    TVal *slot = sprop_slot(cls, sp);
     tval_release(slot);
     *slot = val;
     if (op->tr != OPD_UNUSED) {
@@ -2611,6 +2681,117 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
         tval_release(d);
         d[0] = val;               /* assignment is an expression */
     }
+    return 1;
+}
+
+/* ---- P2-B: $obj::$prop / $className::$prop（实例或类名串访问静态属性） ---- */
+
+/* base → 类：对象取其类；字符串按类名解析；其余抛错（对齐 PHP：
+ * "Class name must be a valid object or a string"） */
+static TClass *osprop_cls(VM *vm, TOp *op, TVal base) {
+    if (base.t == T_OBJ && ((GCHead *)base.u.p)->kind == GC_KIND_OBJ)
+        return ((TObj *)base.u.p)->cls;
+    if (base.t == T_STR) {
+        TStr *s = (TStr *)base.u.p;
+        char lc[128];
+        size_t n = s->len < sizeof lc - 1 ? s->len : sizeof lc - 1;
+        for (size_t i = 0; i < n; i++) {
+            char ch = s->c[i];
+            lc[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+        }
+        lc[n] = 0;
+        extern TClass *class_resolve_lc(const char *fqcn_lc);
+        TClass *cls = class_resolve_lc(lc);
+        if (!cls)
+            vm_raise(vm, ex_class("Error"), op, "Class '%s' not found", s->c);
+        return cls;
+    }
+    vm_raise(vm, ex_class("Error"), op,
+             "Class name must be a valid object or a string");
+    return NULL;
+}
+
+/* $obj::$prop read（与 C::$prop 同语义：flat 查找/可见性/typed） */
+static int32_t op_fetch_osprop(VM *vm, TOp *op) {
+    TVal base = rdv(vm, op, 1);
+    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TClass *cls = osprop_cls(vm, op, base);
+    tphp_class_ensure_flat(cls);
+    TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
+    if (!sp)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Access to undeclared static property %s::$%s",
+                 tstr_val(cls->name), tstr_val(pname) + 1);
+    if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot access %s property %s::$%s",
+                 vis_name(sp->visibility), tstr_val(cls->name),
+                 tstr_val(pname) + 1);
+    TVal r = sprop_slot(cls, sp)[0];
+    tval_addref(r);
+    wtake(vm, op, r);
+    return 1;
+}
+
+/* $obj::$prop = v */
+static int32_t op_assign_osprop(VM *vm, TOp *op) {
+    TVal base = rdv(vm, op, 1);
+    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TClass *cls = osprop_cls(vm, op, base);
+    tphp_class_ensure_flat(cls);
+    TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
+    if (!sp)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Access to undeclared static property %s::$%s",
+                 tstr_val(cls->name), tstr_val(pname) + 1);
+    /* PHP 8.4 asymmetric visibility：静态属性写入按 set 可见性（不回退） */
+    if (sp->set_visibility && sp->set_visibility != sp->visibility) {
+        TClass *owner = sp->decl ? sp->decl : cls;
+        if (!asym_set_ok(sp->set_visibility, owner, frame_scope_cls(vm))) {
+            char sb[160];
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot modify %s(set) property %s::$%s from %s",
+                     vis_name(sp->set_visibility), tstr_val(owner->name),
+                     tstr_val(pname) + 1, asym_scope(vm, sb, sizeof sb));
+        }
+    }
+    if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot access %s property %s::$%s",
+                 vis_name(sp->visibility), tstr_val(cls->name),
+                 tstr_val(pname) + 1);
+    TVal val = rdv(vm, op, 3);
+    /* P1-1: typed 静态属性赋值校验 */
+    if (sp->type) {
+        const char *given = NULL;
+        if (!tphp_type_accepts(tstr_val(sp->type), val, cls, &given))
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Cannot assign %s to property %s::$%s of type %s",
+                     given ? given : "?",
+                     tstr_val(cls->name), tstr_val(pname) + 1,
+                     tstr_val(sp->type));
+    }
+    tval_addref(val);
+    TVal *slot = sprop_slot(cls, sp);
+    tval_release(slot);
+    *slot = val;
+    return 1;
+}
+
+/* isset($obj::$prop)：未声明/不可见/未初始化静默 false；非法基类名仍抛错
+ * （对齐 PHP isset 语义，探针见 TODO-P2-P3 交接） */
+static int32_t op_isset_osprop(VM *vm, TOp *op) {
+    TVal base = rdv(vm, op, 1);
+    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TClass *cls = osprop_cls(vm, op, base);
+    tphp_class_ensure_flat(cls);
+    TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
+    if (!sp || !tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm))) {
+        wtake(vm, op, TV_FALSE);
+        return 1;
+    }
+    TVal v = sprop_slot(cls, sp)[0];
+    wtake(vm, op, (v.t != T_UNDEF && v.t != T_NULL) ? TV_TRUE : TV_FALSE);
     return 1;
 }
 
@@ -2624,6 +2805,18 @@ static int32_t op_unset_prop(VM *vm, TOp *op) {
     TObj *o = (TObj *)objv.u.p;
     int slot = tphp_class_find_prop(o->cls, tstr_val(name));
     if (slot >= 0) {
+        /* PHP 8.4 asymmetric visibility：unset 也按 set 可见性（不回退） */
+        TProp *ap = &o->cls->props[slot];
+        if (ap->set_visibility && ap->set_visibility != ap->visibility) {
+            TClass *owner = ap->decl ? ap->decl : o->cls;
+            if (!asym_set_ok(ap->set_visibility, owner, frame_scope_cls(vm))) {
+                char sb[160];
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot unset %s(set) property %s::$%s from %s",
+                         vis_name(ap->set_visibility), tstr_val(owner->name),
+                         tstr_val(name), asym_scope(vm, sb, sizeof sb));
+            }
+        }
         if (!tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
             /* invisible: __unset fallback, else error */
             TVal pack[1];
@@ -2869,7 +3062,7 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
     }
     if (h->kind != GC_KIND_EX)
         vm_raise(vm, ex_class("Error"), op,
-                 "Property access on non-object lands in M3");
+                 "Attempt to read property \"%s\" on object", tstr_val(name));
     TExObj *x = (TExObj *)obj.u.p;
     const char *n = tstr_val(name);
     if (strcmp(n, "message") == 0) {
@@ -3090,6 +3283,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_init_mcall), H(op_new_user), H(op_assign_prop), H(op_isset_prop),
     H(op_init_smcall), H(op_fetch_cconst), H(op_instanceof), H(op_get_class),
     H(op_assign_sprop), H(op_unset_prop), H(op_clone), H(op_fcc_method),
+    H(op_fetch_osprop), H(op_assign_osprop), H(op_isset_osprop),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -3115,6 +3309,7 @@ const char *tphp_op_name(uint8_t op) {
         "INIT_MCALL", "NEW_USER", "ASSIGN_PROP", "ISSET_PROP",
         "INIT_SMCALL", "FETCH_CCONST", "INSTANCEOF", "GET_CLASS",
         "ASSIGN_SPROP", "UNSET_PROP", "CLONE", "FCC_METHOD",
+        "FETCH_OSPROP", "ASSIGN_OSPROP", "ISSET_OSPROP",
     };
     return op < OP_MAX ? names[op] : "?";
 }
