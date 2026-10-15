@@ -663,8 +663,37 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             e = u;
             break;
         }
-        case P_NULLSAFE:
-            p_error(p, "Nullsafe operator lands in M3");
+        case P_NULLSAFE: {
+            /* P2-A: ?-> (nullsafe member access); the whole chain
+             * short-circuits to null once any hop sees null — compile
+             * layer emits per-hop JMP_NULL guards */
+            advance(p);
+            if (p->tok.kind != L_IDENT &&
+                p->tok.kind != KW_NEW &&
+                p->tok.kind != KW_SELF &&
+                p->tok.kind != KW_PARENT &&
+                p->tok.kind != KW_STATIC) {
+                p_error(p, "Object property access lands in M3");
+            }
+            TStr *name = p->tok.ident;
+            advance(p);
+            if (p->tok.kind == P_LPAREN) {
+                AArgList *args = parse_arg_list(p);
+                AExpr *m = ae_new(A_METHODCALL, line);
+                m->u.mcall.obj = e;
+                m->u.mcall.name = name;
+                m->u.mcall.args = args;
+                m->nullsafe = true;
+                e = m;
+            } else {
+                AExpr *pr = ae_new(A_PROP, line);
+                pr->u.prop.obj = e;
+                pr->u.prop.name = name;
+                pr->nullsafe = true;
+                e = pr;
+            }
+            break;
+        }
         case P_DOUBLE_COLON: {
             /* static access after a primary that bypassed postfix
              * (self::m()/parent::K/Static::m()/static::m()), and the

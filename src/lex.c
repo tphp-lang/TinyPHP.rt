@@ -666,7 +666,7 @@ Token lex_next(Lex *lx) {
     case '?':
         if (match2(lx, '?', '=')) return tok_simple(P_COALESCE_EQ, line);
         if (lx->pos < lx->end && *lx->pos == '?') { lx->pos++; return tok_simple(P_COALESCE, line); }
-        if (lx->pos < lx->end && *lx->pos == '-') { lx->pos++; return tok_simple(P_NULLSAFE, line); }
+        if (lx->pos < lx->end && *lx->pos == '-') { lx->pos += 2; return tok_simple(P_NULLSAFE, line); }
         return tok_simple(P_QUESTION, line);
     default: break;
     }

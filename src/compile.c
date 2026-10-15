@@ -559,6 +559,26 @@ typedef struct WBList {
  * handler may rewrite (COW separation / auto-vivification). Pushes one
  * write-back per level (outermost first; the natural list order is
  * innermost-first which is the required execution order). */
+/* P2-A nullsafe: does this expr's property/method access chain (obj side)
+ * contain a ?-> hop? Once a chain enters nullsafe mode, every later hop is
+ * implicitly null-guarded (PHP: the whole chain short-circuits to null) */
+static bool chain_has_nullsafe(AExpr *e) {
+    for (;;) {
+        if (!e) return false;
+        if (e->tag == A_PROP) {
+            if (e->nullsafe) return true;
+            e = e->u.prop.obj;
+            continue;
+        }
+        if (e->tag == A_METHODCALL) {
+            if (e->nullsafe) return true;
+            e = e->u.mcall.obj;
+            continue;
+        }
+        return false;
+    }
+}
+
 static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
     if (e->tag == A_VAR) {
         if (!c->is_main && var_is_global(c, e->u.name)) {
@@ -1375,7 +1395,18 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         else if (strcmp(tstr_val(name), "getLine") == 0) name = s_line;
         Loc obj = compile_expr(c, e->u.prop.obj, LOC_NONE);
         Loc dst = tmp_dst(c, want);
-        emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, name)), dst, e->line);
+        if (e->nullsafe || chain_has_nullsafe(e->u.prop.obj)) {
+            /* null guard: obj null (or a deeper hop already short-circuited
+             * to null) -> this hop yields null too */
+            int jz = emit(c, OP_JMP_NULL, obj, LOC_NONE, LOC_NONE, e->line);
+            emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, name)), dst, e->line);
+            int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            patch_jump(c, jz, (uint32_t)c->fn->n_ops);
+            emit(c, OP_CONST, LOC_CONST(lit_null(c)), LOC_NONE, dst, e->line);
+            patch_jump(c, jend, (uint32_t)c->fn->n_ops);
+        } else {
+            emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, name)), dst, e->line);
+        }
         return dst;
     }
     case A_METHODCALL: {
@@ -1383,6 +1414,12 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
          * exception getters dispatch inside op_init_mcall for M2 objects.
          * operands: a1 = receiver, ar = method-name literal, a2 = argc */
         Loc obj = compile_expr(c, e->u.mcall.obj, LOC_NONE);
+        Loc dst = tmp_dst(c, want);
+        int jz = -1;
+        if (e->nullsafe || chain_has_nullsafe(e->u.mcall.obj)) {
+            /* receiver null -> method never runs, result is null */
+            jz = emit(c, OP_JMP_NULL, obj, LOC_NONE, LOC_NONE, e->line);
+        }
         int init_at = emit(c, OP_INIT_MCALL, obj, LOC_NONE,
                            LOC_CONST(lit_str(c, e->u.mcall.name)), e->line);
         int n_sent = 0;
@@ -1400,8 +1437,13 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
          * (e.g. $me->post($m * 2) put CONST+MUL between INIT and SEND,
          * and the old `n_ops-1-n_sent` wrote argc over the MUL) */
         c->fn->ops[init_at].a2 = (uint32_t)n_sent;
-        Loc dst = tmp_dst(c, want);
         emit(c, OP_DO_FCALL, LOC_NONE, LOC_NONE, dst, e->line);
+        if (jz >= 0) {
+            int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            patch_jump(c, jz, (uint32_t)c->fn->n_ops);
+            emit(c, OP_CONST, LOC_CONST(lit_null(c)), LOC_NONE, dst, e->line);
+            patch_jump(c, jend, (uint32_t)c->fn->n_ops);
+        }
         return dst;
     }
     case A_STATICCALL: {

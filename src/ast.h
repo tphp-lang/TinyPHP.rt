@@ -119,6 +119,7 @@ typedef struct AExpr {
         struct { AExpr *obj; TStr *name; AArgList *args; } mcall;
         struct { TStr *cls; TStr *member; AArgList *args; } scall;
     } u;
+    bool nullsafe;   /* ?-> (P_NULLSAFE): short-circuits the whole chain */
 } AExpr;
 
 /* destructure target: variable slot or nested list; keys int/string/none */
