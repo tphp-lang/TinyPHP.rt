@@ -1347,6 +1347,10 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             Loc av = compile_expr(c, e->u.newx.args->items[i].e, LOC_NONE);
             emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
         }
+        /* spread here would need op_new_user real-arg counting: both ctor
+         * paths locate args via op->a2 (compile-time item count, wrong once
+         * a spread expands at runtime) — method/static calls are fine, their
+         * DO_FCALL re-counts n_args from the args area */
         Loc dst = tmp_dst(c, want);
         if (user_cls) {
             emit(c, OP_NEW_USER, LOC_CONST(lit_str(c, cname)),
@@ -1425,12 +1429,17 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         int n_sent = 0;
         for (int i = 0; i < e->u.mcall.args->n; i++) {
             AArg *arg = &e->u.mcall.args->items[i];
-            if (arg->name || arg->is_spread)
+            if (arg->name)
                 tphp_fatal_src(c->file, e->line,
-                               "Named/spread method args land later in M3");
-            Loc av = compile_expr(c, arg->e, LOC_NONE);
-            emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
-            n_sent++;
+                               "Named method args land later in M3");
+            if (arg->is_spread) {
+                Loc sv = compile_expr(c, arg->e, LOC_NONE);
+                emit(c, OP_SEND_SPREAD, sv, LOC_NONE, LOC_NONE, e->line);
+            } else {
+                Loc av = compile_expr(c, arg->e, LOC_NONE);
+                emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+                n_sent++;
+            }
         }
         /* argc rides on the INIT op — never count back from n_ops: an
          * argument expression can emit any number of ops in between
@@ -1470,12 +1479,17 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         int n_sent = 0;
         for (int i = 0; i < e->u.scall.args->n; i++) {
             AArg *arg = &e->u.scall.args->items[i];
-            if (arg->name || arg->is_spread)
+            if (arg->name)
                 tphp_fatal_src(c->file, e->line,
-                               "Named/spread static args land later in M3");
-            Loc av = compile_expr(c, arg->e, LOC_NONE);
-            emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
-            n_sent++;
+                               "Named static args land later in M3");
+            if (arg->is_spread) {
+                Loc sv = compile_expr(c, arg->e, LOC_NONE);
+                emit(c, OP_SEND_SPREAD, sv, LOC_NONE, LOC_NONE, e->line);
+            } else {
+                Loc av = compile_expr(c, arg->e, LOC_NONE);
+                emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+                n_sent++;
+            }
         }
         Loc dst = tmp_dst(c, want);
         emit(c, OP_DO_FCALL, LOC_NONE, LOC_NONE, dst, e->line);

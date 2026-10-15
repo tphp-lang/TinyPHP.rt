@@ -9,11 +9,11 @@
 
 ## P2-A：回收 "lands in M3" 占位桩（原任务 #22）
 
-桩位精确坐标（2026-10-15 实测）：
+桩位精确坐标（2026-10-15 实测；**nullsafe `?->` 已完成**——2026-10-15 提交 c7aad8d，lex.c 顺带修了 `?->` 只吃 2 字符的词法 bug；剩余桩位行号因插入有偏移，以搜索为准）：
 
 | 桩 | 位置 | 说明 |
 |---|---|---|
-| nullsafe `?->` | parse.c:667（P_NULLSAFE） | ⚠️ 该 case **没有 break**，直接落穿到 P_DOUBLE_COLON 分支——改时注意；语义：`$a?->b` 若 $a 为 null 整链短路为 null，可在 compile 层发 JMP_NULL 类序列 |
+| ~~nullsafe `?->`~~ | ~~parse.c:667~~ | ✅ 完成（AExpr.nullsafe 字段 + 每级 JMP_NULL 守卫 + 链短路；方法不执行返回 null） |
 | new 命名/展开参数 | compile.c:1325 | 参照普通函数调用的命名参数重排逻辑（compile_call has_named 路径） |
 | 方法命名/展开参数 | compile.c:1393（INIT_MCALL） | 同上，实参重排后 SEND |
 | 静态命名/展开参数 | compile.c:1433（INIT_SMCALL） | 同上 |
