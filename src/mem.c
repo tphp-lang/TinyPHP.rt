@@ -54,6 +54,9 @@ void gc_register(GCHead *h) {
     gc_list = h;
 }
 
+/* registry head (vm.c shutdown dtor walk) */
+GCHead *tphp_gc_registry(void) { return gc_list; }
+
 static void gc_unregister(GCHead *h) {
     if (h->gc_prev) h->gc_prev->gc_next = h->gc_next; else gc_list = h->gc_next;
     if (h->gc_next) h->gc_next->gc_prev = h->gc_prev;
@@ -115,7 +118,57 @@ void tclo_free(TClosure *c) {
     tm_free(c);
 }
 
+/* ---- __destruct (P0-2, 2026-10-15) ----
+ * rc 归零释放对象前运行用户析构器（PHP 语义）：
+ *  - DTORED 标记保证每个对象最多析构一次
+ *  - 析构期间的"引擎引用"防止析构器内释放自身导致 UAF；析构后 rc 仍 >1
+ *    说明对象被复活（析构器里又存了一份），保持存活不再释放
+ *  - GC sweep 期间不运行 PHP（快照遍历中跑用户代码会 UAF）：标记后挂入
+ *    defer 列表，sweep 全部结束后再跑（php-src 同款两段式）
+ *  - enum 单例不析构（PHP 枚举不可实例化，无析构语义） */
+static bool g_in_gc;
+#define DTR_DEFER_MAX 1024
+static TObj *g_dtor_defer[DTR_DEFER_MAX];
+static int g_ndefer;
+
+static bool obj_has_dtor(const TObj *o) {
+    return o->cls->kind != CK_ENUM && o->cls->m_dtor >= 0 &&
+           o->cls->m_dtor < o->cls->n_methods;
+}
+
+/* sweep 结束后的 defer 析构（对象仍被引擎引用持有，不会 UAF） */
+static void gc_run_deferred_dtors(void) {
+    if (!g_ndefer) return;
+    TObj *list[DTR_DEFER_MAX];
+    int n = g_ndefer;
+    memcpy(list, g_dtor_defer, sizeof(TObj *) * (size_t)n);
+    g_ndefer = 0;
+    g_in_gc = false;
+    for (int i = 0; i < n; i++) {
+        TObj *o = list[i];
+        tphp_obj_run_dtor(o);
+        o->h.rc--;                        /* 退掉引擎引用 */
+        if (o->h.rc == 0)
+            tobj_free(o);                 /* DTORED 已置位 → 直连释放路径 */
+    }
+}
+
 void tobj_free(TObj *o) {
+    if (obj_has_dtor(o) && !(o->h.flags & GC_FLAG_DTORED)) {
+        o->h.flags |= GC_FLAG_DTORED;
+        o->h.rc++;                        /* 引擎引用：析构期间保命 */
+        if (g_in_gc) {
+            if (g_ndefer < DTR_DEFER_MAX) g_dtor_defer[g_ndefer++] = o;
+            return;                       /* 保持存活，sweep 后统一析构 */
+        }
+        tphp_obj_run_dtor(o);
+        o->h.rc--;                        /* 退掉引擎引用 */
+        /* rc==1 = 只剩"正在释放的这个引用"（tval_release 在 rc==1 时调用
+         * 本函数，所有权已移交）——不是复活，应继续释放；rc>1 才是析构器
+         * 里又被存了一份（复活），对象保留。写成 >0 会把正常路径全拦成
+         * "复活"，属性永不释放、嵌套析构器不到场（2026-10-15 修）。 */
+        if (o->h.rc > 1) return;          /* 被复活：不再释放 */
+    }
     if (o->cls->native_dtor)
         o->cls->native_dtor(o);   /* M5.5 FFI\CData owned-buffer release */
     for (int i = 0; i < o->cls->n_props; i++)
@@ -126,6 +179,10 @@ void tobj_free(TObj *o) {
 }
 
 void tex_free(TExObj *x) {
+    if (x->wrap) {                  /* P1-2: 用户异常类包装 */
+        TVal w = { .u.p = x->wrap, .t = T_OBJ };
+        tval_release(&w);
+    }
     if (x->message)
         tval_release(&(TVal){ .u.p = x->message, .t = T_STR });
     if (x->previous)
@@ -165,6 +222,8 @@ static void gc_children(GCHead *h, void (*fn)(TVal *)) {
             fn(&c->captures[i]);
     } else if (h->kind == GC_KIND_EX) {
         TExObj *x = (TExObj *)h;
+        if (x->wrap)                 /* P1-2: 用户异常对象也参与 GC 遍历 */
+            fn(&(TVal){ .u.p = x->wrap, .t = T_OBJ });
         if (x->message)
             fn(&(TVal){ .u.p = x->message, .t = T_STR });
         if (x->previous)
@@ -216,14 +275,25 @@ static void gc_mark(TVal *v) {
     gc_children(h, gc_mark);
 }
 
+/* decrement one child's gref if it is in the registry (any refcounted kind;
+ * interned strings never participate) */
+static void gref_dec(GCHead **objs, int64_t *gref, size_t count, TVal *v) {
+    if (v->t < T_STR || v->t > T_CLOSURE) return;
+    GCHead *c = (GCHead *)v->u.p;
+    if (c->flags & GC_FLAG_INTERNED) return;
+    for (size_t j = 0; j < count; j++)
+        if (objs[j] == c) { gref[j]--; return; }
+}
+
 int64_t gc_collect(void) {
     int64_t freed = 0;
     size_t count = 0;
+    g_in_gc = true;
     for (GCHead *h = gc_list; h; h = h->gc_next) {
         h->color = GC_COLOR_UNMARKED;
         count++;
     }
-    if (count == 0) return 0;
+    if (count == 0) { g_in_gc = false; return 0; }
     GCHead **objs = tm_malloc(sizeof(GCHead *) * count);
     int64_t *gref = tm_malloc(sizeof(int64_t) * count);
     size_t i = 0;
@@ -233,40 +303,30 @@ int64_t gc_collect(void) {
         GCHead *h = objs[k];
         if (h->kind == GC_KIND_ARR) {
             TArr *a = (TArr *)h;
-            for (uint32_t d = 0; d < a->dused; d++) {
-                TVal *v = &a->data[d];
-                if (v->t != T_STR && v->t != T_ARR) continue;
-                GCHead *c = (GCHead *)v->u.p;
-                if (c->flags & GC_FLAG_INTERNED) continue;
-                for (size_t j = 0; j < count; j++) if (objs[j] == c) { gref[j]--; break; }
-            }
+            for (uint32_t d = 0; d < a->dused; d++)
+                gref_dec(objs, gref, count, &a->data[d]);
             for (uint32_t b = 0; b < a->bcap; b++) {
                 if (a->buckets[b].val_off == UINT32_MAX) continue;
-                TVal *v = &a->buckets[b].key;
-                if (v->t != T_STR && v->t != T_ARR) continue;
-                GCHead *c = (GCHead *)v->u.p;
-                if (c->flags & GC_FLAG_INTERNED) continue;
-                for (size_t j = 0; j < count; j++) if (objs[j] == c) { gref[j]--; break; }
+                gref_dec(objs, gref, count, &a->buckets[b].key);
             }
         } else if (h->kind == GC_KIND_CLO) {
             TClosure *c = (TClosure *)h;
-            for (uint16_t i = 0; i < c->n_cap; i++) {
-                TVal *v = &c->captures[i];
-                if (v->t != T_STR && v->t != T_ARR) continue;
-                GCHead *ch = (GCHead *)v->u.p;
-                if (ch->flags & GC_FLAG_INTERNED) continue;
-                for (size_t j = 0; j < count; j++) if (objs[j] == ch) { gref[j]--; break; }
-            }
+            for (uint16_t i = 0; i < c->n_cap; i++)
+                gref_dec(objs, gref, count, &c->captures[i]);
         } else if (h->kind == GC_KIND_EX) {
             TExObj *x = (TExObj *)h;
-            if (x->message) {
-                GCHead *ch = (GCHead *)x->message;
-                for (size_t j = 0; j < count; j++) if (objs[j] == ch) { gref[j]--; break; }
-            }
-            if (x->previous) {
-                GCHead *ch = (GCHead *)x->previous;
-                for (size_t j = 0; j < count; j++) if (objs[j] == ch) { gref[j]--; break; }
-            }
+            if (x->wrap)
+                gref_dec(objs, gref, count, &(TVal){ .u.p = x->wrap, .t = T_OBJ });
+            if (x->message)
+                gref_dec(objs, gref, count, &(TVal){ .u.p = x->message, .t = T_STR });
+            if (x->previous)
+                gref_dec(objs, gref, count, &(TVal){ .u.p = x->previous, .t = T_OBJ });
+        } else if (h->kind == GC_KIND_OBJ) {
+            /* 2026-10-15：补对象属性边。此前 OBJ 完全不参与 gref 递减，
+             * 任何含对象的环都因 gref>0 被误判可达——既不回收也不析构。 */
+            TObj *o = (TObj *)h;
+            for (int i = 0; i < o->cls->n_props; i++)
+                gref_dec(objs, gref, count, &o->props[i]);
         }
     }
     /* 3. mark externally-reachable objects and everything under them */
@@ -292,9 +352,18 @@ int64_t gc_collect(void) {
     for (size_t k = 0; k < count; k++) {
         GCHead *h = objs[k];
         if (h->color != GC_COLOR_DEAD) continue;
-        if (h->kind == GC_KIND_STR) tstr_free((TStr *)h);
-        else tarr_free((TArr *)h);
+        /* OBJ/CLO/EX 一并释放：其子引用经 tval_release 的 DEAD 色协议
+         * 安全递减（2026-10-15：此前只释放 STR/ARR，环中对象/闭包/异常
+         * 全部泄漏）。带 __destruct 的对象在 tobj_free 内挂起 defer。 */
+        switch (h->kind) {
+        case GC_KIND_STR: tstr_free((TStr *)h); break;
+        case GC_KIND_ARR: tarr_free((TArr *)h); break;
+        case GC_KIND_CLO: tclo_free((TClosure *)h); break;
+        case GC_KIND_EX:  tex_free((TExObj *)h); break;
+        case GC_KIND_OBJ: tobj_free((TObj *)h); break;
+        }
     }
+    gc_run_deferred_dtors();
     tm_free(objs);
     tm_free(gref);
     return freed;

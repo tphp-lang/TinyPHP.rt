@@ -64,6 +64,7 @@ static const TExClass EX_ASYNC_CANCEL = { "AsyncCancelled", &EX_THROWABLE };
 static const TExClass EX_DEADLOCK = { "DeadlockError", &EX_ERROR };
 static const TExClass EX_NOTCLONEABLE = { "NotCloneableError", &EX_ERROR };
 static const TExClass EX_UNMATCH = { "UnhandledMatchError", &EX_ERROR };
+static const TExClass EX_VALUEERR = { "ValueError", &EX_ERROR };   /* P1-2 */
 
 extern const TExClass *tphp_ex_classes[];
 extern const int tphp_ex_class_count;
@@ -72,7 +73,7 @@ const TExClass *tphp_ex_classes[] = {
     &EX_THROWABLE, &EX_ERROR, &EX_TYPE, &EX_ARITY, &EX_DIVZERO,
     &EX_UNDEF, &EX_COMPILE, &EX_EXCEPTION, &EX_RUNTIME, &EX_LOGIC,
     &EX_INVALIDARG, &EX_ERROREX, &EX_ASYNC_CANCEL, &EX_DEADLOCK,
-    &EX_NOTCLONEABLE, &EX_UNMATCH,
+    &EX_NOTCLONEABLE, &EX_UNMATCH, &EX_VALUEERR,
 };
 const int tphp_ex_class_count =
     (int)(sizeof tphp_ex_classes / sizeof tphp_ex_classes[0]);
@@ -101,6 +102,7 @@ static TClosure *tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap) {
     gc_register(&c->h);
     c->fn = fn;
     c->bfn = NULL;
+    c->scope = NULL;         /* P1-3: 默认继承 fn->decl_cls */
     c->n_cap = n_cap;
     c->captures = tm_malloc(sizeof(TVal) * (size_t)(n_cap ? n_cap : 1));
     for (uint16_t i = 0; i < n_cap; i++) {
@@ -135,6 +137,7 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
     x->code = code;
     x->previous = previous;
     x->line = line;
+    x->wrap = NULL;      /* P1-2: 用户异常类包装；引擎异常为 NULL */
     return x;
 }
 
@@ -233,8 +236,11 @@ static void wtake(VM *vm, TOp *op, TVal v) {
     *p = v;
 }
 
-/* main frame slot lookup by name (the main frame IS the global scope) */
+/* main frame slot lookup by name (the main frame IS the global scope).
+ * main_frame 在主帧 RETURN 时置 NULL（收尾析构期间 global 访问得到干净
+ * 错误而非 UAF——2026-10-15 P0-2） */
 static TVal *global_slot(VM *vm, TStr *name) {
+    if (!vm->main_frame) return NULL;
     TFunc *fn = vm->main_frame->fn;
     for (uint16_t i = 0; i < fn->n_locals; i++)
         if (tstr_eq(fn->local_names[i], name))
@@ -948,6 +954,22 @@ static int32_t op_recv(VM *vm, TOp *op) {
                 v = default_arg_val(d);
             }
         } else {
+            /* P1-1: 参数类型校验——先校验再 move（raise 时引用仍归 args 槽，
+             * 不会泄漏）。默认值不在此校验（PHP 在声明期校验默认值）。 */
+            if (f->fn->param_types && f->fn->param_types[idx]) {
+                const char *given = NULL;
+                if (!tphp_type_accepts(tstr_val(f->fn->param_types[idx]), v,
+                                       (TClass *)f->called_cls, &given)) {
+                    const char *pn = (idx < f->fn->n_locals && f->fn->local_names[idx])
+                        ? tstr_val(f->fn->local_names[idx]) : "?";
+                    vm_raise(vm, ex_class("TypeError"), op,
+                             "%s(): Argument #%u ($%s) must be of type %s, %s given",
+                             f->fn->name ? tstr_val(f->fn->name) : "{closure}",
+                             idx + 1, pn,
+                             tstr_val(f->fn->param_types[idx]),
+                             given ? given : "?");
+                }
+            }
             /* move */
             vm->x.args[f->args_base + idx] = (TVal){ .u.i = 0, .t = T_UNDEF };
         }
@@ -980,6 +1002,27 @@ static int32_t op_recv_variadic(VM *vm, TOp *op) {
         if (v.t != T_UNDEF) tarr_append(a, v);
         else tval_release(&v);
     }
+    /* P1-1: 变参元素类型校验（收集完再校验，raise 无半成品数组） */
+    if (f->fn->param_types && fixed < f->fn->n_params &&
+        f->fn->param_types[fixed]) {
+        TStr *vt = f->fn->param_types[fixed];
+        for (uint32_t i = 0; i < a->dused; i++) {
+            if (a->data[i].t == T_UNDEF) continue;
+            const char *given = NULL;
+            if (!tphp_type_accepts(tstr_val(vt), a->data[i],
+                                   (TClass *)f->called_cls, &given)) {
+                TVal av = TV_ARR(a);
+                tval_release(&av);
+                vm_raise(vm, ex_class("TypeError"), op,
+                         "%s(): Argument #%u ($%s) must be of type %s, %s given",
+                         f->fn->name ? tstr_val(f->fn->name) : "{closure}",
+                         fixed + 1,
+                         (fixed < f->fn->n_locals && f->fn->local_names[fixed])
+                             ? tstr_val(f->fn->local_names[fixed]) : "?",
+                         tstr_val(vt), given ? given : "?");
+            }
+        }
+    }
     wtake(vm, op, TV_ARR(a));
     return 1;
 }
@@ -992,12 +1035,10 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     rec->n_args = (uint16_t)(vm->x.n_args - rec->args_base);  /* real count */
     TVal *args = &vm->x.args[rec->args_base];
     if (rec->is_enum_builtin) {
-        /* enum ::from / ::tryFrom / ::cases */
+        /* enum ::from / ::tryFrom / ::cases（方法名由 INIT_SMCALL 存入
+         * rec->magic_name；kind 3 的 key 形如 "Cls::from"，取末段） */
         TClass *cls = (TClass *)rec->called_cls;
-        /* recover the method name from the caller's INIT op */
-        TOp *init_op = op - 1 - rec->n_args;
-        TStr *key = (TStr *)vm->x.frame->fn->lits[init_op->ar].u.p;
-        const char *s = tstr_val(key);
+        const char *s = tstr_val(rec->magic_name);
         const char *sep = NULL;
         for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2)
             sep = p;
@@ -1019,7 +1060,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                 }
             if (hit) r = TV_OBJ(tphp_enum_case_obj(cls, (int)(hit - cls->cases)));
             else if (lc_eq(mn, "from"))
-                vm_raise(vm, ex_class("Error"), op,
+                vm_raise(vm, ex_class("ValueError"), op,
                          "\"%s\" is not a valid backing value for enum %s",
                          tstr_val(tval_to_str(probe)), tstr_val(cls->name));
         }
@@ -1177,6 +1218,28 @@ static int32_t op_return(VM *vm, TOp *op) {
         r = rdv(vm, op, 1);
         tval_addref(r);
     }
+    /* P1-1: 返回类型校验（void/never/mixed 不校验；void 的返回值本就丢弃）。
+     * 隐式 return（r = null）同样校验——PHP 对非空返回类型抛 TypeError。 */
+    {
+        TFunc *fn = vm->x.frame->fn;
+        TStr *rt = fn->ret_type;
+        if (rt) {
+            const char *ts = tstr_val(rt);
+            bool skip = strcmp(ts, "void") == 0 || strcmp(ts, "never") == 0 ||
+                        strcmp(ts, "mixed") == 0;
+            if (!skip) {
+                const char *given = NULL;
+                if (!tphp_type_accepts(ts, r, (TClass *)vm->x.frame->called_cls,
+                                       &given)) {
+                    tval_release(&r);
+                    vm_raise(vm, ex_class("TypeError"), op,
+                             "%s(): Return value must be of type %s, %s returned",
+                             fn->name ? tstr_val(fn->name) : "{closure}",
+                             ts, given ? given : "?");
+                }
+            }
+        }
+    }
     if (vm->x.n_calls > 0) {
         VMCallRec *rec = &vm->x.calls[vm->x.n_calls - 1];
         vm->x.n_calls--;
@@ -1184,8 +1247,11 @@ static int32_t op_return(VM *vm, TOp *op) {
             /* `new` always yields the object itself, never the ctor's
              * return value (PHP semantics) */
             tval_release(&r);
+            /* $this 的引用是"移动"到 dst 的（op_new_user 的 rc++ 已移交给
+             * ctor 帧槽）：不能再 addref，否则每个对象恒定多持一个引用，
+             * rc 永远归不了零——__destruct 永不触发、对象全部泄漏
+             * （2026-10-15 P0-2 审计修复）。帧销毁时释放槽内的副本。 */
             TVal objv = vm->x.frame->slots[0];   /* $this */
-            tval_addref(objv);
             TVal *d = &vm->x.frame->prev->slots[rec->dst_slot];
             tval_release(d);
             *d = objv;
@@ -1212,6 +1278,7 @@ static int32_t op_return(VM *vm, TOp *op) {
         tval_release(&f->slots[i]);
     tm_free(f->slots);
     tm_free(f);
+    if (f == vm->main_frame) vm->main_frame = NULL;   /* 防 global_slot UAF */
     vm->x.frame = prev;
     if (!vm->x.frame) vm->x.done = true;
     return 0;
@@ -1354,8 +1421,198 @@ static int32_t op_new_ex(VM *vm, TOp *op) {
     return 1;
 }
 
+/* ---- P1-3: Closure 内部类 ----
+ * $this 捕获（compile.c）落地后，call/bindTo 重绑定 "this" 捕获槽是真
+ * 语义（闭包 TFunc 的 local_names[0..n_cap) 就是捕获名）。native 的
+ * self 形参传 TClosure*（GC_KIND_CLO，引用计数同 GCHead）。 */
+static _Thread_local TOp g_magic_stub;   /* 前置：定义在文件尾段 */
+TVal tphp_vm_call_callable(struct VM *vm, TVal callable, TVal *args, int n);
+static TClass *g_closure_cls;
+
+static int16_t clo_this_capture(TClosure *c) {
+    if (!c->fn) return -1;                     /* builtin 包装无捕获名 */
+    for (uint16_t i = 0; i < c->n_cap && i < c->fn->n_locals; i++)
+        if (c->fn->local_names[i] &&
+            lc_eq(tstr_val(c->fn->local_names[i]), "this"))
+            return (int16_t)i;
+    return -1;
+}
+
+/* 重绑定 $this：闭包编译时带 "this" 捕获槽才可重绑；否则原样返回
+ * （闭包体本就引用不到 $this，绑定无意义）。scope = 新作用域类
+ * （PHP bindTo/bind 的第 2/3 参），决定 private/protected 可见性。 */
+static TClosure *clo_rebind(TClosure *src, TVal newthis, TClass *scope) {
+    if (src->bfn) return src;
+    int16_t ti = clo_this_capture(src);
+    if (ti < 0 && !scope) return src;
+    TClosure *c = tclo_alloc(src->fn, src->captures, src->n_cap);
+    if (ti >= 0) {
+        tval_addref(newthis);
+        tval_release(&c->captures[ti]);
+        c->captures[ti] = newthis;
+    }
+    c->scope = scope;
+    return c;
+}
+
+/* scope 参数解析：string 类名（或 ::class 字符串）→ TClass；null → NULL */
+static TClass *clo_scope_arg(TVal v) {
+    if (v.t != T_STR) return NULL;
+    const char *s = tstr_val((TStr *)v.u.p);
+    if (strncmp(s, "static::", 8) == 0) s += 8;   /* D::class 编译成字符串 */
+    char lc[256];
+    size_t k = 0;
+    for (; s[k] && k + 1 < sizeof lc; k++)
+        lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+    lc[k] = 0;
+    extern TClass *class_resolve_lc(const char *fqcn_lc);
+    return class_resolve_lc(lc);
+}
+
+static TVal nm_closure_fromcallable(VM *vm, void *self, TVal *args, int n) {
+    (void)self;
+    if (n != 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Closure::fromCallable() expects exactly 1 argument");
+    TVal cb = args[0];
+    if (cb.t == T_CLOSURE) { tval_addref(cb); return cb; }
+    if (cb.t == T_STR) {
+        bool is_builtin = false;
+        void *hit = resolve_fn_fb(vm, &g_magic_stub, (TStr *)cb.u.p, &is_builtin);
+        if (hit) {
+            TClosure *c = is_builtin ? tclo_alloc_builtin((BuiltinFn)hit)
+                                     : tclo_alloc((TFunc *)hit, NULL, 0);
+            return TV_CLO(c);
+        }
+    }
+    tphp_vm_raise(vm, "TypeError",
+                  "Closure::fromCallable(): Argument #1 ($callback) must be a valid callback");
+    return TV_NULL;
+}
+
+static TVal nm_closure_bindto(VM *vm, void *self, TVal *args, int n) {
+    (void)vm;
+    TClosure *clo = (TClosure *)self;
+    if (n < 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Closure::bindTo() expects at least 1 argument");
+    if (args[0].t != T_OBJ && args[0].t != T_NULL)
+        tphp_vm_raise(vm, "TypeError",
+                      "Closure::bindTo(): Argument #1 ($newThis) must be of type ?object");
+    TClass *scope = n >= 2 ? clo_scope_arg(args[1]) : NULL;
+    TClosure *out = args[0].t == T_OBJ || scope
+        ? clo_rebind(clo, args[0], scope) : clo;
+    TVal ov = TV_CLO(out);
+    tval_addref(ov);
+    return ov;
+}
+
+static TVal nm_closure_call(VM *vm, void *self, TVal *args, int n) {
+    TClosure *clo = (TClosure *)self;
+    if (n < 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Closure::call() expects at least 1 argument");
+    if (args[0].t != T_OBJ && args[0].t != T_NULL)
+        tphp_vm_raise(vm, "TypeError",
+                      "Closure::call(): Argument #1 ($newThis) must be of type ?object");
+    TClosure *target = clo;
+    if (args[0].t == T_OBJ) {
+        /* PHP 语义：call() 以 $newThis 自身类作为临时作用域（private 可达） */
+        TClass *scope = ((TObj *)args[0].u.p)->cls;
+        target = clo_rebind(clo, args[0], scope);
+    }
+    TVal cv = TV_CLO(target);
+    tval_addref(cv);
+    TVal r = tphp_vm_call_callable(vm, cv, &args[1], n - 1);
+    tval_release(&cv);
+    return r;
+}
+
+static TVal nm_closure_bind(VM *vm, void *self, TVal *args, int n) {
+    (void)self; (void)vm;
+    if (n < 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Closure::bind() expects at least 1 argument");
+    if (args[0].t != T_CLOSURE)
+        tphp_vm_raise(vm, "TypeError",
+                      "Closure::bind(): Argument #1 ($closure) must be of type Closure");
+    if (n >= 2 && args[1].t != T_OBJ && args[1].t != T_NULL)
+        tphp_vm_raise(vm, "TypeError",
+                      "Closure::bind(): Argument #2 ($newThis) must be of type ?object");
+    TClass *scope = n >= 3 ? clo_scope_arg(args[2]) : NULL;
+    TClosure *out = (n >= 2 && (args[1].t == T_OBJ || scope))
+        ? clo_rebind((TClosure *)args[0].u.p, args[1], scope)
+        : (TClosure *)args[0].u.p;
+    TVal ov = TV_CLO(out);
+    tval_addref(ov);
+    return ov;
+}
+
+static void clsc_add_method(TClass *cls, const char *name, void *fn, bool is_static) {
+    TMethod *ms = tm_malloc(sizeof(TMethod) * (size_t)(cls->n_methods + 1));
+    if (cls->methods)
+        memcpy(ms, cls->methods, sizeof(TMethod) * (size_t)cls->n_methods);
+    TMethod *m = &ms[cls->n_methods++];
+    memset(m, 0, sizeof *m);
+    m->name = tstr_new(name, strlen(name));
+    m->visibility = 0;
+    m->is_static = is_static;
+    m->native = fn;
+    tm_free(cls->methods);
+    cls->methods = ms;
+}
+
+/* 注册 Closure 内部类（编译前；幂等）。线程表注册——与 Async\Coroutine
+ * 同模式，worker 各自初始化。 */
+static _Thread_local bool g_closure_inited;
+void tphp_closure_class_init(void) {
+    if (g_closure_inited) return;
+    g_closure_inited = true;
+    TClass *cls = tm_malloc(sizeof *cls);
+    memset(cls, 0, sizeof *cls);
+    cls->name = tstr_intern("Closure", 7);
+    cls->kind = CK_CLASS;
+    cls->flattened = true;
+    cls->m_ctor = cls->m_dtor = cls->m_get = cls->m_set = cls->m_isset =
+        cls->m_unset = cls->m_call = cls->m_callstatic = cls->m_tostring =
+        cls->m_invoke = cls->m_clone = cls->m_debuginfo = cls->m_clonestate = -1;
+    clsc_add_method(cls, "fromCallable", (void *)nm_closure_fromcallable, true);
+    clsc_add_method(cls, "bind", (void *)nm_closure_bind, true);
+    clsc_add_method(cls, "call", (void *)nm_closure_call, false);
+    clsc_add_method(cls, "bindTo", (void *)nm_closure_bindto, false);
+    tphp_class_register(cls);
+    g_closure_cls = cls;
+}
+
 static int32_t op_throw(VM *vm, TOp *op) {
     TVal v = rdv(vm, op, 1);
+    if (v.t == T_OBJ && ((GCHead *)v.u.p)->kind == GC_KIND_OBJ) {
+        /* P1-2: 用户异常类实例（isa Throwable）→ 包装成 TExObj 走统一异常
+         * 机制。wrap 字段指向用户对象；catch 绑定/读消息都解包回它，
+         * 用户类自带的方法与属性因此全部可见。 */
+        TObj *o = (TObj *)v.u.p;
+        if (!tphp_class_isa_name(o->cls, "throwable"))
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Can only throw objects");
+        /* wrapper 的 TExClass = 用户类链上最近的内置异常祖先 */
+        const TExClass *ecls = NULL;
+        for (TClass *c = o->cls; c; c = c->parent) {
+            int ci = tphp_ex_class_index(tstr_val(c->name));
+            if (ci >= 0) { ecls = tphp_ex_classes[ci]; break; }
+        }
+        if (!ecls) ecls = ex_class("Error");
+        TStr *msg = tstr_new("", 0);
+        int64_t code = 0;
+        int sm = tphp_class_find_prop(o->cls, "message");
+        if (sm >= 0 && o->props[sm].t == T_STR) msg = (TStr *)o->props[sm].u.p;
+        int sc = tphp_class_find_prop(o->cls, "code");
+        if (sc >= 0 && o->props[sc].t == T_INT) code = o->props[sc].u.i;
+        TExObj *w = tex_alloc(ecls, msg, code, op->line, NULL);
+        tval_addref(TV_OBJ(o));
+        w->wrap = o;                  /* 包装器持一份用户对象引用 */
+        vm->x.exception = w;
+        longjmp(vm->x.unwind, 1);
+    }
     if (v.t != T_OBJ || ((GCHead *)v.u.p)->kind != GC_KIND_EX)
         vm_raise(vm, ex_class("TypeError"), op,
                  "Can only throw objects");
@@ -1371,7 +1628,16 @@ static int32_t op_bind_ex(VM *vm, TOp *op) {
     vm->x.exception = NULL;         /* ownership moves into the catch slot */
     TVal *d = &vm->x.frame->slots[op->ar];
     tval_release(d);
-    d[0] = TV_OBJ(x);
+    if (x->wrap) {
+        /* P1-2: 绑定用户异常对象；包装器仅作传递，用完即释 */
+        TVal out = TV_OBJ(x->wrap);
+        tval_addref(out);
+        d[0] = out;
+        TVal wv = TV_OBJ(x);
+        tval_release(&wv);
+    } else {
+        d[0] = TV_OBJ(x);
+    }
     return 1;
 }
 
@@ -1419,6 +1685,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     if (!m || !m->fn || m->is_abstract) return false;
     if (vm->x.n_args + n > VM_MAX_ARGS)
         vm_raise(vm, ex_class("Error"), op, "Too many arguments");
+    TExObj *pre_ex = vm->x.exception;   /* 调用前已在飞行中的异常（见下方判别） */
     uint32_t base = (uint32_t)vm->x.n_args;
     for (int i = 0; i < n; i++)
         vm->x.args[base + (uint32_t)i] = args[i];
@@ -1453,7 +1720,11 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
         if (d) f->pc += (uint32_t)d;
     }
     vm->x.n_args = (int)base;
-    if (vm->x.exception) {
+    /* 只把"本次调用新抛出"的异常向上传播：调用前已在飞行中的异常
+     * （析构器在 vm_unwind 途中被触发时会带着旧异常进来）原样保留，
+     * 否则会被误判成魔术方法自己抛的——longjmp 打乱外层展开
+     * （2026-10-15 P0-2：ctor 抛异常 + 类带 __destruct 的交互）。 */
+    if (vm->x.exception && vm->x.exception != pre_ex) {
         /* __get etc raised: drop the queued args and propagate through
          * the normal unwind path */
         for (int i = 0; i < n; i++)
@@ -1468,6 +1739,22 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
     TVal objv = rdv(vm, op, 1);
     TStr *mname = (TStr *)vm->x.frame->fn->lits[op->ar].u.p;
     VMCallRec *rec = call_push(vm, op);
+    /* P1-3: $closure->call()/bindTo() —— TClosure 接收者派发到内部
+     * Closure 类（native；self 传 TClosure*）。 */
+    if (objv.t == T_CLOSURE) {
+        TMethod *m = g_closure_cls
+            ? tphp_class_find_method(g_closure_cls, tstr_val(mname)) : NULL;
+        if (!m || !m->native || m->is_static)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Call to undefined method Closure::%s()",
+                     tstr_val(mname));
+        rec->is_builtin = true;
+        rec->nm_fn = m->native;
+        rec->is_method = true;
+        rec->this_obj = objv.u.p;     /* TClosure*（GCHead 兼容引用计数） */
+        tval_addref(objv);
+        return 1;
+    }
     if (objv.t != T_OBJ || objv.u.p == NULL)
         vm_raise(vm, ex_class("Error"), op,
                  "Call to a member function %s() on %s",
@@ -1561,6 +1848,9 @@ static int32_t op_new_user(VM *vm, TOp *op) {
     if (cls->kind == CK_INTERFACE || cls->kind == CK_TRAIT)
         vm_raise(vm, ex_class("Error"), op, "Cannot instantiate %s",
                  tstr_val(cls->name));
+    if (cls == g_closure_cls)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot instantiate Closure");   /* P1-3 */
     TObj *o = tphp_obj_alloc(cls);
     o->h.rc++;                    /* ctor invocation holds a reference */
     if (cls->m_ctor >= 0 && !cls->methods[cls->m_ctor].fn &&
@@ -1574,6 +1864,7 @@ static int32_t op_new_user(VM *vm, TOp *op) {
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
         vm->x.n_args -= (int)op->a2;
         tval_release(&r);
+        o->h.rc--;                    /* 退掉 ctor-invocation 引用（native 路径） */
         if (op->tr != OPD_UNUSED) {
             TVal *d = &vm->x.frame->slots[op->ar];
             tval_release(d);
@@ -1622,6 +1913,7 @@ static int32_t op_new_user(VM *vm, TOp *op) {
     if (op->tr != OPD_UNUSED) {
         TVal *d = &vm->x.frame->slots[op->ar];
         tval_release(d);
+        o->h.rc--;                    /* 无构造器：退掉未发生的 ctor 引用 */
         d[0] = TV_OBJ(o);         /* transfer the +1 */
     } else {
         o->h.rc--;
@@ -1690,6 +1982,17 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot modify readonly property %s::$%s",
                  tstr_val(o->cls->name), tstr_val(name));
+    /* P1-1: typed 属性赋值校验 */
+    if (o->cls->props[slot].type) {
+        const char *given = NULL;
+        if (!tphp_type_accepts(tstr_val(o->cls->props[slot].type), val,
+                               o->cls, &given))
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Cannot assign %s to property %s::$%s of type %s",
+                     given ? given : "?",
+                     tstr_val(o->cls->name), tstr_val(name),
+                     tstr_val(o->cls->props[slot].type));
+    }
     tval_addref(val);
     tval_release(&o->props[slot]);
     o->props[slot] = val;
@@ -1790,11 +2093,15 @@ static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named) {
     }
 }
 
-/* shared: called_cls resolution for a frame being created */
+/* shared: called_cls resolution for a frame being created.
+ * P1-3: 闭包若经 bindTo/bind 重绑过作用域（clo->scope），frame 的
+ * called_cls 用它——private/protected 可见性与 self:: 随新作用域。 */
 static TClass *frame_called_cls(VMCallRec *rec, TFunc *fn) {
     if (rec->is_method)
         return rec->this_obj ? ((TObj *)rec->this_obj)->cls
                              : (TClass *)rec->called_cls;
+    if (rec->clo && rec->clo->scope)
+        return rec->clo->scope;
     return (TClass *)fn->decl_cls;
 }
 
@@ -1847,11 +2154,15 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
         if (lc_eq(mn, "from") || lc_eq(mn, "tryfrom") || lc_eq(mn, "cases")) {
             rec->is_enum_builtin = true;
             rec->is_method = true;
+            rec->magic_name = mname;   /* P1-2: 方法名直接入 rec——DO_FCALL
+                                         * 不再用 op-1-n_args 反查（带参调用
+                                         * 时该公式指错，from() 非法值曾静默
+                                         * 返回 null） */
             rec->called_cls = cls;
             return 1;
         }
     }
-    if (!m || !m->fn || m->is_abstract) {
+    if (!m || (!m->fn && !m->native) || m->is_abstract) {
         TMethod *mcs = tphp_class_find_method(cls, "__callstatic");
         if (mcs && mcs->fn && !mcs->is_abstract) {
             /* __callStatic(name, args): defer to DO_FCALL so the real
@@ -1869,10 +2180,17 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
     if (lc_eq(tstr_val(mname), "__construct")) {
         /* parent::__construct() / self::__construct(): the one legal
          * "static" call to a non-static method — run the ctor body on the
-         * current $this (caller slot 0); expression result is NULL */
+         * current $this (caller slot 0); expression result is NULL.
+         * P1-2: 内部异常类的原生 ctor（fn NULL + native）同样支持——走
+         * nm_fn 带接收者分发（op_do_fcall native 路径）。 */
         rec->is_method = true;
         rec->called_cls = cls;
-        rec->uf = m->fn;
+        if (!m->fn && m->native) {
+            rec->is_builtin = true;
+            rec->nm_fn = m->native;
+        } else {
+            rec->uf = m->fn;
+        }
         if (vm->x.frame->slots[0].t == T_OBJ) {
             TObj *o = (TObj *)vm->x.frame->slots[0].u.p;
             o->h.rc++;               /* reference moves into the ctor frame */
@@ -1890,7 +2208,12 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
             rec->is_method = true;
             rec->called_cls = cls;
             rec->this_obj = o;
-            rec->uf = m->fn;
+            if (!m->fn && m->native) {   /* P1-2: 内部类原生实例方法 */
+                rec->is_builtin = true;
+                rec->nm_fn = m->native;
+            } else {
+                rec->uf = m->fn;
+            }
             return 1;
         }
         vm_raise(vm, ex_class("Error"), op,
@@ -2037,6 +2360,16 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
                  vis_name(sp->visibility), tstr_val(cls->name),
                  tstr_val(pname) + 1);
     TVal val = rdv(vm, op, 3);
+    /* P1-1: typed 静态属性赋值校验 */
+    if (sp->type) {
+        const char *given = NULL;
+        if (!tphp_type_accepts(tstr_val(sp->type), val, cls, &given))
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Cannot assign %s to property %s::$%s of type %s",
+                     given ? given : "?",
+                     tstr_val(cls->name), tstr_val(pname) + 1,
+                     tstr_val(sp->type));
+    }
     tval_addref(val);
     TVal *slot = &tphp_class_sprop_vals(cls)[sp->slot];
     tval_release(slot);
@@ -2169,7 +2502,10 @@ static int32_t op_instanceof(VM *vm, TOp *op) {
     TVal l = rdv(vm, op, 1);
     TStr *cname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
     bool res = false;
-    if (l.t == T_OBJ) {
+    if (l.t == T_CLOSURE) {
+        /* P1-3: 闭包值 instanceof Closure */
+        res = lc_eq(tstr_val(cname), "Closure");
+    } else if (l.t == T_OBJ) {
         GCHead *h = (GCHead *)l.u.p;
         if (h->kind == GC_KIND_OBJ) {
             char lc[128];
@@ -2316,11 +2652,24 @@ static int32_t op_rethrow(VM *vm, TOp *op) {
 }
 
 /* ---- unwinding ---- */
+/* P1-2: catch 匹配按名字跨两个世界——引擎异常走 TExClass 链；用户异常类
+ * 实例（ex->wrap）走 TClass 链（含接口）。catch_cls 索引仅留作builtin
+ * 快路的备注，匹配一律以 catch_nm 为准。 */
 static bool catch_matches(const TExEntry *e, const TExObj *ex) {
     for (int i = 0; i < e->n_catches; i++) {
-        const TExClass *want = tphp_ex_classes[e->catch_cls[i]];
+        const char *want = e->catch_nm ? tstr_val(e->catch_nm[i]) : NULL;
+        if (!want) continue;
+        if (ex->wrap) {
+            char lc[256];
+            size_t k = 0;
+            for (const char *s = want; s[k] && k + 1 < sizeof lc; k++)
+                lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+            lc[k] = 0;
+            TClass *wc = tphp_class_lookup(lc);
+            if (wc && tphp_class_isa(ex->wrap->cls, wc)) return true;
+        }
         for (const TExClass *c = ex->cls; c; c = c->parent)
-            if (c == want) return true;
+            if (tstr_case_eq(c->name, want)) return true;
     }
     return false;
 }
@@ -2380,11 +2729,27 @@ static void vm_unwind(VM *vm) {
         }
         /* no matching handler in this frame: pop it. at_entry still holds
          * this frame's own call rec (main/coroutine-root frames have none) */
+        /* 构造器执行中抛异常：半成品对象不落地，随帧一起释放（PHP 语义：
+         * ctor throw → 对象销毁）。ctor rec 位于 at_entry-1（op_new_user
+         * 先 push rec 再建帧），slot0 的 $this 是最后一个引用。 */
+        VMCallRec *crec = (f->n_calls_at_entry > 0)
+            ? &vm->x.calls[f->n_calls_at_entry - 1] : NULL;
+        TObj *half_obj = NULL;
+        if (crec && crec->is_ctor && f->slots[0].t == T_OBJ &&
+            ((GCHead *)f->slots[0].u.p)->kind == GC_KIND_OBJ)
+            half_obj = (TObj *)f->slots[0].u.p;
         vm->x.n_calls = f->n_calls_at_entry;
         if (vm->x.n_calls > 0) vm->x.n_calls--;
         vm->x.n_args = (int)f->args_base;
         vm->x.frame = f->prev;
         frame_destroy(f);
+        if (half_obj) {
+            /* 构造失败的对象不跑 __destruct（PHP 语义：ctor 抛出即从未
+             * 完成构造）；DTORED 标记让 tobj_free 直连释放路径 */
+            half_obj->h.flags |= GC_FLAG_DTORED;
+            TVal ov = TV_OBJ(half_obj);
+            tval_release(&ov);        /* 帧销毁已释放槽内引用，此处收尾 base */
+        }
     }
     /* bottom reached: uncaught。main 协程就地打印 fatal 并定退出码；
      * 子协程（coro_result != NULL）静默收尾——异常保留在执行上下文，
@@ -2393,8 +2758,10 @@ static void vm_unwind(VM *vm) {
     vm->x.uncaught = true;
     if (!vm->x.coro_result) {
         const char *file = vm->prog->file ? vm->prog->file : "-";
+        const char *cls_name = ex->wrap && ex->wrap->cls->name
+            ? tstr_val(ex->wrap->cls->name) : ex->cls->name;
         fprintf(stderr, "PHP Fatal error:  Uncaught %s: %s in %s:%d\n",
-                ex->cls->name, tstr_val(ex->message), file, ex->line);
+                cls_name, tstr_val(ex->message), file, ex->line);
         fprintf(stderr, "Stack trace:\n");
         for (int i = vm->x.n_trace - 1; i >= 0; i--)
             fprintf(stderr, "#%d %s(%d)\n", vm->x.n_trace - 1 - i,
@@ -2732,6 +3099,70 @@ void tphp_vm_restore_clone_state(VM *vm, TObj *o, TVal state) {
     }
 }
 
+/* ---- __destruct (P0-2, 2026-10-15) ----
+ * 释放点（tobj_free，rc 归零）与请求收尾都会走到这里。语义对齐 PHP：
+ *  - 每个对象最多析构一次（GC_FLAG_DTORED，调用方设置）
+ *  - 析构器内抛异常 = 就地 fatal（exit 255）：PHP 同样不让析构异常从
+ *    释放点向外传播——释放点可能在 op_return 的槽清理或 GC sweep 中途，
+ *    此时 longjmp 会破坏半释放的帧/快照，必须就地设防
+ *  - 局部 setjmp 换掉 vm->x.unwind：vm_call_magic 的 raise 落到这里，
+ *    不会窜到已死 fiber 的外圈 setjmp（收尾路径尤其危险） */
+void tphp_obj_run_dtor(TObj *o) {
+    if (o->cls->kind == CK_ENUM) return;               /* 枚举单例不析构 */
+    if (o->cls->m_dtor < 0 || o->cls->m_dtor >= o->cls->n_methods) return;
+    TMethod *m = &o->cls->methods[o->cls->m_dtor];
+    if (!m->fn || m->is_abstract) return;
+    VM *vm = tphp_vm_instance();
+    jmp_buf saved;
+    memcpy(saved, vm->x.unwind, sizeof(jmp_buf));
+    memset(&g_magic_stub, 0, sizeof g_magic_stub);
+    if (setjmp(vm->x.unwind) == 0) {
+        TVal out;
+        if (vm_call_magic(vm, &g_magic_stub, o, o->cls, "__destruct",
+                          NULL, 0, &out))
+            tval_release(&out);
+        memcpy(vm->x.unwind, saved, sizeof(jmp_buf));
+    } else {
+        TExObj *ex = vm->x.exception;
+        const char *file = (vm->prog && vm->prog->file) ? vm->prog->file : "-";
+        fprintf(stderr, "PHP Fatal error:  Uncaught %s: %s in %s:%d\n",
+                (ex && ex->cls) ? ex->cls->name : "Error",
+                (ex && ex->message) ? tstr_val(ex->message) : "",
+                file, ex ? ex->line : 0);
+        fflush(stdout);
+        exit(255);
+    }
+}
+
+/* 请求收尾：对全部带 __destruct 的存活对象跑一遍。逆创建序近似——
+ * gc_list 头插队，头部即最新。快照引用防析构器相互释放导致 UAF；
+ * DTORED 先标记防止 tobj_free 路径重入。 */
+void tphp_run_shutdown_dtors(void) {
+    VM *vm = tphp_vm_instance();
+    /* tphp_sched_run 把宿主 ctx memset 清零过（数组指针为 NULL）——收尾
+     * 析构要跑 PHP，先确保 per-context 堆数组存在 */
+    tphp_ctx_ensure(&vm->x);
+    vm->x.exception = NULL;      /* 未消费异常已由 sched_report_uncaught 报过 */
+    TObj *list[1024];
+    int n = 0;
+    for (GCHead *h = tphp_gc_registry(); h && n < 1024; h = h->gc_next) {
+        if (h->kind != GC_KIND_OBJ) continue;
+        TObj *o = (TObj *)h;
+        if (o->cls->kind == CK_ENUM) continue;
+        if (o->cls->m_dtor < 0 || o->cls->m_dtor >= o->cls->n_methods) continue;
+        if (h->flags & GC_FLAG_DTORED) continue;
+        h->flags |= GC_FLAG_DTORED;
+        h->rc++;                 /* 快照引用 */
+        list[n++] = o;
+    }
+    for (int i = 0; i < n; i++)
+        tphp_obj_run_dtor(list[i]);
+    for (int i = 0; i < n; i++) {
+        TVal self = TV_OBJ(list[i]);
+        tval_release(&self);     /* 退快照引用；rc 归零则直连释放 */
+    }
+}
+
 /* ---- prog freeze (M5): after compilation, before any thread runs ----
  * 1) eager-flatten every class: runtime ensure_flat calls become no-ops,
  *    so the shared TClass structures are never mutated while workers read
@@ -2809,7 +3240,11 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     f->prev = vm->x.frame;
     f->args_base = base;
     f->n_args_sent = (uint16_t)nq;
-    f->called_cls = NULL;
+    /* P1-3: 闭包作用域——bindTo/bind 重绑过的用新 scope，否则继承声明类
+     * （与 op_do_fcall 主路径的 frame_called_cls 一致；此前硬编码 NULL，
+     * 经 usort/call() 等调用的闭包没有任何作用域） */
+    f->called_cls = (clo && clo->scope) ? clo->scope
+                  : (clo ? (TClass *)clo->fn->decl_cls : NULL);
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
     f->slots = tm_malloc(sizeof(TVal) * nslots);
@@ -2864,6 +3299,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     vm->x.frame = vm->main_frame = f;
     tphp_ctx_ensure(&vm->x);
     int rc = tphp_sched_run();
+    tphp_run_shutdown_dtors();     /* P0-2: worker/闭包入口同样收尾析构 */
     tphp_raise_hook = NULL;
     tphp_vm_current = NULL;
     return rc;
@@ -2894,6 +3330,7 @@ int tphp_vm_run(Program *prog) {
     /* M4: the scheduler takes over — the script becomes the main coroutine
      * and the event loop drives spawn'ed ones until all are done */
     int rc = tphp_sched_run();
+    tphp_run_shutdown_dtors();     /* P0-2: 收尾析构（在 raise 钩子拆除前） */
     tphp_raise_hook = NULL;
     tphp_vm_current = NULL;
     return rc;

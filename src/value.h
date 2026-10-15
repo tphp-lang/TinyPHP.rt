@@ -49,7 +49,7 @@ void   tm_free(void *p);
 enum { GC_COLOR_UNMARKED = 0, GC_COLOR_BLACK, GC_COLOR_DEAD };
 enum { GC_KIND_STR = 1, GC_KIND_ARR = 2, GC_KIND_CLO = 3, GC_KIND_EX = 4,
        GC_KIND_OBJ = 5 };
-enum { GC_FLAG_INTERNED = 1 };
+enum { GC_FLAG_INTERNED = 1, GC_FLAG_DTORED = 2 };
 
 typedef struct GCHead {
     uint32_t rc;
@@ -73,6 +73,9 @@ typedef struct TExObj {
     int64_t code;
     struct TExObj *previous;
     int line;                 /* throw site (0 = raised without an op line) */
+    struct TObj *wrap;        /* P1-2: 用户异常类实例（throw 的 TObj 包装成
+                               * TExObj 走统一异常机制；catch 绑定/取消息
+                               * 时解包回用户对象）。NULL = 引擎异常 */
 } TExObj;
 
 /* ---- closure value (TVal type T_CLOSURE): compiled TFunc + captured
@@ -85,6 +88,8 @@ typedef struct TClosure {
     void *bfn;               /* BuiltinFn when wrapping a builtin, else NULL */
     TVal *captures;
     uint16_t n_cap;
+    struct TClass *scope;    /* P1-3: bindTo/bind 重绑的作用域类；NULL =
+                                继承 fn->decl_cls（创建处作用域） */
 } TClosure;
 
 void tclo_free(TClosure *c);   /* mem.c */
@@ -125,6 +130,7 @@ enum { CLS_ABSTRACT = 1, CLS_FINAL = 2, CLS_READONLY = 4 };   /* class flags */
 
 typedef struct TProp {
     TStr *name;            /* interned, without $ */
+    TStr *type;            /* declared type, normalized; NULL = untyped (P1-1) */
     uint8_t visibility;
     bool is_static;
     bool is_readonly;
@@ -190,6 +196,13 @@ typedef struct TObj {
 } TObj;
 
 void tobj_free(TObj *o);   /* mem.c */
+/* vm.c: 运行 __destruct（若类声明了且未运行过）。异常在析构器内抛出时
+ * 按 PHP 语义就地 fatal（exit 255），不会从释放点向外传播。 */
+void tphp_obj_run_dtor(TObj *o);
+/* vm.c: 请求收尾——对全部带 __destruct 的存活对象跑一遍（逆创建序近似） */
+void tphp_run_shutdown_dtors(void);
+/* mem.c: GC 注册表头（上述收尾遍历用） */
+struct GCHead *tphp_gc_registry(void);
 
 /* __debugInfo() dispatch for var_dump (vm.c): returns the method's array
  * with a +1 reference, or TV_NULL when the class has no __debugInfo */

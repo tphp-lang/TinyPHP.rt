@@ -33,6 +33,82 @@ static void lc_copy(char *dst, const char *src, size_t cap) {
     dst[i] = 0;
 }
 
+/* ---- P1-1: type declaration checks ---- */
+
+/* PHP-style value type name for error messages ("string given" etc.) */
+const char *tphp_val_type_name(TVal v) {
+    switch (v.t) {
+    case T_NULL:   return "null";
+    case T_TRUE:
+    case T_FALSE:  return "bool";
+    case T_INT:    return "int";
+    case T_FLOAT:  return "float";
+    case T_STR:    return "string";
+    case T_ARR:    return "array";
+    case T_CLOSURE: return "Closure";
+    case T_OBJ: {
+        TClass *c = ((TObj *)v.u.p)->cls;
+        return c && c->name ? tstr_val(c->name) : "object";
+    }
+    default:       return "null";   /* T_UNDEF: uninitialized */
+    }
+}
+
+static bool type_seg_ok(const char *seg, size_t len, TVal v, TClass *scope) {
+    /* builtin spellings */
+    if (len == 3 && memcmp(seg, "int", 3) == 0)   return v.t == T_INT;
+    if (len == 5 && memcmp(seg, "float", 5) == 0) return v.t == T_FLOAT || v.t == T_INT;
+    if (len == 6 && memcmp(seg, "string", 6) == 0) return v.t == T_STR;
+    if (len == 4 && memcmp(seg, "bool", 4) == 0)  return v.t == T_TRUE || v.t == T_FALSE;
+    if (len == 5 && memcmp(seg, "array", 5) == 0) return v.t == T_ARR;
+    if (len == 6 && memcmp(seg, "object", 6) == 0) return v.t == T_OBJ;
+    if (len == 8 && memcmp(seg, "iterable", 8) == 0) return v.t == T_ARR || v.t == T_OBJ;
+    if (len == 5 && memcmp(seg, "mixed", 5) == 0) return true;
+    if (len == 4 && memcmp(seg, "null", 4) == 0)  return v.t == T_NULL;
+    if (len == 4 && memcmp(seg, "true", 4) == 0)  return v.t == T_TRUE;
+    if (len == 5 && memcmp(seg, "false", 5) == 0) return v.t == T_FALSE;
+    if (len == 8 && memcmp(seg, "callable", 8) == 0) return v.t == T_CLOSURE || v.t == T_STR;
+    if (len == 7 && memcmp(seg, "closure", 7) == 0) return v.t == T_CLOSURE;
+    if (len == 4 && memcmp(seg, "self", 4) == 0)
+        return scope && v.t == T_OBJ && tphp_class_isa(((TObj *)v.u.p)->cls, scope);
+    if (len == 6 && memcmp(seg, "static", 6) == 0)
+        return scope && v.t == T_OBJ && tphp_class_isa(((TObj *)v.u.p)->cls, scope);
+    if (len == 6 && memcmp(seg, "parent", 6) == 0)
+        return scope && scope->parent && v.t == T_OBJ &&
+               tphp_class_isa(((TObj *)v.u.p)->cls, scope->parent);
+    /* class/interface name (case-insensitive, leading '\' allowed) */
+    {
+        char lc[256];
+        size_t k = 0;
+        const char *s = seg;
+        if (*s == '\\') s++;
+        for (; s[k] && k + 1 < sizeof lc; k++) lc[k] = lc_ascii(s[k]);
+        lc[k] = 0;
+        TClass *want = tphp_class_lookup(lc);
+        if (!want) return false;
+        return v.t == T_OBJ && tphp_class_isa(((TObj *)v.u.p)->cls, want);
+    }
+}
+
+bool tphp_type_accepts(const char *type, TVal v, TClass *scope,
+                       const char **given) {
+    if (!type || !*type) return true;
+    const char *p = type;
+    bool nullable = false;
+    if (*p == '?') { nullable = true; p++; }
+    for (;;) {
+        const char *seg = p;
+        while (*p && *p != '|') p++;
+        size_t len = (size_t)(p - seg);
+        if (len && type_seg_ok(seg, len, v, scope)) return true;
+        if (!*p) break;
+        p++;   /* skip '|' */
+    }
+    if (nullable && v.t == T_NULL) return true;
+    if (given) *given = tphp_val_type_name(v);
+    return false;
+}
+
 /* ---- registry: open-addressed table keyed on lowercased FQCN ----
  * M5: cls_tab is per-OS-thread (_Thread_local). The master table (process
  * level, written only at compile time) is the clone source for worker
@@ -519,10 +595,12 @@ void tphp_class_ensure_flat(TClass *cls) {
     }
 
     /* interface contract: a concrete class may not carry abstract methods
-     * (PHP fatals at declaration time) */
+     * (PHP fatals at declaration time). native 方法（内部类）fn 为 NULL 但
+     * 不是抽象——exclass.c 的内置异常类靠它注册 ctor/getter（P1-2）。 */
     if (cls->kind == CK_CLASS && !(cls->flags & CLS_ABSTRACT)) {
         for (int i = 0; i < cls->n_methods; i++) {
-            if (cls->methods[i].is_abstract || !cls->methods[i].fn)
+            if (cls->methods[i].is_abstract ||
+                (!cls->methods[i].fn && !cls->methods[i].native))
                 tphp_fatal_src("class.c", 0,
                     "Class %s contains abstract method %s::%s() and must "
                     "therefore be declared abstract",

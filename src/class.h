@@ -70,6 +70,16 @@ void tphp_vm_restore_clone_state(struct VM *vm, TObj *o, TVal state);
  * from == NULL means global scope (public only). */
 bool tphp_vis_ok(uint8_t vis, TClass *owner, TClass *from);
 
+/* P1-1 type declarations: does value v satisfy the normalized type string
+ * ("?int", "int|string", "?app\\model\\dog", "self"/"static"/"parent")?
+ * scope = declaring/using class for self/static/parent resolution (NULL ok).
+ * On mismatch *given (when non-NULL) receives a PHP-style value type name
+ * ("string", "int", class name...) for error messages. */
+bool tphp_type_accepts(const char *type, TVal v, TClass *scope,
+                       const char **given);
+/* PHP-style value type name for messages ("string", "int", class name...) */
+const char *tphp_val_type_name(TVal v);
+
 /* ---- object allocation (does NOT run the constructor) ---- */
 TObj *tphp_obj_alloc(TClass *cls);
 
@@ -80,6 +90,10 @@ bool tstr_case_eq(const char *a, const char *b);
  * value or a function-name string; run by the VM on class-lookup miss */
 void tphp_class_set_autoload_val(TVal fn);
 void tphp_vm_run_autoloader(TVal fn, TStr *name);   /* vm.c */
+
+/* P1-2: 注册内置异常层级为内部 TClass（Exception/Error/... + ValueError），
+ * 使用户异常类可 extends/catch/class_exists。编译前调用，幂等。 */
+void tphp_exclass_init(void);
 
 /* runtime resolve (lookup + one autoloader run on miss); class.c */
 TClass *class_resolve_lc(const char *fqcn_lc);

@@ -39,6 +39,8 @@ void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */
 void  tphp_async_init(void);             /* sched.c */
 void  tphp_io_init(void);                /* io.c */
 void  tphp_ffi_init(void);               /* ffi.c */
+void  tphp_exclass_init(void);           /* exclass.c P1-2 */
+void  tphp_closure_class_init(void);     /* vm.c P1-3 */
 /* mem.c */
 void  tm_free(void *p);
 void  gc_register(GCHead *h);
@@ -290,6 +292,9 @@ static void worker_thread(void *arg) {
     tphp_async_init();
     tphp_ffi_init();             /* M5.5：Worker 线程内也可用 FFI */
     tphp_io_init();
+    tphp_closure_class_init();   /* P1-3（线程表注册，同 Coroutine 模式；
+                                  * exclass 的异常类经 clone_thread 从 master
+                                  * 克隆，此处不可重复注册） */
     tphp_class_tab_clone_thread();
     tphp_sched_loop_init();      /* async bind 前 loop 必须已初始化 */
 

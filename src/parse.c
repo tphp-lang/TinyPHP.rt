@@ -615,8 +615,9 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 p->lx = saved;
                 p->tok = saved_tok;
             }
-            if (e->tag != A_VAR)
-                p_error(p, "Expected function name for call");
+            /* P1-3: 链式动态调用 f()() / $obj->m()() / C::m()() —— 被调者
+             * 可以是任意可调用表达式（运行期按值分发；此前一律 Parse
+             * error）。非可调值由 op_init_dyn 报 "Value is not callable"。 */
             AArgList *args = parse_arg_list(p);
             AExpr *c = ae_new(A_CALL, line);
             c->u.call.dyn = e;
@@ -1016,7 +1017,12 @@ static AExpr *parse_pipe_level(Parser *p) {
 }
 
 static bool is_lvalue(AExpr *e) {
-    return e && (e->tag == A_VAR || e->tag == A_DIM || e->tag == A_PROP);
+    if (!e) return false;
+    if (e->tag == A_VAR || e->tag == A_DIM || e->tag == A_PROP) return true;
+    /* self::$x / C::$x / $obj::$x（静态属性成员带 '$' 前缀）——P1-1：
+     * 此前静态属性直接赋值全部报 "Cannot assign to this expression" */
+    if (e->tag == A_STATICGET && tstr_val(e->u.scall.member)[0] == '$') return true;
+    return false;
 }
 
 static AExpr *parse_assign_level(Parser *p) {
@@ -1142,25 +1148,80 @@ static ADestructList *parse_destruct_list(Parser *p, bool bracket_form) {
 }
 
 /* ============ function declarations ============ */
-static void skip_type_decl(Parser *p) {
-    accept(p, P_QUESTION);
+/* ============ type declarations (P1-1) ============
+ * Parse a type declaration into a normalized interned string:
+ *   "?int" / "int|string" / "?app\\model\\dog" / "static"
+ * Builtin spellings are lowercased (PHP types are case-insensitive); class
+ * names keep their declared spelling (matched case-insensitively later).
+ * Returns NULL when no type is present. */
+static TStr *parse_type_decl(Parser *p) {
+    bool nullable = accept(p, P_QUESTION);
+    char buf[512];
+    size_t n = 0;
+    int segs = 0;
     for (;;) {
-        if (p->tok.kind == L_IDENT || p->tok.kind == KW_ARRAY) {
+        const char *seg = NULL;
+        char segbuf[256];
+        if (p->tok.kind == L_IDENT) {
+            /* qualified: A\B\C */
+            size_t k = 0;
+            const char *s = tstr_val(p->tok.ident);
+            for (; s[k] && k < sizeof segbuf - 1; k++) segbuf[k] = s[k];
+            segbuf[k] = 0;
             advance(p);
-            /* qualified type: App\Model\Dog */
             while (p->tok.kind == P_BACKSLASH) {
                 advance(p);
                 if (p->tok.kind != L_IDENT) p_error(p, "Expected name after '\\'");
+                size_t l = strlen(segbuf);
+                if (l + 1 < sizeof segbuf) { segbuf[l] = '\\'; segbuf[l + 1] = 0; }
+                const char *s2 = tstr_val(p->tok.ident);
+                size_t m = strlen(segbuf), j = 0;
+                for (; s2[j] && m + j < sizeof segbuf - 1; j++) segbuf[m + j] = s2[j];
+                segbuf[m + j] = 0;
                 advance(p);
             }
-        }
-        else if (p->tok.kind == KW_SELF || p->tok.kind == KW_PARENT ||
-                 p->tok.kind == KW_STATIC) {   /* keyword types (return types) */
-            advance(p);
-        }
+            /* lowercase builtin spellings (letters only; qualified names
+             * containing '\' keep their declared spelling) */
+            bool all_alpha = true;
+            for (size_t j = 0; segbuf[j]; j++) {
+                char ch = segbuf[j];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
+                    { all_alpha = false; break; }
+            }
+            if (all_alpha) {
+                for (size_t j = 0; segbuf[j]; j++)
+                    if (segbuf[j] >= 'A' && segbuf[j] <= 'Z') segbuf[j] = (char)(segbuf[j] + 32);
+            }
+            seg = segbuf;
+        } else if (p->tok.kind == KW_ARRAY) { seg = "array"; advance(p); }
+        else if (p->tok.kind == KW_SELF) { seg = "self"; advance(p); }
+        else if (p->tok.kind == KW_PARENT) { seg = "parent"; advance(p); }
+        else if (p->tok.kind == KW_STATIC) { seg = "static"; advance(p); }
+        else if (p->tok.kind == KW_NULL) { seg = "null"; advance(p); }
+        else if (p->tok.kind == KW_TRUE) { seg = "true"; advance(p); }
+        else if (p->tok.kind == KW_FALSE) { seg = "false"; advance(p); }
         else break;
+        size_t sl = strlen(seg);
+        if (n + (segs ? 1 : 0) + sl >= sizeof buf - 2)
+            p_error(p, "Type declaration too long");
+        if (segs) buf[n++] = '|';
+        memcpy(buf + n, seg, sl);
+        n += sl;
+        segs++;
         if (!accept(p, P_PIPE)) break;
     }
+    if (!segs) {
+        if (nullable) p_error(p, "Expected type name after '?'");
+        return NULL;
+    }
+    if (nullable) {
+        if (n + 2 >= sizeof buf) p_error(p, "Type declaration too long");
+        memmove(buf + 1, buf, n);
+        buf[0] = '?';
+        n += 1;
+    }
+    buf[n] = 0;
+    return tstr_intern(buf, n);
 }
 
 /* shared parameter list (named functions, closures, arrows) */
@@ -1176,11 +1237,12 @@ static void parse_params(Parser *p, AFunc *f) {
             else if (p->tok.kind == KW_READONLY) { advance(p); pro_readonly = true; }
             else break;
         }
-        skip_type_decl(p);
+        TStr *ptype = parse_type_decl(p);
         bool variadic = accept(p, P_ELLIPSIS);
         if (p->tok.kind != L_VAR) p_error(p, "Expected parameter variable");
         AParam *par = tm_malloc(sizeof(AParam));
         par->name = p->tok.ident;
+        par->type = ptype;
         par->default_val = NULL;
         par->is_variadic = variadic;
         par->is_promoted = pvis >= 0 || pro_readonly;
@@ -1241,7 +1303,7 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
         expect(p, P_LPAREN, "Expected '(' after method name");
         parse_params(p, f);
         expect(p, P_RPAREN, "Expected ')'");
-        if (accept(p, P_COLON)) skip_type_decl(p);
+        if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
         m->tag = CM_METHOD;
         m->func = f;
         if (p->tok.kind == P_LBRACE) {
@@ -1323,10 +1385,18 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
         return m;
     }
 
-    /* property (typed) */
-    if (p->tok.kind == L_VAR) {
+    /* property: [type] $var [= default] — P1-1 typed properties */
+    if (p->tok.kind == L_VAR ||
+        p->tok.kind == P_QUESTION || p->tok.kind == L_IDENT ||
+        p->tok.kind == KW_ARRAY || p->tok.kind == KW_SELF ||
+        p->tok.kind == KW_PARENT || p->tok.kind == KW_STATIC ||
+        p->tok.kind == KW_NULL || p->tok.kind == KW_TRUE ||
+        p->tok.kind == KW_FALSE) {
+        TStr *ptype = parse_type_decl(p);
+        if (p->tok.kind != L_VAR) p_error(p, "Expected property variable after type");
         m->tag = CM_PROP;
         m->prop.name = p->tok.ident;
+        m->prop.type = ptype;
         advance(p);
         if (accept(p, P_ASSIGN)) {
             m->prop.def = parse_expr(p);
@@ -1438,7 +1508,7 @@ static AExpr *parse_closure(Parser *p, bool is_static) {
         }
         expect(p, P_RPAREN, "Expected ')'");
     }
-    if (accept(p, P_COLON)) skip_type_decl(p);
+    if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
     expect(p, P_LBRACE, "Expected '{' for closure body");
     AStmtList *l = asl_new();
     while (p->tok.kind != P_RBRACE) {
@@ -1462,7 +1532,7 @@ static AExpr *parse_arrow_fn(Parser *p) {
     expect(p, P_LPAREN, "Expected '(' after fn");
     parse_params(p, f);
     expect(p, P_RPAREN, "Expected ')'");
-    if (accept(p, P_COLON)) skip_type_decl(p);
+    if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
     expect(p, P_FATARROW, "Expected '=>' after arrow function parameters");
     AStmtList *l = asl_new();
     AStmt *ret = as_new(S_RETURN, line);
@@ -1484,7 +1554,7 @@ static AStmt *parse_function_decl(Parser *p) {
     f->line = line;
     parse_params(p, f);
     expect(p, P_RPAREN, "Expected ')'");
-    if (accept(p, P_COLON)) skip_type_decl(p); /* return type (validated in M2) */
+    if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p); /* P1-1: 运行期校验 */
     expect(p, P_LBRACE, "Expected '{' for function body");
     AStmtList *l = asl_new();
     while (p->tok.kind != P_RBRACE) {

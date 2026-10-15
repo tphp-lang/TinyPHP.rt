@@ -620,22 +620,56 @@ static TVal bi_array_shift(VM *vm, TVal *args, int n) {
 static TVal bi_array_unshift(VM *vm, TVal *args, int n) {
     if (n < 2) RAISE(vm, "ArgumentCountError", "array_unshift() expects at least 2 arguments");
     TArr *a = need_arr(vm, &args[0], "array_unshift", "#1 ($array)");
-    TArr *b = tarr_new();
+    /* 原地前插：新值 + 原元素（字符串键保留、数字键重排，对齐 PHP）。
+     * 旧实现重建数组写回 args[0]——实参副本，调用方收不到（2026-10-15 修） */
+    TVal *vals = tm_malloc(sizeof(TVal) * (size_t)(n - 1 + a->n));
+    bool *is_str = tm_malloc(sizeof(bool) * (size_t)(n - 1 + a->n));
+    TStr **keys = tm_malloc(sizeof(TStr *) * (size_t)(n - 1 + a->n));
+    uint32_t k = 0;
     for (int i = 1; i < n; i++) {
-        tval_addref(args[i]);
-        tarr_append(b, args[i]);
+        vals[k] = args[i];
+        tval_addref(vals[k]);
+        is_str[k] = false;
+        keys[k] = NULL;
+        k++;
+    }
+    for (uint32_t i = 0; i < a->dused && k < (uint32_t)(n - 1) + a->n; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal key = arr_key_at(a, i);
+        vals[k] = a->data[i];
+        tval_addref(vals[k]);
+        if (key.t == T_STR) { is_str[k] = true; keys[k] = (TStr *)key.u.p; tval_addref(key); }
+        else { is_str[k] = false; keys[k] = NULL; }
+        k++;
     }
     for (uint32_t i = 0; i < a->dused; i++) {
-        if (a->data[i].t == T_UNDEF) continue;
-        TVal k = arr_key_at(a, i);
-        TVal v = a->data[i];
-        tval_addref(v);
-        if (k.t == T_STR) tarr_set(b, k, v);
-        else tarr_append(b, v);
+        if (a->data[i].t != T_UNDEF)
+            tval_release(&a->data[i]);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     }
-    tval_release(&args[0]);
-    args[0] = TV_ARR(b);
-    return TV_INT((int64_t)b->n);
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t == T_STR)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    a->n = 0;
+    a->next_idx = 0;
+    a->free_head = UINT32_MAX;
+    a->dused = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        if (is_str[i]) {
+            TVal key = TV_STR(keys[i]);
+            tarr_set(a, key, vals[i]);   /* 所有权转移 */
+            tval_release(&key);
+        } else {
+            tarr_append(a, vals[i]);     /* 所有权转移 */
+        }
+    }
+    tm_free(vals);
+    tm_free(is_str);
+    tm_free(keys);
+    return TV_INT((int64_t)a->n);
 }
 
 static TArr *copy_arr(TArr *a) {
@@ -779,48 +813,84 @@ static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 static TVal bi_sort(VM *vm, TVal *args, int n) {
     (void)n;
     TArr *a = need_arr(vm, &args[0], "sort", "#1 ($array)");
-    TVal vals[MAX_SEQ]; uint32_t cnt = 0;
-    for (uint32_t i = 0; i < a->dused && cnt < MAX_SEQ; i++) {
+    uint32_t cnt = a->n;
+    if (cnt <= 1) return TV_TRUE;
+    /* 原地排序：收集（+1）→ 插入排序 → 清空原数组 → 按序写回。
+     * 旧实现重建新数组后写回 args[0]——args 是实参副本，调用方的槽
+     * 永远收不到，sort/rsort 实际是空操作（2026-10-15 修）。 */
+    TVal *vals = tm_malloc(sizeof(TVal) * cnt);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        vals[cnt++] = a->data[i];
+        vals[k] = a->data[i];
+        tval_addref(vals[k]);
+        k++;
     }
-    for (uint32_t i = 1; i < cnt; i++) {
+    for (uint32_t i = 1; i < k; i++) {
         TVal key = vals[i];
         int64_t j = (int64_t)i - 1;
         while (j >= 0 && loose_cmp(vals[j], key) > 0) { vals[j + 1] = vals[j]; j--; }
         vals[j + 1] = key;
     }
-    TArr *b = tarr_new();
-    for (uint32_t i = 0; i < cnt; i++) {
-        tval_addref(vals[i]);
-        tarr_append(b, vals[i]);
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t != T_UNDEF)
+            tval_release(&a->data[i]);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     }
-    tval_release(&args[0]);
-    args[0] = TV_ARR(b);
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t == T_STR)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    a->n = 0;
+    a->next_idx = 0;
+    a->free_head = UINT32_MAX;
+    a->dused = 0;
+    for (uint32_t i = 0; i < k; i++)
+        tarr_append(a, vals[i]);   /* 所有权转移 */
+    tm_free(vals);
     return TV_TRUE;
 }
 
 static TVal bi_rsort(VM *vm, TVal *args, int n) {
     (void)n;
     TArr *a = need_arr(vm, &args[0], "rsort", "#1 ($array)");
-    TVal vals[MAX_SEQ]; uint32_t cnt = 0;
-    for (uint32_t i = 0; i < a->dused && cnt < MAX_SEQ; i++) {
+    uint32_t cnt = a->n;
+    if (cnt <= 1) return TV_TRUE;
+    /* 原地排序（同 bi_sort；旧实现写回 args[0] 无效） */
+    TVal *vals = tm_malloc(sizeof(TVal) * cnt);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        vals[cnt++] = a->data[i];
+        vals[k] = a->data[i];
+        tval_addref(vals[k]);
+        k++;
     }
-    for (uint32_t i = 1; i < cnt; i++) {
+    for (uint32_t i = 1; i < k; i++) {
         TVal key = vals[i];
         int64_t j = (int64_t)i - 1;
         while (j >= 0 && loose_cmp(vals[j], key) < 0) { vals[j + 1] = vals[j]; j--; }
         vals[j + 1] = key;
     }
-    TArr *b = tarr_new();
-    for (uint32_t i = 0; i < cnt; i++) {
-        tval_addref(vals[i]);
-        tarr_append(b, vals[i]);
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t != T_UNDEF)
+            tval_release(&a->data[i]);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     }
-    tval_release(&args[0]);
-    args[0] = TV_ARR(b);
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t == T_STR)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    a->n = 0;
+    a->next_idx = 0;
+    a->free_head = UINT32_MAX;
+    a->dused = 0;
+    for (uint32_t i = 0; i < k; i++)
+        tarr_append(a, vals[i]);   /* 所有权转移 */
+    tm_free(vals);
     return TV_TRUE;
 }
 

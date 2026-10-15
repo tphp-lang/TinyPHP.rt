@@ -71,7 +71,12 @@ typedef struct TOp {
 /* per-function exception table (try regions; handler = catch chain entry) */
 typedef struct TExEntry {
     uint32_t start_pc, end_pc, handler_pc;
-    const uint16_t *catch_cls;   /* indexes into tphp_ex_classes[] */
+    const uint16_t *catch_cls;   /* indexes into tphp_ex_classes[] (builtin
+                                    fast path; entry i valid when catch_nm[i]
+                                    is NULL) */
+    const TStr **catch_nm;       /* P1-2: per-catch resolved class NAME (user
+                                    exception classes and namespaced builtins);
+                                    matching walks names across both worlds */
     uint8_t n_catches;
     uint8_t has_var;             /* 0 = catch without variable binding */
     uint16_t catch_slot;         /* CV slot receiving the exception object */
@@ -81,6 +86,8 @@ typedef struct TFunc {
     TStr *name;
     uint16_t n_params, n_locals, n_tmps; /* slots: [0..n_params) args, then locals, then tmps */
     TStr  **local_names;   /* n_locals entries (first n_params are parameter names) */
+    TStr  **param_types;   /* n_params entries; NULL = untyped (P1-1) */
+    TStr   *ret_type;      /* declared return type; NULL = none (P1-1) */
     TVal   *defaults;      /* n_params entries; T_UNDEF marker = required */
     uint16_t *default_thunk; /* per-param thunk TFunc index (0 = none) */
     bool    *is_global;    /* slot is a `global` alias */

@@ -67,6 +67,8 @@ typedef struct { AArg *items; int n; } AArgList;
 
 typedef struct AParam {
     TStr *name;
+    TStr *type;             /* declared type, normalized ("?int", "int|string",
+                               "app\\model\\dog"); NULL = none (P1-1) */
     AExpr *default_val;   /* NULL when required */
     bool is_variadic;     /* ...$args (last param only) */
     bool is_promoted;     /* constructor property promotion (M3) */
@@ -79,6 +81,7 @@ typedef struct AFunc {
     AExprList *uses;      /* closure `use ($a, $b)` — A_VAR exprs; NULL */
     bool is_static;
     AStmtList *body;
+    TStr *ret_type;       /* declared return type, normalized; NULL = none */
     int line;
 } AFunc;
 typedef struct ACatch {
@@ -207,7 +210,7 @@ typedef struct AClassMember {
     uint8_t vis;
     bool is_static, is_abstract, is_final, is_readonly;
     AFunc *func;
-    struct { TStr *name; AExpr *def; } prop;
+    struct { TStr *name; TStr *type; AExpr *def; } prop;   /* type: P1-1 */
     struct { TStr **names; int n; AModList *mods; } use;
 } AClassMember;
 

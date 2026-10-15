@@ -1887,17 +1887,24 @@ static void compile_stmt(Ctx *c, AStmt *s) {
                 TFunc *fn = c->fn;
                 fn->ex = tm_realloc(fn->ex, sizeof(TExEntry) * (size_t)(fn->n_ex + 1));
                 TExEntry *ent = &fn->ex[fn->n_ex++];
-                ent->start_pc = start; ent->end_pc = end; ent->handler_pc = handler_pc;
+                /* end+1：把 try 体后的边界 JMP 纳入保护区。DO_FCALL 压帧前
+                 * 会把调用方 pc 前推到边界（vm.c op_do_fcall），若调用是 try
+                 * 体最后一条 op，pc == end 恰好落在排他区间外，跨帧 catch
+                 * 会整段错过 handler（2026-10-15 审计 P0-1）。JMP 自身不会
+                 * raise，纳入无副作用；嵌套区间的相对次序不变。 */
+                ent->start_pc = start; ent->end_pc = end + 1; ent->handler_pc = handler_pc;
                 uint16_t *cls = tm_malloc(sizeof(uint16_t) * (size_t)ct->n_cls);
+                const TStr **nm = tm_malloc(sizeof(TStr *) * (size_t)ct->n_cls);
                 for (int k = 0; k < ct->n_cls; k++) {
                     TStr *cn = resolve_class_name(ct->cls[k]);
+                    /* P1-2: 内置异常类（TExClass 索引快路）+ 用户异常类
+                     * （TClass 名字路径，exclass.c 注册的内部类也走名字） */
                     int ci = tphp_ex_class_index(tstr_val(cn));
-                    if (ci < 0)
-                        tphp_fatal_src(c->file, s->line,
-                                       "Unknown exception class in catch");
-                    cls[k] = (uint16_t)ci;
+                    cls[k] = (uint16_t)(ci >= 0 ? ci : 0xFFFF);
+                    nm[k] = cn;
                 }
                 ent->catch_cls = cls;
+                ent->catch_nm = nm;
                 ent->n_catches = (uint8_t)ct->n_cls;
                 ent->has_var = ct->var ? 1 : 0;
                 ent->catch_slot = slot >= 0 ? (uint16_t)slot : 0;
@@ -1954,17 +1961,18 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             TFunc *fn = c->fn;
             fn->ex = tm_realloc(fn->ex, sizeof(TExEntry) * (size_t)(fn->n_ex + 1));
             TExEntry *ent = &fn->ex[fn->n_ex++];
-            ent->start_pc = start; ent->end_pc = end; ent->handler_pc = handler_pc;
+            /* end+1 同 !has_fin 路径：边界纳入保护区（P0-1，见上注释） */
+            ent->start_pc = start; ent->end_pc = end + 1; ent->handler_pc = handler_pc;
             uint16_t *cls = tm_malloc(sizeof(uint16_t) * (size_t)ct->n_cls);
+            const TStr **nm = tm_malloc(sizeof(TStr *) * (size_t)ct->n_cls);
             for (int k = 0; k < ct->n_cls; k++) {
                 TStr *cn = resolve_class_name(ct->cls[k]);
                 int ci = tphp_ex_class_index(tstr_val(cn));
-                if (ci < 0)
-                    tphp_fatal_src(c->file, s->line,
-                                   "Unknown exception class in catch");
-                cls[k] = (uint16_t)ci;
+                cls[k] = (uint16_t)(ci >= 0 ? ci : 0xFFFF);
+                nm[k] = cn;
             }
             ent->catch_cls = cls;
+            ent->catch_nm = nm;
             ent->n_catches = (uint8_t)ct->n_cls;
             ent->has_var = ct->var ? 1 : 0;
             ent->catch_slot = slot >= 0 ? (uint16_t)slot : 0;
@@ -1976,11 +1984,14 @@ static void compile_stmt(Ctx *c, AStmt *s) {
             TFunc *fn = c->fn;
             fn->ex = tm_realloc(fn->ex, sizeof(TExEntry) * (size_t)(fn->n_ex + 1));
             TExEntry *ent = &fn->ex[fn->n_ex++];
-            ent->start_pc = start; ent->end_pc = end; ent->handler_pc = fin3;
+            ent->start_pc = start; ent->end_pc = end + 1; ent->handler_pc = fin3;
             int ci = tphp_ex_class_index("Throwable");
             uint16_t *cls = tm_malloc(sizeof(uint16_t));
-            cls[0] = (uint16_t)ci;
+            cls[0] = (uint16_t)(ci >= 0 ? ci : 0xFFFF);
             ent->catch_cls = cls;
+            const TStr **nm = tm_malloc(sizeof(TStr *));
+            nm[0] = tstr_intern("Throwable", 9);
+            ent->catch_nm = nm;
             ent->n_catches = 1;
             ent->has_var = 0;
             ent->catch_slot = 0;
@@ -2318,6 +2329,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
     TFunc *f = tm_malloc(sizeof *f);
     memset(f, 0, sizeof *f);
     f->name = af->name;
+    f->ret_type = af->ret_type;   /* P1-1 */
     f->is_closure = is_closure;
     f->is_method = is_method;
     f->is_variadic = af->n_params > 0 && af->params[af->n_params - 1]->is_variadic;
@@ -2342,6 +2354,13 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
         for (int j = 0; j < af->body->n; j++)
             collect_stmt_vars(af->body->stmts[j], uses, af->params, af->n_params);
     }
+    /* P1-3: 方法内创建的闭包自动捕获 $this（static 闭包除外，对齐 PHP）。
+     * compile_closure_expr 侧以同一顺序重算该列表做 SEND_CAP——两处都靠
+     * add_use 的指针去重保持幂等/一致。 */
+    if (is_closure && decl_cls && !af->is_static) {
+        if (!uses) uses = ael_new_c();
+        add_use(uses, tstr_intern("this", 4), af->line);
+    }
     if (uses) {
         for (int i = 0; i < uses->n; i++) {
             get_var(&c, uses->items[i]->u.name);
@@ -2352,9 +2371,11 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
     if (af->n_params) {
         f->defaults = tm_malloc(sizeof(TVal) * (size_t)af->n_params);
         f->default_thunk = tm_malloc(sizeof(uint16_t) * (size_t)af->n_params);
+        f->param_types = tm_malloc(sizeof(TStr *) * (size_t)af->n_params);
         for (int i = 0; i < af->n_params; i++) {
             get_var(&c, af->params[i]->name);
             f->default_thunk[i] = 0;
+            f->param_types[i] = af->params[i]->type;   /* P1-1 */
             if (af->params[i]->default_val) {
                 bool ok = true;
                 TVal d = eval_const2(&c, af->params[i]->default_val, &ok);
@@ -2392,13 +2413,22 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
 static Loc compile_closure_expr(Ctx *c, AExpr *e, Loc want) {
     AFunc *af = e->u.clo.func;
     bool auto_capture = e->tag == A_ARROW;
-    uint16_t idx = compile_fn_like(c->prog, af, c, true, auto_capture, false, NULL, c->file);
     AExprList *uses = af->uses;
     if (auto_capture) {
         uses = ael_new_c();
         for (int j = 0; j < af->body->n; j++)
             collect_stmt_vars(af->body->stmts[j], uses, af->params, af->n_params);
     }
+    /* P1-3: 方法内创建的闭包自动捕获 $this（static 闭包除外，对齐 PHP），
+     * 闭包 TFunc 继承声明类作用域——private/protected 访问与 self:: 解析
+     * 随闭包生效。捕获源是外层方法帧的 CV 0，SEND_CAP 按名取。 */
+    TClass *scope = c->fn->decl_cls;
+    if (scope && !af->is_static) {
+        if (!uses) uses = ael_new_c();
+        add_use(uses, tstr_intern("this", 4), e->line);
+    }
+    uint16_t idx = compile_fn_like(c->prog, af, c, true, auto_capture, false,
+                                   scope, c->file);
     if (uses) {
         for (int i = 0; i < uses->n; i++) {
             TStr *name = uses->items[i]->u.name;
@@ -2546,16 +2576,36 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             TProp prop;
             memset(&prop, 0, sizeof prop);
             prop.name = mem->prop.name;
+            prop.type = mem->prop.type;   /* P1-1: 运行期赋值校验 */
             prop.visibility = mem->vis;
             prop.is_static = mem->is_static;
             prop.is_readonly = mem->is_readonly;
             prop.defval = (TVal){ .u.i = 0, .t = T_UNDEF };
+            /* PHP：readonly 属性必须有类型 */
+            if (prop.is_readonly && !prop.type)
+                tphp_fatal_src(file, mem->line,
+                               "Readonly property %s::$%s must have type",
+                               cd->name ? tstr_val(cd->name) : "?",
+                               tstr_val(mem->prop.name));
             if (mem->prop.def) {
                 Ctx dc; memset(&dc, 0, sizeof dc);
                 dc.file = file;
                 bool ok = true;
                 TVal d = eval_const2(&dc, mem->prop.def, &ok);
-                if (ok) prop.defval = d;
+                if (ok) {
+                    prop.defval = d;
+                    /* PHP：默认值在声明期按类型校验（常量默认值部分） */
+                    if (prop.type) {
+                        const char *given = NULL;
+                        if (!tphp_type_accepts(tstr_val(prop.type), d, NULL, &given))
+                            tphp_fatal_src(file, mem->line,
+                                           "Default value for property %s::$%s of type %s cannot be %s",
+                                           cd->name ? tstr_val(cd->name) : "?",
+                                           tstr_val(mem->prop.name),
+                                           tstr_val(prop.type),
+                                           given ? given : "?");
+                    }
+                }
                 else prop.def_thunk = compile_thunk(p, mem->prop.def, file);
             }
             if (prop.is_static) {

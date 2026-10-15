@@ -37,6 +37,10 @@ void tphp_io_init(void);
 void tphp_worker_init(void);
 /* ffi.c：FFI / FFI\CData 内部类注册（编译前；幂等） */
 void tphp_ffi_init(void);
+/* exclass.c：内置异常层级注册为 TClass（P1-2，编译前；幂等） */
+void tphp_exclass_init(void);
+/* vm.c：Closure 内部类注册（P1-3，编译前；幂等） */
+void tphp_closure_class_init(void);
 /* pack.c：M6.1 原生资产打包（构建 + 启动释放，跨平台） */
 #include "pack.h"
 
@@ -443,6 +447,8 @@ static int run_source(const char *src, const char *name, bool dump) {
     tphp_async_init();            /* 内部类先于编译期类检查注册 */
     tphp_io_init();
     tphp_ffi_init();              /* M5.5 FFI 内部类 */
+    tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
+    tphp_closure_class_init();    /* P1-3: Closure 内部类 */
     if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
     AStmtList *ast = tphp_parse_script(src, name);
     if (g_debug) fprintf(stderr, "DIAG:parse-ok stmts=%d\n", ast ? ast->n : -1);

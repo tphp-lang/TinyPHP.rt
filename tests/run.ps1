@@ -3,6 +3,10 @@
 # Each EXPECT line is compared (exact) against the script's stdout lines.
 # Cross-platform: Windows (tphp.exe) and Unix (tphp) via pwsh/powershell.
 $ErrorActionPreference = "Continue"
+# Child stdout is raw UTF-8 (tphp sets CP_UTF8 on Windows); without pinning
+# the decode here, a 936-CP console turns Chinese EXPECT lines into mojibake
+# non-deterministically (console CP is process-shared state).
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $root = Split-Path -Parent $PSScriptRoot
 $onWindows = ($env:OS -eq 'Windows_NT') -or ($IsWindows -eq $true)
 if ($onWindows) {
