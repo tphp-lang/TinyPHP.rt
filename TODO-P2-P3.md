@@ -78,8 +78,8 @@
 - 状态：**125 passed / 0 failed**
 
 ### 本段发现的新 bug（未修，下次优先）
-1. **`new SameClass()` 在 static 方法内编译期报 "Class not found"**（HEAD 即复现，非本段引入）：`class Solo { static function make(): Solo { return new Solo(); } }` → A_NEW 编译期 lookup 失败。疑与 pass 1.5 注册顺序 / c45c8b7 的 A_NEW 改动有关。**影响面大（自工厂方法模式全挂），建议最优先**
-2. **try 块内的类声明被静默丢弃**：`try { class X {} }` → pass_classes 只递归 S_BLOCK，不递归 S_TRY（及其它包裹语句）→ X 既不注册也不报错（PHP 会提升声明）。q2 探针复现
+1. ~~**`new SameClass()` 在 static 方法内编译期报 "Class not found"**~~ ✅ 已修（f307961 compile_class_decl 提前注册自工厂；2026-10-15 复核 probe ok）
+2. ~~**try 块内的类声明被静默丢弃**~~ ✅ 已修（pass_classes/pass_funcs/pass_sigs 增加 S_TRY 递归；**同时收窄**：不进 if/循环/switch——与 PHP 8 条件声明语义一致，if(false){class X} 不定义。测试 tests/oop/test-oop-try-hoist.php）
 3. FCC 闭包与数组 callable **不重查可见性**（绑私有方法可绕过）——上一段 TODO 遗留
 4. 类常量惰性求值与 freeze 交互未验证：worker 线程克隆后 thunk 求值路径待测
 

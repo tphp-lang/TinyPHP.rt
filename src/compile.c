@@ -2295,6 +2295,15 @@ static void scan_globals_stmt(AStmt *s, TStr ***out, int *n, int *cap) {
     case S_BLOCK:
         scan_globals_list(s->u.stmts, out, n, cap);
         break;
+    case S_TRY:
+        if (s->u.trys) {
+            scan_globals_list(s->u.trys->body, out, n, cap);
+            for (int c = 0; c < s->u.trys->n_catches; c++)
+                scan_globals_list(s->u.trys->catches[c]->body, out, n, cap);
+            if (s->u.trys->finally)
+                scan_globals_list(s->u.trys->finally, out, n, cap);
+        }
+        break;
     case S_FUNCDECL:
         scan_globals_list(s->u.func->body, out, n, cap);
         break;
@@ -2938,13 +2947,34 @@ static void apply_use_list(AUseList *ul) {
 
 /* NS-aware statement walks; declarations inside namespace blocks unfold
  * like top-level ones (plain blocks recurse too, matching hoisting) */
+static void pass_sigs(AStmtList *l, FnSig **sigs, int *n_sigs, int *cap_sigs);
+
+static void pass_sigs_into(AStmtList *body, FnSig **sigs, int *n_sigs, int *cap_sigs) {
+    if (body) pass_sigs(body, sigs, n_sigs, cap_sigs);
+}
+
 static void pass_sigs(AStmtList *l, FnSig **sigs, int *n_sigs, int *cap_sigs) {
+    if (!l) return;
     for (int i = 0; i < l->n; i++) {
         AStmt *st = l->stmts[i];
         if (st->tag == S_NS_BEGIN) { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_NS_END)   { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_USE)      { apply_use_list(st->u.use); continue; }
-        if (st->tag == S_BLOCK)    { pass_sigs(st->u.stmts, sigs, n_sigs, cap_sigs); continue; }
+        switch (st->tag) {
+        case S_BLOCK:
+            pass_sigs_into(st->u.stmts, sigs, n_sigs, cap_sigs);
+            continue;
+        case S_TRY:
+            if (st->u.trys) {
+                pass_sigs_into(st->u.trys->body, sigs, n_sigs, cap_sigs);
+                for (int c = 0; c < st->u.trys->n_catches; c++)
+                    pass_sigs_into(st->u.trys->catches[c]->body, sigs, n_sigs, cap_sigs);
+                pass_sigs_into(st->u.trys->finally, sigs, n_sigs, cap_sigs);
+            }
+            continue;
+        default:
+            break;
+        }
         if (st->tag != S_FUNCDECL) continue;
         AFunc *af = st->u.func;
         bool fb;
@@ -2966,13 +2996,38 @@ static void pass_sigs(AStmtList *l, FnSig **sigs, int *n_sigs, int *cap_sigs) {
     }
 }
 
+/* 包裹语句内仍要提升 class/function 声明（PHP 语义：声明编译期可见，
+ * if(false){class X{}} 也能 new X）。覆盖 BLOCK/控制流/try。 */
+static void pass_classes(AStmtList *l, Program *p, const char *file);
+
+static void pass_classes_into(AStmtList *body, Program *p, const char *file) {
+    if (body) pass_classes(body, p, file);
+}
+
 static void pass_classes(AStmtList *l, Program *p, const char *file) {
+    if (!l) return;
     for (int i = 0; i < l->n; i++) {
         AStmt *st = l->stmts[i];
         if (st->tag == S_NS_BEGIN) { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_NS_END)   { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_USE)      { apply_use_list(st->u.use); continue; }
-        if (st->tag == S_BLOCK)    { pass_classes(st->u.stmts, p, file); continue; }
+        /* 递归进 BLOCK 与 TRY（PHP：try 内声明无条件执行；
+         * if/循环/switch 内为条件声明，PHP 不提升——不进） */
+        switch (st->tag) {
+        case S_BLOCK:
+            pass_classes_into(st->u.stmts, p, file);
+            continue;
+        case S_TRY:
+            if (st->u.trys) {
+                pass_classes_into(st->u.trys->body, p, file);
+                for (int c = 0; c < st->u.trys->n_catches; c++)
+                    pass_classes_into(st->u.trys->catches[c]->body, p, file);
+                pass_classes_into(st->u.trys->finally, p, file);
+            }
+            continue;
+        default:
+            break;
+        }
         if (st->tag != S_CLASSDECL) continue;
         AClassDecl *cd = st->u.cls;
         if (s_cur_ns && tstr_len(s_cur_ns))
@@ -2984,13 +3039,34 @@ static void pass_classes(AStmtList *l, Program *p, const char *file) {
     }
 }
 
+static void pass_funcs(AStmtList *l, Program *p, const char *file);
+
+static void pass_funcs_into(AStmtList *body, Program *p, const char *file) {
+    if (body) pass_funcs(body, p, file);
+}
+
 static void pass_funcs(AStmtList *l, Program *p, const char *file) {
+    if (!l) return;
     for (int i = 0; i < l->n; i++) {
         AStmt *st = l->stmts[i];
         if (st->tag == S_NS_BEGIN) { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_NS_END)   { s_cur_ns = st->u.name; continue; }
         if (st->tag == S_USE)      { apply_use_list(st->u.use); continue; }
-        if (st->tag == S_BLOCK)    { pass_funcs(st->u.stmts, p, file); continue; }
+        switch (st->tag) {
+        case S_BLOCK:
+            pass_funcs_into(st->u.stmts, p, file);
+            continue;
+        case S_TRY:
+            if (st->u.trys) {
+                pass_funcs_into(st->u.trys->body, p, file);
+                for (int c = 0; c < st->u.trys->n_catches; c++)
+                    pass_funcs_into(st->u.trys->catches[c]->body, p, file);
+                pass_funcs_into(st->u.trys->finally, p, file);
+            }
+            continue;
+        default:
+            break;
+        }
         if (st->tag != S_FUNCDECL) continue;
         AFunc *af = st->u.func;
         af->name = resolve_decl_name(af->name);
