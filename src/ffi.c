@@ -321,7 +321,8 @@ static void check_no_preproc(const char *code) {
 
 static FFIType *parse_type(CParser *cp, FFIScope *sc);
 static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
-                                 char *name_out, size_t name_cap);
+                                 char *name_out, size_t name_cap,
+                                 bool unnamed_ok);
 static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                                  const char *sname);
 
@@ -448,9 +449,50 @@ static FFIType *lookup_type_name(CParser *cp, FFIScope *sc) {
 }
 
 static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
-                                 char *name_out, size_t name_cap) {
+                                 char *name_out, size_t name_cap,
+                                 bool unnamed_ok) {
     (void)sc;
     FFIType *t = apply_pointers(cp, base);
+    /* 函数指针：(*name)(params) —— 占位为指针大小。参数表整段跳过
+     * （深度平衡），嵌套声明无需展开；C 回调 trampoline 留待后续。 */
+    if (cp->tkind == 3 && cp->tok[0] == '(') {
+        const char *save = cp->p;
+        int skind = cp->tkind;
+        char stok[256];
+        memcpy(stok, cp->tok, sizeof stok);
+        cnext(cp);
+        if (cp->tkind == 3 && cp->tok[0] == '*') {
+            cnext(cp);
+            if (cp->tkind == 1) {
+                if (name_out && name_cap) snprintf(name_out, name_cap, "%s", cp->tok);
+                cnext(cp);
+                if (cp->tkind == 3 && cp->tok[0] == ')') {
+                    cnext(cp);
+                    if (cis(cp, "(")) {
+                        cnext(cp);
+                        int depth = 1;
+                        while (cp->tkind != 0 && depth > 0) {
+                            if (cp->tkind == 3 && cp->tok[0] == '(') depth++;
+                            else if (cp->tkind == 3 && cp->tok[0] == ')') depth--;
+                            if (depth == 0) break;
+                            cnext(cp);
+                        }
+                        cexpect(cp, ")");
+                        return type_new(FFI_PTR, sizeof(void *), sizeof(void *));
+                    }
+                }
+            }
+        }
+        /* 不是函数指针：回退重解析 */
+        cp->p = save; cp->tkind = skind;
+        memcpy(cp->tok, stok, sizeof cp->tok);
+        t = apply_pointers(cp, base);
+    }
+    /* 无名参数（仅参数位允许）：(int) / (const char *) */
+    if (unnamed_ok && cp->tkind == 3 && (cp->tok[0] == ',' || cp->tok[0] == ')')) {
+        if (name_out && name_cap) name_out[0] = 0;
+        return t;
+    }
     /* cdef 路径：名字必填；类型表达式路径由 parse_type_expr 单独处理 */
     if (cp->tkind != 1)
         tphp_raise("ValueError",
@@ -604,7 +646,7 @@ static void parse_function(CParser *cp, FFIScope *sc, FFIType *ret, const char *
             if (!pb)
                 tphp_raise("ValueError", "FFI::cdef(): bad parameter type near \"%s\"", cp->tok);
             char pn[128] = {0};
-            FFIType *pt = parse_declarator(cp, sc, pb, pn, sizeof pn);
+            FFIType *pt = parse_declarator(cp, sc, pb, pn, sizeof pn, true);
             if (pt->code == FFI_ARRAY) {
                 FFIType *p = type_new(FFI_PTR, sizeof(void *), sizeof(void *));
                 p->array_elem = pt->array_elem;
@@ -866,7 +908,7 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                     tphp_raise("ValueError", "FFI::cdef(): unknown type \"%s\"", nbuf);
                 cnext(cp);
             } else if (named && !cis(cp, "{")) {
-                /* 已命名类型引用：struct Foo field; / union U u; */
+                /* 已命名类型引用：struct Foo field; / struct Foo *ptr; / union U u; */
                 emb = NULL;
                 for (int i = 0; i < sc->n_types; i++)
                     if (sc->types[i]->name && strcmp(sc->types[i]->name, nbuf) == 0) {
@@ -874,7 +916,8 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                     }
                 if (!emb)
                     tphp_raise("ValueError", "FFI::cdef(): unknown type \"%s\"", nbuf);
-                /* 名字已消费，当前在字段名上 */
+                /* 名字已消费；支持 `struct Foo *ptr` / `**pp`（当前在 * 或字段名上） */
+                emb = apply_pointers(cp, emb);
             } else {
                 emb = parse_named_body(cp, sc, en, named ? nbuf : NULL);
                 /* 内嵌 union：重算布局 */
@@ -929,7 +972,7 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
             tphp_raise("ValueError", "FFI::cdef(): bad field type near \"%s\"", cp->tok);
         for (;;) {
             char fname[128] = {0};
-            FFIType *ft = parse_declarator(cp, sc, base, fname, sizeof fname);
+            FFIType *ft = parse_declarator(cp, sc, base, fname, sizeof fname, false);
             if (t->n_fields >= cap) {
                 cap *= 2;
                 t->fields = tm_realloc(t->fields, sizeof(*t->fields) * (size_t)cap);

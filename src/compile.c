@@ -3315,6 +3315,11 @@ static void expand_includes(AStmtList *stmts, const char *cur_file) {
             continue;
         }
         const char *rel = tstr_val(st->u.inc.path);
+        /* 包含方当前命名空间（out 中最后一个 S_NS_BEGIN）：被包含文件的
+         * namespace X; 不得泄漏到 require 之后的语句（PHP 按文件划分） */
+        TStr *prev_ns = NULL;
+        for (int k = 0; k < n_out; k++)
+            if (out[k]->tag == S_NS_BEGIN) prev_ns = out[k]->u.name;
         /* M6: 先查内嵌 bundle 表（单 exe）；命中用内嵌源码 */
         char bname[128];
         tphp_bundle_name_of(rel, bname, sizeof bname);
@@ -3330,6 +3335,10 @@ static void expand_includes(AStmtList *stmts, const char *cur_file) {
             }
             tm_free(inc->stmts);
             tm_free(inc);
+            AStmt *restore = as_new_c(S_NS_BEGIN, st->line);
+            restore->u.name = prev_ns;   /* NULL = 回全局 */
+            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+            out[n_out++] = restore;
             continue;
         }
         char *dir = cur_file ? dir_of(cur_file) : NULL;
@@ -3353,6 +3362,10 @@ static void expand_includes(AStmtList *stmts, const char *cur_file) {
         }
         tm_free(inc->stmts);
         tm_free(inc);
+        AStmt *restore2 = as_new_c(S_NS_BEGIN, st->line);
+        restore2->u.name = prev_ns;
+        out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+        out[n_out++] = restore2;
     }
     if (out) {
         stmts->stmts = out;
