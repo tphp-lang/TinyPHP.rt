@@ -51,6 +51,7 @@ typedef enum {
     A_STATICGET,      /* u.scall {cls, member}: self::KONST (consts first) */
     A_INSTANCEOF,     /* u.bin {l: expr, r: A_CONSTREF class name} */
     A_CLONE,          /* u.e: clone $obj (calls __clone when defined) */
+    A_OBJSTATIC,      /* P2-B $obj::$prop: u.prop {obj, name}; name 带 '$' */
 } ANTag;
 
 typedef struct { AExpr *key; AExpr *val; bool is_spread; } AArrayItem;

@@ -30,7 +30,7 @@
 | ~~trait 常量不导入~~ | ✅ 完成（6e24bdc；bind_traits 导入，同名已有者保留——PHP 8.3 真 collision fatal 近似跳过，P3 对拍收紧） | |
 | 子类静态属性重声明失效 | 现状不变 | class.c add_sprop（~358）：同名"keep parent slot" |
 | ~~数组/字符串 callable~~ | ✅ 完成（5f1629e；op_init_dyn + tphp_vm_call_callable 双路径：[$obj,'m']/['Cls','m']/'Cls::m'（最后一个 :: 分割）+ native 方法；usort/array_map/call_user_func 全通。**TODO：这些形态不重查可见性**） | |
-| `$obj::$x` 实例访问静态属性 | 现状不变 | parse.c:677 |
+| `$obj::$x` 实例访问静态属性 | ⚠️ WIP（2026-10-15 收工，工作区已提交）：ast.h A_OBJSTATIC + compile 读/赋/assign-op + opcode FETCH_OSPROP/ASSIGN_OSPROP 已写；**未完成**：① parse.c P_DOUBLE_COLON 分支判错（tok 还是 `::` 就比 L_VAR，死代码）② is_lvalue 未放行 A_OBJSTATIC ③ vm.c 无 handler、handler 表/名字表未登记 ④ 维写回/++/isset/empty 未接。126 全绿因 parse 死代码不触发 |
 
 验收样例全部与 PHP 对拍（尤其 trait 常量冲突语义、子类静态属性独立存储）。
 

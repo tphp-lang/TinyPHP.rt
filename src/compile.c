@@ -916,6 +916,18 @@ static Loc compile_assign(Ctx *c, AExpr *e, Loc want) {
         }
         return rv;
     }
+    if (t->tag == A_OBJSTATIC) {
+        /* $obj::$prop = v */
+        Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+        Loc rv = compile_expr(c, v, LOC_NONE);
+        emit(c, OP_ASSIGN_OSPROP, obj,
+             LOC_CONST(lit_str(c, t->u.prop.name)), rv, e->line);
+        if (want.kind != OPD_UNUSED) {
+            emit(c, OP_COPY, rv, LOC_NONE, want, e->line);
+            return want;
+        }
+        return rv;
+    }
     tphp_fatal_src(c->file, t->line, "Cannot assign to this expression");
 }
 
@@ -1022,6 +1034,20 @@ static Loc compile_assign_op(Ctx *c, AExpr *e, Loc want) {
         Loc rv = compile_expr(c, v, LOC_NONE);
         emit(c, opc, mid, rv, mid, e->line);
         emit(c, OP_ASSIGN_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        if (want.kind != OPD_UNUSED) {
+            emit(c, OP_COPY, mid, LOC_NONE, want, e->line);
+            return want;
+        }
+        return mid;
+    }
+    if (t->tag == A_OBJSTATIC) {
+        /* $obj::$p op= v */
+        Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+        Loc mid = LOC_TMP(tmp_new(c));
+        emit(c, OP_FETCH_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        Loc rv = compile_expr(c, v, LOC_NONE);
+        emit(c, opc, mid, rv, mid, e->line);
+        emit(c, OP_ASSIGN_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, mid, LOC_NONE, want, e->line);
             return want;
@@ -1684,6 +1710,14 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         Loc src = compile_expr(c, e->u.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         emit(c, OP_CLONE, src, LOC_NONE, dst, e->line);
+        return dst;
+    }
+    case A_OBJSTATIC: {
+        /* $obj::$prop read */
+        Loc obj = compile_expr(c, e->u.prop.obj, LOC_NONE);
+        Loc dst = tmp_dst(c, want);
+        emit(c, OP_FETCH_OSPROP, obj,
+             LOC_CONST(lit_str(c, e->u.prop.name)), dst, e->line);
         return dst;
     }
     case A_PIPELINE: {

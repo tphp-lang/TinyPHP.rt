@@ -722,6 +722,22 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             TStr *cls = NULL;
             if (e->tag == A_CONSTREF) {
                 cls = e->u.name;
+            } else if (p->tok.kind == L_VAR) {
+                /* P2-B: $obj::$staticProp (read / assign target) */
+                const char *vn = tstr_val(p->tok.ident);
+                size_t vn_len = tstr_len(p->tok.ident);
+                char sbuf[160];
+                sbuf[0] = '$';
+                size_t cl = vn_len < sizeof sbuf - 2 ? vn_len : sizeof sbuf - 2;
+                memcpy(sbuf + 1, vn, cl);
+                sbuf[cl + 1] = 0;
+                TStr *member = tstr_intern(sbuf, cl + 1);
+                advance(p);
+                AExpr *os = ae_new(A_OBJSTATIC, line);
+                os->u.prop.obj = e;
+                os->u.prop.name = member;
+                e = os;
+                break;
             } else {
                 /* only `::class` may follow a value: Status::Active::class */
                 advance(p);
