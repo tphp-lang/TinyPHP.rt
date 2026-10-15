@@ -1479,7 +1479,8 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);
 
 static void need_callable(VM *vm, TVal *v, const char *fn, const char *arg) {
     if (v->t == T_CLOSURE) return;
-    if (v->t == T_STR) return;   /* 函数名 */
+    if (v->t == T_STR) return;   /* 函数名或 'Cls::m' */
+    if (v->t == T_ARR) return;   /* P2-B: [$obj,'m'] / ['Cls','m'] */
     RAISE(vm, "TypeError", "%s(): Argument %s must be callable, %s given",
           fn, arg, type_name(v->t));
 }

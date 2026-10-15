@@ -854,6 +854,51 @@ static int32_t op_init_fcall(VM *vm, TOp *op) {
     return 1;
 }
 
+/* P2-B: dispatch a class+method pair from an array ['Cls','m']/[$obj,'m']
+ * or a 'Cls::m' string callable; fills the call rec. o = receiver
+ * (NULL = plain static call). Visibility is not re-checked (same as the
+ * __invoke branch — known simplification). */
+static void init_method_callable(VM *vm, TOp *op, VMCallRec *rec,
+                                 TClass *cls, TObj *o, TStr *mname) {
+    char mlc[128];
+    { const char *s = tstr_val(mname);
+      size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+          mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+      mlc[k] = 0; }
+    tphp_class_ensure_flat(cls);
+    TMethod *m = tphp_class_find_method(cls, mlc);
+    if (!m || (!m->fn && !m->native) || m->is_abstract)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Call to undefined method %s::%s()",
+                 tstr_val(cls->name), tstr_val(mname));
+    if (o && !m->is_static) {
+        rec->is_method = true;
+        rec->called_cls = cls;
+        rec->this_obj = o;
+        tval_addref(TV_OBJ(o));          /* the rec owns a receiver ref */
+        if (!m->fn && m->native) {
+            rec->is_builtin = true;
+            rec->nm_fn = m->native;
+        } else {
+            rec->uf = m->fn;
+        }
+        return;
+    }
+    if (!m->is_static)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Non-static method %s::%s() called statically",
+                 tstr_val(cls->name), tstr_val(mname));
+    if (!m->fn && m->native) {           /* static native (Worker::self 等) */
+        rec->is_builtin = true;
+        rec->nm_fn = m->native;
+        rec->called_cls = cls;
+    } else {
+        rec->is_method = true;
+        rec->called_cls = cls;
+        rec->uf = m->fn;
+    }
+}
+
 static int32_t op_init_dyn(VM *vm, TOp *op) {
     TVal fv = rdv(vm, op, 1);
     VMCallRec *rec = call_push(vm, op);
@@ -903,9 +948,78 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
         }
         vm_raise(vm, ex_class("Error"), op, "Value is not callable");
     }
+    if (fv.t == T_ARR) {
+        /* P2-B: array callable [$obj,'m'] / ['Cls','m'] */
+        TArr *a = (TArr *)fv.u.p;
+        if (a->n != 2)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Callable array must have exactly 2 elements");
+        uint32_t i0 = 0;
+        while (i0 < a->dused && a->data[i0].t == T_UNDEF) i0++;
+        uint32_t i1 = i0 + 1;
+        while (i1 < a->dused && a->data[i1].t == T_UNDEF) i1++;
+        if (i0 >= a->dused || i1 >= a->dused)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Callable array must have exactly 2 elements");
+        TVal *e0 = &a->data[i0], *e1 = &a->data[i1];
+        if (e1->t != T_STR)
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Method name must be a string");
+        TClass *cls = NULL;
+        TObj *o = NULL;
+        if (e0->t == T_OBJ) {
+            o = (TObj *)e0->u.p;
+            cls = o->cls;
+        } else if (e0->t == T_STR) {
+            char clc[256];
+            { const char *s = tstr_val((TStr *)e0->u.p);
+              size_t k = 0; for (; s[k] && k < sizeof clc - 1; k++)
+                  clc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+              clc[k] = 0; }
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            cls = class_resolve_lc(clc);
+            if (!cls)
+                vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+                         tstr_val((TStr *)e0->u.p));
+        } else {
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "Callable array element #1 must be an object or a class name");
+        }
+        init_method_callable(vm, op, rec, cls, o, (TStr *)e1->u.p);
+        return 1;
+    }
     if (fv.t != T_STR)
         vm_raise(vm, ex_class("TypeError"), op, "Function name must be a string");
     TStr *name = (TStr *)fv.u.p;
+    {
+        /* P2-B: 'Cls::m' string callable — split on the LAST separator
+         * (class names contain backslashes, never colons) */
+        const char *s = tstr_val(name);
+        const char *sep = NULL;
+        for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2)
+            sep = p;
+        if (sep) {
+            size_t cl = (size_t)(sep - s);
+            char clc[256];
+            if (cl >= sizeof clc) cl = sizeof clc - 1;
+            for (size_t i = 0; i < cl; i++)
+                clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+            clc[cl] = 0;
+            char mlc[128];
+            { const char *s2 = sep + 2;
+              size_t k = 0; for (; s2[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s2[k] >= 'A' && s2[k] <= 'Z') ? (char)(s2[k] + 32) : s2[k];
+              mlc[k] = 0; }
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            TClass *cls = class_resolve_lc(clc);
+            if (!cls)
+                vm_raise(vm, ex_class("Error"), op, "Class '%.*s' not found",
+                         (int)cl, s);
+            init_method_callable(vm, op, rec, cls, NULL,
+                                 tstr_intern(sep + 2, strlen(sep + 2)));
+            return 1;
+        }
+    }
     bool is_builtin;
     void *hit = resolve_fn(vm, name, &is_builtin);
     if (!hit) {
@@ -3241,23 +3355,131 @@ void tphp_prog_freeze(Program *p) {
 }
 
 /* 调用任意 PHP callable（M5-c：worker 消息回调）：
- * closure（含 first-class builtin 包装）或函数名字符串。返回 +1 值；
- * 异常沿正常 unwind 传播。 */
+ * closure（含 first-class builtin 包装）、函数名字符串、数组 callable
+ * [$obj,'m']/['Cls','m']、'Cls::m' 字符串、绑定方法闭包（MFCC）。
+ * 返回 +1 值；异常沿正常 unwind 传播。 */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     TClosure *clo = NULL;
     BuiltinFn bfn = NULL;
-    TFunc *uf = NULL;
+    TFunc *fn = NULL;
+    NativeMethodFn nat = NULL;
+    void *nat_self = NULL;       /* receiver for native methods */
+    TObj *recv = NULL;           /* $this for a user-method frame */
+    TClass *mcls = NULL;         /* class scope for the method frame */
     if (callable.t == T_CLOSURE) {
         clo = (TClosure *)callable.u.p;
         if (clo->bfn) bfn = (BuiltinFn)clo->bfn;
+        else if (clo->fn == NULL && (clo->h.flags & GC_FLAG_MFCC)) {
+            /* P2-A bound method closure ($obj->m(...)) */
+            recv = (TObj *)clo->captures[0].u.p;
+            TStr *mname = (TStr *)clo->captures[1].u.p;
+            char mlc[128];
+            { const char *s = tstr_val(mname);
+              size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+              mlc[k] = 0; }
+            tphp_class_ensure_flat(recv->cls);
+            TMethod *m = tphp_class_find_method(recv->cls, mlc);
+            if (!m || (!m->fn && !m->native) || m->is_abstract)
+                vm_raise(vm, ex_class("Error"), NULL,
+                         "Method %s::%s() is not callable",
+                         tstr_val(recv->cls->name), tstr_val(mname));
+            mcls = recv->cls;
+            if (m->fn) fn = m->fn;
+            else { nat = (NativeMethodFn)m->native; nat_self = recv; }
+        } else {
+            fn = clo->fn;
+        }
     } else if (callable.t == T_STR) {
-        bool isb;
-        void *hit = resolve_fn(vm, (TStr *)callable.u.p, &isb);
-        if (!hit)
+        const char *s = tstr_val((TStr *)callable.u.p);
+        const char *sep = NULL;
+        /* the LAST separator: class names contain backslashes, never colons */
+        for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2)
+            sep = p;
+        if (sep) {
+            /* P2-B: 'Cls::m' string callable */
+            size_t cl = (size_t)(sep - s);
+            char clc[256];
+            if (cl >= sizeof clc) cl = sizeof clc - 1;
+            for (size_t i = 0; i < cl; i++)
+                clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+            clc[cl] = 0;
+            char mlc[128];
+            { const char *s2 = sep + 2;
+              size_t k = 0; for (; s2[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s2[k] >= 'A' && s2[k] <= 'Z') ? (char)(s2[k] + 32) : s2[k];
+              mlc[k] = 0; }
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            mcls = class_resolve_lc(clc);
+            if (!mcls)
+                vm_raise(vm, ex_class("Error"), NULL, "Class '%.*s' not found",
+                         (int)cl, s);
+            tphp_class_ensure_flat(mcls);
+            TMethod *m = tphp_class_find_method(mcls, mlc);
+            if (!m || (!m->fn && !m->native) || m->is_abstract)
+                vm_raise(vm, ex_class("Error"), NULL,
+                         "Call to undefined method %s::%s()",
+                         tstr_val(mcls->name), sep + 2);
+            if (m->fn) fn = m->fn;
+            else { nat = (NativeMethodFn)m->native; nat_self = NULL; }
+        } else {
+            bool isb;
+            void *hit = resolve_fn(vm, (TStr *)callable.u.p, &isb);
+            if (!hit)
+                vm_raise(vm, ex_class("Error"), NULL,
+                         "Call to undefined function %s()",
+                         tstr_val((TStr *)callable.u.p));
+            if (isb) bfn = (BuiltinFn)hit; else fn = (TFunc *)hit;
+        }
+    } else if (callable.t == T_ARR) {
+        /* P2-B: array callable [$obj,'m'] / ['Cls','m'] */
+        TArr *a = (TArr *)callable.u.p;
+        if (a->n != 2)
             vm_raise(vm, ex_class("Error"), NULL,
-                     "Call to undefined function %s()",
-                     tstr_val((TStr *)callable.u.p));
-        if (isb) bfn = (BuiltinFn)hit; else uf = (TFunc *)hit;
+                     "Callable array must have exactly 2 elements");
+        uint32_t i0 = 0;
+        while (i0 < a->dused && a->data[i0].t == T_UNDEF) i0++;
+        uint32_t i1 = i0 + 1;
+        while (i1 < a->dused && a->data[i1].t == T_UNDEF) i1++;
+        if (i0 >= a->dused || i1 >= a->dused)
+            vm_raise(vm, ex_class("Error"), NULL,
+                     "Callable array must have exactly 2 elements");
+        TVal *e0 = &a->data[i0], *e1 = &a->data[i1];
+        if (e1->t != T_STR)
+            vm_raise(vm, ex_class("TypeError"), NULL,
+                     "Method name must be a string");
+        TStr *mname = (TStr *)e1->u.p;
+        char mlc[128];
+        { const char *s = tstr_val(mname);
+          size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+              mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+          mlc[k] = 0; }
+        if (e0->t == T_OBJ) {
+            recv = (TObj *)e0->u.p;
+            mcls = recv->cls;
+        } else if (e0->t == T_STR) {
+            char clc[256];
+            { const char *s = tstr_val((TStr *)e0->u.p);
+              size_t k = 0; for (; s[k] && k < sizeof clc - 1; k++)
+                  clc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+              clc[k] = 0; }
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            mcls = class_resolve_lc(clc);
+            if (!mcls)
+                vm_raise(vm, ex_class("Error"), NULL, "Class '%s' not found",
+                         tstr_val((TStr *)e0->u.p));
+        } else {
+            vm_raise(vm, ex_class("TypeError"), NULL,
+                     "Callable array element #1 must be an object or a class name");
+        }
+        tphp_class_ensure_flat(mcls);
+        TMethod *m = tphp_class_find_method(mcls, mlc);
+        if (!m || (!m->fn && !m->native) || m->is_abstract)
+            vm_raise(vm, ex_class("Error"), NULL,
+                     "Call to undefined method %s::%s()",
+                     tstr_val(mcls->name), tstr_val(mname));
+        if (m->fn) fn = m->fn;
+        else { nat = (NativeMethodFn)m->native; nat_self = recv; }
     } else {
         vm_raise(vm, ex_class("TypeError"), NULL,
                  "Value is not callable");
@@ -3265,23 +3487,14 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     if (bfn) {                       /* first-class builtin wrapper */
         return bfn(vm, args, n);
     }
-    if (clo && clo->fn == NULL && (clo->h.flags & GC_FLAG_MFCC)) {
-        /* P2-A bound method closure ($obj->m(...)): run as a method frame
-         * on the captured receiver ($this in slot 0, RECV moves params) */
-        TObj *o = (TObj *)clo->captures[0].u.p;
-        TStr *mname = (TStr *)clo->captures[1].u.p;
-        char mlc[128];
-        { const char *s = tstr_val(mname);
-          size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
-              mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
-          mlc[k] = 0; }
-        tphp_class_ensure_flat(o->cls);
-        TMethod *m = tphp_class_find_method(o->cls, mlc);
-        if (!m || !m->fn || m->is_abstract)
-            vm_raise(vm, ex_class("Error"), NULL,
-                     "Method %s::%s() is not callable",
-                     tstr_val(o->cls->name), tstr_val(mname));
-        TFunc *fn = m->fn;
+    if (nat) {                       /* native (internal-class) method */
+        return nat(vm, nat_self, args, n);
+    }
+    if (!fn)
+        vm_raise(vm, ex_class("Error"), NULL, "Value is not callable");
+    if (recv) {
+        /* method frame: $this lives in slot 0 (owned ref — the closure's /
+         * array's reference is separate), RECV moves params, extras die */
         if (vm->x.n_args + n > VM_MAX_ARGS)
             vm_raise(vm, ex_class("Error"), NULL, "Too many arguments");
         uint32_t base = (uint32_t)vm->x.n_args;
@@ -3291,7 +3504,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             tval_addref(args[i]);
         }
         vm->x.n_args = (int)base + nq;
-        for (int i = nq; i < n; i++)          /* extras: nobody consumes them */
+        for (int i = nq; i < n; i++)      /* extras: nobody consumes them */
             if (vm->x.args[base + (uint32_t)i].t != T_UNDEF) {
                 tval_release(&vm->x.args[base + (uint32_t)i]);
                 vm->x.args[base + (uint32_t)i] = (TVal){ .u.i = 0, .t = T_UNDEF };
@@ -3311,10 +3524,9 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         f->slots = tm_malloc(sizeof(TVal) * nslots);
         for (uint32_t i = 0; i < nslots; i++)
             f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
-        f->slots[0] = TV_OBJ(o);              /* $this (own ref: addref, the
-                                                 closure's ref is separate) */
-        tval_addref(clo->captures[0]);
-        f->called_cls = o->cls;
+        f->slots[0] = TV_OBJ(recv);
+        tval_addref(TV_OBJ(recv));
+        f->called_cls = mcls ? mcls : recv->cls;
         vm->x.n_args = (int)base;
         vm->x.frame = f;
         while (vm->x.frame == f) {
@@ -3326,7 +3538,6 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             longjmp(vm->x.unwind, 1);
         return vm->x.thunk_ret;
     }
-    TFunc *fn = clo ? clo->fn : uf;
     if (vm->x.n_args + n > VM_MAX_ARGS)
         vm_raise(vm, ex_class("Error"), NULL, "Too many arguments");
     /* 排队：args 区持有自己的引用（与 SEND 主路径一致，addref）。
