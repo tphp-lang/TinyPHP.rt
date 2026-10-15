@@ -364,6 +364,74 @@ static TVal bi_class_exists(VM *vm, TVal *args, int n) {
     return class_resolve_lc(lc) ? TV_TRUE : TV_FALSE;
 }
 
+/* P3: is_a / is_subclass_of / get_parent_class — object-or-class-string
+ * resolution (allow_string defaults to true, matching PHP); a non-object
+ * non-string argument yields false (PHP 8 would TypeError, see TODO) */
+static TClass *obj_or_class(TVal *v, bool allow_string) {
+    if (v->t == T_OBJ) return ((TObj *)v->u.p)->cls;
+    if (v->t == T_STR && allow_string) {
+        char lc[256];
+        const char *s = tstr_val((TStr *)v->u.p);
+        size_t k = 0;
+        for (; s[k] && k < sizeof lc - 1; k++)
+            lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+        lc[k] = 0;
+        extern TClass *class_resolve_lc(const char *fqcn_lc);
+        return class_resolve_lc(lc);
+    }
+    return NULL;
+}
+
+static bool str_arg_lc(TVal *v, char *lc, size_t cap) {
+    if (v->t != T_STR) return false;
+    const char *s = tstr_val((TStr *)v->u.p);
+    size_t k = 0;
+    for (; s[k] && k < cap - 1; k++)
+        lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+    lc[k] = 0;
+    return true;
+}
+
+static TVal bi_is_a(VM *vm, TVal *args, int n) {
+    (void)vm;
+    if (n < 2)
+        RAISE(vm, "ArgumentCountError", "is_a() expects at least 2 arguments");
+    if (args[1].t != T_STR)
+        RAISE(vm, "TypeError", "is_a(): Argument #2 ($class) must be a string");
+    bool allow = (n < 3) ? true : tval_to_bool(args[2]);
+    TClass *c = obj_or_class(&args[0], allow);
+    char lc[256];
+    if (!c || !str_arg_lc(&args[1], lc, sizeof lc)) return TV_FALSE;
+    return tphp_class_isa_name(c, lc) ? TV_TRUE : TV_FALSE;
+}
+
+static TVal bi_is_subclass_of(VM *vm, TVal *args, int n) {
+    (void)vm;
+    if (n < 2)
+        RAISE(vm, "ArgumentCountError", "is_subclass_of() expects at least 2 arguments");
+    if (args[1].t != T_STR)
+        RAISE(vm, "TypeError", "is_subclass_of(): Argument #2 ($class) must be a string");
+    bool allow = (n < 3) ? true : tval_to_bool(args[2]);
+    TClass *c = obj_or_class(&args[0], allow);
+    char lc[256];
+    if (!c || !str_arg_lc(&args[1], lc, sizeof lc)) return TV_FALSE;
+    if (!tphp_class_isa_name(c, lc)) return TV_FALSE;
+    extern TClass *class_resolve_lc(const char *fqcn_lc);
+    TClass *b = class_resolve_lc(lc);
+    /* is_subclass_of excludes the class itself */
+    return (b && b == c) ? TV_FALSE : TV_TRUE;
+}
+
+static TVal bi_get_parent_class(VM *vm, TVal *args, int n) {
+    (void)vm;
+    if (n < 1) return TV_FALSE;
+    bool allow = (n < 2) ? true : tval_to_bool(args[1]);
+    TClass *c = obj_or_class(&args[0], allow);
+    if (!c) return TV_FALSE;
+    tphp_class_ensure_flat(c);
+    return c->parent ? TV_STR(c->parent->name) : TV_FALSE;
+}
+
 #define PRED1(name, test) \
     static TVal name(VM *vm, TVal *args, int n) { \
         (void)vm; (void)n; \
@@ -2240,6 +2308,9 @@ const Builtin tphp_builtins[] = {
     { "defined", bi_defined },
     { "spl_autoload_register", bi_spl_autoload_register },
     { "class_exists", bi_class_exists },
+    { "is_a", bi_is_a },
+    { "is_subclass_of", bi_is_subclass_of },
+    { "get_parent_class", bi_get_parent_class },
     { "is_int", bi_is_int },
     { "is_integer", bi_is_int },
     { "is_long", bi_is_int },
