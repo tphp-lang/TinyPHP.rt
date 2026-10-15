@@ -139,6 +139,8 @@ typedef struct VMFrame {
     uint32_t args_base;
     uint16_t n_args_sent;
     void *called_cls;    /* TClass*: actual class for static:: (late binding) */
+    void *vis_scope;     /* P3: 可见性作用域覆盖（parent::__construct 帧 =
+                            声明类）；NULL = 用 called_cls */
     uint32_t n_calls_at_entry;   /* n_calls when this frame took over; unwind
                                     restores it (M5-b: leftover call recs of
                                     builtin/magic raises) */
@@ -149,6 +151,8 @@ typedef struct VMCallRec {
     bool is_thunk;
     bool is_method;      /* method call: this_obj carries the receiver */
     bool is_ctor;        /* NEW_USER frame: RETURN writes $this to dst */
+    bool scope_is_called;/* P3: parent::__construct 帧——作用域取
+                            called_cls（声明类）而非接收者类 */
     bool is_enum_builtin;/* INIT_SMCALL on enum ::from/tryFrom/cases */
     bool is_ex_getter;   /* INIT_MCALL on an exception object: getter_val ready */
     TFunc *uf;

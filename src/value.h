@@ -131,6 +131,7 @@ enum { CLS_ABSTRACT = 1, CLS_FINAL = 2, CLS_READONLY = 4 };   /* class flags */
 typedef struct TProp {
     TStr *name;            /* interned, without $ */
     TStr *type;            /* declared type, normalized; NULL = untyped (P1-1) */
+    struct TClass *decl;   /* 声明类（readonly 写入作用域判定用；P3） */
     uint8_t visibility;
     bool is_static;
     bool is_readonly;
@@ -176,8 +177,10 @@ typedef struct TClass {
     TVal *sprop_vals;
     struct TClass **ifaces; int n_ifaces; /* all interfaces, flattened */
     TStr **iface_names; int n_iface_names; /* unresolved (own + flat) */
-    /* class constants: parallel arrays, declaration order */
-    TStr **cnames; TVal *cvals; int n_consts;
+    /* class constants: parallel arrays, declaration order.
+     * cthunks[i] != 0：惰性常量表达式（compile_thunk 索引），cvals[i] 为
+     * T_UNDEF 占位，首次取用时求值并缓存（P2-B 类常量表达式）。 */
+    TStr **cnames; TVal *cvals; uint16_t *cthunks; int n_consts;
     /* enum */
     TEnumCase *cases; int n_cases;        /* CK_ENUM */
     bool backed;          /* enum has a backing type */

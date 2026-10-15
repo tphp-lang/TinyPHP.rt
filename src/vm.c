@@ -91,6 +91,27 @@ static const TExClass *ex_class(const char *name) {
     return &EX_ERROR;
 }
 
+/* ---- P2-B: 类常量惰性求值的环检测 ----
+ * const A = self::B; const B = self::A; → 求值栈查重。异常 unwind 时
+ * 复位（vm_unwind 入口调用），catch-and-retry 后可重新求值（对齐 PHP）。 */
+static struct { TClass *cls; int idx; } g_const_eval[64];
+static int g_n_const_eval;
+static bool const_eval_in_progress(TClass *cls, int idx) {
+    for (int i = 0; i < g_n_const_eval; i++)
+        if (g_const_eval[i].cls == cls && g_const_eval[i].idx == idx)
+            return true;
+    return false;
+}
+static void const_eval_push(TClass *cls, int idx) {
+    if (g_n_const_eval < 64) {
+        g_const_eval[g_n_const_eval].cls = cls;
+        g_const_eval[g_n_const_eval].idx = idx;
+    }
+    g_n_const_eval++;
+}
+static void const_eval_pop(void) { if (g_n_const_eval > 0) g_n_const_eval--; }
+static void const_eval_reset(void) { g_n_const_eval = 0; }
+
 /* ---- object allocation (registered in the GC registry) ---- */
 TStr *tstr_alloc_raw(uint32_t len, bool interned);
 TStr *tstr_new(const char *s, size_t len);
@@ -1330,6 +1351,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
     vm->x.n_args = (int)rec->args_base;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fn;
     f->pc = 0;
     f->prev = vm->x.frame;
@@ -1348,6 +1370,10 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     vm->x.frame->pc++;              /* caller resumes after DO_FCALL */
     vm->x.frame = f;
     f->called_cls = frame_called_cls(rec, fn);
+    /* P3: parent::__construct / self::__construct 帧的可见性作用域 =
+     * 声明类（rec->called_cls）；static:: 仍走 called_cls（后绑定） */
+    if (rec->scope_is_called && rec->called_cls)
+        f->vis_scope = rec->called_cls;
     if (rec->is_method && rec->this_obj) {
         /* $this lives in slot 0 (after capture slots, which methods lack);
          * ownership of the reference moves from the call record */
@@ -1803,8 +1829,13 @@ static const char *vis_name(uint8_t vis) {
 }
 
 /* visibility scope class for the running frame (NULL = global scope) */
+/* 可见性作用域：parent::__construct 帧用声明类（vis_scope 覆盖位），
+ * 其余帧沿用 called_cls（后绑定语义） */
 static TClass *frame_scope_cls(VM *vm) {
-    return vm->x.frame ? (TClass *)vm->x.frame->called_cls : NULL;
+    if (!vm->x.frame) return NULL;
+    VMFrame *f = vm->x.frame;
+    if (f->vis_scope) return (TClass *)f->vis_scope;
+    return (TClass *)f->called_cls;
 }
 
 /* exception getters callable as methods (M2 sugar): getMessage() etc */
@@ -1841,6 +1872,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     rec->uf = m->fn;
     TFunc *fn = m->fn;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fn;
     f->pc = 0;
     f->prev = vm->x.frame;
@@ -1996,6 +2028,17 @@ static int32_t op_new_user(VM *vm, TOp *op) {
     if (cls == g_closure_cls)
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot instantiate Closure");   /* P1-3 */
+    /* P3: 构造器可见性——private/protected ctor 阻断外部实例化 */
+    if (cls->m_ctor >= 0) {
+        TMethod *cm = &cls->methods[cls->m_ctor];
+        if (!tphp_vis_ok(cm->visibility, cls, frame_scope_cls(vm))) {
+            TClass *from = frame_scope_cls(vm);
+            vm_raise(vm, ex_class("Error"), op,
+                     "Call to %s %s::__construct() from %s",
+                     vis_name(cm->visibility), tstr_val(cls->name),
+                     from ? tstr_val(from->name) : "global scope");
+        }
+    }
     TObj *o = tphp_obj_alloc(cls);
     o->h.rc++;                    /* ctor invocation holds a reference */
     if (cls->m_ctor >= 0 && !cls->methods[cls->m_ctor].fn &&
@@ -2033,6 +2076,7 @@ static int32_t op_new_user(VM *vm, TOp *op) {
         rec->n_args = (uint16_t)op->a2;
         TFunc *fn = rec->uf;
         VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
         f->fn = fn;
         f->pc = 0;
         f->prev = vm->x.frame;
@@ -2123,10 +2167,33 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         }
         return 1;
     }
-    if (o->cls->props[slot].is_readonly && o->props[slot].t != T_UNDEF)
-        vm_raise(vm, ex_class("Error"), op,
-                 "Cannot modify readonly property %s::$%s",
-                 tstr_val(o->cls->name), tstr_val(name));
+    /* P3: readonly 属性 / readonly class 写入规则——
+     *  - 只允许"声明类"作用域内写入（子类也不行，PHP 语义）
+     *  - 已初始化后再写：任何作用域都 fatal
+     *  - readonly class 的全部实例属性按 readonly 处理 */
+    {
+        TProp *pp = &o->cls->props[slot];
+        bool ro = pp->is_readonly || (o->cls->flags & CLS_READONLY);
+        if (ro) {
+            TClass *from = frame_scope_cls(vm);
+            bool initialized = o->props[slot].t != T_UNDEF;
+            if (from != pp->decl) {
+                if (initialized)
+                    vm_raise(vm, ex_class("Error"), op,
+                             "Cannot modify readonly property %s::$%s from %s",
+                             tstr_val(o->cls->name), tstr_val(name),
+                             from ? tstr_val(from->name) : "global scope");
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot initialize readonly property %s::$%s from %s",
+                         tstr_val(o->cls->name), tstr_val(name),
+                         from ? tstr_val(from->name) : "global scope");
+            }
+            if (initialized)
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot modify readonly property %s::$%s",
+                         tstr_val(o->cls->name), tstr_val(name));
+        }
+    }
     /* P1-1: typed 属性赋值校验 */
     if (o->cls->props[slot].type) {
         const char *given = NULL;
@@ -2327,9 +2394,11 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
          * "static" call to a non-static method — run the ctor body on the
          * current $this (caller slot 0); expression result is NULL.
          * P1-2: 内部异常类的原生 ctor（fn NULL + native）同样支持——走
-         * nm_fn 带接收者分发（op_do_fcall native 路径）。 */
+         * nm_fn 带接收者分发（op_do_fcall native 路径）。
+         * P3: 帧作用域取 called_cls（声明类）而非接收者类。 */
         rec->is_method = true;
         rec->called_cls = cls;
+        rec->scope_is_called = true;
         if (!m->fn && m->native) {
             rec->is_builtin = true;
             rec->nm_fn = m->native;
@@ -2440,8 +2509,25 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
         wtake(vm, op, r);
         return 1;
     }
-    if (tphp_class_has_const(cls, tstr_val(cname), &out)) {
-        tval_addref(out);
+    TClass *cown = NULL;
+    int cidx = -1;
+    if (tphp_class_has_const(cls, tstr_val(cname), &out, &cown, &cidx)) {
+        /* P2-B: 惰性常量表达式——首次取用求值并缓存到 owner 的槽位。
+         * cvals 的 T_UNDEF 是 thunk 占位标记（折叠过的 null 存 T_NULL）。 */
+        if (cown && cown->cthunks && cidx >= 0 &&
+            cown->cthunks[cidx] && out.t == T_UNDEF) {
+            if (const_eval_in_progress(cown, cidx))
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot declare self-referencing constant %s::%s",
+                         tstr_val(cown->name), tstr_val(cname));
+            const_eval_push(cown, cidx);
+            out = tphp_call_thunk(vm, cown->cthunks[cidx]);
+            const_eval_pop();
+            cown->cvals[cidx] = out;      /* 类接管 thunk 返回值引用 */
+            tval_addref(out);
+        } else {
+            tval_addref(out);
+        }
         wtake(vm, op, out);
         return 1;
     }
@@ -2852,6 +2938,7 @@ static void frame_destroy(VMFrame *f) {
  * bottom with a PHP-style stack trace */
 static void vm_unwind(VM *vm) {
     TExObj *ex = vm->x.exception;
+    const_eval_reset();           /* P2-B: unwind 中断的常量求值允许重试 */
     vm->x.n_trace = 0;
     while (vm->x.frame) {
         VMFrame *f = vm->x.frame;
@@ -2950,6 +3037,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     rec->args_base = (uint32_t)vm->x.n_args;
     rec->is_thunk = true;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fn;
     f->pc = 0;
     f->prev = vm->x.frame;
@@ -3074,6 +3162,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
         return;
     }
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fnc;
     f->pc = 0;
     f->prev = vm->x.frame;
@@ -3514,6 +3603,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         rec->uf = fn;
         rec->args_base = base;
         VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
         f->fn = fn;
         f->pc = 0;
         f->prev = vm->x.frame;
@@ -3558,6 +3648,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     rec->uf = fn;
     rec->args_base = base;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fn;
     f->pc = 0;
     f->prev = vm->x.frame;
@@ -3604,6 +3695,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     tphp_tostr_hook = vm_tostring_hook;
     TFunc *fn = clo->fn;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = fn;
     f->pc = 0;
     f->prev = NULL;
@@ -3637,6 +3729,7 @@ int tphp_vm_run(Program *prog) {
     tphp_raise_hook = vm_value_raise;
     tphp_tostr_hook = vm_tostring_hook;
     VMFrame *f = tm_malloc(sizeof *f);
+    f->vis_scope = NULL;
     f->fn = prog->main;
     f->pc = 0;
     f->prev = NULL;

@@ -313,6 +313,129 @@ static int16_t *quick_slot(TClass *cls, int16_t code) {
     return NULL;
 }
 
+/* ---- P3: override 签名校验的类型格 ----
+ * 段级值域包含关系：covers(wide, narrow) = wide 的值域 ⊇ narrow 的值域。
+ * 精确相等 / mixed / int⊂float / array⊂iterable / 类名⊂object / 类层级 isa。
+ * 参数逆变：child 参数类型必须 ⊇ parent 参数类型（每个 parent 段被 child
+ * 某段覆盖，且 nullability 收缩禁止）；返回协变：child 返回类型 ⊆ parent。 */
+static bool type_seg_is_class(const char *s) {
+    static const char *builtins[] = {
+        "int", "float", "string", "bool", "array", "object", "mixed",
+        "null", "true", "false", "callable", "iterable", "void", "never",
+        "self", "static", "parent", "closure",
+    };
+    for (size_t i = 0; i < sizeof builtins / sizeof builtins[0]; i++)
+        if (strcmp(s, builtins[i]) == 0) return false;
+    return true;
+}
+
+static bool type_seg_covers(const char *wide, const char *narrow, TClass *scope) {
+    if (strcmp(wide, narrow) == 0) return true;
+    if (strcmp(wide, "mixed") == 0) return true;
+    if (strcmp(narrow, "mixed") == 0) return false;
+    if (strcmp(wide, "float") == 0 && strcmp(narrow, "int") == 0) return true;
+    if (strcmp(wide, "iterable") == 0 && strcmp(narrow, "array") == 0) return true;
+    if (type_seg_is_class(wide)) {
+        if (strcmp(narrow, "object") == 0) return true;
+        if (!type_seg_is_class(narrow)) return false;
+        /* 类层级：narrow 类 isa wide 类 */
+        char wlc[256], nlc[256];
+        lc_copy(wlc, wide, sizeof wlc);
+        lc_copy(nlc, narrow, sizeof nlc);
+        TClass *wc = tphp_class_lookup(wlc);
+        TClass *nc = tphp_class_lookup(nlc);
+        if (!wc || !nc) return strcmp(wide, narrow) == 0;
+        return tphp_class_isa(nc, wc);
+    }
+    return false;
+}
+
+/* 段迭代辅助：跳过开头的 '?'（nullable 标记由调用方单独处理） */
+static const char *type_skip_q(const char *t) {
+    return t[0] == '?' ? t + 1 : t;
+}
+
+/* 参数逆变：child 的类型必须接受 parent 类型的全部值 */
+static bool type_param_contravariant(const char *child, const char *parent,
+                                     TClass *scope) {
+    if (!parent || !*parent) return !child || !*child;   /* parent mixed */
+    if (!child || !*child) return true;                  /* child mixed ⊇ 一切 */
+    if (strcmp(child, parent) == 0) return true;
+    bool pnull = parent[0] == '?';
+    bool cnull = child[0] == '?';
+    if (pnull && !cnull) return false;                   /* null 必须仍被接受 */
+    /* 逐 parent 段：必须被 child 的某段覆盖（段数小，双重循环） */
+    const char *p = type_skip_q(parent);
+    for (;;) {
+        const char *seg = p;
+        while (*p && *p != '|') p++;
+        size_t len = (size_t)(p - seg);
+        char pbuf[160];
+        if (len >= sizeof pbuf) len = sizeof pbuf - 1;
+        memcpy(pbuf, seg, len);
+        pbuf[len] = 0;
+        bool covered = false;
+        const char *q = type_skip_q(child);
+        for (;;) {
+            const char *cseg = q;
+            while (*q && *q != '|') q++;
+            size_t clen = (size_t)(q - cseg);
+            char cbuf[160];
+            if (clen >= sizeof cbuf) clen = sizeof cbuf - 1;
+            memcpy(cbuf, cseg, clen);
+            cbuf[clen] = 0;
+            if (type_seg_covers(cbuf, pbuf, scope)) { covered = true; break; }
+            if (!*q) break;
+            q++;
+        }
+        if (!covered) return false;
+        if (!*p) break;
+        p++;
+    }
+    return true;
+}
+
+/* 返回协变：child 的返回类型必须 ⊆ parent 的返回类型 */
+static bool type_ret_covariant(const char *child, const char *parent,
+                               TClass *scope) {
+    if (!parent || !*parent) return true;                /* parent 未声明 */
+    if (!child || !*child) return false;                 /* child 省略 → fatal */
+    if (strcmp(child, parent) == 0) return true;
+    if (strcmp(parent, "mixed") == 0) return true;
+    if (strcmp(child, "mixed") == 0) return false;
+    bool cnull = child[0] == '?';
+    bool pnull = parent[0] == '?';
+    if (cnull && !pnull) return false;                   /* child 可能返回 null */
+    const char *c = type_skip_q(child);
+    for (;;) {
+        const char *cseg = c;
+        while (*c && *c != '|') c++;
+        size_t len = (size_t)(c - cseg);
+        char cbuf[160];
+        if (len >= sizeof cbuf) len = sizeof cbuf - 1;
+        memcpy(cbuf, cseg, len);
+        cbuf[len] = 0;
+        bool covered = false;
+        const char *p = type_skip_q(parent);
+        for (;;) {
+            const char *pseg = p;
+            while (*p && *p != '|') p++;
+            size_t plen = (size_t)(p - pseg);
+            char pbuf[160];
+            if (plen >= sizeof pbuf) plen = sizeof pbuf - 1;
+            memcpy(pbuf, pseg, plen);
+            pbuf[plen] = 0;
+            if (type_seg_covers(pbuf, cbuf, scope)) { covered = true; break; }
+            if (!*p) break;
+            p++;
+        }
+        if (!covered) return false;
+        if (!*c) break;
+        c++;
+    }
+    return true;
+}
+
 static void add_method(TClass *cls, TMethod m) {
     char lc[128];
     lc_copy(lc, tstr_val(m.name), sizeof lc);
@@ -332,6 +455,43 @@ static void add_method(TClass *cls, TMethod m) {
                 tphp_fatal_src("class.c", 0,
                     "Final method %s::%s() cannot be overridden",
                     tstr_val(cls->name), tstr_val(cls->methods[i].name));
+            /* P3: override 签名校验——__construct 豁免（PHP 同）；抽象/
+             * 接口声明（fn NULL，无签名可查）与内部 native 跳过 */
+            TFunc *pf = cls->methods[i].fn, *cf = m.fn;
+            if (strcmp(olc, "__construct") != 0 && pf && cf) {
+                const char *pcls = cls->parent ? tstr_val(cls->parent->name) : "?";
+                if (cls->methods[i].is_static != m.is_static)
+                    tphp_fatal_src("class.c", 0,
+                        cls->methods[i].is_static
+                            ? "Cannot make static method %s::%s() non static in class %s"
+                            : "Cannot make non static method %s::%s() static in class %s",
+                        pcls, tstr_val(cls->methods[i].name), tstr_val(cls->name));
+                /* 参数：只增不减（variadic 父类豁免）；类型逆变 */
+                if (!pf->is_variadic && cf->n_params < pf->n_params)
+                    tphp_fatal_src("class.c", 0,
+                        "Declaration of %s::%s() must be compatible with %s::%s()",
+                        tstr_val(cls->name), tstr_val(m.name),
+                        pcls, tstr_val(cls->methods[i].name));
+                for (int k = 0; k < pf->n_params && k < cf->n_params; k++) {
+                    const char *pt = (pf->param_types && pf->param_types[k])
+                        ? tstr_val(pf->param_types[k]) : NULL;
+                    const char *ct = (cf->param_types && cf->param_types[k])
+                        ? tstr_val(cf->param_types[k]) : NULL;
+                    if (!type_param_contravariant(ct, pt, cls))
+                        tphp_fatal_src("class.c", 0,
+                            "Declaration of %s::%s() must be compatible with %s::%s()",
+                            tstr_val(cls->name), tstr_val(m.name),
+                            pcls, tstr_val(cls->methods[i].name));
+                }
+                /* 返回类型协变 */
+                const char *prt = pf->ret_type ? tstr_val(pf->ret_type) : NULL;
+                const char *crt = cf->ret_type ? tstr_val(cf->ret_type) : NULL;
+                if (!type_ret_covariant(crt, prt, cls))
+                    tphp_fatal_src("class.c", 0,
+                        "Declaration of %s::%s() must be compatible with %s::%s()",
+                        tstr_val(cls->name), tstr_val(m.name),
+                        pcls, tstr_val(cls->methods[i].name));
+            }
             cls->methods[i] = m;
             return;
         }
@@ -358,8 +518,22 @@ static void add_prop(TClass *cls, TProp p) {
 static void add_sprop(TClass *cls, TProp p) {
     for (int i = 0; i < cls->n_sprops; i++) {
         if (tstr_case_eq(tstr_val(cls->sprops[i].name), tstr_val(p.name))) {
-            p.slot = cls->sprops[i].slot;
-            cls->sprops[i] = p;         /* value slot keeps the parent entry */
+            /* P2-B: 子类重声明静态属性 = 独立存储槽（PHP 语义）——
+             * A::$x 与 B::$x 是两个变量。此前沿用父类槽：子类声明值丢失、
+             * 写子类会串改父类。flat 表条目仍替换（名字查找命中子类的
+             * 可见性/类型/默认值），但槽位指向新空间。 */
+            p.slot = (uint16_t)cls->n_sprops;
+            cls->sprops = tm_realloc(cls->sprops, sizeof(TProp) * (size_t)(cls->n_sprops + 1));
+            if (cls->sprop_vals)
+                cls->sprop_vals = tm_realloc(cls->sprop_vals,
+                    sizeof(TVal) * (size_t)(cls->n_sprops + 1));
+            else
+                cls->sprop_vals = tm_malloc(sizeof(TVal) * (size_t)(cls->n_sprops + 1));
+            TVal dv = p.defval.t == T_UNDEF ? (TVal){ .u.i = 0, .t = T_NULL } : p.defval;
+            tval_addref(dv);
+            cls->sprop_vals[cls->n_sprops] = dv;
+            cls->sprops[i] = p;
+            cls->n_sprops++;
             return;
         }
     }
@@ -476,9 +650,14 @@ static void bind_traits(TClass *cls) {
                 sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cvals = tm_realloc(cls->cvals,
                 sizeof(TVal) * (size_t)(cls->n_consts + 1));
+            cls->cthunks = tm_realloc(cls->cthunks,
+                sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
             cls->cnames[cls->n_consts] = t->cnames[ci];
             tval_addref(t->cvals[ci]);
-            cls->cvals[cls->n_consts++] = t->cvals[ci];
+            cls->cvals[cls->n_consts] = t->cvals[ci];
+            /* P2-B: 惰性常量表达式的 thunk 索引随导入共享（prog 级只读） */
+            cls->cthunks[cls->n_consts] = t->cthunks ? t->cthunks[ci] : 0;
+            cls->n_consts++;
         }
     }
     /* adaptation bookkeeping is compile-lifetime; drop the references */
@@ -589,10 +768,15 @@ void tphp_class_ensure_flat(TClass *cls) {
                     sizeof(TStr *) * (size_t)(cls->n_consts + 1));
                 cls->cvals = tm_realloc(cls->cvals,
                     sizeof(TVal) * (size_t)(cls->n_consts + 1));
+                cls->cthunks = tm_realloc(cls->cthunks,
+                    sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
                 cls->cnames[cls->n_consts] = ifc->cnames[k];
                 TVal v = ifc->cvals[k];
                 tval_addref(v);
-                cls->cvals[cls->n_consts++] = v;
+                cls->cvals[cls->n_consts] = v;
+                /* P2-B: 惰性常量 thunk 索引随接口继承共享 */
+                cls->cthunks[cls->n_consts] = ifc->cthunks ? ifc->cthunks[k] : 0;
+                cls->n_consts++;
             }
         }
     }
@@ -652,11 +836,14 @@ TProp *tphp_class_find_sprop(TClass *cls, const char *name_lc) {
     return NULL;
 }
 
-bool tphp_class_has_const(TClass *cls, const char *name_lc, TVal *out) {
+bool tphp_class_has_const(TClass *cls, const char *name_lc, TVal *out,
+                          TClass **owner, int *idx) {
     for (TClass *c = cls; c; c = c->parent) {
         for (int i = 0; i < c->n_consts; i++) {
             if (tstr_case_eq(tstr_val(c->cnames[i]), name_lc)) {
                 if (out) *out = c->cvals[i];
+                if (owner) *owner = c;
+                if (idx) *idx = i;
                 return true;
             }
         }
@@ -821,6 +1008,12 @@ void tphp_class_tab_clone_thread(void) {
             nc->cvals = ncv;              /* cnames stay shared (interned) */
             for (int i = 0; i < nc->n_consts; i++)
                 nc->cvals[i] = tval_clone_deep(ncv[i]);
+            /* P2-B: 惰性常量 thunk 索引是 prog 级（funcs 冻结只读），直接拷 */
+            if (c->cthunks) {
+                nc->cthunks = tm_malloc(sizeof(uint16_t) * (size_t)nc->n_consts);
+                memcpy(nc->cthunks, c->cthunks,
+                       sizeof(uint16_t) * (size_t)nc->n_consts);
+            }
         }
         if (nc->n_cases) {
             TEnumCase *nec = tm_malloc(sizeof(TEnumCase) * (size_t)nc->n_cases);

@@ -2305,7 +2305,8 @@ static void scan_globals_stmt(AStmt *s, TStr ***out, int *n, int *cap) {
 
 /* ---- M2: closures, default-value thunks, goto fixups ---- */
 
-static uint16_t compile_thunk(Program *p, AExpr *expr, const char *file);
+static uint16_t compile_thunk(Program *p, AExpr *expr, const char *file,
+                              TClass *cls);
 
 static int g_closure_counter = 0;
 
@@ -2574,7 +2575,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
                     f->defaults[i] = d;
                 } else {
                     f->defaults[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
-                    f->default_thunk[i] = compile_thunk(p, af->params[i]->default_val, file);
+                    f->default_thunk[i] = compile_thunk(p, af->params[i]->default_val, file, decl_cls);
                 }
             } else {
                 f->defaults[i] = (TVal){ .u.i = 0, .t = T_UNDEF }; /* required */
@@ -2641,7 +2642,8 @@ static Loc compile_closure_expr(Ctx *c, AExpr *e, Loc want) {
 }
 
 /* zero-arg function evaluating one expression (runtime default values) */
-static uint16_t compile_thunk(Program *p, AExpr *expr, const char *file) {
+static uint16_t compile_thunk(Program *p, AExpr *expr, const char *file,
+                              TClass *cls) {
     AFunc af;
     memset(&af, 0, sizeof af);
     char nm[32];
@@ -2653,7 +2655,9 @@ static uint16_t compile_thunk(Program *p, AExpr *expr, const char *file) {
     asl_push_c(l, rs);
     af.body = l;
     af.line = expr->line;
-    return compile_fn_like(p, &af, NULL, false, false, false, NULL, file);
+    /* cls 非空（类常量/属性默认值）：thunk 继承声明类——self::/parent::
+     * 常量引用在求值时正确解析（P2-B 类常量表达式惰性求值） */
+    return compile_fn_like(p, &af, NULL, false, false, false, cls, file);
 }
 
 static void resolve_gotos(Ctx *c, const char *file) {
@@ -2689,6 +2693,13 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
         else if (tstr_case_eq(bm, "string")) { cls->backed = true; cls->backing_type = T_STR; }
         else tphp_fatal_src(file, cd->line, "Enum backing type must be int or string");
     }
+    /* P2: 提前注册——成员方法体内的 `new SameClass()`（自工厂模式）在
+     * 编译期即可查到本类。注册的是指针，成员编译时原地填充（与 flatten
+     * 的惰性填充同一模式）。跨类前向引用（class A 用后声明的 class B）
+     * 仍是缺口。 */
+    if (!tphp_class_register_compile(cls))
+        tphp_fatal_src(file, cd->line, "Cannot redeclare class %s",
+                       tstr_val(cls->name));
 
     for (int i = 0; i < cd->body->n; i++) {
         AClassMember *mem = cd->body->items[i];
@@ -2730,9 +2741,16 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                     TProp prop;
                     memset(&prop, 0, sizeof prop);
                     prop.name = par->name;
+                    prop.type = par->type;        /* P1-1: 提升参数类型 → 属性校验 */
+                    prop.decl = cls;              /* P3: readonly 作用域判定 */
                     prop.visibility = (uint8_t)par->vis;
                     prop.is_readonly = par->is_readonly;
                     prop.defval = (TVal){ .u.i = 0, .t = T_UNDEF };
+                    /* readonly class：提升的实例属性同样必须带类型 */
+                    if ((cls->flags & CLS_READONLY) && !prop.type)
+                        tphp_fatal_src(file, mem->line,
+                                       "Readonly property %s::$%s must have type",
+                                       tstr_val(cls->name), tstr_val(par->name));
                     cls->props = tm_realloc(cls->props,
                         sizeof(TProp) * (size_t)(cls->n_props + 1));
                     cls->props[cls->n_props++] = prop;
@@ -2780,6 +2798,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             memset(&prop, 0, sizeof prop);
             prop.name = mem->prop.name;
             prop.type = mem->prop.type;   /* P1-1: 运行期赋值校验 */
+            prop.decl = cls;              /* P3: readonly 写入作用域判定 */
             prop.visibility = mem->vis;
             prop.is_static = mem->is_static;
             prop.is_readonly = mem->is_readonly;
@@ -2790,6 +2809,11 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                                "Readonly property %s::$%s must have type",
                                cd->name ? tstr_val(cd->name) : "?",
                                tstr_val(mem->prop.name));
+            /* PHP 8.2 readonly class：实例属性必须全部带类型（静态属性除外） */
+            if ((cls->flags & CLS_READONLY) && !prop.is_static && !prop.type)
+                tphp_fatal_src(file, mem->line,
+                               "Readonly property %s::$%s must have type",
+                               tstr_val(cls->name), tstr_val(mem->prop.name));
             if (mem->prop.def) {
                 Ctx dc; memset(&dc, 0, sizeof dc);
                 dc.file = file;
@@ -2809,7 +2833,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                                            given ? given : "?");
                     }
                 }
-                else prop.def_thunk = compile_thunk(p, mem->prop.def, file);
+                else prop.def_thunk = compile_thunk(p, mem->prop.def, file, cls);
             }
             if (prop.is_static) {
                 cls->sprops = tm_realloc(cls->sprops, sizeof(TProp) * (size_t)(cls->n_sprops + 1));
@@ -2825,13 +2849,22 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             dc.file = file;
             bool ok = true;
             TVal d = eval_const2(&dc, mem->prop.def, &ok);
-            if (!ok)
-                tphp_fatal_src(file, mem->line, "Class constant expressions must be constant");
+            /* P2-B: 类常量表达式全惰性（对齐 PHP）——可折叠的直接存值；
+             * 引用 self::X / 其他类常量 / 全局常量 / 复杂表达式的编译成
+             * thunk，首次取用时求值并缓存（含前向引用、跨类引用）。 */
             cls->cnames = tm_realloc(cls->cnames, sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cvals = tm_realloc(cls->cvals, sizeof(TVal) * (size_t)(cls->n_consts + 1));
+            cls->cthunks = tm_realloc(cls->cthunks, sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
             cls->cnames[cls->n_consts] = mem->prop.name;
-            cls->cvals[cls->n_consts] = d;
-            tval_addref(d);
+            if (ok) {
+                cls->cvals[cls->n_consts] = d;
+                tval_addref(d);
+                cls->cthunks[cls->n_consts] = 0;
+            } else {
+                cls->cvals[cls->n_consts] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                cls->cthunks[cls->n_consts] =
+                    compile_thunk(p, mem->prop.def, file, cls);
+            }
             cls->n_consts++;
             break;
         }
@@ -2881,9 +2914,6 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
         }
         }
     }
-    if (!tphp_class_register_compile(cls))
-        tphp_fatal_src(file, cd->line, "Cannot redeclare class %s",
-                       tstr_val(cls->name));
 }
 
 /* apply a file-level use statement to the shared import table */

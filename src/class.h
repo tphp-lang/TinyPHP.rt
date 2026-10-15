@@ -48,7 +48,9 @@ void tphp_class_ensure_flat(TClass *cls);
 TMethod *tphp_class_find_method(TClass *cls, const char *name_lc);
 int  tphp_class_find_prop(TClass *cls, const char *name_lc);   /* slot or -1 */
 TProp *tphp_class_find_sprop(TClass *cls, const char *name_lc);
-bool tphp_class_has_const(TClass *cls, const char *name_lc, TVal *out);
+/* P2-B: 惰性常量表达式需要 owner/idx 供 VM 求值后回写缓存 */
+bool tphp_class_has_const(TClass *cls, const char *name_lc, TVal *out,
+                          TClass **owner, int *idx);
 
 /* hierarchy */
 bool tphp_class_isa(TClass *cls, TClass *ancestor);   /* includes self, ifaces */

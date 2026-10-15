@@ -1358,6 +1358,8 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
         m->func = f;
         if (p->tok.kind == P_LBRACE) {
             if (m->is_abstract) p_error(p, "Abstract method cannot have a body");
+            if (kind == CK_INTERFACE)    /* P3: 接口方法不允许有方法体 */
+                p_error(p, "Interface method must not have a body");
             advance(p);
             AStmtList *l = asl_new();
             while (p->tok.kind != P_RBRACE) {
@@ -1444,6 +1446,8 @@ static AClassMember *parse_class_member(Parser *p, int kind) {
         p->tok.kind == KW_FALSE) {
         TStr *ptype = parse_type_decl(p);
         if (p->tok.kind != L_VAR) p_error(p, "Expected property variable after type");
+        if (kind == CK_INTERFACE)    /* P3: 接口不允许属性 */
+            p_error(p, "Interfaces may not include properties");
         m->tag = CM_PROP;
         m->prop.name = p->tok.ident;
         m->prop.type = ptype;
@@ -1961,6 +1965,7 @@ static AStmt *parse_statement(Parser *p) {
     case KW_CLASS:
     case KW_ABSTRACT:
     case KW_FINAL:
+    case KW_READONLY:   /* P3: readonly class（PHP 8.2） */
     case KW_INTERFACE:
     case KW_TRAIT:
     case KW_ENUM: {
@@ -1968,6 +1973,11 @@ static AStmt *parse_statement(Parser *p) {
         int kind = CK_CLASS;
         if (p->tok.kind == KW_ABSTRACT) { advance(p); flags |= CLS_ABSTRACT; }
         else if (p->tok.kind == KW_FINAL) { advance(p); flags |= CLS_FINAL; }
+        else if (p->tok.kind == KW_READONLY) { advance(p); flags |= CLS_READONLY; }
+        /* 修饰符可混排（final readonly / readonly final） */
+        if (p->tok.kind == KW_ABSTRACT) { advance(p); flags |= CLS_ABSTRACT; }
+        else if (p->tok.kind == KW_FINAL) { advance(p); flags |= CLS_FINAL; }
+        else if (p->tok.kind == KW_READONLY) { advance(p); flags |= CLS_READONLY; }
         if (p->tok.kind == KW_CLASS) { advance(p); kind = CK_CLASS; }
         else if (p->tok.kind == KW_INTERFACE) { advance(p); kind = CK_INTERFACE; flags |= CLS_ABSTRACT; }
         else if (p->tok.kind == KW_TRAIT) { advance(p); kind = CK_TRAIT; }
