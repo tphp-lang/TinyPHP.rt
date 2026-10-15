@@ -907,7 +907,14 @@ static void args_push(VM *vm, TOp *op, TVal v) {
 }
 
 static int32_t op_send_val(VM *vm, TOp *op) {
-    TVal v = rdv(vm, op, 1);
+    /* raw read: the named-args default sentinel is a T_UNDEF literal and
+     * must pass through (RECV turns it into the default value); only an
+     * undefined CV variable raises */
+    TVal v = rd(vm, op, 1);
+    if (v.t == T_UNDEF && op->t1 == OPD_CV) {
+        vm_raise(vm, ex_class("UndefinedError"), op, "Undefined variable $%s",
+                 tstr_val(vm->x.frame->fn->local_names[op->a1]));
+    }
     args_push(vm, op, v);
     return 1;
 }

@@ -689,6 +689,63 @@ static uint32_t lit_undef(Ctx *c) {
     return push_lit(c, (TVal){ .u.i = 0, .t = T_UNDEF });
 }
 
+/* P2-A named args: shared reordering for static/self/parent calls and new
+ * (compile-time signature known). Every declared parameter slot receives a
+ * value or a T_UNDEF sentinel (RECV falls back to the default); extras go
+ * through for variadic use. param_names come from TMethod (AST interned,
+ * pointer-comparable with AArg.name). Returns the arg count sent. */
+static int compile_named_sends(Ctx *c, int line, AArgList *args,
+                               TStr **param_names, uint16_t n_params) {
+    int next_pos = 0;
+    bool *consumed = NULL;
+    if (args->n) {
+        consumed = tm_malloc(sizeof(bool) * (size_t)args->n);
+        memset(consumed, 0, sizeof(bool) * (size_t)args->n);
+    }
+    for (uint16_t pi = 0; pi < n_params; pi++) {
+        AArg *named = NULL;
+        for (int i = 0; i < args->n; i++)
+            if (!consumed[i] && args->items[i].name &&
+                args->items[i].name == param_names[pi]) {
+                named = &args->items[i];
+                consumed[i] = true;
+                break;
+            }
+        if (named) {
+            Loc v = compile_expr(c, named->e, LOC_NONE);
+            emit(c, OP_SEND_VAL, v, LOC_NONE, LOC_NONE, line);
+        } else {
+            while (next_pos < args->n &&
+                   (consumed[next_pos] || args->items[next_pos].name))
+                next_pos++;
+            if (next_pos < args->n && !args->items[next_pos].is_spread) {
+                Loc v = compile_expr(c, args->items[next_pos].e, LOC_NONE);
+                emit(c, OP_SEND_VAL, v, LOC_NONE, LOC_NONE, line);
+                consumed[next_pos] = true;
+                next_pos++;
+            } else {
+                emit(c, OP_SEND_VAL, LOC_CONST(lit_undef(c)), LOC_NONE,
+                     LOC_NONE, line);
+            }
+        }
+    }
+    /* any unconsumed named arg matched no parameter -> unknown (PHP: Error);
+     * must be checked before the extras loop skips it silently */
+    for (int i = 0; i < args->n; i++)
+        if (!consumed[i] && args->items[i].name)
+            tphp_fatal_src(c->file, line, "Unknown named parameter %s",
+                           tstr_val(args->items[i].name));
+    while (next_pos < args->n) {           /* extra args (variadic use) */
+        if (consumed[next_pos]) { next_pos++; continue; }
+        Loc v = compile_expr(c, args->items[next_pos].e, LOC_NONE);
+        emit(c, OP_SEND_VAL, v, LOC_NONE, LOC_NONE, line);
+        consumed[next_pos] = true;
+        next_pos++;
+    }
+    if (consumed) tm_free(consumed);
+    return (int)n_params;
+}
+
 static Loc compile_call(Ctx *c, AExpr *e, Loc want) {
     Loc dst = tmp_dst(c, want);
     AArgList *args = e->u.call.args;
@@ -754,10 +811,14 @@ static Loc compile_call(Ctx *c, AExpr *e, Loc want) {
             }
             n_sent++;
         }
+        /* unconsumed named args matched no parameter -> unknown (PHP: Error);
+         * checked before the extras loop, which would skip them silently */
+        for (int i = 0; i < args->n; i++)
+            if (!consumed[i] && args->items[i].name)
+                tphp_fatal_src(c->file, e->line, "Unknown named parameter %s",
+                               tstr_val(args->items[i].name));
         while (next_pos < args->n) {           /* extra args (variadic use) */
             if (consumed[next_pos]) { next_pos++; continue; }
-            if (args->items[next_pos].name)
-                tphp_fatal_src(c->file, e->line, "Unknown named parameter");
             Loc v = compile_expr(c, args->items[next_pos].e, LOC_NONE);
             emit(c, OP_SEND_VAL, v, LOC_NONE, LOC_NONE, e->line);
             consumed[next_pos] = true;
@@ -1339,28 +1400,53 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         if (!builtin_ex && !user_cls)
             tphp_fatal_src(c->file, e->line, "Class '%s' not found",
                            tstr_val(cname));
-        for (int i = 0; i < e->u.newx.args->n; i++)
-            if (e->u.newx.args->items[i].name || e->u.newx.args->items[i].is_spread)
-                tphp_fatal_src(c->file, e->line,
-                               "new does not support named/spread args in M3");
+        bool has_named = false, has_spread = false;
         for (int i = 0; i < e->u.newx.args->n; i++) {
-            Loc av = compile_expr(c, e->u.newx.args->items[i].e, LOC_NONE);
-            emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+            if (e->u.newx.args->items[i].name) has_named = true;
+            if (e->u.newx.args->items[i].is_spread) has_spread = true;
         }
-        /* spread here would need op_new_user real-arg counting: both ctor
-         * paths locate args via op->a2 (compile-time item count, wrong once
-         * a spread expands at runtime) — method/static calls are fine, their
-         * DO_FCALL re-counts n_args from the args area */
+        TMethod *ctor_m = NULL;
+        if (has_named) {
+            if (has_spread)
+                tphp_fatal_src(c->file, e->line,
+                               "Cannot combine named arguments and spread");
+            if (!user_cls)
+                tphp_fatal_src(c->file, e->line,
+                               "Named constructor arguments require a user class");
+            TClass *cls = tphp_class_lookup(lc);
+            if (!cls)
+                tphp_fatal_src(c->file, e->line, "Class '%s' not found",
+                               tstr_val(cname));
+            tphp_class_ensure_flat(cls);
+            if (cls->m_ctor < 0 || !cls->methods[cls->m_ctor].fn ||
+                !cls->methods[cls->m_ctor].param_names)
+                tphp_fatal_src(c->file, e->line,
+                               "Named constructor arguments require a compiled user constructor");
+            ctor_m = &cls->methods[cls->m_ctor];
+        }
+        int n_ctor_args;
+        if (has_named) {
+            /* reorder sends to ctor parameter order; a2 = n_params is exact
+             * (one SEND per slot) so op_new_user arg addressing stays valid */
+            n_ctor_args = compile_named_sends(c, e->line, e->u.newx.args,
+                                              ctor_m->param_names, ctor_m->n_params);
+        } else {
+            n_ctor_args = e->u.newx.args->n;
+            for (int i = 0; i < e->u.newx.args->n; i++) {
+                Loc av = compile_expr(c, e->u.newx.args->items[i].e, LOC_NONE);
+                emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+            }
+        }
         Loc dst = tmp_dst(c, want);
         if (user_cls) {
             emit(c, OP_NEW_USER, LOC_CONST(lit_str(c, cname)),
                  LOC_NONE, dst, e->line);
-            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)e->u.newx.args->n;
+            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)n_ctor_args;
         } else {
             emit(c, OP_NEW_EX, LOC_NONE, LOC_NONE, dst, e->line);
             c->fn->ops[c->fn->n_ops - 1].a1 =
                 (uint32_t)tphp_ex_class_index(tstr_val(cname));
-            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)e->u.newx.args->n;
+            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)n_ctor_args;
         }
         return dst;
     }
@@ -1431,7 +1517,7 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             AArg *arg = &e->u.mcall.args->items[i];
             if (arg->name)
                 tphp_fatal_src(c->file, e->line,
-                               "Named method args land later in M3");
+                               "Named args on instance methods need the receiver type at compile time (use an array callable or static:: variant)");
             if (arg->is_spread) {
                 Loc sv = compile_expr(c, arg->e, LOC_NONE);
                 emit(c, OP_SEND_SPREAD, sv, LOC_NONE, LOC_NONE, e->line);
@@ -1472,25 +1558,68 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             snprintf(key, sizeof key, "%s::%s", cn, tstr_val(e->u.scall.member));
         else
             snprintf(key, sizeof key, "%s", tstr_val(e->u.scall.member));
-        emit(c, OP_INIT_SMCALL, (Loc){ .kind = OPD_UNUSED, .slot = kind },
-             LOC_NONE, LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
-             e->line);
-        c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)e->u.scall.args->n;
-        int n_sent = 0;
+        bool has_named = false, has_spread = false;
         for (int i = 0; i < e->u.scall.args->n; i++) {
-            AArg *arg = &e->u.scall.args->items[i];
-            if (arg->name)
+            if (e->u.scall.args->items[i].name) has_named = true;
+            if (e->u.scall.args->items[i].is_spread) has_spread = true;
+        }
+        TMethod *nm = NULL;
+        if (has_named) {
+            if (has_spread)
                 tphp_fatal_src(c->file, e->line,
-                               "Named static args land later in M3");
-            if (arg->is_spread) {
-                Loc sv = compile_expr(c, arg->e, LOC_NONE);
-                emit(c, OP_SEND_SPREAD, sv, LOC_NONE, LOC_NONE, e->line);
-            } else {
-                Loc av = compile_expr(c, arg->e, LOC_NONE);
-                emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
-                n_sent++;
+                               "Cannot combine named arguments and spread");
+            /* kind 2 (static::) is late-bound: the real method's signature
+             * may differ from the declaring class — approximated with it
+             * (documented deviation; rewrite-with-renamed-params is rare) */
+            TClass *sig_cls = c->fn->decl_cls;
+            if (kind == 3) {
+                char lc2[256];
+                { const char *s = cn;
+                  size_t k = 0; for (; s[k] && k < sizeof lc2 - 1; k++)
+                      lc2[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+                  lc2[k] = 0; }
+                sig_cls = tphp_class_lookup(lc2);
+            } else if (kind == 1 && sig_cls) {
+                tphp_class_ensure_flat(sig_cls);
+                sig_cls = sig_cls->parent;
+            }
+            if (!sig_cls)
+                tphp_fatal_src(c->file, e->line,
+                               "Unknown class for named static arguments");
+            char mlc[128];
+            { const char *s = tstr_val(e->u.scall.member);
+              size_t k = 0; for (; s[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+              mlc[k] = 0; }
+            tphp_class_ensure_flat(sig_cls);
+            nm = tphp_class_find_method(sig_cls, mlc);
+            if (!nm || !nm->fn || !nm->param_names)
+                tphp_fatal_src(c->file, e->line,
+                               "Named arguments require a compiled user method");
+        }
+        int init_at = emit(c, OP_INIT_SMCALL,
+                           (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                           LOC_NONE, LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
+                           e->line);
+        int n_sent;
+        if (has_named) {
+            n_sent = compile_named_sends(c, e->line, e->u.scall.args,
+                                         nm->param_names, nm->n_params);
+        } else {
+            n_sent = 0;
+            for (int i = 0; i < e->u.scall.args->n; i++) {
+                AArg *arg = &e->u.scall.args->items[i];
+                if (arg->is_spread) {
+                    Loc sv = compile_expr(c, arg->e, LOC_NONE);
+                    emit(c, OP_SEND_SPREAD, sv, LOC_NONE, LOC_NONE, e->line);
+                } else {
+                    Loc av = compile_expr(c, arg->e, LOC_NONE);
+                    emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+                    n_sent++;
+                }
             }
         }
+        c->fn->ops[init_at].a2 = (uint32_t)n_sent;
         Loc dst = tmp_dst(c, want);
         emit(c, OP_DO_FCALL, LOC_NONE, LOC_NONE, dst, e->line);
         return dst;
@@ -2576,6 +2705,12 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                 m.is_static = mem->is_static;
                 m.is_abstract = true;
                 m.is_final = mem->is_final;
+                m.n_params = (uint16_t)af->n_params;
+                if (af->n_params) {
+                    m.param_names = tm_malloc(sizeof(TStr *) * (size_t)af->n_params);
+                    for (int pi = 0; pi < af->n_params; pi++)
+                        m.param_names[pi] = af->params[pi]->name;
+                }
                 cls->methods = tm_realloc(cls->methods, sizeof(TMethod) * (size_t)(cls->n_methods + 1));
                 cls->methods[cls->n_methods++] = m;
                 break;
@@ -2624,6 +2759,12 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             m.is_static = mem->is_static;
             m.is_abstract = mem->is_abstract;
             m.is_final = mem->is_final;
+            m.n_params = (uint16_t)af->n_params;
+            if (af->n_params) {
+                m.param_names = tm_malloc(sizeof(TStr *) * (size_t)af->n_params);
+                for (int pi = 0; pi < af->n_params; pi++)
+                    m.param_names[pi] = af->params[pi]->name;
+            }
             cls->methods = tm_realloc(cls->methods, sizeof(TMethod) * (size_t)(cls->n_methods + 1));
             cls->methods[cls->n_methods++] = m;
             break;

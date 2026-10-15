@@ -148,6 +148,9 @@ typedef struct TMethod {
     bool is_final;
     void *native;          /* M4: NativeMethodFn (opcode.h) for internal
                               classes (Async\Coroutine 等) — fn 为 NULL 时生效 */
+    /* P2-A named args: AST parameter names (same parse-interned TStr* as
+     * AArg.name, pointer-comparable); NULL for native/abstract-in-trait */
+    TStr **param_names; uint16_t n_params;
 } TMethod;
 
 typedef struct TEnumCase {
