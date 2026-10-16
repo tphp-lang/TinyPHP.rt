@@ -359,6 +359,10 @@ static AExpr *parse_primary(Parser *p) {
     case KW_FALSE: advance(p); return ae_new(A_FALSE, line);
     case KW_NULL: advance(p); return ae_new(A_NULL, line);
     case L_VAR: {
+        /* C1: `$$v` 只在成员上下文（->$v / ::$$v）合法；普通表达式仍是
+         * 变量变量（不支持），保持与原词法错误同等的明确报错 */
+        if (tstr_val(p->tok.ident)[0] == '$')
+            p_error(p, "Variable-variable ($$var) is not supported");
         AExpr *e = ae_new(A_VAR, line);
         e->u.name = p->tok.ident;
         advance(p);
@@ -669,15 +673,42 @@ static AExpr *parse_static_access(Parser *p, TStr *name, int line) {
         advance(p);
     } else if (p->tok.kind == L_VAR) {
         /* static property: the member name keeps a leading '$' so the
-         * backend can tell `C::$prop` apart from `C::CONST` */
+         * backend can tell `C::$prop` apart from `C::CONST`.
+         * C1: `C::$$v`（静态属性动态名）/ `C::$v()`（静态方法动态名）→ aname */
         const char *v = tstr_val(p->tok.ident);
         size_t n = tstr_len(p->tok.ident);
+        bool dyn_prop = v[0] == '$';
+        TStr *vident = p->tok.ident;
+        advance(p);
+        bool dyn_call = p->tok.kind == P_LPAREN;
+        if (dyn_prop || dyn_call) {
+            AExpr *av = ae_new(A_VAR, line);
+            av->u.name = dyn_prop ? tstr_intern(v + 1, n - 1) : vident;
+            size_t mn0 = n - (dyn_prop ? 1 : 0);
+            char *mb = tm_malloc(mn0 + 2);
+            mb[0] = '$';
+            memcpy(mb + 1, v + (dyn_prop ? 1 : 0), mn0);
+            TStr *mem = tstr_intern(mb, mn0 + 1);
+            tm_free(mb);
+            if (dyn_call) {
+                AExpr *sc = ae_new(A_STATICCALL, line);
+                sc->u.scall.cls = name;
+                sc->u.scall.member = mem;
+                sc->u.scall.aname = av;
+                sc->u.scall.args = parse_arg_list(p);
+                return sc;
+            }
+            AExpr *sg = ae_new(A_STATICGET, line);
+            sg->u.scall.cls = name;
+            sg->u.scall.member = mem;
+            sg->u.scall.aname = av;
+            return sg;
+        }
         char *tmp = tm_malloc(n + 1);
         tmp[0] = '$';
         memcpy(tmp + 1, v, n);        /* content only: buffer is n+1 total */
         member = tstr_intern(tmp, n + 1);
         tm_free(tmp);
-        advance(p);
     } else if (p->tok.kind == L_IDENT) {
         member = p->tok.ident;
         advance(p);
@@ -763,6 +794,45 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
         }
         case P_OBJECT: {
             advance(p);
+            if (p->tok.kind == L_VAR) {
+                /* C1: $obj->$v / $obj->$v() —— 成员名 = 变量值（求值一次） */
+                AExpr *av = ae_new(A_VAR, line);
+                av->u.name = p->tok.ident;
+                advance(p);
+                if (p->tok.kind == P_LPAREN) {
+                    Lex saved = p->lx;
+                    Token saved_tok = p->tok;
+                    advance(p);
+                    bool is_fcc = false;
+                    if (p->tok.kind == P_ELLIPSIS) {
+                        advance(p);
+                        is_fcc = (p->tok.kind == P_RPAREN);
+                    }
+                    if (is_fcc) {
+                        advance(p);
+                        AExpr *pr = ae_new(A_PROP, line);
+                        pr->u.prop.obj = e;
+                        pr->u.prop.aname = av;
+                        AExpr *fc = ae_new(A_FIRSTCLASS_DYN, line);
+                        fc->u.e = pr;
+                        return fc;
+                    }
+                    p->lx = saved;
+                    p->tok = saved_tok;
+                    AArgList *args = parse_arg_list(p);
+                    AExpr *m = ae_new(A_METHODCALL, line);
+                    m->u.mcall.obj = e;
+                    m->u.mcall.aname = av;
+                    m->u.mcall.args = args;
+                    e = m;
+                } else {
+                    AExpr *pr = ae_new(A_PROP, line);
+                    pr->u.prop.obj = e;
+                    pr->u.prop.aname = av;
+                    e = pr;
+                }
+                break;
+            }
             if (p->tok.kind != L_IDENT &&
                 p->tok.kind != KW_NEW &&
                 p->tok.kind != KW_SELF &&
@@ -825,6 +895,28 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
              * short-circuits to null once any hop sees null — compile
              * layer emits per-hop JMP_NULL guards */
             advance(p);
+            if (p->tok.kind == L_VAR) {
+                /* C1: $obj?->$v */
+                AExpr *av = ae_new(A_VAR, line);
+                av->u.name = p->tok.ident;
+                advance(p);
+                if (p->tok.kind == P_LPAREN) {
+                    AArgList *args = parse_arg_list(p);
+                    AExpr *m = ae_new(A_METHODCALL, line);
+                    m->u.mcall.obj = e;
+                    m->u.mcall.aname = av;
+                    m->u.mcall.args = args;
+                    m->nullsafe = true;
+                    e = m;
+                } else {
+                    AExpr *pr = ae_new(A_PROP, line);
+                    pr->u.prop.obj = e;
+                    pr->u.prop.aname = av;
+                    pr->nullsafe = true;
+                    e = pr;
+                }
+                break;
+            }
             if (p->tok.kind != L_IDENT &&
                 p->tok.kind != KW_NEW &&
                 p->tok.kind != KW_SELF &&
@@ -860,19 +952,27 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             if (e->tag != A_CONSTREF) {
                 advance(p);   /* 消费 '::'——此前 L_VAR 判断在消费前，永假 */
                 if (p->tok.kind == L_VAR) {
-                    /* P2-B: $obj::$staticProp（读/赋值目标） */
+                    /* P2-B: $obj::$staticProp（读/赋值目标）；
+                     * C1: $obj::$$v → aname（动态静态属性名） */
                     const char *vn = tstr_val(p->tok.ident);
                     size_t vn_len = tstr_len(p->tok.ident);
+                    bool dyn_prop = vn[0] == '$';
                     char sbuf[160];
                     sbuf[0] = '$';
                     size_t cl = vn_len < sizeof sbuf - 2 ? vn_len : sizeof sbuf - 2;
                     memcpy(sbuf + 1, vn, cl);
                     sbuf[cl + 1] = 0;
                     TStr *member = tstr_intern(sbuf, cl + 1);
+                    AExpr *av = NULL;
+                    if (dyn_prop) {
+                        av = ae_new(A_VAR, line);
+                        av->u.name = tstr_intern(vn + 1, vn_len - 1);
+                    }
                     advance(p);
                     AExpr *os = ae_new(A_OBJSTATIC, line);
                     os->u.prop.obj = e;
                     os->u.prop.name = member;
+                    os->u.prop.aname = av;
                     e = os;
                     break;
                 }

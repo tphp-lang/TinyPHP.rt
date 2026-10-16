@@ -144,6 +144,8 @@ typedef struct TProp {
 typedef struct TMethod {
     TStr *name;            /* interned method name (case preserved) */
     struct TFunc *fn;      /* NULL for abstract / interface declarations */
+    struct TClass *decl;   /* 声明类（private/protected 可见性 owner 判定；
+                            * trait 拷贝归使用类；NULL = 内部类兜底用查找类） */
     uint8_t visibility;
     bool is_static;
     bool is_abstract;

@@ -40,6 +40,10 @@ void tphp_class_flatten_all(void);
  * class's frozen template on first access */
 TVal *tphp_class_sprop_vals(TClass *cls);
 
+/* B4: 请求收尾按类声明序释放本线程静态属性值（级联触发 __destruct，
+ * 对齐 PHP shutdown 析构序）。幂等，可重复调用。 */
+void tphp_class_release_sprops(void);
+
 /* lazy flattening: inherit parent members, bind traits, build the
  * magic-method quick links. Recurses to the parent first. */
 void tphp_class_ensure_flat(TClass *cls);

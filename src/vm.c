@@ -273,13 +273,46 @@ static void wtake(VM *vm, TOp *op, TVal v) {
 /* main frame slot lookup by name (the main frame IS the global scope).
  * main_frame 在主帧 RETURN 时置 NULL（收尾析构期间 global 访问得到干净
  * 错误而非 UAF——2026-10-15 P0-2） */
+
+/* B2: 动态全局条目（per-thread；见 global_slot 内注释） */
+typedef struct { TStr *name; TVal val; } DygEnt;
+static _Thread_local DygEnt *g_dyg;
+static _Thread_local uint32_t g_ndyg, g_capdyg;
+
 static TVal *global_slot(VM *vm, TStr *name) {
-    if (!vm->main_frame) return NULL;
-    TFunc *fn = vm->main_frame->fn;
-    for (uint16_t i = 0; i < fn->n_locals; i++)
-        if (tstr_eq(fn->local_names[i], name))
-            return &vm->main_frame->slots[i];
+    if (vm->main_frame) {
+        TFunc *fn = vm->main_frame->fn;
+        for (uint16_t i = 0; i < fn->n_locals; i++)
+            if (tstr_eq(fn->local_names[i], name))
+                return &vm->main_frame->slots[i];
+    }
+    /* B2: 预扫描（scan_globals）只覆盖顶层语句嵌套与顶层函数体——方法/
+     * 闭包内的 `global $x` 若 $x 顶层从未出现，main 帧没有槽。动态全局
+     * 条目只会在这种场景创建（顶层出现该名 → main 槽必存在并先命中），
+     * 故动态表与 main 帧槽永不分裂，语义即 PHP 全局符号表。 */
+    for (uint32_t i = 0; i < g_ndyg; i++)
+        if (tstr_eq(g_dyg[i].name, name)) return &g_dyg[i].val;
     return NULL;
+}
+
+/* B2: 创建动态全局条目（仅 op_assign_global 在 miss 时调用） */
+static TVal *dyn_global_create(TStr *name) {
+    if (g_ndyg == g_capdyg) {
+        g_capdyg = g_capdyg ? g_capdyg * 2 : 16;
+        g_dyg = tm_realloc(g_dyg, sizeof(DygEnt) * (size_t)g_capdyg);
+    }
+    g_dyg[g_ndyg].name = name;
+    g_dyg[g_ndyg].val = (TVal){ .u.i = 0, .t = T_UNDEF };
+    return &g_dyg[g_ndyg++].val;
+}
+
+/* 收尾释放（tphp_run_shutdown_dtors 末尾；幂等） */
+static void dyn_global_release_all(void) {
+    for (uint32_t i = 0; i < g_ndyg; i++) {
+        tval_release(&g_dyg[i].val);
+        g_dyg[i].val = (TVal){ .u.i = 0, .t = T_UNDEF };
+    }
+    g_ndyg = 0;
 }
 
 static void fatal_missing_key(VM *vm, TOp *op, TVal key) {
@@ -620,6 +653,8 @@ static int32_t op_fetch_global(VM *vm, TOp *op) {
 static int32_t op_assign_global(VM *vm, TOp *op) {
     TVal v = rdv(vm, op, 1);
     TVal *g = global_slot(vm, (TStr *)vm->x.frame->fn->lits[op->a2].u.p);
+    if (!g)
+        g = dyn_global_create((TStr *)vm->x.frame->fn->lits[op->a2].u.p);  /* B2 */
     if (!g)
         vm_raise(vm, ex_class("Error"), op, "Internal: global slot missing");
     tval_addref(v);
@@ -1013,7 +1048,7 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
             extern TClass *class_resolve_lc(const char *fqcn_lc);
             cls = class_resolve_lc(clc);
             if (!cls)
-                vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+                vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                          tstr_val((TStr *)e0->u.p));
         } else {
             vm_raise(vm, ex_class("TypeError"), op,
@@ -1048,7 +1083,7 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
             extern TClass *class_resolve_lc(const char *fqcn_lc);
             TClass *cls = class_resolve_lc(clc);
             if (!cls)
-                vm_raise(vm, ex_class("Error"), op, "Class '%.*s' not found",
+                vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                          (int)cl, s);
             init_method_callable(vm, op, rec, cls, NULL,
                                  tstr_intern(sep + 2, strlen(sep + 2)));
@@ -1115,6 +1150,32 @@ static int32_t op_send_spread(VM *vm, TOp *op) {
     return 1;
 }
 
+/* B8: 参数不足错误补全 PHP 8 调用点尾巴——"%u passed in FILE on line N
+ * and (exactly|at least) %u expected"。异常行仍是定义行（vm_raise 取
+ * RECV op->line，对齐 PHP getLine()）；消息内行号取调用点 call rec。 */
+static void raise_arg_count(VM *vm, VMFrame *f, TOp *op) {
+    TFunc *fn = f->fn;
+    uint32_t required = 0;
+    for (uint16_t i = 0; i < fn->n_params; i++) {
+        bool has_def = (fn->defaults && fn->defaults[i].t != T_UNDEF) ||
+                       (fn->default_thunk && fn->default_thunk[i]);
+        if (!has_def) required++;
+    }
+    const char *fname = fn->name ? tstr_val(fn->name) : "{closure}";
+    if (vm->x.n_calls > 0) {
+        int cline = vm->x.calls[vm->x.n_calls - 1].line;
+        const char *file = (vm->prog && vm->prog->file) ? vm->prog->file : "-";
+        vm_raise(vm, ex_class("ArgumentCountError"), op,
+                 "Too few arguments to function %s(), %u passed in %s on line %d and %s %u expected",
+                 fname, (unsigned)f->n_args_sent, file, cline,
+                 required == fn->n_params ? "exactly" : "at least",
+                 (unsigned)required);
+    } else {
+        vm_raise(vm, ex_class("ArgumentCountError"), op,
+                 "Too few arguments to function %s()", fname);
+    }
+}
+
 static int32_t op_recv(VM *vm, TOp *op) {
     VMFrame *f = vm->x.frame;
     uint32_t idx = op->a1;
@@ -1127,9 +1188,7 @@ static int32_t op_recv(VM *vm, TOp *op) {
             if (d.t == T_UNDEF && f->fn->default_thunk && f->fn->default_thunk[idx]) {
                 v = tphp_call_thunk(vm, f->fn->default_thunk[idx]);
             } else if (d.t == T_UNDEF) {
-                vm_raise(vm, ex_class("ArgumentCountError"), op,
-                         "Too few arguments to function %s()",
-                         tstr_val(f->fn->name));
+                raise_arg_count(vm, f, op);
             } else {
                 v = default_arg_val(d);
             }
@@ -1158,9 +1217,7 @@ static int32_t op_recv(VM *vm, TOp *op) {
         if (d.t == T_UNDEF && f->fn->default_thunk && f->fn->default_thunk[idx]) {
             v = tphp_call_thunk(vm, f->fn->default_thunk[idx]);
         } else if (d.t == T_UNDEF) {
-            vm_raise(vm, ex_class("ArgumentCountError"), op,
-                     "Too few arguments to function %s()",
-                     tstr_val(f->fn->name));
+            raise_arg_count(vm, f, op);
         } else {
             v = default_arg_val(d);
         }
@@ -1404,10 +1461,17 @@ static int32_t op_return(VM *vm, TOp *op) {
         tval_addref(r);
     }
     /* P1-1: 返回类型校验（void/never/mixed 不校验；void 的返回值本就丢弃）。
-     * 隐式 return（r = null）同样校验——PHP 对非空返回类型抛 TypeError。 */
+     * 隐式 return（r = null）同样校验——PHP 对非空返回类型抛 TypeError。
+     * B1: never 函数隐式返回 = 运行期可捕获 TypeError（对齐 PHP；带值
+     * return 已在加载期拦截，走到这里的 OP_RETURN 只能是落到函数尾）。 */
     {
         TFunc *fn = vm->x.frame->fn;
         TStr *rt = fn->ret_type;
+        if (rt && strcmp(tstr_val(rt), "never") == 0 && op->t1 == OPD_UNUSED) {
+            vm_raise(vm, ex_class("TypeError"), op,
+                     "%s(): never-returning function must not implicitly return",
+                     fn->name ? tstr_val(fn->name) : "{closure}");
+        }
         if (rt) {
             const char *ts = tstr_val(rt);
             bool skip = strcmp(ts, "void") == 0 || strcmp(ts, "never") == 0 ||
@@ -1656,6 +1720,9 @@ static TClass *clo_scope_arg(TVal v) {
     if (v.t != T_STR) return NULL;
     const char *s = tstr_val((TStr *)v.u.p);
     if (strncmp(s, "static::", 8) == 0) s += 8;   /* D::class 编译成字符串 */
+    /* B3: 字面量 "static" = 保留闭包原 scope（PHP：传 "static" 不改变
+     * 作用域，LSB 交给调用时 $this 的类回落解析） */
+    if (strcmp(s, "static") == 0) return NULL;
     char lc[256];
     size_t k = 0;
     for (; s[k] && k + 1 < sizeof lc; k++)
@@ -1884,7 +1951,65 @@ static const char *asym_scope(VM *vm, char *buf, size_t cap) {
     return buf;
 }
 
+/* B3: 方法可见性错误的 scope 措辞（PHP 对拍）——类作用域 → "scope X"，
+ * 未带 scope 参数的闭包帧 → "scope Closure"，函数/全局 → "global scope" */
+static const char *meth_scope_disp(VM *vm, char *buf, size_t cap) {
+    TClass *from = frame_scope_cls(vm);
+    if (from) { snprintf(buf, cap, "scope %s", tstr_val(from->name)); return buf; }
+    if (vm->x.frame && vm->x.frame->fn && vm->x.frame->fn->is_closure)
+        return "scope Closure";
+    return "global scope";
+}
+
 /* exception getters callable as methods (M2 sugar): getMessage() etc */
+
+/* C1: 成员名操作数读取——kind==CONST → 编译期字面量；否则取槽位值转字符串
+ * （tval_to_str：int/float/bool/null 直转；数组/无 __toString 对象按项目
+ * “诊断即异常”规则抛 TypeError）。转换结果存 thread-local scratch，
+ * handler 取到后立即使用。 */
+static _Thread_local TStr *g_mname_scratch;
+static TStr *op_member_name(VM *vm, TOp *op, int which) {
+    uint8_t kind;
+    uint32_t a;
+    if (which == 1) { kind = op->t1; a = op->a1; }
+    else if (which == 2) { kind = op->t2; a = op->a2; }
+    else { kind = op->tr; a = op->ar; }
+    if (kind == OPD_CONST)
+        return (TStr *)vm->x.frame->fn->lits[a].u.p;
+    if (kind == OPD_UNUSED)
+        return tstr_intern("", 0);
+    TVal v = vm->x.frame->slots[a];
+    if (v.t == T_STR) return (TStr *)v.u.p;      /* borrowed（槽持有引用） */
+    if (v.t == T_UNDEF) return tstr_intern("", 0);
+    TStr *s = tval_to_str(v);
+    if (g_mname_scratch && g_mname_scratch != s) {
+        TStr *old = g_mname_scratch;
+        g_mname_scratch = NULL;
+        tval_release(&(TVal){ .u.p = old, .t = T_STR });
+    }
+    g_mname_scratch = s;
+    return s;
+}
+
+/* C1: 动态静态属性 key 拼接（与静态路径同构："Cls::$name" / "$name"；
+ * 运行期名 intern 进全局串表，同名复用指针稳定）。 */
+static TStr *dyn_sprop_key(int kind, const char *prefix, TStr *name) {
+    static _Thread_local char kbuf[384];
+    if (kind == 3)
+        snprintf(kbuf, sizeof kbuf, "%s::$%s", prefix, tstr_val(name));
+    else
+        snprintf(kbuf, sizeof kbuf, "$%s", tstr_val(name));
+    return tstr_intern(kbuf, strlen(kbuf));
+}
+
+/* C1: OSPROP 类成员名操作数——CONST → 原字面量（带 '$'）；
+ * 动态 → 运行期值统一补 '$' 前缀（与静态形式同构）。 */
+static TStr *op_member_name_os(VM *vm, TOp *op) {
+    if (op->t2 == OPD_CONST)
+        return (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    return dyn_sprop_key(0, "", op_member_name(vm, op, 2));
+}
+
 static bool ex_getter(const char *n, TExObj *x, TVal *out) {
     if (lc_eq(n, "getMessage"))   { *out = TV_STR(x->message); tval_addref(*out); return true; }
     if (lc_eq(n, "getCode"))      { *out = TV_INT(x->code); return true; }
@@ -1960,7 +2085,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
 
 static int32_t op_init_mcall(VM *vm, TOp *op) {
     TVal objv = rdv(vm, op, 1);
-    TStr *mname = (TStr *)vm->x.frame->fn->lits[op->ar].u.p;
+    TStr *mname = op_member_name(vm, op, 3);   /* C1: CONST 字面量或动态名 */
     VMCallRec *rec = call_push(vm, op);
     /* P1-3: $closure->call()/bindTo() —— TClosure 接收者派发到内部
      * Closure 类（native；self 传 TClosure*）。 */
@@ -2005,10 +2130,10 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
                  "Method calls on this object type land in M3");
     TObj *o = (TObj *)h;
     TMethod *m = tphp_class_find_method(o->cls, tstr_val(mname));
-    /* owner is the lookup class (flat table carries no declaring-class);
-     * M3 difference: a parent-declared private method stays callable from
-     * subclasses because owner == from collapses the check */
-    bool m_hidden = m && !tphp_vis_ok(m->visibility, o->cls,
+    /* B3: owner = 声明类（TMethod.decl；内部类无 decl 用查找类兜底）——
+     * 关闭 M3 差异：父类 private 方法对子类 scope 不可见（对齐 PHP） */
+    bool m_hidden = m && !tphp_vis_ok(m->visibility,
+                                      m->decl ? m->decl : o->cls,
                                       frame_scope_cls(vm));
     if (m && !m->fn && !m->is_abstract && m->native) {
         /* internal-class native method (M4): dispatched at DO_FCALL with
@@ -2035,12 +2160,14 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
             tval_addref(objv);            /* frame slot 0 owns a reference */
             return 1;
         }
-        if (m_hidden)
+        if (m_hidden) {
+            char sb[160];
             vm_raise(vm, ex_class("Error"), op,
-                     "Call to %s method %s::%s() from scope %s",
-                     vis_name(m->visibility), tstr_val(o->cls->name),
-                     tstr_val(mname),
-                     frame_scope_cls(vm) ? tstr_val(frame_scope_cls(vm)->name) : "global");
+                     "Call to %s method %s::%s() from %s",
+                     vis_name(m->visibility),
+                     tstr_val(m->decl ? m->decl->name : o->cls->name),
+                     tstr_val(mname), meth_scope_disp(vm, sb, sizeof sb));
+        }
         vm_raise(vm, ex_class("Error"), op,
                  "Call to undefined method %s::%s()",
                  tstr_val(o->cls->name), tstr_val(mname));
@@ -2075,7 +2202,8 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
     /* P3: 构造器可见性——private/protected ctor 阻断外部实例化 */
     if (cls->m_ctor >= 0) {
         TMethod *cm = &cls->methods[cls->m_ctor];
-        if (!tphp_vis_ok(cm->visibility, cls, frame_scope_cls(vm))) {
+        if (!tphp_vis_ok(cm->visibility, cm->decl ? cm->decl : cls,
+                         frame_scope_cls(vm))) {
             TClass *from = frame_scope_cls(vm);
             vm_raise(vm, ex_class("Error"), op,
                      "Call to %s %s::__construct() from %s",
@@ -2175,7 +2303,7 @@ static int32_t op_new_user(VM *vm, TOp *op) {
     extern TClass *class_resolve_lc(const char *fqcn_lc);
     TClass *cls = class_resolve_lc(lc);
     if (!cls || cls->kind != CK_CLASS)
-        vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+        vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                  tstr_val(cname));
     return new_user_at(vm, op, cls, cname);
 }
@@ -2216,15 +2344,23 @@ static int32_t op_new_dyn(VM *vm, TOp *op) {
     extern TClass *class_resolve_lc(const char *fqcn_lc);
     TClass *cls = class_resolve_lc(lc);
     if (!cls)
-        vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+        vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                  tstr_val(cname));
     return new_user_at(vm, op, cls, cname);
 }
 
+/* B3: 实例属性可见性的 owner = 属性声明类（TProp.decl，与 asym 检查同源）
+ * ——private/protected 按声明类判定，非接收者类（PHP 语义；bindTo scope
+ * 对拍的关键：scope=声明类可读父类 private，scope=子类不可读） */
+static TClass *prop_owner(TObj *o, int slot) {
+    TProp *p = &o->cls->props[slot];
+    return p->decl ? p->decl : o->cls;
+}
+
 static int32_t op_assign_prop(VM *vm, TOp *op) {
     TVal objv = rdv(vm, op, 1);
-    TStr *name = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
-    TVal val = rdv(vm, op, 3);    /* o3: operands are obj, name-lit, value */
+    TStr *name = op_member_name(vm, op, 2);   /* C1 */
+    TVal val = rdv(vm, op, 3);    /* o3: operands are obj, name, value */
     if (objv.t != T_OBJ || ((GCHead *)objv.u.p)->kind != GC_KIND_OBJ)
         vm_raise(vm, ex_class("Error"), op,
                  "Attempt to assign property \"%s\" on %s", tstr_val(name),
@@ -2257,7 +2393,8 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         }
     }
     if (slot >= 0 &&
-        !tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
+        !tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
+                     frame_scope_cls(vm))) {
         /* invisible from this scope: __set fallback, else error */
         TVal pack[2];
         pack[0] = TV_STR(name);
@@ -2345,7 +2482,7 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
 
 static int32_t op_isset_prop(VM *vm, TOp *op) {
     TVal objv = rdv(vm, op, 1);
-    TStr *name = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *name = op_member_name(vm, op, 2);   /* C1 */
     bool set = false;
     if (objv.t == T_OBJ) {
         GCHead *h = (GCHead *)objv.u.p;
@@ -2353,7 +2490,7 @@ static int32_t op_isset_prop(VM *vm, TOp *op) {
             TObj *o = (TObj *)h;
             int slot = tphp_class_find_prop(o->cls, tstr_val(name));
             if (slot >= 0) {
-                if (tphp_vis_ok(o->cls->props[slot].visibility, o->cls,
+                if (tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
                                 frame_scope_cls(vm)))
                     set = o->props[slot].t != T_UNDEF;
                 else if (o->cls->m_isset >= 0) {
@@ -2395,6 +2532,20 @@ static int32_t op_isset_prop(VM *vm, TOp *op) {
     return 1;
 }
 
+/* B3: 当前帧的 $this 捕获槽对应的类（闭包 n_cap 区按名找 "this" 槽；
+ * 方法帧 decl/called 必非空，走不到此回落） */
+static TClass *frame_this_cls(VM *vm) {
+    VMFrame *f = vm->x.frame;
+    TFunc *fn = f->fn;
+    for (uint16_t i = 0; i < fn->n_cap && i < fn->n_locals; i++)
+        if (fn->local_names[i] && lc_eq(tstr_val(fn->local_names[i]), "this")) {
+            TVal v = f->slots[i];
+            if (v.t == T_OBJ) return ((TObj *)v.u.p)->cls;
+            return NULL;
+        }
+    return NULL;
+}
+
 /* resolve a static-call class target: kind 0 self / 1 parent / 2 static /
  * 3 named; late binding uses frame->called_cls (set by frame creators) */
 static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named) {
@@ -2411,6 +2562,7 @@ static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named) {
         return decl->parent;
     case 2: {
         TClass *c = called ? called : decl;
+        if (!c) c = frame_this_cls(vm);   /* B3: 闭包 static:: 回落 $this 类 */
         if (!c) vm_raise(vm, ex_class("Error"), op,
                          "static:: used outside a class context");
         return c;
@@ -2424,8 +2576,9 @@ static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named) {
         lc[k] = 0;
         extern TClass *class_resolve_lc(const char *fqcn_lc);
         TClass *c = class_resolve_lc(lc);
-        if (!c) vm_raise(vm, ex_class("Error"), op,
-                         "Class '%s' not found", s);
+        if (!c)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Class \"%s\" not found", s);
         return c;
     }
     }
@@ -2444,8 +2597,12 @@ static TClass *frame_called_cls(VMCallRec *rec, TFunc *fn) {
 }
 
 static int32_t op_init_smcall(VM *vm, TOp *op) {
-    int kind = (int)op->a1;
+    /* C1: 动态名放 t1（argc 复用 a2，动态时 a1 被 name 占用 → kind 挂 ext）；
+     * 静态保持 o1={UNUSED,kind}、a1=kind */
+    bool dynm = op->t1 != OPD_UNUSED;
+    int kind = dynm ? (int)op->ext : (int)op->a1;
     TStr *key = (TStr *)vm->x.frame->fn->lits[op->ar].u.p;
+    TStr *dyn = dynm ? op_member_name(vm, op, 1) : NULL;
     TClass *cls;
     TStr *mname;
     if (kind == 3) {
@@ -2454,10 +2611,11 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
         const char *sep = NULL;
         for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2)
             sep = p;
-        if (!sep)
+        if (!sep && !dyn)
             vm_raise(vm, ex_class("Error"), op, "Malformed static call key");
+        /* 动态时 key 是纯类名（无 "::method"），整段作类名 */
+        size_t cl = sep ? (size_t)(sep - s) : strlen(s);
         char clc[128];
-        size_t cl = (size_t)(sep - s);
         if (cl >= sizeof clc) cl = sizeof clc - 1;
         for (size_t i = 0; i < cl; i++)
             clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
@@ -2465,12 +2623,12 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
         extern TClass *class_resolve_lc(const char *fqcn_lc);
         cls = class_resolve_lc(clc);
         if (!cls)
-            vm_raise(vm, ex_class("Error"), op, "Class '%.*s' not found",
+            vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
-        mname = tstr_intern(sep + 2, strlen(sep + 2));
+        mname = dyn ? dyn : tstr_intern(sep + 2, strlen(sep + 2));
     } else {
         cls = smcall_cls(vm, op, kind, NULL);
-        mname = key;
+        mname = dyn ? dyn : key;
     }
     VMCallRec *rec = call_push(vm, op);
     /* internal-class native static method (M5-c): dispatched at DO_FCALL;
@@ -2543,6 +2701,28 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
          * current $this (the one legal non-static "static" call besides
          * __construct); an explicit Cls::method() stays an error */
         if (kind != 3 && vm->x.frame->slots[0].t == T_OBJ) {
+            /* B3: PHP 对该路径同样做方法可见性检查（caller scope vs 声明类）
+             * ——parent::privateMethod() 从子类 scope 报错，__call 兜底 */
+            if (!tphp_vis_ok(m->visibility, m->decl ? m->decl : cls,
+                             frame_scope_cls(vm))) {
+                TMethod *mc = tphp_class_find_method(cls, "__call");
+                if (mc && mc->fn && !mc->is_abstract) {
+                    TObj *mo = (TObj *)vm->x.frame->slots[0].u.p;
+                    mo->h.rc++;
+                    rec->magic_kind = 1;
+                    rec->magic_name = mname;
+                    rec->is_method = true;
+                    rec->called_cls = cls;
+                    rec->this_obj = mo;
+                    return 1;
+                }
+                char sb[160];
+                vm_raise(vm, ex_class("Error"), op,
+                         "Call to %s method %s::%s() from %s",
+                         vis_name(m->visibility),
+                         tstr_val(m->decl ? m->decl->name : cls->name),
+                         tstr_val(mname), meth_scope_disp(vm, sb, sizeof sb));
+            }
             TObj *o = (TObj *)vm->x.frame->slots[0].u.p;
             o->h.rc++;               /* reference moves into the new frame */
             rec->is_method = true;
@@ -2560,7 +2740,8 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
                  "Non-static method %s::%s() called statically",
                  tstr_val(cls->name), tstr_val(mname));
     }
-    if (!tphp_vis_ok(m->visibility, cls, frame_scope_cls(vm))) {
+    if (!tphp_vis_ok(m->visibility, m->decl ? m->decl : cls,
+                     frame_scope_cls(vm))) {
         TMethod *mcs = tphp_class_find_method(cls, "__callstatic");
         if (mcs && mcs->fn && !mcs->is_abstract) {
             rec->magic_kind = 2;
@@ -2569,10 +2750,14 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
             rec->called_cls = cls;
             return 1;
         }
-        vm_raise(vm, ex_class("Error"), op,
-                 "Call to %s method %s::%s() from scope %s",
-                 vis_name(m->visibility), tstr_val(cls->name), tstr_val(mname),
-                 frame_scope_cls(vm) ? tstr_val(frame_scope_cls(vm)->name) : "global");
+        {
+            char sb[160];
+            vm_raise(vm, ex_class("Error"), op,
+                     "Call to %s method %s::%s() from %s",
+                     vis_name(m->visibility),
+                     tstr_val(m->decl ? m->decl->name : cls->name),
+                     tstr_val(mname), meth_scope_disp(vm, sb, sizeof sb));
+        }
     }
     rec->is_method = true;
     rec->called_cls = cls;
@@ -2589,8 +2774,19 @@ static TVal *sprop_slot(TClass *cls, TProp *sp) {
 }
 
 static int32_t op_fetch_cconst(VM *vm, TOp *op) {
-    int kind = (int)op->a1;
-    TStr *key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    int kind;
+    TStr *key;
+    if (op->t1 != OPD_UNUSED) {
+        /* C1: C::$$v 动态——t1=成员名，ext=kind，t2=类名前缀(kind3)；
+         * 运行期拼 key 后走与静态完全相同的解析 */
+        kind = (int)op->ext;
+        TStr *mn = op_member_name(vm, op, 1);
+        TStr *pf = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+        key = dyn_sprop_key(kind, tstr_val(pf), mn);
+    } else {
+        kind = (int)op->a1;
+        key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    }
     TClass *cls;
     TStr *cname;
     if (kind == 3) {
@@ -2611,7 +2807,7 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
         extern TClass *class_resolve_lc(const char *fqcn_lc);
         cls = class_resolve_lc(clc);
         if (!cls)
-            vm_raise(vm, ex_class("Error"), op, "Class '%.*s' not found",
+            vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
         cname = tstr_intern(sep + 2, strlen(sep + 2));
     } else {
@@ -2680,11 +2876,81 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
              tstr_val(cls->name), tstr_val(cname));
 }
 
+/* C1+既有缺口: isset(C::$prop / C::$$v / C::CONST) —— 未声明/不可见/
+ * 未初始化静默 false（对齐 PHP；此前 A_ISSET 没有静态分支、连字面
+ * isset(C::$x) 都是加载期报错）。操作数布局与 op_fetch_cconst 一致。 */
+static int32_t op_isset_cconst(VM *vm, TOp *op) {
+    int kind;
+    TStr *key;
+    if (op->t1 != OPD_UNUSED) {
+        kind = (int)op->ext;
+        TStr *mn = op_member_name(vm, op, 1);
+        TStr *pf = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+        key = dyn_sprop_key(kind, tstr_val(pf), mn);
+    } else {
+        kind = (int)op->a1;
+        key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    }
+    TClass *cls;
+    TStr *cname;
+    if (kind == 3) {
+        const char *s = tstr_val(key);
+        const char *sep = NULL;
+        for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2)
+            sep = p;
+        if (!sep)
+            vm_raise(vm, ex_class("Error"), op, "Malformed class constant key");
+        char clc[128];
+        size_t cl = (size_t)(sep - s);
+        if (cl >= sizeof clc) cl = sizeof clc - 1;
+        for (size_t i = 0; i < cl; i++)
+            clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+        clc[cl] = 0;
+        extern TClass *class_resolve_lc(const char *fqcn_lc);
+        cls = class_resolve_lc(clc);
+        if (!cls)
+            vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
+                     (int)cl, s);
+        cname = tstr_intern(sep + 2, strlen(sep + 2));
+    } else {
+        cls = smcall_cls(vm, op, kind, NULL);
+        cname = key;
+    }
+    bool set = false;
+    tphp_class_ensure_flat(cls);
+    if (tstr_val(cname)[0] == '$') {
+        TProp *sp = tphp_class_find_sprop(cls, tstr_val(cname) + 1);
+        if (sp && tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm))) {
+            TVal v = sprop_slot(cls, sp)[0];
+            set = v.t != T_UNDEF;
+        }
+    } else {
+        TVal out;
+        set = tphp_class_has_const(cls, tstr_val(cname), &out, NULL, NULL);
+    }
+    if (op->tr != OPD_UNUSED) {
+        TVal *d = &vm->x.frame->slots[op->ar];
+        tval_release(d);
+        d[0] = set ? TV_TRUE : TV_FALSE;
+    }
+    return 1;
+}
+
 /* static property write: C::$prop = v / self::$prop = v
  * operands: o1=kind (0 self/1 parent/2 static/3 FQ), o2=key lit, o3=value */
 static int32_t op_assign_sprop(VM *vm, TOp *op) {
-    int kind = (int)op->a1;
-    TStr *key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    int kind;
+    TStr *key;
+    if (op->t1 != OPD_UNUSED) {
+        /* C1: C::$$v = x 动态（同 op_fetch_cconst 布局） */
+        kind = (int)op->ext;
+        TStr *mn = op_member_name(vm, op, 1);
+        TStr *pf = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+        key = dyn_sprop_key(kind, tstr_val(pf), mn);
+    } else {
+        kind = (int)op->a1;
+        key = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    }
     TClass *cls;
     TStr *pname;
     if (kind == 3) {
@@ -2703,7 +2969,7 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
         extern TClass *class_resolve_lc(const char *fqcn_lc);
         cls = class_resolve_lc(clc);
         if (!cls)
-            vm_raise(vm, ex_class("Error"), op, "Class '%.*s' not found",
+            vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
         pname = tstr_intern(sep + 2, strlen(sep + 2));
     } else {
@@ -2778,7 +3044,7 @@ static TClass *osprop_cls(VM *vm, TOp *op, TVal base) {
         extern TClass *class_resolve_lc(const char *fqcn_lc);
         TClass *cls = class_resolve_lc(lc);
         if (!cls)
-            vm_raise(vm, ex_class("Error"), op, "Class '%s' not found", s->c);
+            vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found", s->c);
         return cls;
     }
     vm_raise(vm, ex_class("Error"), op,
@@ -2789,7 +3055,7 @@ static TClass *osprop_cls(VM *vm, TOp *op, TVal base) {
 /* $obj::$prop read（与 C::$prop 同语义：flat 查找/可见性/typed） */
 static int32_t op_fetch_osprop(VM *vm, TOp *op) {
     TVal base = rdv(vm, op, 1);
-    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *pname = op_member_name_os(vm, op);   /* C1 */
     TClass *cls = osprop_cls(vm, op, base);
     tphp_class_ensure_flat(cls);
     TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
@@ -2811,7 +3077,7 @@ static int32_t op_fetch_osprop(VM *vm, TOp *op) {
 /* $obj::$prop = v */
 static int32_t op_assign_osprop(VM *vm, TOp *op) {
     TVal base = rdv(vm, op, 1);
-    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *pname = op_member_name_os(vm, op);   /* C1 */
     TClass *cls = osprop_cls(vm, op, base);
     tphp_class_ensure_flat(cls);
     TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
@@ -2857,7 +3123,7 @@ static int32_t op_assign_osprop(VM *vm, TOp *op) {
  * （对齐 PHP isset 语义，探针见 TODO-P2-P3 交接） */
 static int32_t op_isset_osprop(VM *vm, TOp *op) {
     TVal base = rdv(vm, op, 1);
-    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *pname = op_member_name_os(vm, op);   /* C1 */
     TClass *cls = osprop_cls(vm, op, base);
     tphp_class_ensure_flat(cls);
     TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
@@ -2874,7 +3140,7 @@ static int32_t op_isset_osprop(VM *vm, TOp *op) {
  * a missing slot forwards to __unset(name) */
 static int32_t op_unset_prop(VM *vm, TOp *op) {
     TVal objv = rdv(vm, op, 1);
-    TStr *name = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *name = op_member_name(vm, op, 2);   /* C1 */
     if (objv.t != T_OBJ || ((GCHead *)objv.u.p)->kind != GC_KIND_OBJ)
         return 1;                         /* non-user objects: no-op */
     TObj *o = (TObj *)objv.u.p;
@@ -2892,7 +3158,8 @@ static int32_t op_unset_prop(VM *vm, TOp *op) {
                          tstr_val(name), asym_scope(vm, sb, sizeof sb));
             }
         }
-        if (!tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
+        if (!tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
+                         frame_scope_cls(vm))) {
             /* invisible: __unset fallback, else error */
             TVal pack[1];
             pack[0] = TV_STR(name);
@@ -2991,7 +3258,7 @@ static int32_t op_fcc_method(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot create a first-class method callable from a non-object");
     TObj *o = (TObj *)ov.u.p;
-    TStr *mname = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *mname = op_member_name(vm, op, 2);   /* C1: $obj->$m(...) */
     TVal caps[2];
     caps[0] = ov;
     caps[1] = TV_STR(mname);
@@ -3054,7 +3321,7 @@ static int32_t op_instanceof(VM *vm, TOp *op) {
 
 static int32_t op_fetch_prop(VM *vm, TOp *op) {
     TVal obj = rdv(vm, op, 1);
-    TStr *name = (TStr *)vm->x.frame->fn->lits[op->a2].u.p;
+    TStr *name = op_member_name(vm, op, 2);   /* C1 */
     if (obj.t != T_OBJ)
         vm_raise(vm, ex_class("Error"), op,
                  "Attempt to read property \"%s\" on %s",
@@ -3115,7 +3382,8 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
             vm_raise(vm, ex_class("UndefinedError"), op,
                      "Typed property %s::$%s must not be accessed before initialization",
                      tstr_val(o->cls->name), tstr_val(name));
-        if (!tphp_vis_ok(o->cls->props[slot].visibility, o->cls, frame_scope_cls(vm))) {
+        if (!tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
+                         frame_scope_cls(vm))) {
             /* invisible from this scope: __get fallback, else error */
             TVal pack[1];
             pack[0] = TV_STR(name);
@@ -3208,13 +3476,22 @@ static void vm_unwind(VM *vm) {
     TExObj *ex = vm->x.exception;
     const_eval_reset();           /* P2-B: unwind 中断的常量求值允许重试 */
     vm->x.n_trace = 0;
+    /* B6: 跨帧归因修正——帧被弹出说明异常来自其 callee，而调用方 pc 已在
+     * 压帧时前推过调用点（op_do_fcall/op_new_user 的 pc++），归因必须落回
+     * 调用点 op 自身：否则"调用点后紧跟 try"时 pc == 下一个 try 的
+     * start_pc，会被误判进其保护区（PHP 归因到调用点、不捕获）。
+     * thunk 例外：tphp_call_thunk 不前推 caller pc（pc 仍停在调用 handler
+     * 上），弹 thunk 帧后不减。首个帧是抛出点本身，pc 语义本就正确。 */
+    uint32_t pc_back = 0;
     while (vm->x.frame) {
         VMFrame *f = vm->x.frame;
         TFunc *fn = f->fn;
-        if (vm->x.n_trace < 64 && fn->n_ops && f->pc < fn->n_ops) {
+        uint32_t pc = f->pc;
+        if (pc > pc_back) pc -= pc_back;
+        if (vm->x.n_trace < 64 && fn->n_ops && pc < fn->n_ops) {
             vm->x.trace[vm->x.n_trace].fn =
                 fn->name ? tstr_val(fn->name) : "{closure}";
-            vm->x.trace[vm->x.n_trace].line = fn->ops[f->pc].line;
+            vm->x.trace[vm->x.n_trace].line = fn->ops[pc].line;
             vm->x.n_trace++;
         }
         /* innermost try region first; within it, catch clauses in
@@ -3222,7 +3499,7 @@ static void vm_unwind(VM *vm) {
         uint32_t best_end = UINT32_MAX;
         for (int i = 0; i < fn->n_ex; i++) {
             TExEntry *e = &fn->ex[i];
-            if (f->pc >= e->start_pc && f->pc < e->end_pc &&
+            if (pc >= e->start_pc && pc < e->end_pc &&
                 e->end_pc < best_end)
                 best_end = e->end_pc;
         }
@@ -3230,7 +3507,7 @@ static void vm_unwind(VM *vm) {
         if (best_end != UINT32_MAX) {
             for (int i = 0; i < fn->n_ex; i++) {
                 TExEntry *e = &fn->ex[i];
-                if (f->pc >= e->start_pc && f->pc < e->end_pc &&
+                if (pc >= e->start_pc && pc < e->end_pc &&
                     e->end_pc == best_end && catch_matches(e, ex)) {
                     hit = e;
                     break;
@@ -3254,6 +3531,8 @@ static void vm_unwind(VM *vm) {
          * 先 push rec 再建帧），slot0 的 $this 是最后一个引用。 */
         VMCallRec *crec = (f->n_calls_at_entry > 0)
             ? &vm->x.calls[f->n_calls_at_entry - 1] : NULL;
+        /* B6: 下一轮（父帧）的归因修正量——thunk 不前推 caller pc */
+        pc_back = (crec && crec->is_thunk) ? 0u : 1u;
         TObj *half_obj = NULL;
         if (crec && crec->is_ctor && f->slots[0].t == T_OBJ &&
             ((GCHead *)f->slots[0].u.p)->kind == GC_KIND_OBJ)
@@ -3360,6 +3639,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_assign_sprop), H(op_unset_prop), H(op_clone), H(op_fcc_method),
     H(op_fetch_osprop), H(op_assign_osprop), H(op_isset_osprop),
     H(op_init_new), H(op_new_late), H(op_new_dyn),
+    H(op_isset_cconst),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -3387,6 +3667,7 @@ const char *tphp_op_name(uint8_t op) {
         "ASSIGN_SPROP", "UNSET_PROP", "CLONE", "FCC_METHOD",
         "FETCH_OSPROP", "ASSIGN_OSPROP", "ISSET_OSPROP",
         "INIT_NEW", "NEW_LATE", "NEW_DYN",
+        "ISSET_CCONST",
     };
     return op < OP_MAX ? names[op] : "?";
 }
@@ -3669,6 +3950,9 @@ void tphp_run_shutdown_dtors(void) {
      * 析构要跑 PHP，先确保 per-context 堆数组存在 */
     tphp_ctx_ensure(&vm->x);
     vm->x.exception = NULL;      /* 未消费异常已由 sched_report_uncaught 报过 */
+    /* B4: 先按类声明序释放静态属性（级联触发 __destruct，对齐 PHP
+     * shutdown 析构序）；随后快照循环兜底环中/其它持有者对象 */
+    tphp_class_release_sprops();
     TObj *list[1024];
     int n = 0;
     for (GCHead *h = tphp_gc_registry(); h && n < 1024; h = h->gc_next) {
@@ -3687,6 +3971,7 @@ void tphp_run_shutdown_dtors(void) {
         TVal self = TV_OBJ(list[i]);
         tval_release(&self);     /* 退快照引用；rc 归零则直连释放 */
     }
+    dyn_global_release_all();    /* B2: 动态全局条目收尾（幂等） */
 }
 
 /* ---- prog freeze (M5): after compilation, before any thread runs ----
@@ -3773,7 +4058,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             extern TClass *class_resolve_lc(const char *fqcn_lc);
             mcls = class_resolve_lc(clc);
             if (!mcls)
-                vm_raise(vm, ex_class("Error"), NULL, "Class '%.*s' not found",
+                vm_raise(vm, ex_class("Error"), NULL, "Class \"%.*s\" not found",
                          (int)cl, s);
             tphp_class_ensure_flat(mcls);
             TMethod *m = tphp_class_find_method(mcls, mlc);
@@ -3827,7 +4112,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             extern TClass *class_resolve_lc(const char *fqcn_lc);
             mcls = class_resolve_lc(clc);
             if (!mcls)
-                vm_raise(vm, ex_class("Error"), NULL, "Class '%s' not found",
+                vm_raise(vm, ex_class("Error"), NULL, "Class \"%s\" not found",
                          tstr_val((TStr *)e0->u.p));
         } else {
             vm_raise(vm, ex_class("TypeError"), NULL,

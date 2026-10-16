@@ -59,6 +59,8 @@ typedef enum {
                           (spread-safe count; pairs with NEW_*) */
     OP_NEW_LATE,       /* new self/parent/static: a1=kind(0/1/2) */
     OP_NEW_DYN,        /* new $cls / new ($expr): o1=class-name value */
+    OP_ISSET_CCONST,   /* C1+既有缺口: isset(C::$prop / C::$$v) 静默 bool；
+                        * 布局同 FETCH_CCONST（动态时 t1=name，kind 挂 ext） */
     OP_MAX,
 } Opcode;
 

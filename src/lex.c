@@ -557,11 +557,24 @@ Token lex_next(Lex *lx) {
     /* variables */
     if (c == '$') {
         lx->pos++;
+        /* C1: `$$v`（动态静态成员名 Dyn::$$v）——第二个 '$' 并入标识符，
+         * 产出 L_VAR ident="$v"（前导 '$' 保留给 parser 区分动态） */
+        bool dbl = false;
+        if (lx->pos < lx->end && *lx->pos == '$') { lx->pos++; dbl = true; }
         const char *s = lx->pos;
         while (lx->pos < lx->end && is_ident_char((unsigned char)*lx->pos)) lx->pos++;
         if (lx->pos == s) lex_error(lx, "Expected variable name after '$'");
         Token t = tok_simple(L_VAR, line);
-        t.ident = tstr_intern(s, (size_t)(lx->pos - s));
+        if (dbl) {
+            char buf[256];
+            size_t n = (size_t)(lx->pos - s);
+            if (n > sizeof buf - 2) n = sizeof buf - 2;
+            buf[0] = '$';
+            memcpy(buf + 1, s, n);
+            t.ident = tstr_intern(buf, n + 1);
+        } else {
+            t.ident = tstr_intern(s, (size_t)(lx->pos - s));
+        }
         return t;
     }
     if (is_ident_start((unsigned char)c)) {

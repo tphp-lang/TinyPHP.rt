@@ -129,6 +129,9 @@ static _Thread_local uint32_t cls_cap, cls_n;
 static ClsSlot *cls_tab_master;
 static uint32_t cls_cap_m, cls_n_m;
 
+/* B4: 声明序记录（定义在 ClsRt 区，注册函数在其之前） */
+static void cls_ord_push(TClass *cls);
+
 static uint32_t cls_hash(const char *s) {
     uint32_t h = 2166136261u;
     while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
@@ -196,6 +199,7 @@ bool tphp_class_register(TClass *cls) {
     strcpy(cls_tab[j].key_lc, lc);
     cls_tab[j].cls = cls;
     cls_n++;
+    cls_ord_push(cls);          /* B4: 注册序（= 声明序）记录 */
     return true;
 }
 
@@ -222,28 +226,65 @@ bool tphp_class_exists(const char *fqcn_lc) {
 typedef struct ClsRt {
     TClass *cls;
     TVal *sprop_vals;      /* n_sprops+1 slots */
+    int n;                 /* B4: seeded slot count (release bound) */
     TObj **case_objs;      /* n_cases slots (enum singletons) */
     struct ClsRt *next;
 } ClsRt;
 
 static _Thread_local ClsRt *g_cls_rt;
 
-static ClsRt *cls_rt_get(TClass *cls) {
+/* B4: 类注册序（声明序）——hash 表无序，shutdown 按此序释放静态属性，
+ * 级联析构顺序对齐 PHP（q4e: d1,d2 而非 gc_list 逆创建序 d2,d1） */
+static _Thread_local TClass **cls_ord;
+static _Thread_local uint32_t cls_ord_n, cls_ord_cap;
+
+static void cls_ord_push(TClass *cls) {
+    if (cls_ord_n == cls_ord_cap) {
+        cls_ord_cap = cls_ord_cap ? cls_ord_cap * 2 : 32;
+        cls_ord = tm_realloc(cls_ord, sizeof(TClass *) * (size_t)cls_ord_cap);
+    }
+    cls_ord[cls_ord_n++] = cls;
+}
+
+static ClsRt *cls_rt_peek(TClass *cls) {
     for (ClsRt *r = g_cls_rt; r; r = r->next)
         if (r->cls == cls) return r;
-    ClsRt *r = tm_malloc(sizeof *r);
+    return NULL;
+}
+
+static ClsRt *cls_rt_get(TClass *cls) {
+    ClsRt *r = cls_rt_peek(cls);
+    if (r) return r;
+    r = tm_malloc(sizeof *r);
     r->cls = cls;
     r->sprop_vals = tm_malloc(sizeof(TVal) *
                               (size_t)(cls->n_sprops ? cls->n_sprops : 1));
     /* seed from the frozen template (deep copy: per-thread heap values) */
     for (int i = 0; i < cls->n_sprops; i++)
         r->sprop_vals[i] = tval_clone_deep(cls->sprop_vals[i]);
+    r->n = cls->n_sprops;
     r->case_objs = tm_malloc(sizeof(TObj *) *
                              (size_t)(cls->n_cases ? cls->n_cases : 1));
     for (int i = 0; i < cls->n_cases; i++) r->case_objs[i] = NULL;
     r->next = g_cls_rt;
     g_cls_rt = r;
     return r;
+}
+
+/* B4: 请求收尾——按类声明序释放本线程静态属性值，持有链级联触发
+ * __destruct（对齐 PHP shutdown 序）。共享 TClass.cvals 不在此释放：
+ * 值为编译期常量（无析构面）、且 cvals 是 worker 共享写入位，释放会
+ * 破坏其它线程——保持 program 生命周期（等价 PHP 请求生命周期）。
+ * 幂等：释放后置 T_UNDEF，重复收尾为 no-op。 */
+void tphp_class_release_sprops(void) {
+    for (uint32_t i = 0; i < cls_ord_n; i++) {
+        ClsRt *r = cls_rt_peek(cls_ord[i]);
+        if (!r) continue;                     /* 从未访问过 → 值仍在模板 */
+        for (int k = 0; k < r->n; k++) {
+            tval_release(&r->sprop_vals[k]);
+            r->sprop_vals[k] = (TVal){ .u.i = 0, .t = T_UNDEF };
+        }
+    }
 }
 
 TVal *tphp_class_sprop_vals(TClass *cls) {
@@ -570,10 +611,11 @@ static void bind_traits(TClass *cls) {
         lc_copy(tlc, tstr_val(cls->trait_names[ti]), sizeof tlc);
         TClass *t = class_resolve_lc(tlc);
         if (!t || t->kind != CK_TRAIT)
-            tphp_fatal_src("class.c", 0, "Trait '%s' not found",
+            tphp_fatal_src("class.c", 0, "Trait \"%s\" not found",
                            tstr_val(cls->trait_names[ti]));
         for (int mi = 0; mi < t->n_methods; mi++) {
             TMethod m = t->methods[mi];
+            m.decl = cls;      /* B3: trait 方法归使用类（private 对使用类可见） */
             const char *mlc = tstr_val(m.name);
             /* `as` adaptations first: a renamed method escapes insteadof
              * exclusion (PHP semantics) */
@@ -682,7 +724,7 @@ void tphp_class_ensure_flat(TClass *cls) {
         lc_copy(lc, tstr_val(cls->parent_name), sizeof lc);
         parent = class_resolve_lc(lc);
         if (!parent)
-            tphp_fatal_src("class.c", 0, "Class '%s' not found",
+            tphp_fatal_src("class.c", 0, "Class \"%s\" not found",
                            tstr_val(cls->parent_name));
         if (parent->kind == CK_TRAIT)
             tphp_fatal_src("class.c", 0, "Cannot extend a trait");
@@ -744,7 +786,7 @@ void tphp_class_ensure_flat(TClass *cls) {
         lc_copy(lc, tstr_val(cls->iface_names[i]), sizeof lc);
         TClass *ifc = class_resolve_lc(lc);
         if (!ifc || ifc->kind != CK_INTERFACE)
-            tphp_fatal_src("class.c", 0, "Interface '%s' not found",
+            tphp_fatal_src("class.c", 0, "Interface \"%s\" not found",
                            tstr_val(cls->iface_names[i]));
         bool dup = false;
         for (int k = 0; k < cls->n_ifaces; k++)
@@ -885,9 +927,10 @@ bool tphp_vis_ok(uint8_t vis, TClass *owner, TClass *from) {
     if (vis == CVIS_PUBLIC) return true;
     if (!from) return false;
     if (vis == CVIS_PRIVATE) {
-        for (TClass *c = from; c; c = c->parent)
-            if (c == owner) return true;
-        return false;
+        /* B3 对拍（PHP 8.5 实测）：private 仅声明类作用域精确可见——
+         * 父类私有对子类 scope 不可见（$this->parentPrivate / parent::f()
+         * 均不可达），原 parent 链遍历与 PHP 冲突 */
+        return from == owner;
     }
     /* protected: owner must be in from's hierarchy either way */
     for (TClass *c = from; c; c = c->parent)
@@ -967,6 +1010,15 @@ void tphp_class_flatten_all(void) {
  * (defval/cvals/sprop_vals/case backing) are deep-copied. */
 typedef struct { TClass *old; TClass *nw; } ClsClonePair;
 
+/* B3: decl 重指向（原指针指向 master 图；worker 的 from 类在克隆图中，
+ * 不重指向则 private/protected 判定跨图永假） */
+static TClass *decl_remap(ClsClonePair *pairs, uint32_t n, TClass *d) {
+    if (!d) return NULL;
+    for (uint32_t j = 0; j < n; j++)
+        if (pairs[j].old == d) return pairs[j].nw;
+    return d;
+}
+
 void tphp_class_tab_clone_thread(void) {
     /* collect master entries */
     ClsClonePair *pairs = tm_malloc(sizeof(ClsClonePair) *
@@ -995,6 +1047,12 @@ void tphp_class_tab_clone_thread(void) {
             nc->props = np;
             for (int i = 0; i < nc->n_props; i++)
                 nc->props[i].defval = tval_clone_deep(np[i].defval);
+        }
+        if (nc->n_methods) {
+            /* B3: 原与 master 共享——decl 重指向需要独立副本 */
+            TMethod *nmm = tm_malloc(sizeof(TMethod) * (size_t)nc->n_methods);
+            memcpy(nmm, c->methods, sizeof(TMethod) * (size_t)nc->n_methods);
+            nc->methods = nmm;
         }
         if (nc->n_sprops) {
             TProp *nsp = tm_malloc(sizeof(TProp) * (size_t)nc->n_sprops);
@@ -1047,6 +1105,13 @@ void tphp_class_tab_clone_thread(void) {
                     if (pairs[j].old == c->ifaces[i]) { nc->ifaces[i] = pairs[j].nw; break; }
             }
         }
+        /* B3: 声明类指针重指向克隆图（props/sprops/methods 的 decl） */
+        for (int i = 0; i < nc->n_props; i++)
+            nc->props[i].decl = decl_remap(pairs, n, nc->props[i].decl);
+        for (int i = 0; i < nc->n_sprops; i++)
+            nc->sprops[i].decl = decl_remap(pairs, n, nc->sprops[i].decl);
+        for (int i = 0; i < nc->n_methods; i++)
+            nc->methods[i].decl = decl_remap(pairs, n, nc->methods[i].decl);
     }
     tm_free(pairs);
 }

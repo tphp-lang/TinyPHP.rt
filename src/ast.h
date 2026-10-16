@@ -122,9 +122,11 @@ typedef struct AExpr {
          * paren_args: ctor list was spelled with '(' — gates dereference
          * (PHP new_dereferenceable vs new_non_dereferenceable). */
         struct { AExpr *input; AExpr *call; } pipe;
-        struct { AExpr *obj; TStr *name; } prop;
-        struct { AExpr *obj; TStr *name; AArgList *args; } mcall;
-        struct { TStr *cls; TStr *member; AArgList *args; } scall;
+        /* C1: aname 非空 = 动态成员名（$obj->$v / $obj->$v() / C::$$v），
+         * 与 name 互斥；aname 是求值一次的 A_VAR 表达式 */
+        struct { AExpr *obj; TStr *name; AExpr *aname; } prop;
+        struct { AExpr *obj; TStr *name; AExpr *aname; AArgList *args; } mcall;
+        struct { TStr *cls; TStr *member; AExpr *aname; AArgList *args; } scall;
     } u;
     bool nullsafe;   /* ?-> (P_NULLSAFE): short-circuits the whole chain */
 } AExpr;

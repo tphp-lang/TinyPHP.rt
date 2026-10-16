@@ -217,6 +217,26 @@ static void patch_jump(Ctx *c, int at, uint32_t target) {
     c->fn->ops[at].ar = target;
 }
 
+/* B7: return-trampoline 收尾——本层 finally 拷贝执行后，若链上还有外层
+ * finally（fin->prev），发占位 JMP 并把续链条目记入外层 pend（外层 S_TRY
+ * 稍后编译其 trampoline 时 patch 该 JMP）；到链尾才 RETURN 暂存值。
+ * 修复：多层嵌套 finally 的 return 曾直接 RETURN，跳过外层 finally。 */
+static void emit_pend_tail(Ctx *c, FinCtx *fin, int val_tmp, int line) {
+    if (fin->prev) {
+        int up = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, line);
+        FinCtx *p = fin->prev;
+        if (p->n_pend == p->cap_pend) {
+            p->cap_pend = p->cap_pend ? p->cap_pend * 2 : 4;
+            p->pend = tm_realloc(p->pend, sizeof(*p->pend) * (size_t)p->cap_pend);
+        }
+        p->pend[p->n_pend].jmp_pc = up;
+        p->pend[p->n_pend].val_tmp = val_tmp;
+        p->n_pend++;
+    } else {
+        emit(c, OP_RETURN, LOC_TMP(val_tmp), LOC_NONE, LOC_NONE, line);
+    }
+}
+
 static int cur_pc(Ctx *c) { return c->fn->n_ops; }
 
 /* ---- literals ---- */
@@ -552,7 +572,11 @@ typedef struct WBList {
     int skind;               /* static-prop class kind (0/1/2/3) */
     TStr *gname;
     TStr *pname;
+    Loc pname_l;             /* C1: 动态成员名 Loc（pname_dyn 时有效） */
+    bool pname_dyn;          /* C1: write-back 名字来自 Loc 而非字面量 */
     TStr *skey;              /* static-prop lit key ("Cls::$prop"/"$prop") */
+    TStr *sprefix;           /* C1: 动态 sprop 类名前缀（kind3；skey_dyn） */
+    bool skey_dyn;           /* C1: sprop write-back 名字动态 */
     struct WBList *next;
 } WBList;
 
@@ -580,6 +604,17 @@ static bool chain_has_nullsafe(AExpr *e) {
     }
 }
 
+/* C1: 成员名操作数——静态名 → 编译期字面量；aname（$obj->$v）→ 求值
+ * 一次到 tmp/CV（同一表达式的两处使用复用同一 Loc，语义即 PHP 的
+ * 单次求值）。 */
+static Loc member_name_loc(Ctx *c, AExpr *aname, TStr *name, int line) {
+    (void)line;
+    /* name==NULL 且无 aname：调用点是“动态专用”位但走了静态路径——
+     * 绝不能 push NULL 字面量（freeze/释放期解引用即 AV），用空串占位 */
+    if (!aname) return LOC_CONST(lit_str(c, name ? name : tstr_intern("", 0)));
+    return compile_expr(c, aname, LOC_NONE);
+}
+
 static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
     if (e->tag == A_VAR) {
         if (!c->is_main && var_is_global(c, e->u.name)) {
@@ -600,14 +635,16 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
         /* $obj->prop[...] = v : fetch the prop into a tmp, mutate the dim,
          * write the tmp back through ASSIGN_PROP (__set hooks apply) */
         Loc b = compile_expr(c, e->u.prop.obj, LOC_NONE);
+        Loc nl = member_name_loc(c, e->u.prop.aname, e->u.prop.name, e->line);
         Loc mid = LOC_TMP(tmp_new(c));
-        emit(c, OP_FETCH_PROP, b, LOC_CONST(lit_str(c, e->u.prop.name)),
-             mid, e->line);
+        emit(c, OP_FETCH_PROP, b, nl, mid, e->line);
         WBList *w = tm_malloc(sizeof *w);
         memset(w, 0, sizeof *w);
         w->base = b; w->val = mid;
         w->is_prop = true;
         w->pname = e->u.prop.name;
+        w->pname_dyn = e->u.prop.aname != NULL;
+        w->pname_l = nl;
         w->next = *wb;
         *wb = w;
         return mid;
@@ -631,14 +668,28 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
             snprintf(key, sizeof key, "%s", tstr_val(e->u.scall.member));
         TStr *keystr = tstr_intern(key, strlen(key));
         Loc mid = LOC_TMP(tmp_new(c));
-        emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
-             LOC_CONST(lit_str(c, keystr)), mid, e->line);
+        Loc nl = member_name_loc(c, e->u.scall.aname, NULL, e->line);
+        if (e->u.scall.aname) {
+            /* C1: C::$$v[...] —— t1=动态名，kind 挂 ext */
+            const char *pf = kind == 3 ? cn : "";
+            int at = emit(c, OP_FETCH_CCONST, nl,
+                          LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                          mid, e->line);
+            c->fn->ops[at].ext = (uint16_t)kind;
+        } else {
+            emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                 LOC_CONST(lit_str(c, keystr)), mid, e->line);
+        }
         WBList *w = tm_malloc(sizeof *w);
         memset(w, 0, sizeof *w);
         w->val = mid;
         w->is_sprop = true;
         w->skind = kind;
         w->skey = keystr;
+        w->skey_dyn = e->u.scall.aname != NULL;
+        w->pname_dyn = e->u.scall.aname != NULL;   /* 复用 pname_l 存动态名 */
+        w->pname_l = nl;
+        w->sprefix = tstr_intern(kind == 3 ? cn : "", strlen(kind == 3 ? cn : ""));
         w->next = *wb;
         *wb = w;
         return mid;
@@ -647,14 +698,16 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
         /* $obj::$prop[...] = v : fetch the static prop into a tmp, mutate
          * the dim, write back through ASSIGN_OSPROP */
         Loc b = compile_expr(c, e->u.prop.obj, LOC_NONE);
+        Loc nl = member_name_loc(c, e->u.prop.aname, e->u.prop.name, e->line);
         Loc mid = LOC_TMP(tmp_new(c));
-        emit(c, OP_FETCH_OSPROP, b, LOC_CONST(lit_str(c, e->u.prop.name)),
-             mid, e->line);
+        emit(c, OP_FETCH_OSPROP, b, nl, mid, e->line);
         WBList *w = tm_malloc(sizeof *w);
         memset(w, 0, sizeof *w);
         w->base = b; w->val = mid;
         w->is_osprop = true;
         w->pname = e->u.prop.name;
+        w->pname_dyn = e->u.prop.aname != NULL;
+        w->pname_l = nl;
         w->next = *wb;
         *wb = w;
         return mid;
@@ -681,16 +734,30 @@ static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
 static void emit_writebacks(Ctx *c, WBList *wb, int line) {
     while (wb) {
         WBList *next = wb->next;
+        /* 必须单条互斥链：拆成两个 if 会让 is_global 节点发完
+         * ASSIGN_GLOBAL 后再掉进第二条链的 else 兜底，多发一条
+         * ASSIGN_DIM(UNUSED,UNUSED,val) 垃圾指令（destruct-gc 回归） */
         if (wb->is_global)
             emit(c, OP_ASSIGN_GLOBAL, wb->val, LOC_CONST(lit_str(c, wb->gname)), LOC_NONE, line);
-        else if (wb->is_sprop)
-            emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = wb->skind },
-                 LOC_CONST(lit_str(c, wb->skey)), wb->val, line);
-        else if (wb->is_osprop)
-            emit(c, OP_ASSIGN_OSPROP, wb->base, LOC_CONST(lit_str(c, wb->pname)),
+        else if (wb->is_sprop) {
+            /* C1: 动态名 write-back —— 同 FETCH 布局（t1=name，kind 挂 ext） */
+            if (wb->skey_dyn) {
+                int at = emit(c, OP_ASSIGN_SPROP, wb->pname_l,
+                              LOC_CONST(lit_str(c, wb->sprefix)), wb->val, line);
+                c->fn->ops[at].ext = (uint16_t)wb->skind;
+            } else {
+                emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = wb->skind },
+                     LOC_CONST(lit_str(c, wb->skey)), wb->val, line);
+            }
+        } else if (wb->is_osprop)
+            emit(c, OP_ASSIGN_OSPROP, wb->base,
+                 wb->pname_dyn ? wb->pname_l
+                               : LOC_CONST(lit_str(c, wb->pname)),
                  wb->val, line);
         else if (wb->is_prop)
-            emit(c, OP_ASSIGN_PROP, wb->base, LOC_CONST(lit_str(c, wb->pname)),
+            emit(c, OP_ASSIGN_PROP, wb->base,
+                 wb->pname_dyn ? wb->pname_l
+                               : LOC_CONST(lit_str(c, wb->pname)),
                  wb->val, line);
         else
             emit(c, OP_ASSIGN_DIM, wb->base, wb->idx, wb->val, line);
@@ -903,8 +970,9 @@ static Loc compile_assign(Ctx *c, AExpr *e, Loc want) {
     }
     if (t->tag == A_PROP) {
         Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+        Loc nl = member_name_loc(c, t->u.prop.aname, t->u.prop.name, e->line);
         Loc rv = compile_expr(c, v, LOC_NONE);
-        emit(c, OP_ASSIGN_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), rv, e->line);
+        emit(c, OP_ASSIGN_PROP, obj, nl, rv, e->line);
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, rv, LOC_NONE, want, e->line);
             return want;
@@ -928,8 +996,18 @@ static Loc compile_assign(Ctx *c, AExpr *e, Loc want) {
         else
             snprintf(key, sizeof key, "%s", tstr_val(t->u.scall.member));
         Loc rv = compile_expr(c, v, LOC_NONE);
-        emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = kind },
-             LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), rv, e->line);
+        if (t->u.scall.aname) {
+            /* C1: C::$$v = rv */
+            const char *pf = kind == 3 ? cn : "";
+            int at = emit(c, OP_ASSIGN_SPROP,
+                          member_name_loc(c, t->u.scall.aname, NULL, e->line),
+                          LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                          rv, e->line);
+            c->fn->ops[at].ext = (uint16_t)kind;
+        } else {
+            emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                 LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), rv, e->line);
+        }
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, rv, LOC_NONE, want, e->line);
             return want;
@@ -941,7 +1019,7 @@ static Loc compile_assign(Ctx *c, AExpr *e, Loc want) {
         Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
         Loc rv = compile_expr(c, v, LOC_NONE);
         emit(c, OP_ASSIGN_OSPROP, obj,
-             LOC_CONST(lit_str(c, t->u.prop.name)), rv, e->line);
+             member_name_loc(c, t->u.prop.aname, t->u.prop.name, e->line), rv, e->line);
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, rv, LOC_NONE, want, e->line);
             return want;
@@ -1049,11 +1127,61 @@ static Loc compile_assign_op(Ctx *c, AExpr *e, Loc want) {
     if (t->tag == A_PROP) {
         /* $obj->p op= v : read-modify-write through a tmp */
         Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+        Loc nl = member_name_loc(c, t->u.prop.aname, t->u.prop.name, e->line);
         Loc mid = LOC_TMP(tmp_new(c));
-        emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        emit(c, OP_FETCH_PROP, obj, nl, mid, e->line);
         Loc rv = compile_expr(c, v, LOC_NONE);
         emit(c, opc, mid, rv, mid, e->line);
-        emit(c, OP_ASSIGN_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        emit(c, OP_ASSIGN_PROP, obj, nl, mid, e->line);
+        if (want.kind != OPD_UNUSED) {
+            emit(c, OP_COPY, mid, LOC_NONE, want, e->line);
+            return want;
+        }
+        return mid;
+    }
+    if (t->tag == A_STATICGET && tstr_val(t->u.scall.member)[0] == '$') {
+        /* C::$prop op= v : FETCH_CCONST → opc → ASSIGN_SPROP。
+         * 此分支原缺失（C::$p += 5 一直报 Cannot assign——C1 补齐并
+         * 同时支持动态名 C::$$v op= v） */
+        TStr *ccls = t->u.scall.cls;
+        const char *raw = tstr_val(ccls);
+        bool is_sp = tstr_case_eq(raw, "self") || tstr_case_eq(raw, "parent") ||
+                     tstr_case_eq(raw, "static");
+        if (!is_sp) ccls = resolve_class_name(ccls);
+        const char *cn = tstr_val(ccls);
+        int kind = tstr_case_eq(cn, "self") ? 0 :
+                   tstr_case_eq(cn, "parent") ? 1 :
+                   tstr_case_eq(cn, "static") ? 2 : 3;
+        char key[256];
+        if (kind == 3)
+            snprintf(key, sizeof key, "%s::%s", cn, tstr_val(t->u.scall.member));
+        else
+            snprintf(key, sizeof key, "%s", tstr_val(t->u.scall.member));
+        TStr *keystr = tstr_intern(key, strlen(key));
+        Loc nlc = member_name_loc(c, t->u.scall.aname, NULL, e->line);
+        Loc mid = LOC_TMP(tmp_new(c));
+        if (t->u.scall.aname) {
+            const char *pf = kind == 3 ? cn : "";
+            int at = emit(c, OP_FETCH_CCONST, nlc,
+                          LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                          mid, e->line);
+            c->fn->ops[at].ext = (uint16_t)kind;
+        } else {
+            emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                 LOC_CONST(lit_str(c, keystr)), mid, e->line);
+        }
+        Loc rv = compile_expr(c, v, LOC_NONE);
+        emit(c, opc, mid, rv, mid, e->line);
+        if (t->u.scall.aname) {
+            const char *pf = kind == 3 ? cn : "";
+            int at = emit(c, OP_ASSIGN_SPROP, nlc,
+                          LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                          mid, e->line);
+            c->fn->ops[at].ext = (uint16_t)kind;
+        } else {
+            emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                 LOC_CONST(lit_str(c, keystr)), mid, e->line);
+        }
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, mid, LOC_NONE, want, e->line);
             return want;
@@ -1063,11 +1191,12 @@ static Loc compile_assign_op(Ctx *c, AExpr *e, Loc want) {
     if (t->tag == A_OBJSTATIC) {
         /* $obj::$p op= v */
         Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+        Loc nl = member_name_loc(c, t->u.prop.aname, t->u.prop.name, e->line);
         Loc mid = LOC_TMP(tmp_new(c));
-        emit(c, OP_FETCH_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        emit(c, OP_FETCH_OSPROP, obj, nl, mid, e->line);
         Loc rv = compile_expr(c, v, LOC_NONE);
         emit(c, opc, mid, rv, mid, e->line);
-        emit(c, OP_ASSIGN_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)), mid, e->line);
+        emit(c, OP_ASSIGN_OSPROP, obj, nl, mid, e->line);
         if (want.kind != OPD_UNUSED) {
             emit(c, OP_COPY, mid, LOC_NONE, want, e->line);
             return want;
@@ -1265,14 +1394,13 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             /* $obj->prop++ : fetch, RMW in place, write back through
              * ASSIGN_PROP (__set hooks / readonly checks apply) */
             Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+            Loc nl = member_name_loc(c, t->u.prop.aname, t->u.prop.name, t->line);
             Loc mid = LOC_TMP(tmp_new(c));
-            emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
-                 mid, t->line);
+            emit(c, OP_FETCH_PROP, obj, nl, mid, t->line);
             Loc dst = tmp_dst(c, want);
             emit(c, is_inc ? OP_INC : OP_DEC, mid, LOC_NONE, dst, t->line);
             c->fn->ops[c->fn->n_ops - 1].ext = prefix ? 1 : 0;
-            emit(c, OP_ASSIGN_PROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
-                 mid, t->line);
+            emit(c, OP_ASSIGN_PROP, obj, nl, mid, t->line);
             return dst;
         }
         if (t->tag == A_STATICGET && tstr_val(t->u.scall.member)[0] == '$') {
@@ -1292,26 +1420,42 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             else
                 snprintf(key, sizeof key, "%s", tstr_val(t->u.scall.member));
             Loc mid = LOC_TMP(tmp_new(c));
-            emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
-                 LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), mid, t->line);
+            Loc nlc = member_name_loc(c, t->u.scall.aname, NULL, t->line);
+            if (t->u.scall.aname) {
+                const char *pf = kind == 3 ? cn : "";
+                int a1at = emit(c, OP_FETCH_CCONST, nlc,
+                                LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                                mid, t->line);
+                c->fn->ops[a1at].ext = (uint16_t)kind;
+            } else {
+                emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                     LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), mid, t->line);
+            }
             Loc dst = tmp_dst(c, want);
             emit(c, is_inc ? OP_INC : OP_DEC, mid, LOC_NONE, dst, t->line);
             c->fn->ops[c->fn->n_ops - 1].ext = prefix ? 1 : 0;
-            emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = kind },
-                 LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), mid, t->line);
+            if (t->u.scall.aname) {
+                const char *pf = kind == 3 ? cn : "";
+                int a2at = emit(c, OP_ASSIGN_SPROP, nlc,
+                                LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                                mid, t->line);
+                c->fn->ops[a2at].ext = (uint16_t)kind;
+            } else {
+                emit(c, OP_ASSIGN_SPROP, (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                     LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), mid, t->line);
+            }
             return dst;
         }
         if (t->tag == A_OBJSTATIC) {
             /* $obj::$prop++ : fetch, RMW in place, write back via ASSIGN_OSPROP */
             Loc obj = compile_expr(c, t->u.prop.obj, LOC_NONE);
+            Loc nl = member_name_loc(c, t->u.prop.aname, t->u.prop.name, t->line);
             Loc mid = LOC_TMP(tmp_new(c));
-            emit(c, OP_FETCH_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
-                 mid, t->line);
+            emit(c, OP_FETCH_OSPROP, obj, nl, mid, t->line);
             Loc dst = tmp_dst(c, want);
             emit(c, is_inc ? OP_INC : OP_DEC, mid, LOC_NONE, dst, t->line);
             c->fn->ops[c->fn->n_ops - 1].ext = prefix ? 1 : 0;
-            emit(c, OP_ASSIGN_OSPROP, obj, LOC_CONST(lit_str(c, t->u.prop.name)),
-                 mid, t->line);
+            emit(c, OP_ASSIGN_OSPROP, obj, nl, mid, t->line);
             return dst;
         }
         tphp_fatal_src(c->file, t->line, "Cannot increment/decrement this expression");
@@ -1336,14 +1480,47 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             } else if (a->tag == A_PROP) {
                 Loc obj = compile_expr(c, a->u.prop.obj, LOC_NONE);
                 r = LOC_TMP(tmp_new(c));
-                emit(c, OP_ISSET_PROP, obj, LOC_CONST(lit_str(c, a->u.prop.name)),
+                emit(c, OP_ISSET_PROP, obj,
+                     member_name_loc(c, a->u.prop.aname, a->u.prop.name, a->line),
                      r, a->line);
             } else if (a->tag == A_OBJSTATIC) {
                 /* P2-B: isset($obj::$x) —— 未声明/不可见静默 false（对齐 PHP） */
                 Loc base = compile_expr(c, a->u.prop.obj, LOC_NONE);
                 r = LOC_TMP(tmp_new(c));
                 emit(c, OP_ISSET_OSPROP, base,
-                     LOC_CONST(lit_str(c, a->u.prop.name)), r, a->line);
+                     member_name_loc(c, a->u.prop.aname, a->u.prop.name, a->line),
+                     r, a->line);
+            } else if (a->tag == A_STATICGET &&
+                       tstr_val(a->u.scall.member)[0] == '$') {
+                /* C1+既有缺口: isset(C::$x / C::$$v) —— 静默 false（对齐 PHP） */
+                r = LOC_TMP(tmp_new(c));
+                TStr *ccls = a->u.scall.cls;
+                const char *raw = tstr_val(ccls);
+                bool is_sp = tstr_case_eq(raw, "self") || tstr_case_eq(raw, "parent") ||
+                             tstr_case_eq(raw, "static");
+                if (!is_sp) ccls = resolve_class_name(ccls);
+                const char *cn = tstr_val(ccls);
+                int kind = tstr_case_eq(cn, "self") ? 0 :
+                           tstr_case_eq(cn, "parent") ? 1 :
+                           tstr_case_eq(cn, "static") ? 2 : 3;
+                char key[256];
+                if (kind == 3)
+                    snprintf(key, sizeof key, "%s::%s", cn, tstr_val(a->u.scall.member));
+                else
+                    snprintf(key, sizeof key, "%s", tstr_val(a->u.scall.member));
+                Loc nls = member_name_loc(c, a->u.scall.aname, NULL, a->line);
+                if (a->u.scall.aname) {
+                    const char *pf = kind == 3 ? cn : "";
+                    int at = emit(c, OP_ISSET_CCONST, nls,
+                                  LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                                  r, a->line);
+                    c->fn->ops[at].ext = (uint16_t)kind;
+                } else {
+                    emit(c, OP_ISSET_CCONST,
+                         (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                         LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
+                         r, a->line);
+                }
             } else {
                 tphp_fatal_src(c->file, a->line, "isset() requires a variable");
             }
@@ -1371,16 +1548,57 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             /* empty($obj::$x)：isset 静默语义 + 真值取反（对齐 PHP：
              * 未声明/不可见/未初始化 → empty=true，不抛错） */
             Loc base = compile_expr(c, a->u.prop.obj, LOC_NONE);
+            Loc nl = member_name_loc(c, a->u.prop.aname, a->u.prop.name, a->line);
             Loc t = LOC_TMP(tmp_new(c));
-            emit(c, OP_ISSET_OSPROP, base,
-                 LOC_CONST(lit_str(c, a->u.prop.name)), t, a->line);
+            emit(c, OP_ISSET_OSPROP, base, nl, t, a->line);
             int jset = emit(c, OP_JMPNZ, t, LOC_NONE, LOC_NONE, a->line);
             emit(c, OP_CONST, LOC_CONST(lit_bool(c, true)), LOC_NONE, dst, e->line);
             int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
             patch_jump(c, jset, (uint32_t)cur_pc(c));
             Loc v = LOC_TMP(tmp_new(c));
-            emit(c, OP_FETCH_OSPROP, base,
-                 LOC_CONST(lit_str(c, a->u.prop.name)), v, a->line);
+            emit(c, OP_FETCH_OSPROP, base, nl, v, a->line);
+            int tb2 = tmp_new(c);
+            emit(c, OP_BOOL_VAL, v, LOC_NONE, LOC_TMP(tb2), a->line);
+            emit(c, OP_BOOL_NOT, LOC_TMP(tb2), LOC_NONE, dst, e->line);
+            patch_jump(c, jend, (uint32_t)cur_pc(c));
+            return dst;
+        } else if (a->tag == A_STATICGET &&
+                   tstr_val(a->u.scall.member)[0] == '$') {
+            /* C1+既有缺口: empty(C::$x / C::$$v) —— isset 静默 + 真值取反
+             * （对齐 PHP：未声明/不可见/未初始化 → empty=true，不抛错） */
+            TStr *ccls = a->u.scall.cls;
+            const char *raw = tstr_val(ccls);
+            bool is_sp = tstr_case_eq(raw, "self") || tstr_case_eq(raw, "parent") ||
+                         tstr_case_eq(raw, "static");
+            if (!is_sp) ccls = resolve_class_name(ccls);
+            const char *cn = tstr_val(ccls);
+            int kind = tstr_case_eq(cn, "self") ? 0 :
+                       tstr_case_eq(cn, "parent") ? 1 :
+                       tstr_case_eq(cn, "static") ? 2 : 3;
+            char key[256];
+            if (kind == 3)
+                snprintf(key, sizeof key, "%s::%s", cn, tstr_val(a->u.scall.member));
+            else
+                snprintf(key, sizeof key, "%s", tstr_val(a->u.scall.member));
+            const char *pf = kind == 3 ? cn : "";
+            TStr *pflit = tstr_intern(pf, strlen(pf));
+            TStr *keylit = tstr_intern(key, strlen(key));
+            Loc nle = member_name_loc(c, a->u.scall.aname, NULL, a->line);
+            bool dyn = a->u.scall.aname != NULL;
+            Loc t = LOC_TMP(tmp_new(c));
+            int ia = emit(c, OP_ISSET_CCONST,
+                          dyn ? nle : (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                          LOC_CONST(lit_str(c, dyn ? pflit : keylit)), t, a->line);
+            if (dyn) c->fn->ops[ia].ext = (uint16_t)kind;
+            int jset = emit(c, OP_JMPNZ, t, LOC_NONE, LOC_NONE, a->line);
+            emit(c, OP_CONST, LOC_CONST(lit_bool(c, true)), LOC_NONE, dst, e->line);
+            int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            patch_jump(c, jset, (uint32_t)cur_pc(c));
+            Loc v = LOC_TMP(tmp_new(c));
+            int fa = emit(c, OP_FETCH_CCONST,
+                          dyn ? nle : (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                          LOC_CONST(lit_str(c, dyn ? pflit : keylit)), v, a->line);
+            if (dyn) c->fn->ops[fa].ext = (uint16_t)kind;
             int tb2 = tmp_new(c);
             emit(c, OP_BOOL_VAL, v, LOC_NONE, LOC_TMP(tb2), a->line);
             emit(c, OP_BOOL_NOT, LOC_TMP(tb2), LOC_NONE, dst, e->line);
@@ -1503,9 +1721,13 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             lc[k] = 0;
             builtin_ex = tphp_ex_class_index(tstr_val(cname)) >= 0;
             user_cls = !builtin_ex && tphp_class_lookup(lc) != NULL;
+            /* B5: 加载期查不到的类不再 fatal——按 OP_NEW_USER 走运行期解析
+             * （op_new_user 内 class_resolve_lc + 可捕获 Error "Class not
+             * found"，autoload/运行期注册类可用），对齐 PHP 运行期语义；
+             * 未执行到的死分支也不再加载期报错（PHP：条件跳过不报错）。
+             * 命名参数路径仍要求加载期可见（下方 1546 查找失败保持原报错）。 */
             if (!builtin_ex && !user_cls)
-                tphp_fatal_src(c->file, e->line, "Class '%s' not found",
-                               tstr_val(cname));
+                user_cls = true;
         }
         bool has_named = false, has_spread = false;
         for (int i = 0; i < e->u.newx.args->n; i++) {
@@ -1525,7 +1747,7 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                                "Named constructor arguments require a user class");
             TClass *cls = tphp_class_lookup(lc);
             if (!cls)
-                tphp_fatal_src(c->file, e->line, "Class '%s' not found",
+                tphp_fatal_src(c->file, e->line, "Class \"%s\" not found",
                                tstr_val(cname));
             tphp_class_ensure_flat(cls);
             if (cls->m_ctor < 0 || !cls->methods[cls->m_ctor].fn ||
@@ -1581,7 +1803,9 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
              * method name captured; op_init_dyn dispatches it) */
             Loc obj = compile_expr(c, e->u.e->u.prop.obj, LOC_NONE);
             Loc dst = tmp_dst(c, want);
-            emit(c, OP_FCC_METHOD, obj, LOC_CONST(lit_str(c, e->u.e->u.prop.name)),
+            emit(c, OP_FCC_METHOD, obj,
+                 member_name_loc(c, e->u.e->u.prop.aname, e->u.e->u.prop.name,
+                                 e->line),
                  dst, e->line);
             return dst;
         }
@@ -1601,24 +1825,32 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             s_line = tstr_intern("line", 4);
         }
         TStr *name = e->u.prop.name;
-        /* method-call sugar: getMessage/getCode/getPrevious/getLine */
-        if (strcmp(tstr_val(name), "getMessage") == 0) name = s_msg;
-        else if (strcmp(tstr_val(name), "getCode") == 0) name = s_code;
-        else if (strcmp(tstr_val(name), "getPrevious") == 0) name = s_prev;
-        else if (strcmp(tstr_val(name), "getLine") == 0) name = s_line;
+        /* method-call sugar: getMessage/getCode/getPrevious/getLine
+         * （仅静态名字；动态名不做糖——PHP 动态读即普通属性） */
+        if (!e->u.prop.aname) {
+            if (strcmp(tstr_val(name), "getMessage") == 0) name = s_msg;
+            else if (strcmp(tstr_val(name), "getCode") == 0) name = s_code;
+            else if (strcmp(tstr_val(name), "getPrevious") == 0) name = s_prev;
+            else if (strcmp(tstr_val(name), "getLine") == 0) name = s_line;
+        }
         Loc obj = compile_expr(c, e->u.prop.obj, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         if (e->nullsafe || chain_has_nullsafe(e->u.prop.obj)) {
             /* null guard: obj null (or a deeper hop already short-circuited
-             * to null) -> this hop yields null too */
+             * to null) -> this hop yields null too；动态名在 guard 后求值
+             * （短路时成员名表达式不求值，对齐 PHP ?-> 语义） */
             int jz = emit(c, OP_JMP_NULL, obj, LOC_NONE, LOC_NONE, e->line);
-            emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, name)), dst, e->line);
+            emit(c, OP_FETCH_PROP, obj,
+                 member_name_loc(c, e->u.prop.aname, name, e->line),
+                 dst, e->line);
             int jend = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
             patch_jump(c, jz, (uint32_t)c->fn->n_ops);
             emit(c, OP_CONST, LOC_CONST(lit_null(c)), LOC_NONE, dst, e->line);
             patch_jump(c, jend, (uint32_t)c->fn->n_ops);
         } else {
-            emit(c, OP_FETCH_PROP, obj, LOC_CONST(lit_str(c, name)), dst, e->line);
+            emit(c, OP_FETCH_PROP, obj,
+                 member_name_loc(c, e->u.prop.aname, name, e->line),
+                 dst, e->line);
         }
         return dst;
     }
@@ -1634,7 +1866,8 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             jz = emit(c, OP_JMP_NULL, obj, LOC_NONE, LOC_NONE, e->line);
         }
         int init_at = emit(c, OP_INIT_MCALL, obj, LOC_NONE,
-                           LOC_CONST(lit_str(c, e->u.mcall.name)), e->line);
+                           member_name_loc(c, e->u.mcall.aname, e->u.mcall.name,
+                                           e->line), e->line);
         int n_sent = 0;
         for (int i = 0; i < e->u.mcall.args->n; i++) {
             AArg *arg = &e->u.mcall.args->items[i];
@@ -1676,16 +1909,21 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         int kind = tstr_case_eq(cn, "self") ? 0 :
                    tstr_case_eq(cn, "parent") ? 1 :
                    tstr_case_eq(cn, "static") ? 2 : 3;
+        bool dynm = e->u.scall.aname != NULL;   /* C1: C::$v() */
         char key[256];
         if (kind == 3)
-            snprintf(key, sizeof key, "%s::%s", cn, tstr_val(e->u.scall.member));
+            snprintf(key, sizeof key, dynm ? "%s" : "%s::%s",
+                     cn, tstr_val(e->u.scall.member));
         else
-            snprintf(key, sizeof key, "%s", tstr_val(e->u.scall.member));
+            snprintf(key, sizeof key, "%s", dynm ? "" : tstr_val(e->u.scall.member));
         bool has_named = false, has_spread = false;
         for (int i = 0; i < e->u.scall.args->n; i++) {
             if (e->u.scall.args->items[i].name) has_named = true;
             if (e->u.scall.args->items[i].is_spread) has_spread = true;
         }
+        if (has_named && dynm)
+            tphp_fatal_src(c->file, e->line,
+                           "Named arguments require a compile-time static method name");
         TMethod *nm = NULL;
         if (has_named) {
             if (has_spread)
@@ -1720,10 +1958,22 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                 tphp_fatal_src(c->file, e->line,
                                "Named arguments require a compiled user method");
         }
-        int init_at = emit(c, OP_INIT_SMCALL,
-                           (Loc){ .kind = OPD_UNUSED, .slot = kind },
-                           LOC_NONE, LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
+        int init_at;
+        if (dynm) {
+            /* C1: 动态名放 t1（a2 被 argc 复用，不能占用），kind 挂 ext */
+            init_at = emit(c, OP_INIT_SMCALL,
+                           member_name_loc(c, e->u.scall.aname, NULL, e->line),
+                           LOC_NONE,
+                           LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
                            e->line);
+            c->fn->ops[init_at].ext = (uint16_t)kind;
+        } else {
+            init_at = emit(c, OP_INIT_SMCALL,
+                           (Loc){ .kind = OPD_UNUSED, .slot = kind },
+                           LOC_NONE,
+                           LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))),
+                           e->line);
+        }
         int n_sent;
         if (has_named) {
             n_sent = compile_named_sends(c, e->line, e->u.scall.args,
@@ -1779,6 +2029,17 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         else
             snprintf(key, sizeof key, "%s", mem);
         Loc dst = tmp_dst(c, want);
+        if (e->u.scall.aname) {
+            /* C1: C::$$v —— t1=动态名，t2=类名前缀(kind3)，kind 挂 ext；
+             * op_fetch_cconst 运行期拼 key 后走原解析 */
+            const char *pf = kind == 3 ? cn : "";
+            int at = emit(c, OP_FETCH_CCONST,
+                          member_name_loc(c, e->u.scall.aname, NULL, e->line),
+                          LOC_CONST(lit_str(c, tstr_intern(pf, strlen(pf)))),
+                          dst, e->line);
+            c->fn->ops[at].ext = (uint16_t)kind;
+            return dst;
+        }
         emit(c, OP_FETCH_CCONST, (Loc){ .kind = OPD_UNUSED, .slot = kind },
              LOC_CONST(lit_str(c, tstr_intern(key, strlen(key)))), dst, e->line);
         return dst;
@@ -1808,7 +2069,8 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         Loc obj = compile_expr(c, e->u.prop.obj, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         emit(c, OP_FETCH_OSPROP, obj,
-             LOC_CONST(lit_str(c, e->u.prop.name)), dst, e->line);
+             member_name_loc(c, e->u.prop.aname, e->u.prop.name, e->line),
+             dst, e->line);
         return dst;
     }
     case A_PIPELINE: {
@@ -2083,6 +2345,16 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         break;
     }
     case S_RETURN:
+        /* B1: void/never 禁止返回——PHP 加载期 Fatal（行号 = return 语句行） */
+        if (c->fn && c->fn->ret_type) {
+            const char *rt = tstr_val(c->fn->ret_type);
+            if (s->u.e && strcmp(rt, "void") == 0)
+                tphp_fatal_src(c->file, s->line,
+                               "A void function must not return a value");
+            if (strcmp(rt, "never") == 0)
+                tphp_fatal_src(c->file, s->line,
+                               "A never-returning function must not return");
+        }
         if (c->fin) {
             /* return inside a try or catch body: stash value, jump to a
              * per-return copy of the finally block which then RETURNs */
@@ -2139,7 +2411,8 @@ static void compile_stmt(Ctx *c, AStmt *s) {
                 /* unset($obj->prop): declared slot -> UNDEF, else __unset */
                 Loc obj = compile_expr(c, a->u.prop.obj, LOC_NONE);
                 emit(c, OP_UNSET_PROP, obj,
-                     LOC_CONST(lit_str(c, a->u.prop.name)), LOC_NONE, a->line);
+                     member_name_loc(c, a->u.prop.aname, a->u.prop.name, a->line),
+                     LOC_NONE, a->line);
             } else {
                 tphp_fatal_src(c->file, a->line, "unset() requires a variable");
             }
@@ -2251,7 +2524,7 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         for (int p = 0; p < fin.n_pend; p++) {
             pentry[p] = (uint32_t)cur_pc(c);
             compile_stmt_list(c, tr->finally);        /* copy #p */
-            emit(c, OP_RETURN, LOC_TMP(fin.pend[p].val_tmp), LOC_NONE, LOC_NONE, s->line);
+            emit_pend_tail(c, &fin, fin.pend[p].val_tmp, s->line);  /* B7 续链 */
         }
         int j_end1 = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
         /* catch 体区间（finally 拷贝之前）——体上抛出的异常先跑 finally 再传播 */
@@ -2298,7 +2571,7 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         for (int p = try_np; p < fin.n_pend; p++) {
             cpentry[p - try_np] = (uint32_t)cur_pc(c);
             compile_stmt_list(c, tr->finally);        /* copy #p */
-            emit(c, OP_RETURN, LOC_TMP(fin.pend[p].val_tmp), LOC_NONE, LOC_NONE, s->line);
+            emit_pend_tail(c, &fin, fin.pend[p].val_tmp, s->line);  /* B7 续链 */
         }
         if (tr->finally) {
             uint32_t fin3 = (uint32_t)cur_pc(c);
@@ -2574,15 +2847,30 @@ static void collect_expr_vars(AExpr *e, AExprList *out, AParam **params, int n_p
 
     case A_PROP:
         collect_expr_vars(e->u.prop.obj, out, params, n_params);
+        if (e->u.prop.aname)
+            collect_expr_vars(e->u.prop.aname, out, params, n_params);
         return;
     case A_METHODCALL:
         collect_expr_vars(e->u.mcall.obj, out, params, n_params);
+        if (e->u.mcall.aname)
+            collect_expr_vars(e->u.mcall.aname, out, params, n_params);
+        for (int i = 0; i < e->u.mcall.args->n; i++)
+            collect_expr_vars(e->u.mcall.args->items[i].e, out, params, n_params);
         return;
     case A_STATICCALL: {
         for (int i = 0; i < e->u.scall.args->n; i++)
             collect_expr_vars(e->u.scall.args->items[i].e, out, params, n_params);
+        if (e->u.scall.aname)
+            collect_expr_vars(e->u.scall.aname, out, params, n_params);
         return;
     }
+    case A_STATICGET:
+    case A_OBJSTATIC:
+        if (e->u.prop.aname)
+            collect_expr_vars(e->u.prop.aname, out, params, n_params);
+        if (e->tag == A_OBJSTATIC)
+            collect_expr_vars(e->u.prop.obj, out, params, n_params);
+        return;
     case A_INSTANCEOF:
         collect_expr_vars(e->u.bin.l, out, params, n_params);
         return;
@@ -2678,6 +2966,22 @@ static void collect_stmt_vars(AStmt *s, AExprList *out, AParam **params, int n_p
 }
 
 /* compile one function-like body (named fn, closure, arrow, thunk, method) */
+
+/* B3: 闭包体是否引用 $this（复用 capture 收集器的遍历；临时列表用后即弃，
+ * 与两处闭包编译重建 uses 的方式一致——只做存在性检测） */
+static bool af_body_uses_this(AStmtList *body) {
+    AExprList *tmp = ael_new_c();
+    for (int i = 0; i < body->n; i++)
+        collect_stmt_vars(body->stmts[i], tmp, NULL, 0);
+    TStr *thiz = tstr_intern("this", 4);
+    bool hit = false;
+    for (int i = 0; i < tmp->n; i++)
+        if (tmp->items[i]->u.name == thiz) { hit = true; break; }
+    tm_free(tmp->items);
+    tm_free(tmp);
+    return hit;
+}
+
 static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
                                 bool is_closure, bool auto_capture,
                                 bool is_method, void *decl_cls,
@@ -2714,6 +3018,14 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
      * compile_closure_expr 侧以同一顺序重算该列表做 SEND_CAP——两处都靠
      * add_use 的指针去重保持幂等/一致。 */
     if (is_closure && decl_cls && !af->is_static) {
+        if (!uses) uses = ael_new_c();
+        add_use(uses, tstr_intern("this", 4), af->line);
+    }
+    /* B3: 全局/函数作用域闭包引用 $this 也分配捕获槽——未绑定时为 UNDEF，
+     * bindTo 提供 newThis 后可重绑（对齐 PHP）。compile_closure_expr 侧
+     * 同式重算保持 SEND_CAP 与槽位一致。 */
+    if (is_closure && !decl_cls && !af->is_static &&
+        af_body_uses_this(af->body)) {
         if (!uses) uses = ael_new_c();
         add_use(uses, tstr_intern("this", 4), af->line);
     }
@@ -2780,6 +3092,11 @@ static Loc compile_closure_expr(Ctx *c, AExpr *e, Loc want) {
      * 随闭包生效。捕获源是外层方法帧的 CV 0，SEND_CAP 按名取。 */
     TClass *scope = c->fn->decl_cls;
     if (scope && !af->is_static) {
+        if (!uses) uses = ael_new_c();
+        add_use(uses, tstr_intern("this", 4), e->line);
+    }
+    /* B3: 与 compile_fn_like 同式（SEND_CAP 依赖同一 uses 顺序） */
+    if (!scope && !af->is_static && af_body_uses_this(af->body)) {
         if (!uses) uses = ael_new_c();
         add_use(uses, tstr_intern("this", 4), e->line);
     }
@@ -2882,6 +3199,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                 TMethod m;
                 memset(&m, 0, sizeof m);
                 m.name = af->name;
+                m.decl = cls;                /* B3: 可见性 owner = 声明类 */
                 m.visibility = mem->vis;
                 m.is_static = mem->is_static;
                 m.is_abstract = true;
@@ -2945,6 +3263,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             memset(&m, 0, sizeof m);
             m.name = af->name;
             m.fn = p->funcs[idx];
+            m.decl = cls;                    /* B3: 可见性 owner = 声明类 */
             m.visibility = mem->vis;
             m.is_static = mem->is_static;
             m.is_abstract = mem->is_abstract;

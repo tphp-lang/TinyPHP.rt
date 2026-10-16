@@ -109,26 +109,31 @@ Throwable
 
 ## 10. 与 PHP 的行为差异（有意为之，全部列出）
 
+> **2026-10-16 修复闭环**：历史清单中的 10 项行为缺陷/缺口已全部修复并与
+> PHP 8.5.1 逐条对拍——`void`/`never` 返回校验、`global` 槽缺口、`bindTo
+> "static"`（含 private/protected 按声明类可见的全链语义）、shutdown 静态
+> 属性析构序、缺失类加载期报错、try 归因 quirk、多层嵌套 finally 的
+> return、ArgumentCountError 消息尾巴、`$obj->$name` 动态成员全形态
+> （读/写/调用/nullsafe/fcc/链式/isset/unset/静态 `C::$$v` 与 `C::$v()`），
+> 以及顺带补齐的既有缺口 `C::$x op= v`、`isset/empty(C::$x)`。回归测试见
+> `tests/lang/test-{void,never}-*`、`test-argcount-message`、
+> `test-global-closure-method`、`test-finally-nested`、
+> `test-exception-next-try`、`test-missing-class`、`test-dynamic-member`、
+> `tests/oop/test-{bindto-scope,static-dtor-order,isset-empty-static}`。
+> 下列为仍存在的**有意差异**与**唯一未实现项**。
+
 | 场景 | PHP 8 | TinyPHP.rt |
 |---|---|---|
 | 读未定义变量 | Warning + null | 抛 `UndefinedError`（加载期可静态检测的先报错） |
 | strict_types | 需显式声明 | 全局隐含 strict（declare 可写但冗余；仍是运行期校验，非加载期擦除） |
-| warning/notice 诊断 | 不中断 | 全部升级为异常 |
+| warning/notice 诊断 | 不中断 | 全部升级为异常（含动态成员名不可见/不存在、数组等非字符串成员名的字符串化） |
 | 解构非数组值（8.5 新增 warning，UPGRADING 实锤） | 提示后继续 | 抛 `TypeError`（"诊断即异常"既定规则；**NULL 例外**：`[$a] = null` 在 PHP 8.5 合法无警告、产出全 null，对齐放行） |
 | float→int 越界 cast（8.5 新增 warning） | 提示后继续 | 抛 `TypeError`（转换越界；8.5 同时覆盖显式 `(int)` 与隐式两种） |
 | NAN cast 到其他类型（8.5 新增 warning） | 提示后继续 | 抛 `TypeError` |
 | 无 `declare` 开销差异 | — | `<?php` 外的内联 HTML 允许 |
-| `void`/`never` 返回类型 | 运行期校验 | 解析接受但不校验（调用方拿到实际值） |
 | 未初始化 typed 属性读取 | Error "must not be accessed before initialization" | 抛 `UndefinedError`（同为致命，措辞不同） |
-| `global $x` 而 $x 顶层从未出现 | 正常 | 编译期全局槽分配缺口："Internal: global slot missing" |
-| `Closure::bindTo` 的 `$scope = "static"` | 接受（晚绑定） | 只接受真实类名/`X::class` |
-| GC 遍历 | 静态属性/类常量堆值参与回收 | `gc_children` 不遍历 sprop_vals/cvals（program 生命周期兜底） |
-| 缺失类的 `new NoClass()` / `NoClass::K` | 运行期 Error | **加载期**报错（类绑定在加载期；跨类前向引用缺口） |
-| callee 内抛异常 + 调用点后紧跟 `try` | 归因到调用点 | VM 边界归因 quirk：可能误入**下一个** try 的保护区（try 与 call 间插一条普通语句即可避开） |
-| `return` 穿越多层嵌套 finally | 逐层执行 | 只执行最内层 finally（fast_call 级全链展开未做） |
-| 参数个数错误消息尾巴 | "…, 0 passed in file on line N and exactly 1 expected" | 只有主句 "Too few arguments to function f()"（缺调用位置尾巴） |
-| `$obj->$name` 动态成员名 | 支持 | 解析期报错（"Variable property access … is not supported"） |
-| `eval()` | 支持 | 未实现 |
+| 动态静态方法名 + 命名参数 `C::$v(a: 1)` | 运行期按真实签名重排 | 加载期拒绝（命名参数重排需编译期签名） |
+| `eval()` | 支持 | **不实现**（决策：注入面不安全、实际使用率低）；调用报 `Call to undefined function eval()` |
 
 其余语义（数组键、`==`、字符串算术 "123"+1=124、整除零抛 DivisionByZeroError、非数字字符串算术抛 TypeError 等）**全部对齐 PHP 8**。
 
