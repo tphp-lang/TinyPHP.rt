@@ -489,8 +489,10 @@ static AExpr *parse_primary(Parser *p) {
         if (p->tok.kind == KW_CLASS) {
             advance(p);
             AArgList *args;
+            bool paren_args = false;
             if (p->tok.kind == P_LPAREN) {
                 args = parse_arg_list(p);
+                paren_args = true;
             } else {
                 args = tm_malloc(sizeof(AArgList));
                 memset(args, 0, sizeof *args);   /* no-arg form */
@@ -505,15 +507,78 @@ static AExpr *parse_primary(Parser *p) {
             cd->body = parse_class_body(p, CK_CLASS, NULL);
             AExpr *e = ae_new(A_NEW, line);
             e->u.newx.name = NULL;
+            e->u.newx.dyn = NULL;
             e->u.newx.args = args;
             e->u.newx.anon = cd;
+            e->u.newx.paren_args = paren_args;
             return e;
         }
-        TStr *name = parse_qual_name(p, NULL);
-        AArgList *args = parse_arg_list(p);
+        TStr *name = NULL;
+        AExpr *dyn = NULL;
+        if (p->tok.kind == KW_SELF || p->tok.kind == KW_PARENT ||
+            p->tok.kind == KW_STATIC) {
+            /* new self / new parent / new static */
+            name = p->tok.ident;   /* interned keyword text */
+            advance(p);
+        } else if (p->tok.kind == L_VAR) {
+            /* dynamic class name: new $c / new $a->b / new $a['k']
+             * (PHP new_variable: dim/prop postfixes, NO method calls —
+             * `new $h->m()` is property fetch + ctor args) */
+            dyn = parse_primary(p);
+            for (;;) {
+                if (p->tok.kind == P_LBRACKET) {
+                    int ln = p->tok.line;
+                    advance(p);
+                    AExpr *idx = NULL;
+                    if (p->tok.kind != P_RBRACKET) idx = parse_expr(p);
+                    expect(p, P_RBRACKET, "Expected ']'");
+                    AExpr *d = ae_new(A_DIM, ln);
+                    d->u.dim.base = dyn;
+                    d->u.dim.idx = idx;
+                    dyn = d;
+                } else if (p->tok.kind == P_OBJECT ||
+                           p->tok.kind == P_NULLSAFE) {
+                    bool ns = p->tok.kind == P_NULLSAFE;
+                    int ln = p->tok.line;
+                    advance(p);
+                    if (p->tok.kind != L_IDENT && p->tok.kind != KW_NEW &&
+                        p->tok.kind != KW_CLASS) {
+                        p_error(p, "Expected property name after '->'");
+                        break;
+                    }
+                    TStr *pname = p->tok.ident;
+                    advance(p);
+                    AExpr *pr = ae_new(A_PROP, ln);
+                    pr->u.prop.obj = dyn;
+                    pr->u.prop.name = pname;
+                    pr->nullsafe = ns;
+                    dyn = pr;
+                } else break;
+            }
+        } else if (p->tok.kind == P_LPAREN) {
+            /* new (expr) — parenthesized class-name expression */
+            advance(p);
+            dyn = parse_expr(p);
+            expect(p, P_RPAREN, "Expected ')'");
+        } else {
+            name = parse_qual_name(p, NULL);
+        }
+        /* ctor args: optional (PHP new_non_dereferenceable has none) */
+        AArgList *args;
+        bool paren_args = false;
+        if (p->tok.kind == P_LPAREN) {
+            args = parse_arg_list(p);
+            paren_args = true;
+        } else {
+            args = tm_malloc(sizeof(AArgList));
+            memset(args, 0, sizeof *args);
+        }
         AExpr *e = ae_new(A_NEW, line);
         e->u.newx.name = name;
+        e->u.newx.dyn = dyn;
         e->u.newx.args = args;
+        e->u.newx.anon = NULL;
+        e->u.newx.paren_args = paren_args;
         return e;
     }
     case KW_CLONE: {
@@ -618,6 +683,12 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             /* P1-3: 链式动态调用 f()() / $obj->m()() / C::m()() —— 被调者
              * 可以是任意可调用表达式（运行期按值分发；此前一律 Parse
              * error）。非可调值由 op_init_dyn 报 "Value is not callable"。 */
+            /* A paren-less `new X` is complete: a following `(` belongs to the
+             * outer call (`get_class(new A)`), not to new — and it must not be
+             * re-parsed as a method call. A paren-ful `new X(...)` already
+             * consumed its args in KW_NEW, so this branch is unreachable for it. */
+            if (e->tag == A_NEW && !e->u.newx.paren_args)
+                return e;
             AArgList *args = parse_arg_list(p);
             AExpr *c = ae_new(A_CALL, line);
             c->u.call.dyn = e;
@@ -1509,9 +1580,31 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         m->tag = CM_PROP;
         m->prop.name = p->tok.ident;
         m->prop.type = ptype;
+        m->prop.def = NULL;
+        m->next = NULL;
         advance(p);
-        if (accept(p, P_ASSIGN)) {
-            m->prop.def = parse_expr(p);
+        if (accept(p, P_ASSIGN)) m->prop.def = parse_expr(p);
+        /* PHP: `public $a, $b;` / `public $a = 1, $b = 2;` — chain the extras
+         * off `next`; the class-body walker flattens them into the item list. */
+        AClassMember *tail = m;
+        while (p->tok.kind == P_COMMA) {
+            advance(p);
+            if (p->tok.kind != L_VAR) { p_error(p, "Expected property variable after ','"); break; }
+            AClassMember *nx = tm_malloc(sizeof(AClassMember));
+            memset(nx, 0, sizeof *nx);
+            nx->tag = CM_PROP;
+            nx->line = line;
+            nx->vis = m->vis;
+            nx->set_vis = m->set_vis;
+            nx->is_static = m->is_static;
+            nx->is_readonly = m->is_readonly;
+            nx->prop.name = p->tok.ident;
+            nx->prop.type = ptype;
+            nx->prop.def = NULL;
+            advance(p);
+            if (accept(p, P_ASSIGN)) nx->prop.def = parse_expr(p);
+            tail->next = nx;
+            tail = nx;
         }
         expect(p, P_SEMI, "Expected ';'");
         return m;
@@ -1546,8 +1639,14 @@ static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name) {
             continue;
         }
         AClassMember *m = parse_class_member(p, kind, cls_name);
-        b->items = tm_realloc(b->items, sizeof(AClassMember *) * (size_t)(b->n + 1));
-        b->items[b->n++] = m;
+        /* flatten CM_PROP comma chains (`public $a, $b;`) into separate items */
+        while (m) {
+            AClassMember *nx = m->next;
+            m->next = NULL;
+            b->items = tm_realloc(b->items, sizeof(AClassMember *) * (size_t)(b->n + 1));
+            b->items[b->n++] = m;
+            m = nx;
+        }
     }
     expect(p, P_RBRACE, "Expected '}'");
     return b;

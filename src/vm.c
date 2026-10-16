@@ -1576,32 +1576,43 @@ static int32_t op_new_ex(VM *vm, TOp *op) {
     if (ci >= (uint32_t)tphp_ex_class_count)
         vm_raise(vm, ex_class("Error"), op, "Internal: exception class missing");
     const TExClass *cls = tphp_ex_classes[ci];
-    TVal *args = vm->x.args + vm->x.n_args - (int)op->a2;
+    /* ext=1: no INIT_NEW rec (UnhandledMatchError path) — zero args, no rec
+     * to pop. Otherwise the INIT_NEW rec at n_calls-1 owns the args. */
+    uint32_t base;
+    uint16_t nargs;
+    VMCallRec *rec = NULL;
+    if (op->ext) {
+        base = (uint32_t)vm->x.n_args;
+        nargs = 0;
+    } else {
+        rec = &vm->x.calls[vm->x.n_calls - 1];
+        base = rec->args_base;
+        nargs = (uint16_t)(vm->x.n_args - (int)base);
+    }
+    TVal *args = vm->x.args + base;
     TStr *msg = tstr_new("", 0);
     int64_t code = 0;
-    if (op->a2 > 0) {
+    if (nargs > 0) {
         if (args[0].t != T_STR)
             vm_raise(vm, ex_class("TypeError"), op,
                      "Exception message must be a string");
         msg = (TStr *)args[0].u.p;
         tval_addref(TV_STR(msg));
     }
-    if (op->a2 > 1 && args[1].t == T_INT) code = args[1].u.i;
+    if (nargs > 1 && args[1].t == T_INT) code = args[1].u.i;
     TExObj *prev = NULL;
-    if (op->a2 > 2 && args[2].t == T_OBJ) {
+    if (nargs > 2 && args[2].t == T_OBJ) {
         prev = (TExObj *)args[2].u.p;
         prev->h.rc++;                       /* exception owns the chain */
     }
     /* consume the queued ctor args (msg/prev took their own references):
      * release the area slots and pop them off, or the next call would
      * inherit them as phantom arguments */
-    {
-        uint32_t base = vm->x.n_args - (int)op->a2;
-        for (uint32_t i = 0; i < op->a2; i++)
-            if (vm->x.args[base + i].t != T_UNDEF)
-                tval_release(&vm->x.args[base + i]);
-        vm->x.n_args = (int)base;
-    }
+    for (uint16_t i = 0; i < nargs; i++)
+        if (args[i].t != T_UNDEF)
+            tval_release(&args[i]);
+    vm->x.n_args = (int)base;
+    if (rec) vm->x.n_calls--;              /* pop INIT_NEW rec */
     wtake(vm, op, TV_OBJ(tex_alloc(cls, msg, code, op->line, prev)));
     return 1;
 }
@@ -2041,19 +2052,17 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
     return 1;
 }
 
-static int32_t op_new_user(VM *vm, TOp *op) {
-    TStr *cname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
-    char lc[128];
-    { const char *s = tstr_val(cname);
-      size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
-          lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
-      lc[k] = 0; }
-    /* class_resolve_lc runs spl_autoload hooks; declared in class.c */
-    extern TClass *class_resolve_lc(const char *fqcn_lc);
-    TClass *cls = class_resolve_lc(lc);
-    if (!cls || cls->kind != CK_CLASS)
-        vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
-                 tstr_val(cname));
+/* OP_INIT_NEW: snapshot args_base before ctor sends (spread-safe count;
+ * same pattern as INIT_FCALL). The rec is consumed by NEW_USER/NEW_EX/
+ * NEW_LATE/NEW_DYN — user-ctor path reuses it as the ctor rec. */
+static int32_t op_init_new(VM *vm, TOp *op) {
+    call_push(vm, op);
+    return 1;
+}
+
+/* shared construction after the class is resolved. The INIT_NEW rec at
+ * n_calls-1 holds args_base; real count = n_args - args_base (spread-safe). */
+static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
     if (cls->flags & CLS_ABSTRACT)
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot instantiate abstract class %s", tstr_val(cls->name));
@@ -2074,6 +2083,12 @@ static int32_t op_new_user(VM *vm, TOp *op) {
                      from ? tstr_val(from->name) : "global scope");
         }
     }
+    VMCallRec *rec = &vm->x.calls[vm->x.n_calls - 1];  /* INIT_NEW */
+    uint32_t base = rec->args_base;
+    uint16_t nargs = (uint16_t)(vm->x.n_args - (int)base);
+    rec->n_args = nargs;
+    TVal *args = &vm->x.args[base];
+    (void)cname;
     TObj *o = tphp_obj_alloc(cls);
     o->h.rc++;                    /* ctor invocation holds a reference */
     if (cls->m_ctor >= 0 && !cls->methods[cls->m_ctor].fn &&
@@ -2081,11 +2096,11 @@ static int32_t op_new_user(VM *vm, TOp *op) {
         /* native constructor (M4 internal classes, e.g. Async\Channel):
          * run the C ctor with the sent args, then land the object */
         NativeMethodFn ctor = (NativeMethodFn)cls->methods[cls->m_ctor].native;
-        TVal *args = &vm->x.args[vm->x.n_args - (int)op->a2];
-        TVal r = ctor(vm, o, args, (int)op->a2);
-        for (uint16_t i = 0; i < op->a2; i++)
+        TVal r = ctor(vm, o, args, (int)nargs);
+        for (uint16_t i = 0; i < nargs; i++)
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
-        vm->x.n_args -= (int)op->a2;
+        vm->x.n_args = (int)base;
+        vm->x.n_calls--;                    /* pop INIT_NEW rec */
         tval_release(&r);
         o->h.rc--;                    /* 退掉 ctor-invocation 引用（native 路径） */
         if (op->tr != OPD_UNUSED) {
@@ -2100,23 +2115,21 @@ static int32_t op_new_user(VM *vm, TOp *op) {
     }
     if (cls->m_ctor >= 0 && cls->methods[cls->m_ctor].fn &&
         !cls->methods[cls->m_ctor].is_abstract) {
-        VMCallRec *rec = call_push(vm, op);
+        /* reuse the INIT_NEW rec as the ctor rec (already on the stack) */
         rec->is_method = true;
         rec->is_ctor = true;
         rec->this_obj = NULL;      /* $this moves straight into the frame */
         rec->uf = cls->methods[cls->m_ctor].fn;
         rec->dst_kind = op->tr;
         rec->dst_slot = op->ar;
-        rec->args_base = (uint32_t)vm->x.n_args - (uint32_t)op->a2;  /* args pre-sent */
-        rec->n_args = (uint16_t)op->a2;
         TFunc *fn = rec->uf;
         VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
         f->fn = fn;
         f->pc = 0;
         f->prev = vm->x.frame;
-        f->args_base = rec->args_base;
-        f->n_args_sent = (uint16_t)op->a2;
+        f->args_base = base;
+        f->n_args_sent = nargs;
         f->n_calls_at_entry = vm->x.n_calls;
         uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
         f->slots = tm_malloc(sizeof(TVal) * nslots);
@@ -2128,12 +2141,17 @@ static int32_t op_new_user(VM *vm, TOp *op) {
          * live in f->args_base (RECV moves from there) — otherwise leftover
          * ctor args pollute the next nested call's parameter area (M5-b:
          * serialize(new Point(3,4)) landed 3 args) */
-        vm->x.n_args = rec->args_base;
+        vm->x.n_args = (int)base;
         vm->x.frame->pc++;           /* caller resumes after NEW_USER */
         vm->x.frame = f;
         return 0;                  /* pc managed: ctor frame is running */
     }
-    /* no constructor: the object lands in dst directly */
+    /* no constructor: release the sent args (INIT_NEW rec owns the base),
+     * pop the rec, and land the object */
+    for (uint16_t i = 0; i < nargs; i++)
+        if (args[i].t != T_UNDEF) tval_release(&args[i]);
+    vm->x.n_args = (int)base;
+    vm->x.n_calls--;
     if (op->tr != OPD_UNUSED) {
         TVal *d = &vm->x.frame->slots[op->ar];
         tval_release(d);
@@ -2144,6 +2162,63 @@ static int32_t op_new_user(VM *vm, TOp *op) {
         tval_release(&(TVal){ .u.p = o, .t = T_OBJ });
     }
     return 1;
+}
+
+static int32_t op_new_user(VM *vm, TOp *op) {
+    TStr *cname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
+    char lc[128];
+    { const char *s = tstr_val(cname);
+      size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
+          lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+      lc[k] = 0; }
+    /* class_resolve_lc runs spl_autoload hooks; declared in class.c */
+    extern TClass *class_resolve_lc(const char *fqcn_lc);
+    TClass *cls = class_resolve_lc(lc);
+    if (!cls || cls->kind != CK_CLASS)
+        vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+                 tstr_val(cname));
+    return new_user_at(vm, op, cls, cname);
+}
+
+/* new self / new parent / new static — a1 = kind (0/1/2), same as smcall */
+static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named);
+static int32_t op_new_late(VM *vm, TOp *op) {
+    TClass *cls = smcall_cls(vm, op, (int)op->a1, NULL);
+    return new_user_at(vm, op, cls, cls->name);
+}
+
+/* new $cls / new ($expr) / new $a->b — o1 = class-name value.
+ * PHP accepts a string (class name) or an object (uses its class). */
+static int32_t op_new_dyn(VM *vm, TOp *op) {
+    TVal cv = rdv(vm, op, 1);
+    TStr *cname = NULL;
+    if (cv.t == T_STR) {
+        cname = (TStr *)cv.u.p;
+    } else if (cv.t == T_OBJ) {
+        GCHead *h = (GCHead *)cv.u.p;
+        if (h->kind == GC_KIND_OBJ)
+            cname = ((TObj *)h)->cls->name;
+        else if (h->kind == GC_KIND_EX)
+            cname = tstr_intern(((TExObj *)h)->cls->name,
+                                strlen(((TExObj *)h)->cls->name));
+        else
+            vm_raise(vm, ex_class("Error"), op,
+                     "Class name must be a valid object or a string");
+    } else {
+        vm_raise(vm, ex_class("Error"), op,
+                 "Class name must be a valid object or a string");
+    }
+    char lc[256];
+    { const char *s = tstr_val(cname);
+      size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
+          lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+      lc[k] = 0; }
+    extern TClass *class_resolve_lc(const char *fqcn_lc);
+    TClass *cls = class_resolve_lc(lc);
+    if (!cls)
+        vm_raise(vm, ex_class("Error"), op, "Class '%s' not found",
+                 tstr_val(cname));
+    return new_user_at(vm, op, cls, cname);
 }
 
 static int32_t op_assign_prop(VM *vm, TOp *op) {
@@ -3284,6 +3359,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_init_smcall), H(op_fetch_cconst), H(op_instanceof), H(op_get_class),
     H(op_assign_sprop), H(op_unset_prop), H(op_clone), H(op_fcc_method),
     H(op_fetch_osprop), H(op_assign_osprop), H(op_isset_osprop),
+    H(op_init_new), H(op_new_late), H(op_new_dyn),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -3310,6 +3386,7 @@ const char *tphp_op_name(uint8_t op) {
         "INIT_SMCALL", "FETCH_CCONST", "INSTANCEOF", "GET_CLASS",
         "ASSIGN_SPROP", "UNSET_PROP", "CLONE", "FCC_METHOD",
         "FETCH_OSPROP", "ASSIGN_OSPROP", "ISSET_OSPROP",
+        "INIT_NEW", "NEW_LATE", "NEW_DYN",
     };
     return op < OP_MAX ? names[op] : "?";
 }

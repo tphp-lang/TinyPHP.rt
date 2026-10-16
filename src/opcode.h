@@ -55,6 +55,10 @@ typedef enum {
     OP_FETCH_OSPROP,   /* $obj::$prop read: o1=base(obj|str), a2=lit "$name" */
     OP_ASSIGN_OSPROP,  /* $obj::$prop = v: o1=base, a2=lit "$name", rd3=val */
     OP_ISSET_OSPROP,   /* isset($obj::$prop): o1=base, a2=lit "$name" */
+    OP_INIT_NEW,       /* snapshot args_base before new's ctor sends
+                          (spread-safe count; pairs with NEW_*) */
+    OP_NEW_LATE,       /* new self/parent/static: a1=kind(0/1/2) */
+    OP_NEW_DYN,        /* new $cls / new ($expr): o1=class-name value */
     OP_MAX,
 } Opcode;
 

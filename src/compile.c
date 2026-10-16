@@ -1435,6 +1435,7 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             emit(c, OP_NEW_EX, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
             c->fn->ops[c->fn->n_ops - 1].a1 = (uint32_t)ci;
             c->fn->ops[c->fn->n_ops - 1].a2 = 0;
+            c->fn->ops[c->fn->n_ops - 1].ext = 1;   /* no INIT_NEW rec */
             emit(c, OP_THROW, LOC_TMP(tmp_new(c)), LOC_NONE, LOC_NONE, e->line);
         }
         for (int i = 0; i < n_ends; i++)
@@ -1453,9 +1454,24 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         return compile_closure_expr(c, e, want);
     case A_NEW: {
         /* user classes resolve at runtime through the registry (allows
-         * forward references and `new $cls`-style dynamics later); the
-         * built-in exception hierarchy keeps the M2 fast path */
-        TStr *cname;
+         * forward references); builtin exceptions keep the M2 fast path;
+         * `new self/parent/static` and `new $cls` resolve at runtime */
+        AExpr *dyn = e->u.newx.dyn;
+        TStr *name = e->u.newx.name;
+        bool is_late = false;
+        int late_kind = 0;                /* 0=self 1=parent 2=static */
+        if (!dyn && name) {
+            if (tstr_case_eq(tstr_val(name), "self")) {
+                is_late = true; late_kind = 0;
+            } else if (tstr_case_eq(tstr_val(name), "parent")) {
+                is_late = true; late_kind = 1;
+            } else if (tstr_case_eq(tstr_val(name), "static")) {
+                is_late = true; late_kind = 2;
+            }
+        }
+        TStr *cname = NULL;
+        char lc[256] = {0};
+        bool builtin_ex = false, user_cls = false;
         if (e->u.newx.anon) {
             /* anonymous class: compile + register under a unique name at
              * the declaring site, then construct like a named class */
@@ -1471,24 +1487,34 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                 cd->ifaces[k] = resolve_class_name(cd->ifaces[k]);
             compile_class_decl(c->prog, cd, c->file);
             cname = cd->name;
-        } else {
-            cname = resolve_class_name(e->u.newx.name);
+        } else if (is_late) {
+            if (!c->fn->decl_cls)
+                tphp_fatal_src(c->file, e->line,
+                               "Cannot use %s when current class scope has no class",
+                               tstr_val(name));
+        } else if (!dyn) {
+            /* static-name path: resolve through use-table / current NS */
+            cname = resolve_class_name(name);
         }
-        char lc[256];
-        { const char *s = tstr_val(cname);
-          size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
-              lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
-          lc[k] = 0; }
-        bool builtin_ex = tphp_ex_class_index(tstr_val(cname)) >= 0;
-        bool user_cls = !builtin_ex && tphp_class_lookup(lc) != NULL;
-        if (!builtin_ex && !user_cls)
-            tphp_fatal_src(c->file, e->line, "Class '%s' not found",
-                           tstr_val(cname));
+        if (cname) {
+            const char *s = tstr_val(cname);
+            size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
+                lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+            lc[k] = 0;
+            builtin_ex = tphp_ex_class_index(tstr_val(cname)) >= 0;
+            user_cls = !builtin_ex && tphp_class_lookup(lc) != NULL;
+            if (!builtin_ex && !user_cls)
+                tphp_fatal_src(c->file, e->line, "Class '%s' not found",
+                               tstr_val(cname));
+        }
         bool has_named = false, has_spread = false;
         for (int i = 0; i < e->u.newx.args->n; i++) {
             if (e->u.newx.args->items[i].name) has_named = true;
             if (e->u.newx.args->items[i].is_spread) has_spread = true;
         }
+        if (has_named && (dyn || is_late))
+            tphp_fatal_src(c->file, e->line,
+                           "Named constructor arguments require a compile-time class name");
         TMethod *ctor_m = NULL;
         if (has_named) {
             if (has_spread)
@@ -1508,29 +1534,36 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
                                "Named constructor arguments require a compiled user constructor");
             ctor_m = &cls->methods[cls->m_ctor];
         }
-        int n_ctor_args;
+        /* INIT_NEW snapshots args_base so NEW_* can compute the real
+         * (spread-expanded) count at runtime — same pattern as INIT_FCALL */
+        emit(c, OP_INIT_NEW, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
         if (has_named) {
-            /* reorder sends to ctor parameter order; a2 = n_params is exact
-             * (one SEND per slot) so op_new_user arg addressing stays valid */
-            n_ctor_args = compile_named_sends(c, e->line, e->u.newx.args,
-                                              ctor_m->param_names, ctor_m->n_params);
+            /* reorder sends to ctor parameter order (one SEND per slot) */
+            compile_named_sends(c, e->line, e->u.newx.args,
+                                ctor_m->param_names, ctor_m->n_params);
         } else {
-            n_ctor_args = e->u.newx.args->n;
             for (int i = 0; i < e->u.newx.args->n; i++) {
-                Loc av = compile_expr(c, e->u.newx.args->items[i].e, LOC_NONE);
-                emit(c, OP_SEND_VAL, av, LOC_NONE, LOC_NONE, e->line);
+                AArg *arg = &e->u.newx.args->items[i];
+                Loc av = compile_expr(c, arg->e, LOC_NONE);
+                emit(c, arg->is_spread ? OP_SEND_SPREAD : OP_SEND_VAL,
+                     av, LOC_NONE, LOC_NONE, e->line);
             }
         }
         Loc dst = tmp_dst(c, want);
-        if (user_cls) {
+        if (dyn) {
+            /* new $cls / new ($expr): resolve the name value at runtime */
+            Loc cv = compile_expr(c, dyn, LOC_NONE);
+            emit(c, OP_NEW_DYN, cv, LOC_NONE, dst, e->line);
+        } else if (is_late) {
+            emit(c, OP_NEW_LATE, LOC_NONE, LOC_NONE, dst, e->line);
+            c->fn->ops[c->fn->n_ops - 1].a1 = (uint32_t)late_kind;
+        } else if (user_cls) {
             emit(c, OP_NEW_USER, LOC_CONST(lit_str(c, cname)),
                  LOC_NONE, dst, e->line);
-            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)n_ctor_args;
         } else {
             emit(c, OP_NEW_EX, LOC_NONE, LOC_NONE, dst, e->line);
             c->fn->ops[c->fn->n_ops - 1].a1 =
                 (uint32_t)tphp_ex_class_index(tstr_val(cname));
-            c->fn->ops[c->fn->n_ops - 1].a2 = (uint32_t)n_ctor_args;
         }
         return dst;
     }
@@ -2529,6 +2562,8 @@ static void collect_expr_vars(AExpr *e, AExprList *out, AParam **params, int n_p
     case A_CLOSURE: case A_ARROW:
         return;
     case A_NEW:
+        if (e->u.newx.dyn)
+            collect_expr_vars(e->u.newx.dyn, out, params, n_params);
         for (int i = 0; i < e->u.newx.args->n; i++)
             collect_expr_vars(e->u.newx.args->items[i].e, out, params, n_params);
         return;

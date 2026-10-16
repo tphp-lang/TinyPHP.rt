@@ -115,7 +115,12 @@ typedef struct AExpr {
         AExprList *args;
         AExpr *e;
         struct { AFunc *func; bool is_static; } clo;
-        struct { TStr *name; AArgList *args; void *anon; } newx;
+        struct { TStr *name; AExpr *dyn; AArgList *args; void *anon;
+                 bool paren_args; } newx;
+        /* name XOR dyn: dyn = runtime class-name expr (`new $c` / `new ($e)`).
+         * name = "self"/"parent"/"static" keyword text or a class name.
+         * paren_args: ctor list was spelled with '(' — gates dereference
+         * (PHP new_dereferenceable vs new_non_dereferenceable). */
         struct { AExpr *input; AExpr *call; } pipe;
         struct { AExpr *obj; TStr *name; } prop;
         struct { AExpr *obj; TStr *name; AArgList *args; } mcall;
@@ -214,6 +219,7 @@ typedef struct AClassMember {
     uint8_t set_vis;      /* PHP 8.4 private(set)/protected(set)；0 = 无 */
     bool is_static, is_abstract, is_final, is_readonly;
     AFunc *func;
+    struct AClassMember *next;  /* CM_PROP 逗号链: `public $a, $b;` 的后续项 */
     struct { TStr *name; TStr *type; AExpr *def; } prop;   /* type: P1-1 */
     struct { TStr **names; int n; AModList *mods; } use;
 } AClassMember;
