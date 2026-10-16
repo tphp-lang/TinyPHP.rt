@@ -14,5 +14,5 @@
 - P1-2 用户异常类：双世界名字匹配（TExObj 快路 + wrap 字段包装用户 TObj）；exclass.c 注册 16+1 内置异常 TClass（master 表，worker 靠克隆）；**enum from(非法值) 曾静默返回 null**（op-1-n_args 反查 INIT 公式在带参时指错→改存 rec->magic_name）
 - P1-3 Closure：闭包 $this 自动捕获（uses 双侧同序+指针去重）；TClosure.scope 重绑（bindTo/bind scope 参、call() 用新对象类）；tphp_vm_call_callable 曾 called_cls=NULL；链式调用 f()() 曾 Parse error
 - 环境注意：main.c 等处中文注释经 Edit 写入是合法 UTF-8（clang 输出乱码只是控制台显示）；exclass 走 master 注册后 worker 不可再直接 init（clone 重复 fatal）
-- 已知待办（2026-10-15 终盘，125/0，进度权威源=TODO-P2-P3.md）：**未修 bug**：try 块内类声明被 pass_classes 静默丢弃（S_TRY 不递归）、跨类前向 `new`（A 用后声明的 B）、FCC/数组 callable 不重查可见性；**未做**：方法命名参数（P4 需运行期 named 机制）、`$obj::$x`、return-in-catch+finally、错误措辞全面对拍
-- 架构锚点：惰性类常量=TClass.cthunks+compile_thunk(cls)；readonly 写入=TProp.decl 声明类判定；override 签名=class.c 类型格（逆变/协变）；parent::__construct 帧作用域=VMFrame.vis_scope（与 called_cls 后绑定分离）；自工厂=compile_class_decl 壳建后提前注册
+- ~~已知待办~~ **进度已全清（2026-10-16 核对）**：TODO-P2-P3.md 已于 a8fb0b2 删除，P2/P3 全部关闭或迁至 **PLAN/01 §10（行为差异权威源，18 条）**；基线 **135 passed / 0 failed**，HEAD=fca98d1。后续新缺口一律记 PLAN/01 §10。
+- 架构锚点：惰性类常量=TClass.cthunks+compile_thunk(cls)；readonly 写入=TProp.decl 声明类判定；**继承静态属性共享=TProp.decl 共享父槽（重声明才分槽）**；override 签名=class.c 类型格；parent::__construct 帧作用域=VMFrame.vis_scope（与 called_cls 分离）；自工厂=compile_class_decl 壳建后提前注册；try 内声明=pass 系递归 S_TRY（if/循环不递归）；`$obj::$x`=OSPROP 三 handler；测试运行器=cmd /c 引号剥离需 @ 前缀+rc&0xFF
