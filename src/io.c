@@ -113,6 +113,24 @@ static const char *asset_rel(const char *path) {
     return NULL;
 }
 
+/* T13: 磁盘未命中回落 —— path 在打包时记录的 source_root 之下时，剥离前缀
+ * 得到 zip 内 key。需要静态缓冲（source_root 可能比 path 长），返回是否命中。 */
+static bool src_root_rel(const char *path, char *out, size_t cap) {
+    const char *root = tphp_pack_source_root();
+    if (!root || !root[0]) return false;
+    size_t rn = strlen(root);
+    /* 去掉尾部斜杠便于前缀比对 */
+    while (rn > 0 && (root[rn - 1] == '/' || root[rn - 1] == '\\')) rn--;
+    if (strncmp(path, root, rn) != 0) return false;
+    if (path[rn] != '/' && path[rn] != '\\') return false;
+    const char *rel = path + rn;
+    while (*rel == '/' || *rel == '\\') rel++;
+    if (!rel[0]) return false;
+    snprintf(out, cap, "%s", rel);
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+    return true;
+}
+
 static const char *asset_err(void) {
     return tphp_pack_has_bundle() ? "no such file in bundle"
                                   : "not a packed executable";
@@ -302,6 +320,17 @@ TVal tphp_io_file_get_contents(VM *vm, TVal *args, int n) {
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_open, path, UV_FS_O_RDONLY, 0);
     if (op.result < 0) {
+        /* T13: 磁盘未命中 → 若在打包 source_root 下则回落 zip */
+        char rel[1024];
+        if (src_root_rel(path, rel, sizeof rel)) {
+            void *data = NULL;
+            size_t len = 0;
+            if (tphp_pack_read(rel, &data, &len)) {
+                TStr *s = tstr_new(data, len);
+                free(data);
+                return TV_STR(s);
+            }
+        }
         io_warn(what, uv_strerror((int)op.result));
         return TV_FALSE;
     }
@@ -403,6 +432,22 @@ TVal tphp_io_fopen(VM *vm, TVal *args, int n) {
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_open, path, flags, 0644);
     if (op.result < 0) {
+        /* T13: 磁盘未命中 → 若在打包 source_root 下且为读模式则回落 zip */
+        char srel[1024];
+        if (!(flags & (UV_FS_O_WRONLY | UV_FS_O_RDWR | UV_FS_O_CREAT |
+                       UV_FS_O_APPEND | UV_FS_O_TRUNC)) &&
+            src_root_rel(path, srel, sizeof srel)) {
+            void *data = NULL;
+            size_t len = 0;
+            if (tphp_pack_read(srel, &data, &len)) {
+                int bidx = stream_ctx_new(-1, flags);
+                g_streams[bidx]->mem = data;
+                g_streams[bidx]->mem_len = len;
+                TObj *bo = tphp_obj_alloc(g_stream_cls);
+                bo->props[0] = TV_INT(bidx);
+                return TV_OBJ(bo);
+            }
+        }
         char what[256];
         snprintf(what, sizeof what, "fopen(%s): failed to open stream", path);
         io_warn(what, uv_strerror((int)op.result));
@@ -636,7 +681,12 @@ TVal tphp_io_file_exists(VM *vm, TVal *args, int n) {
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_stat, path);
-    return op.result == 0 ? TV_TRUE : TV_FALSE;
+    if (op.result == 0) return TV_TRUE;
+    /* T13: 磁盘未命中 → 若在打包 source_root 下则回落 zip */
+    char srel[1024];
+    if (src_root_rel(path, srel, sizeof srel))
+        return tphp_pack_stat(srel, NULL) ? TV_TRUE : TV_FALSE;
+    return TV_FALSE;
 }
 
 TVal tphp_io_filesize(VM *vm, TVal *args, int n) {
@@ -657,6 +707,12 @@ TVal tphp_io_filesize(VM *vm, TVal *args, int n) {
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_stat, path);
     if (op.result < 0) {
+        /* T13: 磁盘未命中 → 若在打包 source_root 下则回落 zip */
+        char srel[1024];
+        size_t sz = 0;
+        if (src_root_rel(path, srel, sizeof srel) &&
+            tphp_pack_stat(srel, &sz))
+            return TV_INT((int64_t)sz);
         char what[256];
         snprintf(what, sizeof what, "filesize(): stat failed for %s", path);
         io_warn(what, uv_strerror((int)op.result));
@@ -768,6 +824,25 @@ TVal tphp_io_scandir(VM *vm, TVal *args, int n) {
     op.want_names = true;
     FS_DO(&op, uv_fs_scandir, path, 0);
     if (op.result < 0) {
+        /* T13: 磁盘未命中 → 若在打包 source_root 下则列 zip 内该目录 */
+        char srel[1024];
+        if (src_root_rel(path, srel, sizeof srel) && tphp_pack_has_bundle()) {
+            char **snames = NULL;
+            int scnt = tphp_pack_list(srel, &snames);
+            if (scnt > 0 || !srel[0]) {
+                TArr *sarr = tarr_new();
+                tarr_append(sarr, TV_STR(tstr_new(".", 1)));
+                tarr_append(sarr, TV_STR(tstr_new("..", 2)));
+                for (int i = 0; i < scnt; i++) {
+                    tarr_append(sarr, TV_STR(tstr_new(snames[i], strlen(snames[i]))));
+                    free(snames[i]);
+                }
+                free(snames);
+                fs_op_clear(&op);
+                return TV_ARR(sarr);
+            }
+            free(snames);
+        }
         char what[256];
         snprintf(what, sizeof what, "scandir(%s): failed to open dir", path);
         io_warn(what, uv_strerror((int)op.result));

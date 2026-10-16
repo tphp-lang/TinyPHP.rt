@@ -38,12 +38,15 @@ jobs:
       - name: Pack smoke (PE resources)
         shell: pwsh
         run: |
-          Set-Content -Path asset.txt -Value "asset-data" -NoNewline
-          Set-Content -Path app.php -Value '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' -NoNewline
-          ./build/tphp.exe build app.php --with asset.txt -o app.exe
+          # __DIR__-relative read: source_root-relative key + disk-miss fallback (T13)
+          New-Item -ItemType Directory -Path data -Force | Out-Null
+          Set-Content -Path data/asset.txt -Value "asset-data" -NoNewline
+          Set-Content -Path app.php -Value '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' -NoNewline
+          ./build/tphp.exe build app.php --with data -o app.exe
           $out = ./app.exe
-          if ("$out" -notmatch 'asset-data') { throw "packed asset not readable" }
-          if (Test-Path runtime/lib) { throw "data asset must not hit disk" }
+          if (($out -split "`n") -notcontains 'asset-data') { throw "packed __DIR__ asset not readable" }
+          if (($out -split "`n").Count -lt 2) { throw "ASSET_ROOT compat path broken" }
+          if (Test-Path runtime/data) { throw "data asset must not hit disk" }
           "asset-in-memory"
 
       - name: Smoke
@@ -82,12 +85,13 @@ jobs:
 
       - name: Pack smoke (ELF section / footer)
         run: |
-          printf '%s' 'asset-data' > asset.txt
-          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with asset.txt -o app
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
           ./app > out.txt
-          grep -q 'asset-data' out.txt
-          test ! -d runtime/lib
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
           echo "asset-in-memory"
 
       - name: Smoke
@@ -125,12 +129,13 @@ jobs:
 
       - name: Pack smoke (ELF section / footer)
         run: |
-          printf '%s' 'asset-data' > asset.txt
-          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with asset.txt -o app
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
           ./app > out.txt
-          grep -q 'asset-data' out.txt
-          test ! -d runtime/lib
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
           echo "asset-in-memory"
 
       - name: Smoke
@@ -168,12 +173,13 @@ jobs:
 
       - name: Pack smoke (footer container)
         run: |
-          printf '%s' 'asset-data' > asset.txt
-          printf '%s' '<?php echo file_get_contents(ASSET_ROOT . "/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with asset.txt -o app
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
           ./app > out.txt
-          grep -q 'asset-data' out.txt
-          test ! -d runtime/lib
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
           echo "asset-in-memory"
 
       - name: Smoke

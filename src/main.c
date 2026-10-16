@@ -17,6 +17,7 @@
 #else
 #include <unistd.h>
 #include <sys/stat.h>
+#include <limits.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -24,6 +25,36 @@
 
 /* compile.c */
 Program *tphp_compile(AStmtList *ast, const char *file);
+
+/* absolute + separator-normalized path (best-effort: falls back to input) */
+static void main_abspath(const char *in, char *out, size_t cap) {
+    out[0] = 0;
+    if (!in || !in[0]) return;
+#ifdef _WIN32
+    char full[1024];
+    if (_fullpath(full, in, sizeof full) == NULL) { snprintf(out, cap, "%s", in); }
+    else { snprintf(out, cap, "%s", full); }
+#else
+    char full[1024];
+    if (!realpath(in, full)) { snprintf(out, cap, "%s", in); }
+    else { snprintf(out, cap, "%s", full); }
+#endif
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+}
+
+/* dirname of an absolute path (no trailing slash); returns length, 0 if none */
+static size_t main_dirname(const char *abspath, char *out, size_t cap) {
+    const char *slash = NULL;
+    for (const char *q = abspath; *q; q++) if (*q == '/') slash = q;
+    if (!slash) { out[0] = 0; return 0; }
+    size_t n = (size_t)(slash - abspath);
+    if (n == 0) n = 1;                 /* "/x" -> "/" */
+    if (n + 1 > cap) n = cap - 1;
+    memcpy(out, abspath, n);
+    out[n] = 0;
+    return n;
+}
+
 /* vm.c */
 int tphp_vm_run(Program *prog);
 void tphp_dump_program(Program *prog);
@@ -492,9 +523,12 @@ int main(int argc, char **argv) {
     tphp_pack_startup(&embedded_main, &embedded_len);
 
     if (argc < 2) {
-        /* 打包应用：无参数时跑嵌入主脚本 */
+        /* 打包应用：无参数时跑嵌入主脚本。__FILE__/__DIR__ 折叠用打包时
+         * 记录的真实主脚本路径，而非 "<embedded>"（否则 __DIR__ 会是 "."，
+         * 使 io 层的 source_root 剥离失效，T13）。 */
         if (embedded_main) {
-            int rc = run_source(embedded_main, "<embedded>", false);
+            const char *mp = tphp_pack_main_path();
+            int rc = run_source(embedded_main, mp[0] ? mp : "<embedded>", false);
             free(embedded_main);
             return rc;
         }
@@ -583,7 +617,13 @@ int main(int argc, char **argv) {
                 chmod(out_exe, 0755);
             }
 #endif
-            int rc = tphp_pack_exe(out_exe, php, strlen(php), withs, nwith);
+            /* src_root = 主脚本目录（绝对路径）：--with 的 key 以此为基准，
+             * 也是运行期 __DIR__ 相对读回落进 zip 的剥离前缀 */
+            char script_abs[1024], src_root[1024] = "";
+            main_abspath(script, script_abs, sizeof script_abs);
+            main_dirname(script_abs, src_root, sizeof src_root);
+            int rc = tphp_pack_exe(out_exe, php, strlen(php), withs, nwith,
+                                   src_root[0] ? src_root : NULL, script_abs);
             free(php);
             return rc == 0 ? (int)TPHP_OK : (int)TPHP_E_IO;
         }

@@ -139,14 +139,16 @@ phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包与 phpc
   - **macOS**：文件尾 footer 容器 `[zip][u64 le size][magic "TPHPBND1"]`
   - Unix 主脚本：zip 内 `__main.php`
 - 运行期（main 最早期）：
-  zip **常驻内存**（Bun 式）：数据资产由 io 层经 `ASSET_ROOT`（`tphp://asset/`）前缀
-  直读内存 zip，**不落盘**；manifest 中 `type=dll`（`.dll/.so/.dylib`）按**等效相对路径**
-  提取到 **exe 同级**（`<exedir>/<relpath>`；磁盘已存在且 sha1 与清单一致则跳过，
+  zip **常驻内存**（Bun 式）：数据资产首选经 `__DIR__` 相对读——磁盘未命中时
+  io 层按打包时记录的源码根（`__source_root` zip 条目）剥离前缀、直读内存 zip，**不落盘**；
+  `ASSET_ROOT`（`tphp://asset/`）是直接访问包根的次要前缀路径。manifest 中
+  `type=dll`（`.dll/.so/.dylib`）按**等效相对路径**提取到 **exe 同级**
+  （`<exedir>/<relpath>`；磁盘已存在且 sha1 与清单一致则跳过，
   否则校验 zip 侧 sha1 后原子写 .tmp → rename）；FFI 用包内相对路径命中清单 →
   `<exedir>/<relpath>` 绝对加载（`LOAD_WITH_ALTERED_SEARCH_PATH`，依赖走应用目录默认搜索）
   无嵌入 → 零开销正常启动；有嵌入主脚本且无 CLI 参数 → 执行
   防护：zip-slip（拒绝 `..`/绝对路径/盘符）；DLL 提取 sha1 校验
-- CI 对每个平台跑 Pack smoke（build → 读 `ASSET_ROOT` 断言 → 断言数据不落盘）
+- CI 对每个平台跑 Pack smoke（build → `__DIR__` 相对读断言 → 断言数据不落盘）
 
 ## 7. 构建脚本要点
 

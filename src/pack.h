@@ -26,10 +26,14 @@
  * exe_path: 目标可执行文件（UTF-8）
  * main_php: 主脚本源码与长度（可 NULL）
  * with_paths: --with 列表（UTF-8）；with_n 个数
+ * src_root: 源码根绝对路径（--with 的 key 以此为基准；可 NULL）
+ * main_path: 主脚本绝对路径（运行时 __FILE__/__DIR__ 折叠用；可 NULL）
  * 返回 0 成功 */
 int tphp_pack_exe(const char *exe_path,
                   const char *main_php, size_t main_php_len,
-                  char **with_paths, int with_n);
+                  char **with_paths, int with_n,
+                  const char *src_root,
+                  const char *main_path);
 
 /* 运行期：定位嵌入 zip → 常驻内存 → 提取 DLL（无则跳过）→ 配置搜索路径。
  * out_main: 若存在嵌入主脚本且 *out_main 为空，*out_main = malloc 源码
@@ -50,6 +54,14 @@ bool tphp_pack_read(const char *rel, void **out, size_t *out_len);
 
 /* 查 zip 内文件大小；out_size 可为 NULL */
 bool tphp_pack_stat(const char *rel, size_t *out_size);
+
+/* 打包时记录的源码根（绝对路径，正斜杠；无则返回 ""）。
+ * io 层用它把 __DIR__ 相对路径剥离成 zip 内 key（T13）。 */
+const char *tphp_pack_source_root(void);
+
+/* 打包时记录的主脚本绝对路径（无则返回 ""）。
+ * 运行时 __FILE__/__DIR__ 用它折叠，而非 "<embedded>"（T13）。 */
+const char *tphp_pack_main_path(void);
 
 /* 列 zip 内 dir_rel（"" = 根）下一级名字（含目录项，不含 '.'/'..'）。
  * 返回个数；*names = malloc 数组（每项 malloc），调用方逐项 free。 */

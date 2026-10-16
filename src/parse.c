@@ -12,6 +12,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+/* windows.h would drag in a POSIX accept() declaration that collides with
+ * parse.c's own accept(); _fullpath in <stdlib.h> is enough here. */
+#include <direct.h>
+#else
+#include <unistd.h>
+#include <limits.h>
+#endif
 
 void tphp_fatal_src(const char *file, int line, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
@@ -99,6 +107,38 @@ static AExpr *ae_new(int tag, int line) {
     e->tag = tag;
     e->line = line;
     return e;
+}
+
+/* dirname for __DIR__: strip at last '/' or '\\'; returns NULL at fs root
+ * or for a bare name (no separator). */
+static const char *parse_dirname(const char *path, size_t *out_len) {
+    const char *last = NULL;
+    for (const char *q = path; *q; q++)
+        if (*q == '/' || *q == '\\') last = q;
+    if (!last) return NULL;
+    *out_len = (size_t)(last - path);
+    if (*out_len == 0) *out_len = 1;   /* "/x" -> "/" */
+    return path;
+}
+
+/* Resolve to an absolute, separator-normalized path. PHP's __FILE__ is always
+ * absolute; we need that too so a runtime cwd change cannot break the io
+ * layer's source_root -> bundle key mapping (T12/T13). Best-effort: if the
+ * platform call fails we fall back to the input unchanged. */
+static void parse_abspath(const char *in, char *out, size_t cap) {
+    out[0] = 0;
+    if (!in || !in[0]) return;
+#ifdef _WIN32
+    char full[1024];
+    if (_fullpath(full, in, sizeof full) == NULL) { snprintf(out, cap, "%s", in); }
+    else { snprintf(out, cap, "%s", full); }
+#else
+    char full[PATH_MAX];
+    if (!realpath(in, full)) { snprintf(out, cap, "%s", in); }
+    else { snprintf(out, cap, "%s", full); }
+#endif
+    /* normalize backslashes to '/' so zip keys and source_root agree */
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
 }
 
 static AStmt *as_new(int tag, int line) {
@@ -428,6 +468,31 @@ static AExpr *parse_primary(Parser *p) {
         if (p->tok.kind == P_DOUBLE_COLON) {
             /* C::member static access (primary returns here bypass postfix) */
             return parse_static_access(p, name, line);
+        }
+        /* PHP magic constants — folded at parse time so each inlined require
+         * keeps its own file identity (the AST has no per-node file field).
+         * __FILE__/__DIR__ are the ORIGINAL source paths, packed or not; the
+         * io layer transparently re-roots a disk-miss into the bundle. */
+        if (strcmp(tstr_val(name), "__LINE__") == 0) {
+            AExpr *e = ae_new(A_INT, line);
+            e->u.i = line;
+            return e;
+        }
+        if (strcmp(tstr_val(name), "__FILE__") == 0) {
+            char ab[1024];
+            parse_abspath(p->file, ab, sizeof ab);
+            AExpr *e = ae_new(A_STR, line);
+            e->u.name = tstr_intern(ab, strlen(ab));
+            return e;
+        }
+        if (strcmp(tstr_val(name), "__DIR__") == 0) {
+            char ab[1024];
+            parse_abspath(p->file, ab, sizeof ab);
+            size_t dlen = 0;
+            const char *dir = parse_dirname(ab, &dlen);
+            AExpr *e = ae_new(A_STR, line);
+            e->u.name = tstr_intern(dir ? dir : ab, dir ? dlen : strlen(ab));
+            return e;
         }
         AExpr *e = ae_new(A_CONSTREF, line);
         e->u.name = name;

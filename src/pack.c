@@ -131,6 +131,7 @@ static bool move_replace_u8(const char *from, const char *to) {
 static bool move_replace_u8(const char *from, const char *to) {
     return rename(from, to) == 0;
 }
+#include <limits.h>
 #endif
 
 /* load_file: UTF-8 路径（源文件/--with 输入） */
@@ -342,6 +343,61 @@ static bool path_is_abs(const char *p) {
     return p[0] == '/' || p[0] == '\\' || (strlen(p) >= 2 && p[1] == ':');
 }
 
+/* Source root for --with key computation and the __source_root zip entry.
+ * Set once per tphp_pack_exe() call (from the main script's absolute dir).
+ * Keys become source-root-relative so __DIR__-relative io can re-root a
+ * disk-miss into the bundle (T12/T13). */
+static char g_src_root[1024] = "";
+
+/* Build-time path of the main script, written to the __main_path zip entry.
+ * The runtime folds __FILE__/__DIR__ from this instead of "<embedded>",
+ * which would make __DIR__ == "." and break the source_root strip (T13). */
+static char g_main_path[1024] = "";
+
+/* Resolve `in` to an absolute, separator-normalized path (forward slashes).
+ * Best-effort: falls back to the input if the platform call fails. */
+static void pack_abspath(const char *in, char *out, size_t cap) {
+    out[0] = 0;
+    if (!in || !in[0]) return;
+#ifdef _WIN32
+    wchar_t wbuf[1024], wfull[1024];
+    u8_to_w(in, wbuf, 1024);
+    DWORD n = wbuf[0] ? GetFullPathNameW(wbuf, 1024, wfull, NULL) : 0;
+    if (n == 0 || n >= 1024) { snprintf(out, cap, "%s", in); }
+    else { w_to_u8(wfull, out, cap); }
+#else
+    char full[1024];
+    if (!realpath(in, full)) { snprintf(out, cap, "%s", in); }
+    else { snprintf(out, cap, "%s", full); }
+#endif
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+}
+
+static void set_src_root(const char *dir) {
+    if (!dir || !dir[0]) { g_src_root[0] = 0; return; }
+    size_t n = 0;
+    for (; dir[n] && n + 1 < sizeof g_src_root; n++)
+        g_src_root[n] = dir[n] == '\\' ? '/' : dir[n];
+    g_src_root[n] = 0;
+    while (n > 1 && g_src_root[n - 1] == '/') g_src_root[--n] = 0; /* no trail */
+}
+
+/* If `p` (relative to cwd, or absolute) resolves under g_src_root, write the
+ * source-root-relative key (forward slashes) and return true. */
+static bool key_from_src_root(const char *p, char *out, size_t cap) {
+    if (!g_src_root[0]) return false;
+    char abs[1024];
+    pack_abspath(p, abs, sizeof abs);
+    size_t rl = strlen(g_src_root);
+    if (strncmp(abs, g_src_root, rl) != 0) return false;
+    if (abs[rl] != '/' && abs[rl] != 0) return false;
+    const char *rel = abs + rl;
+    while (*rel == '/') rel++;
+    if (!rel[0]) return false;
+    snprintf(out, cap, "%s", rel);
+    return true;
+}
+
 static void collect_with(PackList *l, const char *p) {
 #ifdef _WIN32
     wchar_t wp[1024];
@@ -362,7 +418,9 @@ static void collect_with(PackList *l, const char *p) {
 #endif
     if (is_dir) {
         char relbase[1024];
-        if (path_is_abs(p)) {
+        if (key_from_src_root(p, relbase, sizeof relbase)) {
+            /* under source root: key is source-root-relative (T12) */
+        } else if (path_is_abs(p)) {
             /* 绝对路径无包内等效前缀：按目录内部相对收集（旧锚点行为） */
             relbase[0] = 0;
         } else {
@@ -377,7 +435,9 @@ static void collect_with(PackList *l, const char *p) {
         collect_dir(l, p, relbase, 0);
     } else {
         char rel[1024];
-        if (path_is_abs(p)) {
+        if (key_from_src_root(p, rel, sizeof rel)) {
+            /* under source root: key is source-root-relative (T12) */
+        } else if (path_is_abs(p)) {
             /* 绝对路径无法作包内相对名 → 退回文件名 */
             const char *base = p;
             for (const char *q = p; *q; q++)
@@ -501,6 +561,16 @@ static bool build_zip(PackList *list, const char *main_php, size_t main_len,
     }
     mz_zip_writer_add_mem(&zip, "manifest.json", manifest, strlen(manifest),
                           MZ_DEFAULT_COMPRESSION);
+    /* source root (absolute, forward slashes): lets the io layer re-root a
+     * disk-miss into the bundle for __DIR__-relative reads (T12/T13) */
+    if (g_src_root[0])
+        mz_zip_writer_add_mem(&zip, "__source_root", g_src_root, strlen(g_src_root),
+                              MZ_DEFAULT_COMPRESSION);
+    /* main script build-time path: runtime folds __FILE__/__DIR__ from this
+     * instead of "<embedded>" (T13) */
+    if (g_main_path[0])
+        mz_zip_writer_add_mem(&zip, "__main_path", g_main_path, strlen(g_main_path),
+                              MZ_DEFAULT_COMPRESSION);
     if (main_php && main_len)
         mz_zip_writer_add_mem(&zip, "__main.php", main_php, main_len,
                               MZ_DEFAULT_COMPRESSION);
@@ -573,10 +643,18 @@ static bool pe_is_x64(const char *path) {
 
 int tphp_pack_exe(const char *exe_path,
                   const char *main_php, size_t main_php_len,
-                  char **with_paths, int with_n) {
+                  char **with_paths, int with_n,
+                  const char *src_root, const char *main_path) {
     if (!pe_is_x64(exe_path)) {
         fprintf(stderr, "tphp: '%s' is not a x64 PE\n", exe_path);
         return -1;
+    }
+    set_src_root(src_root);
+    g_main_path[0] = 0;
+    if (main_path && main_path[0]) {
+        char ab[1024];
+        pack_abspath(main_path, ab, sizeof ab);
+        snprintf(g_main_path, sizeof g_main_path, "%s", ab);
     }
     PackList list = {0};
     for (int i = 0; i < with_n; i++) collect_with(&list, with_paths[i]);
@@ -642,7 +720,15 @@ static bool elf_inject_section(const char *exe_path, const char *zip_path) {
 
 int tphp_pack_exe(const char *exe_path,
                   const char *main_php, size_t main_php_len,
-                  char **with_paths, int with_n) {
+                  char **with_paths, int with_n,
+                  const char *src_root, const char *main_path) {
+    set_src_root(src_root);
+    g_main_path[0] = 0;
+    if (main_path && main_path[0]) {
+        char ab[1024];
+        pack_abspath(main_path, ab, sizeof ab);
+        snprintf(g_main_path, sizeof g_main_path, "%s", ab);
+    }
     PackList list = {0};
     for (int i = 0; i < with_n; i++) collect_with(&list, with_paths[i]);
     packlist_load(&list);
@@ -855,6 +941,47 @@ bool tphp_pack_has_bundle(void) {
 
 const char *tphp_pack_dll_root(void) {
     return g_dll_root[0] ? g_dll_root : NULL;
+}
+
+/* Source root recorded at build time (T12). Lazily read from the __source_root
+ * zip entry and cached; returns "" when unpacked or when the entry is absent
+ * (bundles built before T12). */
+const char *tphp_pack_source_root(void) {
+    static char root[1024] = "";
+    static bool loaded = false;
+    if (loaded) return root;
+    loaded = true;
+    if (!g_bundle) return root;
+    void *data = NULL;
+    size_t len = 0;
+    if (!tphp_pack_read("__source_root", &data, &len)) return root;
+    size_t n = len < sizeof root - 1 ? len : sizeof root - 1;
+    memcpy(root, data, n);
+    root[n] = 0;
+    free(data);
+    while (n > 0 && (root[n - 1] == '\n' || root[n - 1] == '\r')) root[--n] = 0;
+    return root;
+}
+
+/* Build-time path of the embedded main script (T13). Lets the runtime fold
+ * __FILE__/__DIR__ to the ORIGINAL source path instead of "<embedded>",
+ * which would make __DIR__ resolve to dirname("<embedded>") == "." and break
+ * the io layer's source_root strip. Returns "" when absent. */
+const char *tphp_pack_main_path(void) {
+    static char path[1024] = "";
+    static bool loaded = false;
+    if (loaded) return path;
+    loaded = true;
+    if (!g_bundle) return path;
+    void *data = NULL;
+    size_t len = 0;
+    if (!tphp_pack_read("__main_path", &data, &len)) return path;
+    size_t n = len < sizeof path - 1 ? len : sizeof path - 1;
+    memcpy(path, data, n);
+    path[n] = 0;
+    free(data);
+    while (n > 0 && (path[n - 1] == '\n' || path[n - 1] == '\r')) path[--n] = 0;
+    return path;
 }
 
 bool tphp_pack_read(const char *rel, void **out, size_t *out_len) {

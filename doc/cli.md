@@ -50,16 +50,21 @@ tphp build app.php --with vendor/ --with bar.dll -o app
 
 - **`--with`**：文件或目录（可重复）
   - 目录递归收**非 .php** 文件（.php 排除并警告——PHP 走 phpc）
-  - **路径原样进包**（保留目录前缀：`--with vendor\ssl\foo.dll` → zip 内
-    `vendor/ssl/foo.dll`；`--with vendor` → `vendor/…`）
+  - **key 相对源码根**（主脚本所在目录）：`--with data` 且主脚本在 `src/` 下
+    → zip 内 `data/…`；这让 `__DIR__` 相对读能在打包后自动映射进 zip
   - 绝对路径无法表达包内等效名：单文件退回文件名、目录退回目录内部相对
 - 产物含嵌入 zip + 主脚本；**无参数运行**时自动执行主脚本
-- **数据资产不落盘**（Bun 式内存直读）：zip 常驻内存，`ASSET_ROOT`（值 `tphp://asset`）
-  前缀由 io 层直接读包内文件——`file_get_contents` / `fopen` / `file_exists` /
-  `filesize` / `scandir` 均支持，只读：
+- **数据资产不落盘**（Bun 式内存直读）：zip 常驻内存。首选地道写法
+  `__DIR__` 相对读——未打包读磁盘，打包后磁盘未命中自动回落到 zip（按源码根剥离）：
+  ```php
+  echo file_get_contents(__DIR__ . "/config.json");
+  ```
+  `ASSET_ROOT`（值 `tphp://asset`）是直接访问包根的次要途径（不经过源码根）：
   ```php
   echo file_get_contents(ASSET_ROOT . "/config.json");
   ```
+  两者都只读；`file_get_contents` / `fopen` / `file_exists` / `filesize` /
+  `scandir` 均支持
 - **`.dll` / `.so` / `.dylib` 按等效相对路径落盘到 exe 同级**：manifest `type=dll`
   条目提取为 `<exedir>/<包内相对路径>`（如 exe 旁 `vendor/foo.dll`）；磁盘已存在且
   sha1 与清单一致则跳过，否则校验后原子写入。FFI 里直接用包内相对路径即可加载：
