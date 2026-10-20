@@ -312,7 +312,7 @@ static TVal sr_val(SR *r) {
                 lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
             lc[k] = 0;
         }
-        TClass *c = class_resolve_lc(lc);
+        TClass *c = class_resolve_lc2(lc, tstr_val(cls));
         /* 类名大小写不敏感：先精确 lc，再按 PHP 规则已由 lookup 处理 */
         if (!c) {
             r->ok = false;
@@ -349,7 +349,7 @@ static TVal sr_val(SR *r) {
                 lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
             lc[k] = 0;
         }
-        TClass *c = class_resolve_lc(lc);
+        TClass *c = class_resolve_lc2(lc, tstr_val(cls));
         TVal out = TV_NULL;
         if (c && c->kind == CK_ENUM) {
             for (int i = 0; i < c->n_cases; i++) {

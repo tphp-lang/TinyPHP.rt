@@ -74,6 +74,8 @@ void tphp_exclass_init(void);
 void tphp_closure_class_init(void);
 /* pack.c：M6.1 原生资产打包（构建 + 启动释放，跨平台） */
 #include "pack.h"
+/* pkg.c：内置包管理（无外部 git 依赖） */
+#include "pkg.h"
 
 static char *read_file(const char *path);
 
@@ -90,6 +92,7 @@ static void print_usage(FILE *out) {
         "  tphp phpc <dir> -o <out.c>      pack lib\\*.php into bundle_data.c\n"
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
+        "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
         "  tphp -v, --version              print version\n",
         TPHP_VERSION);
 }
@@ -660,6 +663,36 @@ int main(int argc, char **argv) {
                 return (int)TPHP_E_ARGS;
             }
             return run_phpc(dir, outp);
+        }
+        if (strcmp(a, "new") == 0) {
+            /* tphp new <name> [--lib]：应用骨架 / 库包骨架 */
+            bool lib = false;
+            const char *name = NULL;
+            for (int j = i + 1; j < argc; j++) {
+                if (strcmp(argv[j], "--lib") == 0) lib = true;
+                else if (!name) name = argv[j];
+            }
+            if (!name) {
+                fprintf(stderr, "tphp: new requires a package name\n");
+                return (int)TPHP_E_ARGS;
+            }
+            /* 目标目录：应用 = 名字本身；库包 = 最后一段（foo/bar → bar） */
+            char dir[512];
+            if (lib) {
+                const char *slash = strrchr(name, '/');
+                snprintf(dir, sizeof dir, "%s", slash ? slash + 1 : name);
+            } else {
+                snprintf(dir, sizeof dir, "%s", name);
+            }
+            char err[512] = "";
+            int rc = tphp_pkg_new(dir, name, lib, err, sizeof err);
+            if (rc != 0) {
+                fprintf(stderr, "tphp: %s\n", err);
+                return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+            }
+            printf("Created %s package \"%s\" in %s\n", lib ? "lib" : "app",
+                   name, dir);
+            return (int)TPHP_OK;
         }
         if (strcmp(a, "-e") == 0) {
             if (i + 1 >= argc) {

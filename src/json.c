@@ -218,6 +218,7 @@ typedef struct {
     const char *p, *end;
     VM *vm;
     int depth;
+    bool silent;   /* C API (tphp_json_decode_c): suppress stderr warnings */
 } JDec;
 
 static void jskip(JDec *d) {
@@ -226,8 +227,8 @@ static void jskip(JDec *d) {
 }
 
 static bool jfail(JDec *d, const char *msg) {
-    (void)d;
-    fprintf(stderr, "PHP Warning:  json_decode(): %s\n", msg);
+    if (!d->silent)
+        fprintf(stderr, "PHP Warning:  json_decode(): %s\n", msg);
     return false;
 }
 
@@ -491,4 +492,17 @@ TVal bi_json_last_error(VM *vm, TVal *args, int n) {
 TVal bi_json_last_error_msg(VM *vm, TVal *args, int n) {
     (void)vm; (void)args; (void)n;
     return TV_STR(tstr_new("No error", 8));
+}
+
+/* ---- C-level decode (pkg.c): no VM, silent on failure ---- */
+bool tphp_json_decode_c(const char *src, size_t len, TVal *out) {
+    if (!src || !out) return false;
+    JDec d = { .p = src, .end = src + len, .vm = NULL, .depth = 0, .silent = true };
+    if (!jparse_value(&d, out)) return false;
+    jskip(&d);
+    if (d.p != d.end) {
+        tval_release(out);
+        return false;
+    }
+    return true;
 }

@@ -103,6 +103,9 @@ void tphp_exclass_init(void);
 
 /* runtime resolve (lookup + one autoloader run on miss); class.c */
 TClass *class_resolve_lc(const char *fqcn_lc);
+/* 同上，但 spl_autoload 回调收到 orig_name（原始大小写；PHP 对齐——
+ * PSR-4 前缀匹配大小写敏感）。orig 为 NULL 时退回 fqcn_lc。 */
+TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
 
 /* global class table reset (not needed: program lifetime) */
 

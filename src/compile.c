@@ -3225,6 +3225,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
     memset(f, 0, sizeof *f);
     f->name = af->name;
     f->file = file;
+    f->prog = p;
     f->ret_type = af->ret_type;   /* P1-1 */
     f->is_closure = is_closure;
     f->is_method = is_method;
@@ -4359,6 +4360,7 @@ Program *tphp_compile(AStmtList *ast, const char *file) {
     p->funcs = tm_malloc(sizeof(TFunc *));
     p->funcs[0] = tm_malloc(sizeof(TFunc));
     memset(p->funcs[0], 0, sizeof(TFunc));
+    p->funcs[0]->prog = p;
     p->n_funcs = 1;
     ns_reset();
     /* pass 1: collect top-level function signatures (named-arg reorder);
@@ -4380,6 +4382,7 @@ Program *tphp_compile(AStmtList *ast, const char *file) {
     memset(m, 0, sizeof *m);
     m->name = tstr_intern("~main", 5);
     m->file = file;
+    m->prog = p;
     m->is_main = true;
     Ctx c;
     memset(&c, 0, sizeof c);

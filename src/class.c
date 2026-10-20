@@ -302,17 +302,23 @@ void tphp_class_set_autoload_val(TVal fn) {
 }
 
 /* resolve a class by lowercase FQCN; runs the registered autoloader once on
- * miss (runtime only — during load there is no VM to run PHP code in) */
-TClass *class_resolve_lc(const char *fqcn_lc) {
+ * miss (runtime only — during load there is no VM to run PHP code in).
+ * orig_name（可 NULL）以原始大小写传给 spl_autoload 回调（PHP 对齐）。 */
+TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name) {
     TClass *c = tphp_class_lookup(fqcn_lc);
     if (c) return c;
     if (autoload_fn.t != T_NULL && tphp_vm_current) {
-        TStr *req = tstr_intern(fqcn_lc, strlen(fqcn_lc));
+        const char *on = orig_name ? orig_name : fqcn_lc;
+        TStr *req = tstr_intern(on, strlen(on));
         tval_addref(TV_STR(req));
         tphp_vm_run_autoloader(autoload_fn, req);
         return tphp_class_lookup(fqcn_lc);
     }
     return NULL;
+}
+
+TClass *class_resolve_lc(const char *fqcn_lc) {
+    return class_resolve_lc2(fqcn_lc, NULL);
 }
 
 /* ---- flattening ---- */
@@ -623,7 +629,7 @@ static void bind_traits(TClass *cls) {
     for (int ti = 0; ti < cls->n_trait_names; ti++) {
         char tlc[256];
         lc_copy(tlc, tstr_val(cls->trait_names[ti]), sizeof tlc);
-        TClass *t = class_resolve_lc(tlc);
+        TClass *t = class_resolve_lc2(tlc, tstr_val(cls->trait_names[ti]));
         if (!t || t->kind != CK_TRAIT)
             tphp_fatal_src("class.c", 0, "Trait \"%s\" not found",
                            tstr_val(cls->trait_names[ti]));
@@ -736,7 +742,7 @@ void tphp_class_ensure_flat(TClass *cls) {
     if (cls->parent_name) {
         char lc[256];
         lc_copy(lc, tstr_val(cls->parent_name), sizeof lc);
-        parent = class_resolve_lc(lc);
+        parent = class_resolve_lc2(lc, tstr_val(cls->parent_name));
         if (!parent)
             tphp_fatal_src("class.c", 0, "Class \"%s\" not found",
                            tstr_val(cls->parent_name));
@@ -798,7 +804,7 @@ void tphp_class_ensure_flat(TClass *cls) {
     for (int i = 0; i < cls->n_iface_names; i++) {
         char lc[256];
         lc_copy(lc, tstr_val(cls->iface_names[i]), sizeof lc);
-        TClass *ifc = class_resolve_lc(lc);
+        TClass *ifc = class_resolve_lc2(lc, tstr_val(cls->iface_names[i]));
         if (!ifc || ifc->kind != CK_INTERFACE)
             tphp_fatal_src("class.c", 0, "Interface \"%s\" not found",
                            tstr_val(cls->iface_names[i]));

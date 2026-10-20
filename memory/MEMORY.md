@@ -62,3 +62,10 @@
 - Edit 工具改 C 文件中文注释合法 UTF-8；clang 控制台输出乱码只是显示
 - PowerShell 5.1 `Set-Content -Encoding UTF8` 写 BOM——测试 fixture 注意
 - git 提交时 `build/cacert.pem` 是刻意入库的（.gitignore `!` 豁免），勿误删
+
+## 2026-10-20 会话二：包管理阶段 A（174/174，HEAD=8fcee3f 未提交）
+- **决策变更（用户拍板）：包管理不依赖 git 应用**——来源=HTTP(S) zip 直链 + 本地路径/zip（http_get+miniz）；ref 精确定位（无 ls-remote，不做 ^~ /latest）；deps=`{url, ref}`（读兼容旧 git 键）。PLAN/pkg-manager.md 待阶段 D 改写
+- 阶段 A 完成：src/pkg.{c,h}（jsonc 剥离→json.c C API `tphp_json_decode_c`→TMod；libuv 同步 fs；tmod pretty writer；autoload 生成=根+vendor 扫描+PSR-4 长前缀排序+首版 stub；`tphp new`；builtin `pkg_new` 测试缝）；tests/pkg/ 2 个；run.ps1 目录表 +"pkg"；零警告
+- 附带运行时修复（锚点）：①class_resolve_lc2(lc,orig)——spl_autoload 收原始大小写类名（PSR-4 必需，全调用点已换）②TFunc.prog 反查——动态 require 的独立 Program funcs 表，CLOSURE_INIT 用 vm->prog 会越界 0xC0000005 ③嵌套循环两套语义：默认 run_frame_until_pop 保持旧"帧切换即退出"（改深=析构/magic 时序崩、大面积 0xC0000005）；仅 autoload 用 run_frame_until_pop_deep，且**必须先缓存 stop=f->prev（f 弹出即 free，条件读 f->prev 是 UAF）**
+- 杂项坑：stdlib 无 strncmp（生成代码用 substr）；build 每次重生成 bundle_data.c——stash/checkout 撞它先 restore；PS 把 `stash@{0}` 的花括号剥掉
+- 下次：阶段 B add/remove（zip 下载/本地拷贝+传递依赖+mod.lock，fixture 改本地 zip 目录）→ C（install+build 衔接）→ D（upload/文档/PLAN 同步）；工作区改动未提交

@@ -1087,8 +1087,8 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
               size_t k = 0; for (; s[k] && k < sizeof clc - 1; k++)
                   clc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
               clc[k] = 0; }
-            extern TClass *class_resolve_lc(const char *fqcn_lc);
-            cls = class_resolve_lc(clc);
+            extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+            cls = class_resolve_lc2(clc, tstr_val((TStr *)e0->u.p));
             if (!cls)
                 vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                          tstr_val((TStr *)e0->u.p));
@@ -1122,8 +1122,9 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
               size_t k = 0; for (; s2[k] && k < sizeof mlc - 1; k++)
                   mlc[k] = (s2[k] >= 'A' && s2[k] <= 'Z') ? (char)(s2[k] + 32) : s2[k];
               mlc[k] = 0; }
-            extern TClass *class_resolve_lc(const char *fqcn_lc);
-            TClass *cls = class_resolve_lc(clc);
+            extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+            TClass *cls = class_resolve_lc2(
+                clc, tstr_val(tstr_intern(s, cl)));
             if (!cls)
                 vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                          (int)cl, s);
@@ -1629,9 +1630,13 @@ static int32_t op_fetch_const(VM *vm, TOp *op) {
 static int32_t op_closure_init(VM *vm, TOp *op) {
     uint32_t fn_idx = op->a1;
     uint16_t n_cap = (uint16_t)op->a2;
-    if (fn_idx >= (uint32_t)vm->prog->n_funcs)
+    /* 经当前帧 fn 的归属 Program 取 funcs 表——动态 require 的文件是独立
+     * Program，vm->prog 仍是外层程序（fn_idx 会越界 → 0xC0000005） */
+    Program *prog = (Program *)vm->x.frame->fn->prog;
+    if (!prog) prog = vm->prog;
+    if (fn_idx >= (uint32_t)prog->n_funcs)
         vm_raise(vm, ex_class("Error"), op, "Internal: closure function missing");
-    TFunc *fn = vm->prog->funcs[fn_idx];
+    TFunc *fn = prog->funcs[fn_idx];
     if (vm->x.n_caps < n_cap)
         vm_raise(vm, ex_class("Error"), op, "Internal: capture stack underflow");
     TClosure *c = tclo_alloc(fn, &vm->x.caps[vm->x.n_caps - n_cap], n_cap);
@@ -1777,8 +1782,8 @@ static TClass *clo_scope_arg(TVal v) {
     for (; s[k] && k + 1 < sizeof lc; k++)
         lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
     lc[k] = 0;
-    extern TClass *class_resolve_lc(const char *fqcn_lc);
-    return class_resolve_lc(lc);
+    extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+    return class_resolve_lc2(lc, s);
 }
 
 static TVal nm_closure_fromcallable(VM *vm, void *self, TVal *args, int n) {
@@ -2066,6 +2071,24 @@ static bool ex_getter(const char *n, TExObj *x, TVal *out) {
                                     if (x->previous) tval_addref(*out); return true; }
     if (lc_eq(n, "getLine"))      { *out = TV_INT(x->line); return true; }
     return false;
+}
+
+/* ---- nested frame dispatcher (deep) ----
+ * 跑到 f 真正弹出，子帧（动态 require 等）继续在本循环内执行。
+ * 仅供 autoload 回调：回调体内 require 类文件时，"帧切换即退出"的旧式
+ * 嵌套循环会提前收工造成帧栈错乱（2026-10-20 pkg autoload）。
+ * 其余嵌套调用点保持各自的旧式 while (vm->x.frame == f)——历史行为
+ * 依赖该提前退出，改深会破坏析构/magic 执行时序（实测大面积 0xC0000005）。 */
+static void run_frame_until_pop_deep(VM *vm, VMFrame *f) {
+    /* 必须先缓存 stop：f 弹出时已被 tm_free（op_return/frame_destroy），
+     * 循环条件再读 f->prev 就是 UAF——曾导致 compare/autoload 场景错乱 */
+    VMFrame *stop = f->prev;
+    while (vm->x.frame && vm->x.frame != stop) {
+        VMFrame *cf = vm->x.frame;
+        TOp *cop = &cf->fn->ops[cf->pc];
+        int32_t d = ((OpHandler)cop->handler)(vm, cop);
+        if (d) cf->pc += (uint32_t)d;
+    }
 }
 
 /* ---- magic-method invocation helper (C-level method call) ----
@@ -2494,8 +2517,8 @@ static int32_t op_new_user(VM *vm, TOp *op) {
           lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
       lc[k] = 0; }
     /* class_resolve_lc runs spl_autoload hooks; declared in class.c */
-    extern TClass *class_resolve_lc(const char *fqcn_lc);
-    TClass *cls = class_resolve_lc(lc);
+    extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+    TClass *cls = class_resolve_lc2(lc, tstr_val(cname));
     if (!cls || cls->kind != CK_CLASS)
         vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                  tstr_val(cname));
@@ -2535,8 +2558,8 @@ static int32_t op_new_dyn(VM *vm, TOp *op) {
       size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
           lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
       lc[k] = 0; }
-    extern TClass *class_resolve_lc(const char *fqcn_lc);
-    TClass *cls = class_resolve_lc(lc);
+    extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+    TClass *cls = class_resolve_lc2(lc, tstr_val(cname));
     if (!cls)
         vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
                  tstr_val(cname));
@@ -2812,8 +2835,8 @@ static TClass *smcall_cls(VM *vm, TOp *op, int kind, TStr *named) {
         for (; s[k] && k < sizeof lc - 1; k++)
             lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
         lc[k] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        TClass *c = class_resolve_lc(lc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        TClass *c = class_resolve_lc2(lc, s);
         if (!c)
             vm_raise(vm, ex_class("Error"), op,
                      "Class \"%s\" not found", s);
@@ -2858,8 +2881,8 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
         for (size_t i = 0; i < cl; i++)
             clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
         clc[cl] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        cls = class_resolve_lc(clc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        cls = class_resolve_lc2(clc, tstr_val(tstr_intern(s, cl)));
         if (!cls)
             vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
@@ -3042,8 +3065,8 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
         for (size_t i = 0; i < cl; i++)
             clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
         clc[cl] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        cls = class_resolve_lc(clc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        cls = class_resolve_lc2(clc, tstr_val(tstr_intern(s, cl)));
         if (!cls)
             vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
@@ -3144,8 +3167,8 @@ static int32_t op_isset_cconst(VM *vm, TOp *op) {
         for (size_t i = 0; i < cl; i++)
             clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
         clc[cl] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        cls = class_resolve_lc(clc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        cls = class_resolve_lc2(clc, tstr_val(tstr_intern(s, cl)));
         if (!cls)
             vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
@@ -3204,8 +3227,8 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
         for (size_t i = 0; i < cl; i++)
             clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
         clc[cl] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        cls = class_resolve_lc(clc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        cls = class_resolve_lc2(clc, tstr_val(tstr_intern(s, cl)));
         if (!cls)
             vm_raise(vm, ex_class("Error"), op, "Class \"%.*s\" not found",
                      (int)cl, s);
@@ -3279,8 +3302,8 @@ static TClass *osprop_cls(VM *vm, TOp *op, TVal base) {
             lc[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
         }
         lc[n] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        TClass *cls = class_resolve_lc(lc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        TClass *cls = class_resolve_lc2(lc, s->c);
         if (!cls)
             vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found", s->c);
         return cls;
@@ -3542,8 +3565,8 @@ static int32_t op_instanceof(VM *vm, TOp *op) {
             for (; s[k] && k < sizeof lc - 1; k++)
                 lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
             lc[k] = 0;
-            extern TClass *class_resolve_lc(const char *fqcn_lc);
-            TClass *b = class_resolve_lc(lc);
+            extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+            TClass *b = class_resolve_lc2(lc, tstr_val(cname));
             if (b) res = tphp_class_isa(((TObj *)h)->cls, b);
         } else if (h->kind == GC_KIND_EX) {
             /* exception objects: match against the built-in hierarchy */
@@ -4212,11 +4235,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
             f->slots[i] = clo->captures[i];
         }
     vm->x.frame = f;
-    while (vm->x.frame == f) {
-        TOp *cop = &f->fn->ops[f->pc];
-        int32_t d = ((OpHandler)cop->handler)(vm, cop);
-        if (d) f->pc += (uint32_t)d;
-    }
+    run_frame_until_pop_deep(vm, f);
     if (vm->x.exception) longjmp(vm->x.unwind, 1);
 }
 

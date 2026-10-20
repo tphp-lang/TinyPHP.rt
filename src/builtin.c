@@ -11,6 +11,7 @@
 #include "class.h"
 #include "tsched.h"
 #include "tio.h"
+#include "pkg.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -334,6 +335,25 @@ static TVal bi_defined(VM *vm, TVal *args, int n) {
     return TV_FALSE;
 }
 
+/* ---- package manager (pkg.c; CLI 同一核心，测试/脚本化缝) ---- */
+static TVal bi_pkg_new(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_new() expects (string $dir, string $name, bool $lib = false)");
+    if (n >= 3 && args[2].t != T_TRUE && args[2].t != T_FALSE)
+        RAISE(vm, "TypeError", "pkg_new(): Argument #3 ($lib) must be bool");
+    const char *dir = tstr_val((TStr *)args[0].u.p);
+    const char *name = tstr_val((TStr *)args[1].u.p);
+    bool lib = n >= 3 && args[2].t == T_TRUE;
+    char err[512] = "";
+    int rc = tphp_pkg_new(dir, name, lib, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_new(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_new(): %s", err);
+    return TV_TRUE;
+}
+
 /* ---- autoload / class inspection ---- */
 static TVal bi_spl_autoload_register(VM *vm, TVal *args, int n) {
     (void)vm;
@@ -360,8 +380,8 @@ static TVal bi_class_exists(VM *vm, TVal *args, int n) {
     for (; s[k] && k < sizeof lc - 1; k++)
         lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
     lc[k] = 0;
-    extern TClass *class_resolve_lc(const char *fqcn_lc);
-    return class_resolve_lc(lc) ? TV_TRUE : TV_FALSE;
+    extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+    return class_resolve_lc2(lc, s) ? TV_TRUE : TV_FALSE;
 }
 
 /* P3: is_a / is_subclass_of / get_parent_class — object-or-class-string
@@ -376,8 +396,8 @@ static TClass *obj_or_class(TVal *v, bool allow_string) {
         for (; s[k] && k < sizeof lc - 1; k++)
             lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
         lc[k] = 0;
-        extern TClass *class_resolve_lc(const char *fqcn_lc);
-        return class_resolve_lc(lc);
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        return class_resolve_lc2(lc, s);
     }
     return NULL;
 }
@@ -2439,6 +2459,8 @@ const Builtin tphp_builtins[] = {
     { "stream_socket_server", tphp_net_server },
     { "stream_socket_accept", tphp_net_accept },
     { "http_get", tphp_net_http_get },
+    /* 包管理（pkg.c；tphp new/add/... 的 PHP 可调用层） */
+    { "pkg_new", bi_pkg_new },
 };
 
 const int tphp_builtin_count = (int)(sizeof tphp_builtins / sizeof tphp_builtins[0]);

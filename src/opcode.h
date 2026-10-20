@@ -118,6 +118,9 @@ typedef struct TFunc {
     bool is_method;        /* M3: slot 0 (after captures) holds $this */
     bool is_variadic;      /* last param is ...$x: extras go to RECV_VARIADIC */
     void *decl_cls;        /* TClass*: class this method was declared in */
+    void *prog;            /* Program*: owning program（动态 require 的文件有
+                            * 自己的 funcs 表——CLOSURE_INIT 等按索引取函数
+                            * 必须经此反查，不能用 vm->prog） */
 } TFunc;
 
 typedef struct Program {
