@@ -371,6 +371,7 @@ static bool type_seg_is_class(const char *s) {
 }
 
 static bool type_seg_covers(const char *wide, const char *narrow, TClass *scope) {
+    (void)scope;
     if (strcmp(wide, narrow) == 0) return true;
     if (strcmp(wide, "mixed") == 0) return true;
     if (strcmp(narrow, "mixed") == 0) return false;
@@ -545,6 +546,19 @@ static void add_method(TClass *cls, TMethod m) {
 static void add_prop(TClass *cls, TProp p) {
     for (int i = 0; i < cls->n_props; i++) {
         if (tstr_case_eq(tstr_val(cls->props[i].name), tstr_val(p.name))) {
+            /* PHP 8.4：final 钩子不得被子类覆盖 */
+            if (cls->props[i].hook_get_final && p.hook_get)
+                tphp_fatal_src("class.c", 0,
+                               "Cannot override final get hook of property %s::$%s",
+                               tstr_val(cls->props[i].decl ? cls->props[i].decl->name
+                                                           : cls->name),
+                               tstr_val(p.name));
+            if (cls->props[i].hook_set_final && p.hook_set)
+                tphp_fatal_src("class.c", 0,
+                               "Cannot override final set hook of property %s::$%s",
+                               tstr_val(cls->props[i].decl ? cls->props[i].decl->name
+                                                           : cls->name),
+                               tstr_val(p.name));
             /* child redeclares parent prop: keep parent slot, update meta */
             p.slot = cls->props[i].slot;
             cls->props[i] = p;

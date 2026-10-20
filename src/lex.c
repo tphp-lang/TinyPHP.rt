@@ -34,6 +34,9 @@ void lex_init_len(Lex *lx, const char *src, size_t len, const char *file) {
 void tphp_fatal_src(const char *file, int line, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
 
+static void lex_error(Lex *lx, const char *msg)
+    __attribute__((noreturn));
+
 static void lex_error(Lex *lx, const char *msg) {
     tphp_fatal_src(lx->file, lx->line, "%s", msg);
 }
@@ -70,6 +73,7 @@ static const struct { const char *name; LKind k; } keywords[] = {
     { "isset", KW_ISSET }, { "empty", KW_EMPTY },
     { "declare", KW_DECLARE }, { "namespace", KW_NAMESPACE }, { "use", KW_USE },
     { "require", KW_REQUIRE }, { "include", KW_INCLUDE },
+    { "require_once", KW_REQUIRE_ONCE }, { "include_once", KW_INCLUDE_ONCE },
     { "fn", KW_FN }, { "goto", KW_GOTO }, { "class", KW_CLASS },
     /* M3 OOP */
     { "public", KW_PUBLIC }, { "protected", KW_PROTECTED }, { "private", KW_PRIVATE },

@@ -662,7 +662,6 @@ static void parse_function(CParser *cp, FFIScope *sc, FFIType *ret, const char *
     }
 params_semicolon:
     cexpect(cp, ";");
-params_done:;
 
     FFIFunc *fn = tm_malloc(sizeof *fn);
     memset(fn, 0, sizeof *fn);
@@ -1609,6 +1608,13 @@ static TVal nm_cdata_getvalue(VM *vm, void *self, TVal *args, int n) {
     case FFI_FLOAT: return TV_FLOAT(*(float *)d->ptr);
     case FFI_DOUBLE:return TV_FLOAT(*(double *)d->ptr);
     case FFI_ENUM:  return TV_INT(*(int32_t *)d->ptr);
+    case FFI_VOID:  return TV_NULL;
+    case FFI_WCHAR:
+#if defined(_WIN32)
+        return TV_INT(*(uint16_t *)d->ptr);
+#else
+        return TV_INT(*(int32_t *)d->ptr);
+#endif
     case FFI_PTR: {
         void *p = *(void **)d->ptr;
         if (!p) return TV_NULL;

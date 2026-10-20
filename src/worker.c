@@ -32,7 +32,8 @@
 TStr *tphp_serialize_val(struct VM *vm, TVal v);
 bool  tphp_unserialize_val(struct VM *vm, const char *d, size_t n, TVal *out);
 TStr *tstr_new(const char *s, size_t len);
-void  tphp_vm_raise(struct VM *vm, const char *cls, const char *fmt, ...);
+void  tphp_vm_raise(struct VM *vm, const char *cls, const char *fmt, ...)
+    __attribute__((noreturn, format(printf, 3, 4)));
 TVal  tphp_vm_call_callable(struct VM *vm, TVal callable, TVal *args, int n);
 int   tphp_vm_run_closure(Program *prog, TClosure *clo);
 void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */

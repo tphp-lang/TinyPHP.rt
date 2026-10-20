@@ -10,7 +10,7 @@
 - **真线程 Worker**：独立 VM + 堆隔离 + Channel
 - **FFI**：libffi 调 C 库（`FFI::cdef` / `CData`）
 - **单文件应用**：`tphp build app.php --with assets/ -o app`（Windows/Linux/macOS）
-- **PHP 8 语义**：过程式 + 完整 OOP、数组全语义、异常、命名空间
+- **PHP 8 语义**：过程式 + 完整 OOP、数组全语义、异常、命名空间、PHP 8.4 属性钩子
 
 当前版本 `0.0.1`。内置函数与异步 API 清单见 **[doc/stdlib.md](doc/stdlib.md)**。
 

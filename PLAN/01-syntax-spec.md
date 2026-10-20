@@ -37,7 +37,7 @@
 
 ## 3. 语句与控制流（全支持）
 
-`if/elseif/else`、`while`、`do-while`、`for`、`foreach`（值/键值；**foreach 引用 `&$v` 不支持**，见 §6）、`switch`（松散比较语义对齐 PHP）、`match`（严格比较）、`break N / continue N`、`return`、`goto`（便宜，做；进出 try/catch 块除外）、`declare(strict_types=1)`（冗余但可写）、`require/include/require_once/include_once`、`global`（读写均支持：编译期别名，函数内读写直接编译为全局表访问，无需引用）、`static` 局部静态变量、`unset()`、`echo/print`。
+`if/elseif/else`、`while`、`do-while`、`for`、`foreach`（值/键值；**foreach 引用 `&$v` 不支持**，见 §6）、`switch`（松散比较语义对齐 PHP）、`match`（严格比较）、`break N / continue N`、`return`、`goto`（便宜，做；进出 try/catch 块除外）、`declare(strict_types=1)`（冗余但可写）、`require/include/require_once/include_once`（字面量编译期内联；**动态路径 OP_REQUIRE 运行期**；`*_once` 去重；表达式返回 1/false/文件 return 值）、`global`（读写均支持：编译期别名，函数内读写直接编译为全局表访问，无需引用）、`static` 局部静态变量、`unset()`、`echo/print`。
 
 ## 4. 表达式与运算符
 
@@ -67,7 +67,7 @@
 | 魔术方法 | ✅ `__construct __destruct __get __set __isset __unset __call __callStatic __toString __invoke __clone __debugInfo __cloneState(跨线程克隆与 serialize 共用协议，见 PLAN/02 §3)` |
 | 静态与晚期绑定 self / static / parent / $this / `static::class` | ✅ |
 | 对象比较 `==`（属性递归宽松比较）/ `===`（同实例） | ✅ 对齐 PHP |
-| 属性钩子 property hooks（PHP 8.4） | ❌ 后置 M7+ |
+| 属性钩子 property hooks（PHP 8.4） | ✅ `get`/`set` 全/短形式、隐式 `$value`、虚拟属性判定、isset 调 get、unset 禁止、readonly 拒绝、接口 `{ get; }` 声明、`__PROPERTY__`、`parent::$p::get()/set()`、`final` 覆盖校验；`&get` 引用返回后置 |
 | 弱引用 WeakMap/WeakReference | ❌ 后置 |
 
 ## 7. 异常体系（简化但形态一致）
@@ -134,6 +134,13 @@ Throwable
 | 未初始化 typed 属性读取 | Error "must not be accessed before initialization" | 抛 `UndefinedError`（同为致命，措辞不同） |
 | 动态静态方法名 + 命名参数 `C::$v(a: 1)` | 运行期按真实签名重排 | 加载期拒绝（命名参数重排需编译期签名） |
 | `eval()` | 支持 | **不实现**（决策：注入面不安全、实际使用率低）；调用报 `Call to undefined function eval()` |
+| 属性钩子 `&get` 引用返回 | 支持 | v1 按普通 `get` 执行（引用返回后置） |
+| 属性钩子 `parent::$p::get()` | 支持 | ✅ 已实现（`A_PROPHOOK` + `OP_PROPHOOK`） |
+| 属性钩子 `final` override 校验 | 编译期拒绝子类覆盖 final 钩子 | ✅ 已实现（flatten 时校验） |
+| 属性钩子 `__PROPERTY__` 魔术常量 | 支持 | ✅ 已实现（parse 期折为属性名字符串） |
+| `(void)` 转换（PHP 8.5） | 支持 | ✅ 求值后丢弃，表达式值 null |
+| `final` 提升属性（PHP 8.5） | 支持 | ✅ `__construct(final private int $x)` |
+| `clone` 属性列表（PHP 8.4） | 支持 | ✅ `clone($o, ['p'=>v])`（字面量数组；走 ASSIGN_PROP） |
 
 其余语义（数组键、`==`、字符串算术 "123"+1=124、整除零抛 DivisionByZeroError、非数字字符串算术抛 TypeError 等）**全部对齐 PHP 8**。
 

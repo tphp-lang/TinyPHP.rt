@@ -226,6 +226,7 @@ static void jskip(JDec *d) {
 }
 
 static bool jfail(JDec *d, const char *msg) {
+    (void)d;
     fprintf(stderr, "PHP Warning:  json_decode(): %s\n", msg);
     return false;
 }

@@ -34,7 +34,7 @@ echo "hello\n";
 | 目录 | 内容 |
 |---|---|
 | `tests/lang/` | 语言核心：算术/数组/字符串/控制流/闭包/命名空间 |
-| `tests/oop/` | OOP：类/接口/trait/enum/魔术方法/可见性 |
+| `tests/oop/` | OOP：类/接口/trait/enum/魔术方法/可见性/属性钩子 |
 | `tests/async/` | 协程：spawn/await/cancel/Channel/死锁/IO 并发 |
 | `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong |
 | `tests/ffi/` | FFI：CData/struct/union/系统库/拒绝预处理 |

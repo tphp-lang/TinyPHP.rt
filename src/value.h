@@ -136,9 +136,18 @@ typedef struct TProp {
     uint8_t set_visibility; /* PHP 8.4 asymmetric visibility；0 = 同 visibility */
     bool is_static;
     bool is_readonly;
+    bool is_final;         /* PHP 8.5 final 属性：子类不得重声明 */
     TVal defval;           /* T_UNDEF = required (constructor must set) */
     uint16_t def_thunk;    /* compiled constant-expression thunk, 0 = none */
     uint16_t slot;         /* instance property slot (declaration order) */
+    /* PHP 8.4 property hooks：get/set 钩子 TFunc（NULL = 默认行为）；
+     * virtual = 有钩子且钩子体未引用 $this->prop（无真实槽语义） */
+    struct TFunc *hook_get;
+    struct TFunc *hook_set;
+    bool has_hooks;
+    bool is_virtual;
+    bool hook_get_final;   /* final get 钩子：子类不得覆盖 */
+    bool hook_set_final;   /* final set 钩子 */
 } TProp;
 
 typedef struct TMethod {
@@ -264,8 +273,8 @@ TStr  *tstr_new(const char *s, size_t len);        /* heap string */
 TStr  *tstr_intern(const char *s, size_t len);     /* program-lifetime string */
 TStr  *tstr_concat(TStr *a, TStr *b);              /* new heap string */
 uint32_t tstr_hash(TStr *s);
-static inline size_t tstr_len(TStr *s) { return s->len; }
-static inline const char *tstr_val(TStr *s) { return s->c; }
+static inline size_t tstr_len(const TStr *s) { return s->len; }
+static inline const char *tstr_val(const TStr *s) { return s->c; }
 bool tstr_eq(TStr *a, TStr *b);                    /* pointer-or-content equality */
 
 /* number -> string formatting, PHP 8 semantics (precision=14, zend_gcvt) */

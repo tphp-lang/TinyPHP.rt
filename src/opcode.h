@@ -61,6 +61,12 @@ typedef enum {
     OP_NEW_DYN,        /* new $cls / new ($expr): o1=class-name value */
     OP_ISSET_CCONST,   /* C1+既有缺口: isset(C::$prop / C::$$v) 静默 bool；
                         * 布局同 FETCH_CCONST（动态时 t1=name，kind 挂 ext） */
+    OP_REQUIRE,        /* 运行期 require/include：t1=path 字符串值；
+                        * ext bit0=is_require bit1=is_once；tr/ar=结果
+                        * （成功 1 / include 失败 false / 被包含文件 return 值） */
+    OP_PROPHOOK,       /* PHP 8.4 parent::$p::get()/set()：a1=prop 名字面量
+                        * （含$前缀）；ext=0 get / 1 set；实参已 SEND 入栈
+                        * （args_base 由本 op 的 call rec 记录） */
     OP_MAX,
 } Opcode;
 
@@ -95,6 +101,7 @@ typedef struct TExEntry {
 
 typedef struct TFunc {
     TStr *name;
+    const char *file;       /* 源文件路径（require 相对路径解析 / 报错） */
     uint16_t n_params, n_locals, n_tmps; /* slots: [0..n_params) args, then locals, then tmps */
     TStr  **local_names;   /* n_locals entries (first n_params are parameter names) */
     TStr  **param_types;   /* n_params entries; NULL = untyped (P1-1) */
@@ -130,9 +137,9 @@ typedef struct { const char *name; BuiltinFn fn; } Builtin;
 extern const Builtin tphp_builtins[];
 extern const int tphp_builtin_count;
 
-/* raise a typed exception from anywhere holding a VM* */
+/* raise a typed exception from anywhere holding a VM* (never returns) */
 void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    __attribute__((noreturn, format(printf, 3, 4)));
 
 /* evaluate a zero-arg compiled thunk (runtime default values) */
 TVal tphp_call_thunk(VM *vm, uint16_t fn_idx);
@@ -142,6 +149,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx);
 
 typedef struct VMFrame {
     TFunc *fn;
+    const char *file;    /* 当前执行文件（相对 require 解析；NULL=prog->file） */
     uint32_t pc;
     TVal *slots;
     struct VMFrame *prev;
@@ -182,6 +190,7 @@ typedef struct VMCallRec {
     uint8_t dst_kind;
     uint32_t dst_slot;
     int line;
+    bool is_include;     /* 运行期 require 帧：RETURN 时空值提升为 1 */
 } VMCallRec;
 
 /* per-coroutine execution context (M4): EVERYTHING that defines a paused
@@ -219,6 +228,13 @@ struct VM {
     int exit_code;
     struct { TStr *name; TVal v; } consts[256];
     int n_consts;
+    /* 运行期 require：include 的 Program 常驻（TFunc 指针依赖其分配） */
+    Program **inc_progs;
+    int n_inc_progs;
+    /* PHP 8.4 property hooks：当前正在执行钩子的 (对象, 属性) —
+     * 钩子体内 $this->prop 直读/直写 backing，绕过钩子 */
+    void *hook_obj;        /* TObj* */
+    TStr *hook_prop;       /* 属性名（interned）；NULL = 无钩子上下文 */
 };
 
 

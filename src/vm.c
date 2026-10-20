@@ -35,6 +35,9 @@
 #include "class.h"
 #include "tsched.h"
 #include "tffi.h"
+#include "bundle.h"
+#include "pack.h"
+#include "ast.h"
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,6 +46,10 @@
 
 void tphp_fatal_src(const char *file, int line, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
+
+/* compile.c / parse.c（运行期 require 动态路径） */
+Program *tphp_compile(AStmtList *ast, const char *file);
+/* tphp_parse_script 在 ast.h */
 
 /* ---- builtins (builtin.c) ---- */
 
@@ -177,6 +184,10 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
 
 /* ---- engine raise: store the exception and longjmp to the main loop ---- */
 static void vm_raise_at(VM *vm, const TExClass *cls, int line,
+                        const char *fmt, va_list ap)
+    __attribute__((noreturn));
+
+static void vm_raise_at(VM *vm, const TExClass *cls, int line,
                         const char *fmt, va_list ap) {
     char buf[512];
     vsnprintf(buf, sizeof buf, fmt, ap);
@@ -184,6 +195,10 @@ static void vm_raise_at(VM *vm, const TExClass *cls, int line,
     vm->x.exception = tex_alloc(cls, msg, 0, line, NULL);
     longjmp(vm->x.unwind, 1);
 }
+
+static void vm_raise(VM *vm, const TExClass *cls, TOp *op,
+                     const char *fmt, ...)
+    __attribute__((noreturn, format(printf, 4, 5)));
 
 static void vm_raise(VM *vm, const TExClass *cls, TOp *op,
                      const char *fmt, ...) {
@@ -210,6 +225,9 @@ void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...) {
 }
 
 /* value.c hook: convert engine value errors into exceptions */
+static void vm_value_raise(const char *cls_name, const char *fmt, va_list ap)
+    __attribute__((noreturn));
+
 static void vm_value_raise(const char *cls_name, const char *fmt, va_list ap) {
     VM *vm = (VM *)tphp_vm_current;
     int line = 0;
@@ -325,6 +343,7 @@ static void fatal_missing_key(VM *vm, TOp *op, TVal key) {
 
 /* COW separation for a writable array slot; returns the (possibly new) TArr */
 static TArr *dim_cow(VM *vm, TVal *bp) {
+    (void)vm;
     TArr *a = tarr_cow((TArr *)bp->u.p);
     if (a != (TArr *)bp->u.p) {
         tval_release(bp);
@@ -864,12 +883,33 @@ static void *resolve_fn(VM *vm, TStr *name, bool *is_builtin) {
             *is_builtin = false;
             return vm->prog->funcs[i];
         }
+    /* 运行期 require 注册的函数（inc_progs）——不写入共享 ic（未 freeze） */
+    for (int pi = 0; pi < vm->n_inc_progs; pi++) {
+        Program *ip = vm->inc_progs[pi];
+        for (int i = 0; i < ip->n_funcs; i++)
+            if (ip->funcs[i]->name &&
+                !ip->funcs[i]->is_closure &&
+                tstr_eq(ip->funcs[i]->name, name)) {
+                *is_builtin = false;
+                return ip->funcs[i];
+            }
+    }
     for (int i = 0; i < tphp_builtin_count; i++)
         if (strcmp(tphp_builtins[i].name, tstr_val(name)) == 0) {
             *is_builtin = true;
             return (void *)tphp_builtins[i].fn;
         }
     return NULL;
+}
+
+/* 返回 true = 来自 inc_progs（调用方勿把指针写进共享 bytecode ic） */
+static bool resolve_fn_is_inc(VM *vm, TFunc *fn) {
+    for (int pi = 0; pi < vm->n_inc_progs; pi++) {
+        Program *ip = vm->inc_progs[pi];
+        for (int i = 0; i < ip->n_funcs; i++)
+            if (ip->funcs[i] == fn) return true;
+    }
+    return false;
 }
 
 /* last path segment after the final '\' (bare global name) */
@@ -916,7 +956,9 @@ static int32_t op_init_fcall(VM *vm, TOp *op) {
         op->ic = (void *)((uintptr_t)hit | 1);
     } else {
         rec->uf = (TFunc *)hit;
-        op->ic = hit;
+        /* inc_progs 来源不写共享 ic（Program 未 freeze，跨线程不安全） */
+        if (!resolve_fn_is_inc(vm, (TFunc *)hit))
+            op->ic = hit;
     }
     rec->dst_kind = op->tr;
     rec->dst_slot = op->ar;
@@ -1153,6 +1195,9 @@ static int32_t op_send_spread(VM *vm, TOp *op) {
 /* B8: 参数不足错误补全 PHP 8 调用点尾巴——"%u passed in FILE on line N
  * and (exactly|at least) %u expected"。异常行仍是定义行（vm_raise 取
  * RECV op->line，对齐 PHP getLine()）；消息内行号取调用点 call rec。 */
+static void raise_arg_count(VM *vm, VMFrame *f, TOp *op)
+    __attribute__((noreturn));
+
 static void raise_arg_count(VM *vm, VMFrame *f, TOp *op) {
     TFunc *fn = f->fn;
     uint32_t required = 0;
@@ -1424,6 +1469,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = fn;
+    f->file = fn->file;
     f->pc = 0;
     f->prev = vm->x.frame;
     f->args_base = rec->args_base;
@@ -1509,6 +1555,9 @@ static int32_t op_return(VM *vm, TOp *op) {
         } else if (rec->dst_kind != OPD_UNUSED) {
             TVal *d = &vm->x.frame->prev->slots[rec->dst_slot];
             tval_release(d);
+            /* include：无显式 return 时 PHP 返回 1 */
+            if (rec->is_include && r.t == T_NULL)
+                r = TV_INT(1);
             *d = r;
         } else {
             tval_release(&r);
@@ -2045,6 +2094,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = fn;
+    f->file = fn->file;
     f->pc = 0;
     f->prev = vm->x.frame;
     f->args_base = base;
@@ -2081,6 +2131,149 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     }
     *out = vm->x.thunk_ret;
     return true;
+}
+
+/* ---- PHP 8.4 property hook invocation ----
+ * 直接调用已编译的钩子 TFunc（方法形态：$this=slot0）。args 为实参（MOVED）。
+ * 执行期间设置 (hook_obj, hook_prop) 上下文：钩子体内 $this->prop 直读/直写
+ * backing，绕过钩子本身。返回前恢复外层上下文。 */
+static bool call_hook(VM *vm, TOp *op, TObj *o, TStr *pname, TFunc *fn,
+                      TVal *args, int nargs, TVal *out) {
+    if (!fn) return false;
+    if (vm->x.n_args + nargs > VM_MAX_ARGS)
+        vm_raise(vm, ex_class("Error"), op, "Too many arguments");
+    TExObj *pre_ex = vm->x.exception;
+    uint32_t base = (uint32_t)vm->x.n_args;
+    for (int i = 0; i < nargs; i++)
+        vm->x.args[base + (uint32_t)i] = args[i];
+    vm->x.n_args = (int)base + nargs;
+    VMCallRec *rec = call_push(vm, op);
+    rec->is_method = true;
+    rec->is_thunk = true;
+    rec->uf = fn;
+    rec->called_cls = o->cls;
+    VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);
+    f->fn = fn;
+    f->file = fn->file;
+    f->pc = 0;
+    f->prev = vm->x.frame;
+    f->args_base = base;
+    f->n_args_sent = (uint16_t)nargs;
+    f->called_cls = o->cls;
+    f->vis_scope = fn->decl_cls ? (TClass *)fn->decl_cls : o->cls;
+    f->n_calls_at_entry = vm->x.n_calls;
+    uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
+    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    for (uint32_t i = 0; i < nslots; i++)
+        f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+    f->slots[0] = TV_OBJ(o);     /* $this（方法形态 slot 0；无捕获） */
+    tval_addref(f->slots[0]);
+
+    void *saved_obj = vm->hook_obj;
+    TStr *saved_prop = vm->hook_prop;
+    vm->hook_obj = o;
+    vm->hook_prop = pname;
+
+    vm->x.frame = f;
+    while (vm->x.frame == f) {
+        TOp *cop = &f->fn->ops[f->pc];
+        int32_t d = ((OpHandler)cop->handler)(vm, cop);
+        if (d) f->pc += (uint32_t)d;
+    }
+    vm->x.n_args = (int)base;
+    vm->hook_obj = saved_obj;
+    vm->hook_prop = saved_prop;
+
+    if (vm->x.exception && vm->x.exception != pre_ex) {
+        for (int i = 0; i < nargs; i++)
+            tval_release(&vm->x.args[base + (uint32_t)i]);
+        longjmp(vm->x.unwind, 1);
+    }
+    *out = vm->x.thunk_ret;
+    return true;
+}
+
+/* 钩子上下文判定：当前 (obj, prop) 正在执行其钩子 → $this->prop 走 backing */
+static bool in_hook_backing(VM *vm, TObj *o, TStr *pname) {
+    return vm->hook_obj == (void *)o && vm->hook_prop == pname;
+}
+
+/* OP_PROPHOOK：parent::$p::get()/set() — 从当前方法帧的 decl_cls->parent
+ * 找属性钩子并调用。set 实参已在 args 栈顶（SEND 序列）。 */
+static int32_t op_prophook(VM *vm, TOp *op) {
+    TStr *pname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
+    /* prop 名含 '$' 前缀 → 去掉 */
+    const char *raw = tstr_val(pname);
+    const char *bare = (raw[0] == '$') ? raw + 1 : raw;
+    TClass *decl = (TClass *)vm->x.frame->fn->decl_cls;
+    if (!decl || !decl->parent)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot use parent::$%s::%s() outside a class hierarchy",
+                 bare, op->ext ? "set" : "get");
+    TClass *par = decl->parent;
+    tphp_class_ensure_flat(par);
+    int slot = tphp_class_find_prop(par, bare);
+    if (slot < 0)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Parent class %s has no property $%s",
+                 tstr_val(par->name), bare);
+    TProp *pp = &par->props[slot];
+    /* this 对象：当前帧若是方法/钩子帧，slot 0 是 $this */
+    TVal thisv = vm->x.frame->slots[0];
+    if (thisv.t != T_OBJ)
+        vm_raise(vm, ex_class("Error"), op,
+                 "Cannot call parent::$%s::%s() without an object",
+                 bare, op->ext ? "set" : "get");
+    TObj *o = (TObj *)thisv.u.p;
+
+    if (op->ext) {
+        /* set：实参已在 args 栈顶（1 个） */
+        TVal arg = TV_NULL;
+        int nargs = 0;
+        /* 从 SEND 序列看：SEND_VAL 推入 args；这里 n_args 已含它们。
+         * 我们没有 INIT rec，故取栈顶 1 个作为 $value。 */
+        if (vm->x.n_args > 0) {
+            arg = vm->x.args[vm->x.n_args - 1];
+            nargs = 1;
+        }
+        TVal out;
+        if (!pp->hook_set)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Parent property %s::$%s has no set hook",
+                     tstr_val(par->name), bare);
+        bool ok = call_hook(vm, op, o, pp->name, pp->hook_set, &arg, nargs, &out);
+        /* 释放 SEND 进来的引用 */
+        if (nargs)
+            tval_release(&vm->x.args[vm->x.n_args - 1]);
+        vm->x.n_args -= nargs;
+        if (ok) tval_release(&out);
+        if (op->tr != OPD_UNUSED) {
+            TVal *d = &vm->x.frame->slots[op->ar];
+            tval_release(d);
+            d[0] = TV_NULL;   /* set 返回 void */
+        }
+        return 1;
+    }
+    /* get */
+    TVal out;
+    if (!pp->hook_get) {
+        /* parent 无 get 钩子 → 读 backing（若可见） */
+        if (!tphp_vis_ok(pp->visibility, par, frame_scope_cls(vm)))
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot access %s property %s::$%s",
+                     vis_name(pp->visibility), tstr_val(par->name), bare);
+        TVal v = o->props[slot];
+        tval_addref(v);
+        wtake(vm, op, v);
+        return 1;
+    }
+    if (!call_hook(vm, op, o, pp->name, pp->hook_get, NULL, 0, &out))
+        vm_raise(vm, ex_class("Error"), op,
+                 "Parent property %s::$%s has no get hook",
+                 tstr_val(par->name), bare);
+    wtake(vm, op, out);
+    return 1;
 }
 
 static int32_t op_init_mcall(VM *vm, TOp *op) {
@@ -2254,6 +2447,7 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
         f->fn = fn;
+        f->file = fn->file;
         f->pc = 0;
         f->prev = vm->x.frame;
         f->args_base = base;
@@ -2412,6 +2606,34 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         }
         return 1;
     }
+    /* ---- PHP 8.4 property hooks：写路径（可见性之后） ---- */
+    if (slot >= 0) {
+        TProp *ap = &o->cls->props[slot];
+        if (ap->has_hooks && !in_hook_backing(vm, o, ap->name)) {
+            if (ap->hook_set) {
+                TVal out;
+                TVal arg = val;
+                tval_addref(arg);
+                if (call_hook(vm, op, o, ap->name, ap->hook_set,
+                              &arg, 1, &out)) {
+                    tval_release(&out);   /* set 钩子返回值丢弃（void 语义） */
+                }
+                /* 赋值表达式返回 RHS（对齐 __set 行为） */
+                if (op->tr != OPD_UNUSED) {
+                    tval_addref(val);
+                    TVal *d = &vm->x.frame->slots[op->ar];
+                    tval_release(d);
+                    d[0] = val;
+                }
+                return 1;
+            }
+            if (ap->is_virtual)
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot modify virtual property %s::$%s without set hook",
+                         tstr_val(o->cls->name), tstr_val(name));
+            /* 有 backing 无 set 钩子 → 落回默认写（下方类型/readonly 检查） */
+        }
+    }
     if (slot < 0) {
         /* __set(name, value) fallback */
         TVal pack[2];
@@ -2490,9 +2712,26 @@ static int32_t op_isset_prop(VM *vm, TOp *op) {
             TObj *o = (TObj *)h;
             int slot = tphp_class_find_prop(o->cls, tstr_val(name));
             if (slot >= 0) {
-                if (tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
-                                frame_scope_cls(vm)))
-                    set = o->props[slot].t != T_UNDEF;
+                TProp *pp = &o->cls->props[slot];
+                if (tphp_vis_ok(pp->visibility, prop_owner(o, slot),
+                                frame_scope_cls(vm))) {
+                    /* PHP 8.4：isset 带 get 钩子 → 调钩子，结果非 null 为 true */
+                    if (pp->has_hooks && pp->hook_get &&
+                        !in_hook_backing(vm, o, pp->name)) {
+                        TVal out;
+                        if (call_hook(vm, op, o, pp->name, pp->hook_get,
+                                      NULL, 0, &out)) {
+                            set = out.t != T_NULL;
+                            tval_release(&out);
+                        }
+                    } else if (pp->has_hooks && pp->is_virtual && !pp->hook_get) {
+                        vm_raise(vm, ex_class("Error"), op,
+                                 "Cannot read virtual property %s::$%s without get hook",
+                                 tstr_val(o->cls->name), tstr_val(name));
+                    } else {
+                        set = pp->is_virtual ? false : o->props[slot].t != T_UNDEF;
+                    }
+                }
                 else if (o->cls->m_isset >= 0) {
                     /* __isset(name) fallback (invisible property) */
                     TVal pack[1];
@@ -2517,7 +2756,6 @@ static int32_t op_isset_prop(VM *vm, TOp *op) {
                 }
             }
         } else if (h->kind == GC_KIND_EX) {
-            TExObj *x = (TExObj *)h;
             set = lc_eq(tstr_val(name), "message") ||
                   lc_eq(tstr_val(name), "code") ||
                   lc_eq(tstr_val(name), "previous") ||
@@ -3174,6 +3412,11 @@ static int32_t op_unset_prop(VM *vm, TOp *op) {
                          tstr_val(o->cls->name), tstr_val(name));
             return 1;
         }
+        /* PHP 8.4：任一钩子存在 → 禁止 unset（会绕过 set 钩子） */
+        if (ap->has_hooks)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot unset hooked property %s::$%s",
+                     tstr_val(o->cls->name), tstr_val(name));
         tval_release(&o->props[slot]);
         o->props[slot] = (TVal){ .u.i = 0, .t = T_UNDEF };
         return 1;
@@ -3257,7 +3500,6 @@ static int32_t op_fcc_method(VM *vm, TOp *op) {
     if (ov.t != T_OBJ)
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot create a first-class method callable from a non-object");
-    TObj *o = (TObj *)ov.u.p;
     TStr *mname = op_member_name(vm, op, 2);   /* C1: $obj->$m(...) */
     TVal caps[2];
     caps[0] = ov;
@@ -3378,13 +3620,9 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
                      "Undefined property %s::$%s",
                      tstr_val(o->cls->name), tstr_val(name));
         }
-        if (o->props[slot].t == T_UNDEF)
-            vm_raise(vm, ex_class("UndefinedError"), op,
-                     "Typed property %s::$%s must not be accessed before initialization",
-                     tstr_val(o->cls->name), tstr_val(name));
+        /* 可见性优先（对齐 PHP：不可见 → __get，与有无钩子无关） */
         if (!tphp_vis_ok(o->cls->props[slot].visibility, prop_owner(o, slot),
                          frame_scope_cls(vm))) {
-            /* invisible from this scope: __get fallback, else error */
             TVal pack[1];
             pack[0] = TV_STR(name);
             tval_addref(pack[0]);
@@ -3397,6 +3635,30 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
                      "Cannot access %s property %s::$%s",
                      vis_name(o->cls->props[slot].visibility),
                      tstr_val(o->cls->name), tstr_val(name));
+        }
+        /* ---- PHP 8.4 property hooks：读路径（可见性之后） ---- */
+        {
+            TProp *pp = &o->cls->props[slot];
+            if (pp->has_hooks && !in_hook_backing(vm, o, pp->name)) {
+                if (pp->hook_get) {
+                    TVal out;
+                    if (call_hook(vm, op, o, pp->name, pp->hook_get,
+                                  NULL, 0, &out)) {
+                        wtake(vm, op, out);
+                        return 1;
+                    }
+                }
+                if (pp->is_virtual)
+                    vm_raise(vm, ex_class("Error"), op,
+                             "Cannot read virtual property %s::$%s without get hook",
+                             tstr_val(o->cls->name), tstr_val(name));
+                /* 有 backing 且无 get 钩子 → 落回默认读 */
+            }
+            /* 虚拟属性 backing 槽恒为 UNDEF，跳过 T_UNDEF 检查 */
+            if (!pp->is_virtual && o->props[slot].t == T_UNDEF)
+                vm_raise(vm, ex_class("UndefinedError"), op,
+                         "Typed property %s::$%s must not be accessed before initialization",
+                         tstr_val(o->cls->name), tstr_val(name));
         }
         TVal out = o->props[slot];
         tval_addref(out);
@@ -3586,6 +3848,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = fn;
+    f->file = fn->file;
     f->pc = 0;
     f->prev = vm->x.frame;
     f->args_base = (uint32_t)vm->x.n_args;
@@ -3609,6 +3872,218 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
         if (d) f->pc += (uint32_t)d;
     }
     return vm->x.thunk_ret;
+}
+
+/* ---- 运行期 require/include（动态路径 OP_REQUIRE） ---- */
+
+/* 运行期 once 去重 + 展开防环（per-thread） */
+static _Thread_local char **g_rt_once;
+static _Thread_local int g_n_rt_once, g_cap_rt_once;
+static _Thread_local char **g_rt_busy;
+static _Thread_local int g_n_rt_busy, g_cap_rt_busy;
+
+static bool rt_list_has(char **list, int n, const char *s) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(list[i], s) == 0) return true;
+    return false;
+}
+
+static void rt_list_push(char ***list, int *n, int *cap, const char *s) {
+    if (*n >= *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *list = tm_realloc(*list, sizeof(char *) * (size_t)*cap);
+    }
+    (*list)[*n] = tm_malloc(strlen(s) + 1);
+    strcpy((*list)[*n], s);
+    (*n)++;
+}
+
+static const char *rt_dir_of(const char *path) {
+    static char dir[1024];
+    const char *slash = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    const char *s = slash > bslash ? slash : bslash;
+    if (!s) return NULL;
+    size_t n = (size_t)(s - path);
+    if (n >= sizeof dir) n = sizeof dir - 1;
+    memcpy(dir, path, n);
+    dir[n] = 0;
+    return dir;
+}
+
+/* 拼绝对/相对路径；dir 为 NULL 时返回 rel 副本 */
+static char *rt_join(const char *dir, const char *rel) {
+    if (!dir || !dir[0]) {
+        char *r = tm_malloc(strlen(rel) + 1);
+        strcpy(r, rel);
+        return r;
+    }
+    size_t dl = strlen(dir), rl = strlen(rel);
+    char *r = tm_malloc(dl + 1 + rl + 1);
+    memcpy(r, dir, dl);
+    r[dl] = '/';
+    memcpy(r + dl + 1, rel, rl + 1);
+    return r;
+}
+
+static char *rt_read_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz < 0) { fclose(fp); return NULL; }
+    char *buf = tm_malloc((size_t)sz + 1);
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[got] = 0;
+    return buf;
+}
+
+/* 运行期读被包含源码：bundle → 磁盘 → pack zip */
+static char *rt_load_source(const char *full, const char *rel,
+                            const char **out_name) {
+    char bname[128];
+    tphp_bundle_name_of(rel, bname, sizeof bname);
+    const TBundle *bun = tphp_bundle_find(bname);
+    if (bun) {
+        *out_name = bun->name;
+        char *cp = tm_malloc(bun->len + 1);
+        memcpy(cp, bun->src, bun->len);
+        cp[bun->len] = 0;
+        return cp;
+    }
+    char *src = full ? rt_read_file(full) : NULL;
+    if (src) {
+        *out_name = full;
+        return src;
+    }
+    /* pack zip：source_root 剥离 + 原样 rel */
+    if (tphp_pack_has_bundle()) {
+        void *data = NULL;
+        size_t len = 0;
+        const char *root = tphp_pack_source_root();
+        if (root && root[0] && full) {
+            size_t rn = strlen(root);
+            while (rn > 0 && (root[rn - 1] == '/' || root[rn - 1] == '\\')) rn--;
+            if (strncmp(full, root, rn) == 0 &&
+                (full[rn] == '/' || full[rn] == '\\')) {
+                const char *p = full + rn;
+                while (*p == '/' || *p == '\\') p++;
+                if (p[0] && tphp_pack_read(p, &data, &len)) {
+                    char *cp = tm_malloc(len + 1);
+                    memcpy(cp, data, len);
+                    cp[len] = 0;
+                    free(data);
+                    *out_name = full;
+                    return cp;
+                }
+            }
+        }
+        char key[1024];
+        snprintf(key, sizeof key, "%s", rel);
+        for (char *q = key; *q; q++) if (*q == '\\') *q = '/';
+        if (tphp_pack_read(key, &data, &len)) {
+            char *cp = tm_malloc(len + 1);
+            memcpy(cp, data, len);
+            cp[len] = 0;
+            free(data);
+            *out_name = full ? full : rel;
+            return cp;
+        }
+    }
+    return NULL;
+}
+
+/* OP_REQUIRE：t1=path 字符串；ext bit0=is_require bit1=is_once；tr/ar=结果
+ * 成功时压入被包含文件 main 帧（is_include），RETURN 后结果写入 dst。 */
+static int32_t op_require(VM *vm, TOp *op) {
+    TVal pv = rdv(vm, op, 1);
+    if (pv.t != T_STR)
+        vm_raise(vm, ex_class("TypeError"), op,
+                 "require/include expects string path, %s given",
+                 tphp_val_type_name(pv));
+    const char *rel = tstr_val((TStr *)pv.u.p);
+    bool is_req = (op->ext & 1) != 0;
+    bool is_once = (op->ext & 2) != 0;
+
+    /* once 去重用 rel 原样（与语句级内联一致；不强制 realpath） */
+    if (is_once && rt_list_has(g_rt_once, g_n_rt_once, rel)) {
+        wtake(vm, op, TV_INT(1));
+        return 1;
+    }
+    if (rt_list_has(g_rt_busy, g_n_rt_busy, rel)) {
+        if (is_req)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Circular require/include of '%s'", rel);
+        wtake(vm, op, TV_FALSE);
+        return 1;
+    }
+
+    const char *cur_file = vm->x.frame->file
+        ? vm->x.frame->file
+        : (vm->prog && vm->prog->file ? vm->prog->file : NULL);
+    char *full = NULL;
+    if (rel[0] != '/' && !(rel[0] && rel[1] == ':')) {
+        const char *dir = cur_file ? rt_dir_of(cur_file) : NULL;
+        full = rt_join(dir, rel);
+    } else {
+        full = rt_join(NULL, rel);
+    }
+
+    const char *parse_name = NULL;
+    char *src = rt_load_source(full, rel, &parse_name);
+    if (!src) {
+        tm_free(full);
+        if (is_req)
+            vm_raise(vm, ex_class("Error"), op,
+                     "Failed opening required file '%s'", rel);
+        wtake(vm, op, TV_FALSE);
+        return 1;
+    }
+
+    rt_list_push(&g_rt_busy, &g_n_rt_busy, &g_cap_rt_busy, rel);
+
+    /* parse + compile；parse_name 指向 full 或 intern/bundle 名，需稳定 */
+    char *name_copy = tm_malloc(strlen(parse_name) + 1);
+    strcpy(name_copy, parse_name);
+    AStmtList *ast = tphp_parse_script(src, name_copy);
+    tm_free(src);
+    Program *inc = tphp_compile(ast, name_copy);
+    /* 类已 register；不 freeze（lazy flatten；跨线程共享后置） */
+
+    /* 挂到 VM 的 include 程序表（TFunc 生命周期） */
+    vm->inc_progs = tm_realloc(vm->inc_progs,
+                               sizeof(Program *) * (size_t)(vm->n_inc_progs + 1));
+    vm->inc_progs[vm->n_inc_progs++] = inc;
+
+    if (is_once) rt_list_push(&g_rt_once, &g_n_rt_once, &g_cap_rt_once, rel);
+    g_n_rt_busy--;   /* pop busy */
+
+    /* 压 include main 帧：RETURN 经 call rec 写 dst；is_include 空值→1 */
+    VMCallRec *rec = call_push(vm, op);
+    rec->uf = inc->main;
+    rec->dst_kind = op->tr;
+    rec->dst_slot = op->ar;
+    rec->is_include = true;
+
+    VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);
+    f->fn = inc->main;
+    f->file = name_copy;
+    f->pc = 0;
+    f->prev = vm->x.frame;
+    f->args_base = rec->args_base;
+    f->n_args_sent = 0;
+    f->n_calls_at_entry = vm->x.n_calls;
+    uint32_t nslots = (uint32_t)inc->main->n_locals + inc->main->n_tmps;
+    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    for (uint32_t i = 0; i < nslots; i++)
+        f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+    vm->x.frame->pc++;
+    vm->x.frame = f;
+    tm_free(full);
+    return 0;   /* 新帧从 pc=0 起跑 */
 }
 
 /* ---- handler table ---- */
@@ -3640,6 +4115,8 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_fetch_osprop), H(op_assign_osprop), H(op_isset_osprop),
     H(op_init_new), H(op_new_late), H(op_new_dyn),
     H(op_isset_cconst),
+    H(op_require),
+    H(op_prophook),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -3668,6 +4145,8 @@ const char *tphp_op_name(uint8_t op) {
         "FETCH_OSPROP", "ASSIGN_OSPROP", "ISSET_OSPROP",
         "INIT_NEW", "NEW_LATE", "NEW_DYN",
         "ISSET_CCONST",
+        "REQUIRE",
+        "PROPHOOK",
     };
     return op < OP_MAX ? names[op] : "?";
 }
@@ -4162,6 +4641,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
         f->fn = fn;
+        f->file = fn->file;
         f->pc = 0;
         f->prev = vm->x.frame;
         f->args_base = base;
@@ -4207,6 +4687,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = fn;
+    f->file = fn->file;
     f->pc = 0;
     f->prev = vm->x.frame;
     f->args_base = base;
@@ -4254,6 +4735,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = fn;
+    f->file = fn->file;
     f->pc = 0;
     f->prev = NULL;
     f->args_base = 0;
@@ -4288,6 +4770,7 @@ int tphp_vm_run(Program *prog) {
     VMFrame *f = tm_malloc(sizeof *f);
     f->vis_scope = NULL;
     f->fn = prog->main;
+    f->file = prog->file;
     f->pc = 0;
     f->prev = NULL;
     f->args_base = 0;

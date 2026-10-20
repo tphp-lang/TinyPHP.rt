@@ -41,17 +41,21 @@ const char *tphp_status_str(TPhpStatus s);
 /* ---- fatal errors (error.c) ----
  * tphp_fatal_src: hard abort (compile-time errors, internal invariants).
  * tphp_raise: value-layer errors — routed to the VM's exception machinery
- * when the interpreter is running, otherwise hard-abort like above. */
+ * when the interpreter is running, otherwise hard-abort like above.
+ * Both never return (noreturn longjmp via hook / exit). */
 void tphp_fatal_src(const char *php_file, int php_line, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
 void tphp_raise(const char *ex_class_name, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((noreturn, format(printf, 2, 3)));
 
 /* installed by vm.c while the interpreter runs (NULL otherwise).
- * M5: per-OS-thread — every worker runtime installs its own. */
+ * M5: per-OS-thread — every worker runtime installs its own.
+ * Hook never returns (longjmp into VM unwind). */
+typedef void (*TphpRaiseHook)(const char *ex_class_name,
+                              const char *fmt, va_list ap)
+    __attribute__((noreturn));
 extern _Thread_local void *tphp_vm_current;
-extern _Thread_local void (*tphp_raise_hook)(const char *ex_class_name,
-                                             const char *fmt, va_list ap);
+extern _Thread_local TphpRaiseHook tphp_raise_hook;
 
 #ifdef __cplusplus
 }

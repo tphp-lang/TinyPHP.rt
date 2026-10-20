@@ -31,6 +31,8 @@ typedef struct {
     const char *file;
     TStr *ns;        /* current namespace (S_NS_END carries the outer) */
 } Parser;
+/* PHP 8.4 __PROPERTY__：钩子体内折叠为属性名字符串（parse 期设置） */
+static TStr *g_hook_prop_name;
 static AExpr *parse_unary(Parser *p);
 static AExpr *parse_closure(Parser *p, bool is_static);
 static AExpr *parse_arrow_fn(Parser *p);
@@ -44,6 +46,9 @@ static TStr **parse_name_list(Parser *p, int *out_n);
 static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name);
 
 /* ---- small helpers ---- */
+static void p_error(Parser *p, const char *msg)
+    __attribute__((noreturn));
+
 static void p_error(Parser *p, const char *msg) {
     tphp_fatal_src(p->file, p->tok.line, "Parse error: %s", msg);
 }
@@ -358,6 +363,26 @@ static AExpr *parse_primary(Parser *p) {
     case KW_TRUE: advance(p); return ae_new(A_TRUE, line);
     case KW_FALSE: advance(p); return ae_new(A_FALSE, line);
     case KW_NULL: advance(p); return ae_new(A_NULL, line);
+    case KW_REQUIRE: case KW_INCLUDE:
+    case KW_REQUIRE_ONCE: case KW_INCLUDE_ONCE: {
+        /* 表达式形态：$v = require 'x'; / require $path;
+         * 字面量路径编译期内联；动态路径 OP_REQUIRE 运行期求值 */
+        bool is_req = p->tok.kind == KW_REQUIRE || p->tok.kind == KW_REQUIRE_ONCE;
+        bool is_once = p->tok.kind == KW_REQUIRE_ONCE || p->tok.kind == KW_INCLUDE_ONCE;
+        advance(p);
+        AExpr *path = parse_ternary(p);
+        AExpr *e = ae_new(A_REQUIRE, line);
+        e->u.inc.is_require = is_req;
+        e->u.inc.is_once = is_once;
+        if (path->tag == A_STR) {
+            e->u.inc.path = path->u.name;
+            e->u.inc.path_expr = NULL;
+        } else {
+            e->u.inc.path = NULL;
+            e->u.inc.path_expr = path;   /* 运行期求值 */
+        }
+        return e;
+    }
     case L_VAR: {
         /* C1: `$$v` 只在成员上下文（->$v / ::$$v）合法；普通表达式仍是
          * 变量变量（不支持），保持与原词法错误同等的明确报错 */
@@ -496,6 +521,14 @@ static AExpr *parse_primary(Parser *p) {
             const char *dir = parse_dirname(ab, &dlen);
             AExpr *e = ae_new(A_STR, line);
             e->u.name = tstr_intern(dir ? dir : ab, dir ? dlen : strlen(ab));
+            return e;
+        }
+        /* PHP 8.4 __PROPERTY__：仅在属性钩子体内有定义；折为属性名字符串 */
+        if (strcmp(tstr_val(name), "__PROPERTY__") == 0) {
+            if (!g_hook_prop_name)
+                p_error(p, "__PROPERTY__ can only be used inside a property hook");
+            AExpr *e = ae_new(A_STR, line);
+            e->u.name = g_hook_prop_name;
             return e;
         }
         AExpr *e = ae_new(A_CONSTREF, line);
@@ -651,10 +684,20 @@ static AExpr *parse_primary(Parser *p) {
         return e;
     }
     case KW_CLONE: {
-        /* clone <expr> — the operand is a unary-level expression */
+        /* clone <expr> 或 PHP 8.4 clone($obj, ['p'=>v]) */
         advance(p);
         AExpr *e = ae_new(A_CLONE, line);
-        e->u.e = parse_unary(p);
+        if (p->tok.kind == P_LPAREN) {
+            advance(p);
+            e->u.clone.e = parse_expr(p);
+            e->u.clone.overrides = NULL;
+            if (accept(p, P_COMMA))
+                e->u.clone.overrides = parse_expr(p);   /* 覆盖数组 */
+            expect(p, P_RPAREN, "Expected ')' after clone arguments");
+        } else {
+            e->u.clone.e = parse_unary(p);
+            e->u.clone.overrides = NULL;
+        }
         return e;
     }
     default:
@@ -709,6 +752,27 @@ static AExpr *parse_static_access(Parser *p, TStr *name, int line) {
         memcpy(tmp + 1, v, n);        /* content only: buffer is n+1 total */
         member = tstr_intern(tmp, n + 1);
         tm_free(tmp);
+        /* PHP 8.4 parent::$p::get() / parent::$p::set($v) */
+        if (p->tok.kind == P_DOUBLE_COLON &&
+            (name == tstr_intern("parent", 6) || strcmp(tstr_val(name), "parent") == 0)) {
+            Lex saved_lx = p->lx;
+            Token saved_tok = p->tok;
+            advance(p);   /* consume '::' */
+            if (p->tok.kind == L_IDENT &&
+                (strcmp(tstr_val(p->tok.ident), "get") == 0 ||
+                 strcmp(tstr_val(p->tok.ident), "set") == 0)) {
+                bool is_set = tstr_val(p->tok.ident)[0] == 's';
+                advance(p);
+                AExpr *ph = ae_new(A_PROPHOOK, line);
+                ph->u.phook.cls = name;
+                ph->u.phook.prop = member;   /* 含 '$' 前缀 */
+                ph->u.phook.is_set = is_set;
+                ph->u.phook.args = parse_arg_list(p);
+                return ph;
+            }
+            p->lx = saved_lx;
+            p->tok = saved_tok;
+        }
     } else if (p->tok.kind == L_IDENT) {
         member = p->tok.ident;
         advance(p);
@@ -1028,7 +1092,7 @@ static AExpr *parse_postfix(Parser *p) {
 static const struct { const char *n; int c; } ctypes[] = {
     { "int", 1 }, { "integer", 1 }, { "bool", 2 }, { "boolean", 2 },
     { "float", 3 }, { "double", 3 }, { "real", 3 }, { "string", 4 },
-    { "array", 5 },
+    { "array", 5 }, { "void", 6 },   /* PHP 8.5 (void) cast：求值后丢弃 */
 };
 
 /* pow: right-assoc, exponent may be unary; valid after any primary-sized
@@ -1550,6 +1614,7 @@ static void parse_params(Parser *p, AFunc *f) {
         int pvis = -1;
         int pset = 0;
         bool pro_readonly = false;
+        bool pro_final = false;
         for (;;) {
             if (p->tok.kind == KW_PUBLIC) {
                 advance(p);
@@ -1563,20 +1628,26 @@ static void parse_params(Parser *p, AFunc *f) {
                 else pvis = v;
             }
             else if (p->tok.kind == KW_READONLY) { advance(p); pro_readonly = true; }
+            else if (p->tok.kind == KW_FINAL) {
+                /* PHP 8.5 final 提升属性：final 可在可见性前/后 */
+                advance(p); pro_final = true;
+            }
             else break;
         }
         TStr *ptype = parse_type_decl(p);
         bool variadic = accept(p, P_ELLIPSIS);
         if (p->tok.kind != L_VAR) p_error(p, "Expected parameter variable");
         AParam *par = tm_malloc(sizeof(AParam));
+        memset(par, 0, sizeof *par);
         par->name = p->tok.ident;
         par->type = ptype;
         par->default_val = NULL;
         par->is_variadic = variadic;
-        par->is_promoted = pvis >= 0 || pro_readonly || pset > 0;
+        par->is_promoted = pvis >= 0 || pro_readonly || pset > 0 || pro_final;
         par->vis = pvis >= 0 ? pvis : CVIS_PUBLIC;
         par->set_vis = pset;
         par->is_readonly = pro_readonly;
+        par->is_final = pro_final;
         if ((pvis >= 0 || pro_readonly) && variadic)
             p_error(p, "Cannot promote a variadic parameter");
         advance(p);
@@ -1589,6 +1660,129 @@ static void parse_params(Parser *p, AFunc *f) {
 
 /* ============ class declarations (M3) ============ */
 static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name);
+
+/* ---- PHP 8.4 property hooks ----
+ * 在属性名/默认值之后解析 `{ get ...; set ...; }`。
+ * 当前 token 必须是 '{'。interface/abstract 允许仅声明（`get;`）。 */
+static void parse_prop_hooks(Parser *p, AClassMember *m, int kind) {
+    m->prop.has_hooks = true;
+    expect(p, P_LBRACE, "Expected '{' for property hooks");
+    while (p->tok.kind != P_RBRACE) {
+        if (p->tok.kind == L_EOF) p_error(p, "Unterminated property hook block");
+        /* 短形式 `get => expr;` 的收尾分号；全形式 `{ }` 后通常无分号 */
+        if (p->tok.kind == P_SEMI) { advance(p); continue; }
+        bool hook_final = false;
+        if (p->tok.kind == KW_FINAL) { advance(p); hook_final = true; }
+        bool by_ref = false;
+        if (p->tok.kind == P_AMP) { advance(p); by_ref = true; }
+        if (p->tok.kind != L_IDENT)
+            p_error(p, "Expected 'get' or 'set' in property hook block");
+        const char *hn = tstr_val(p->tok.ident);
+        bool is_get;
+        if (strncasecmp(hn, "get", 3) == 0 && hn[3] == 0) is_get = true;
+        else if (strncasecmp(hn, "set", 3) == 0 && hn[3] == 0) is_get = false;
+        else p_error(p, "Expected 'get' or 'set' in property hook block");
+        int hline = p->tok.line;
+        advance(p);
+
+        AFunc *fn = tm_malloc(sizeof(AFunc));
+        memset(fn, 0, sizeof *fn);
+        fn->line = hline;
+
+        /* 可选参数表：set (type $value) / get() 空表 */
+        if (p->tok.kind == P_LPAREN) {
+            advance(p);
+            if (p->tok.kind != P_RPAREN)
+                parse_params(p, fn);
+            expect(p, P_RPAREN, "Expected ')' after hook parameters");
+        }
+
+        if (p->tok.kind == P_SEMI) {
+            /* 仅声明：interface / abstract 要求钩子存在但无实现 */
+            advance(p);
+            if (is_get) {
+                if (m->prop.hook_get) p_error(p, "Duplicate get hook");
+                m->prop.decl_get = true;
+                if (by_ref) m->prop.get_by_ref = true;
+            } else {
+                if (m->prop.hook_set) p_error(p, "Duplicate set hook");
+                m->prop.decl_set = true;
+            }
+            if (fn->params) tm_free(fn->params);
+            tm_free(fn);
+            continue;
+        }
+
+        if (p->tok.kind == P_FATARROW) {
+            /* 短形式：get => expr / set => expr */
+            advance(p);
+            TStr *saved_hp = g_hook_prop_name;
+            g_hook_prop_name = m->prop.name;   /* __PROPERTY__ 折叠上下文 */
+            AExpr *e = parse_expr(p);
+            g_hook_prop_name = saved_hp;
+            AStmtList *body = asl_new();
+            if (is_get) {
+                AStmt *ret = as_new(S_RETURN, hline);
+                ret->u.e = e;
+                asl_push(body, ret);
+            } else {
+                /* set => expr：表达式结果写入 backing（钩子上下文内 $this->prop = 绕过 set） */
+                AExpr *tv = ae_new(A_VAR, hline);
+                tv->u.name = tstr_intern("this", 4);
+                AExpr *pr = ae_new(A_PROP, hline);
+                pr->u.prop.obj = tv;
+                pr->u.prop.name = m->prop.name;
+                AExpr *as = ae_new(A_ASSIGN, hline);
+                as->u.bin.l = pr;
+                as->u.bin.r = e;
+                AStmt *st = as_new(S_EXPR, hline);
+                st->u.e = as;
+                asl_push(body, st);
+            }
+            fn->body = body;
+        } else if (p->tok.kind == P_LBRACE) {
+            advance(p);
+            TStr *saved_hp = g_hook_prop_name;
+            g_hook_prop_name = m->prop.name;   /* __PROPERTY__ 折叠上下文 */
+            AStmtList *body = asl_new();
+            while (p->tok.kind != P_RBRACE) {
+                if (p->tok.kind == L_EOF) p_error(p, "Unterminated hook body");
+                asl_push(body, parse_statement(p));
+            }
+            g_hook_prop_name = saved_hp;
+            expect(p, P_RBRACE, "Expected '}' after hook body");
+            fn->body = body;
+        } else {
+            p_error(p, "Expected '=>' or '{' for property hook body");
+        }
+
+        /* set 隐式参数 $value（未显式声明时补一个） */
+        if (!is_get && fn->n_params == 0) {
+            AParam *par = tm_malloc(sizeof(AParam));
+            memset(par, 0, sizeof *par);
+            par->name = tstr_intern("value", 5);
+            fn->params = tm_malloc(sizeof(AParam *));
+            fn->params[0] = par;
+            fn->n_params = 1;
+        }
+
+        if (is_get) {
+            if (m->prop.hook_get || m->prop.decl_get) p_error(p, "Duplicate get hook");
+            m->prop.hook_get = fn;
+            m->prop.get_final = hook_final;
+            if (by_ref) m->prop.get_by_ref = true;
+        } else {
+            if (m->prop.hook_set || m->prop.decl_set) p_error(p, "Duplicate set hook");
+            m->prop.hook_set = fn;
+            m->prop.set_final = hook_final;
+        }
+    }
+    expect(p, P_RBRACE, "Expected '}' for property hooks");
+    if (!m->prop.hook_get && !m->prop.hook_set &&
+        !m->prop.decl_get && !m->prop.decl_set)
+        p_error(p, "Property hook block must contain at least one hook");
+    (void)kind;
+}
 
 static TStr **parse_name_list(Parser *p, int *out_n) {
     TStr **names = NULL; int n = 0;
@@ -1731,7 +1925,8 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         return m;
     }
 
-    /* property: [type] $var [= default] — P1-1 typed properties */
+    /* property: [type] $var [= default] — P1-1 typed properties
+     * PHP 8.4: 属性名后可接 `{ get/set }` 钩子块（替代 ';'） */
     if (p->tok.kind == L_VAR ||
         p->tok.kind == P_QUESTION || p->tok.kind == L_IDENT ||
         p->tok.kind == KW_ARRAY || p->tok.kind == KW_SELF ||
@@ -1740,8 +1935,10 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         p->tok.kind == KW_FALSE) {
         TStr *ptype = parse_type_decl(p);
         if (p->tok.kind != L_VAR) p_error(p, "Expected property variable after type");
-        if (kind == CK_INTERFACE)    /* P3: 接口不允许属性 */
-            p_error(p, "Interfaces may not include properties");
+        if (kind == CK_INTERFACE && p->tok.kind == L_VAR) {
+            /* 接口仅允许带钩子声明的属性（public string $x { get; }）；
+             * 无钩子的普通属性仍然禁止 —— 但 `{` 还没看到，先放行到钩子判定 */
+        }
         m->tag = CM_PROP;
         m->prop.name = p->tok.ident;
         m->prop.type = ptype;
@@ -1749,6 +1946,23 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         m->next = NULL;
         advance(p);
         if (accept(p, P_ASSIGN)) m->prop.def = parse_expr(p);
+
+        /* 钩子块：`{ get ...; set ...; }` —— 替代 ';'（php-src hooked_property
+         * 文法：T_VARIABLE '{' hook_list '}' 后无分号），且禁止逗号链 */
+        if (p->tok.kind == P_LBRACE) {
+            if (kind == CK_INTERFACE && m->vis != CVIS_PUBLIC)
+                p_error(p, "Access type for interface property must be public");
+            if (m->is_static)
+                p_error(p, "Property hooks are not supported on static properties");
+            if (m->is_readonly)
+                p_error(p, "Cannot declare readonly property with hooks");
+            parse_prop_hooks(p, m, kind);
+            return m;
+        }
+
+        if (kind == CK_INTERFACE)
+            p_error(p, "Interfaces may not include properties");
+
         /* PHP: `public $a, $b;` / `public $a = 1, $b = 2;` — chain the extras
          * off `next`; the class-body walker flattens them into the item list. */
         AClassMember *tail = m;
@@ -2402,17 +2616,32 @@ static AStmt *parse_statement(Parser *p) {
         return s;
     }
     case KW_REQUIRE:
-    case KW_INCLUDE: {
-        /* M6: require/include —— 字符串字面量编译期内联；其他后置 */
-        bool is_req = p->tok.kind == KW_REQUIRE;
+    case KW_INCLUDE:
+    case KW_REQUIRE_ONCE:
+    case KW_INCLUDE_ONCE: {
+        /* 字面量路径 → S_INCLUDE 编译期内联；动态路径 → S_EXPR + A_REQUIRE */
+        bool is_req = p->tok.kind == KW_REQUIRE || p->tok.kind == KW_REQUIRE_ONCE;
+        bool is_once = p->tok.kind == KW_REQUIRE_ONCE || p->tok.kind == KW_INCLUDE_ONCE;
         advance(p);
         AExpr *e = parse_expr(p);
         expect(p, P_SEMI, "Expected ';' after require/include");
-        if (e->tag != A_STR)
-            p_error(p, "require/include currently supports only string literal paths (M6)");
-        AStmt *s = as_new(S_INCLUDE, line);
-        s->u.inc.path = e->u.name;   /* A_STR 存在 u.name */
-        s->u.inc.is_require = is_req;
+        if (e->tag == A_STR) {
+            AStmt *s = as_new(S_INCLUDE, line);
+            s->u.inc.path = e->u.name;
+            s->u.inc.path_expr = NULL;
+            s->u.inc.is_require = is_req;
+            s->u.inc.is_once = is_once;
+            return s;
+        }
+        /* 动态路径：语句形态包成 S_EXPR + A_REQUIRE */
+        AExpr *rq = ae_new(A_REQUIRE, line);
+        rq->line = line;
+        rq->u.inc.path = NULL;
+        rq->u.inc.path_expr = e;
+        rq->u.inc.is_require = is_req;
+        rq->u.inc.is_once = is_once;
+        AStmt *s = as_new(S_EXPR, line);
+        s->u.e = rq;
         return s;
     }
     case KW_LIST: {

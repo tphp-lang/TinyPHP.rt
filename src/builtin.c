@@ -740,19 +740,6 @@ static TVal bi_array_unshift(VM *vm, TVal *args, int n) {
     return TV_INT((int64_t)a->n);
 }
 
-static TArr *copy_arr(TArr *a) {
-    TArr *b = tarr_new();
-    for (uint32_t i = 0; i < a->dused; i++) {
-        if (a->data[i].t == T_UNDEF) continue;
-        TVal k = arr_key_at(a, i);
-        TVal v = a->data[i];
-        tval_addref(v);
-        if (k.t == T_STR) tarr_set(b, k, v);
-        else tarr_append(b, v);
-    }
-    return b;
-}
-
 static TVal bi_array_keys(VM *vm, TVal *args, int n) {
     (void)vm; (void)n;
     TArr *a = need_arr(vm, &args[0], "array_keys", "#1 ($array)");
@@ -1419,7 +1406,7 @@ static TVal bi_str_ends_with(VM *vm, TVal *args, int n) {
 /* microtime(true)：epoch 浮点秒。uv_hrtime 是单调时钟（非 epoch），
  * 以进程首次调用时的 time(NULL) 为基准换算——耗时差值测量不受影响 */
 static TVal bi_microtime(VM *vm, TVal *args, int n) {
-    (void)vm; (void)n;
+    (void)vm; (void)args; (void)n;
     static double base_epoch = 0;
     static uint64_t base_hr = 0;
     if (base_epoch == 0) {

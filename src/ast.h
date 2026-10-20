@@ -50,8 +50,14 @@ typedef enum {
     A_STATICCALL,     /* u.scall {cls, member, args}: self::m() / C::m() */
     A_STATICGET,      /* u.scall {cls, member}: self::KONST (consts first) */
     A_INSTANCEOF,     /* u.bin {l: expr, r: A_CONSTREF class name} */
-    A_CLONE,          /* u.e: clone $obj (calls __clone when defined) */
+    A_CLONE,          /* u.clone {e, overrides}: clone $obj；overrides =
+                       * PHP 8.4 clone($o, ['p'=>v]) 属性覆盖数组或 NULL */
     A_OBJSTATIC,      /* P2-B $obj::$prop: u.prop {obj, name}; name 带 '$' */
+    A_REQUIRE,        /* u.inc {path, path_expr, is_require, is_once}:
+                       * path = 字面量（编译期内联用）；path_expr = 动态路径表达式
+                       * （OP_REQUIRE 运行期求值）。二者至少一个非 NULL。 */
+    A_PROPHOOK,       /* u.phook {cls, prop, is_set, args}:
+                       * PHP 8.4 parent::$p::get() / parent::$p::set($v) */
 } ANTag;
 
 typedef struct { AExpr *key; AExpr *val; bool is_spread; } AArrayItem;
@@ -76,6 +82,7 @@ typedef struct AParam {
     int vis;              /* CVIS_* when promoted */
     int set_vis;          /* PHP 8.4 private(set)/protected(set)；0 = 无 */
     bool is_readonly;     /* promoted readonly */
+    bool is_final;        /* PHP 8.5 final 提升属性 */
 } AParam;
 typedef struct AFunc {
     TStr *name;           /* NULL for closures/arrows */
@@ -122,11 +129,16 @@ typedef struct AExpr {
          * paren_args: ctor list was spelled with '(' — gates dereference
          * (PHP new_dereferenceable vs new_non_dereferenceable). */
         struct { AExpr *input; AExpr *call; } pipe;
+        struct { AExpr *e; AExpr *overrides; } clone;   /* A_CLONE */
+        struct { TStr *cls; TStr *prop; bool is_set; AArgList *args; } phook;
+        /* A_PROPHOOK: parent::$name::get() / ::set($v) */
         /* C1: aname 非空 = 动态成员名（$obj->$v / $obj->$v() / C::$$v），
          * 与 name 互斥；aname 是求值一次的 A_VAR 表达式 */
         struct { AExpr *obj; TStr *name; AExpr *aname; } prop;
         struct { AExpr *obj; TStr *name; AExpr *aname; AArgList *args; } mcall;
         struct { TStr *cls; TStr *member; AExpr *aname; AArgList *args; } scall;
+        struct { TStr *path; AExpr *path_expr; bool is_require; bool is_once; } inc;
+        /* A_REQUIRE / S_INCLUDE：path 字面量 or path_expr 动态表达式 */
     } u;
     bool nullsafe;   /* ?-> (P_NULLSAFE): short-circuits the whole chain */
 } AExpr;
@@ -169,8 +181,9 @@ typedef enum {
      * S_NS_BEGIN may appear anywhere at statement level, S_NS_END restores */
     S_NS_BEGIN, S_NS_END,
     S_USE,           /* u.use: AUseList* */
-    /* M6: require/include 字符串字面量 → 编译期内联；非字面量 parse 报错 */
-    S_INCLUDE,       /* u.inc {path, is_require} */
+    /* M6: require/include 字符串字面量 → 编译期内联；非字面量 parse 报错。
+     * *_once：按路径全局去重；普通 require/include 可重复展开（防环栈单独判）。 */
+    S_INCLUDE,       /* u.inc {path, is_require, is_once} */
 } ASTag;
 
 
@@ -222,7 +235,15 @@ typedef struct AClassMember {
     bool is_static, is_abstract, is_final, is_readonly;
     AFunc *func;
     struct AClassMember *next;  /* CM_PROP 逗号链: `public $a, $b;` 的后续项 */
-    struct { TStr *name; TStr *type; AExpr *def; } prop;   /* type: P1-1 */
+    struct {
+        TStr *name; TStr *type; AExpr *def;
+        /* PHP 8.4 property hooks：hook_get/hook_set 为钩子函数体（AFunc）；
+         * has_hooks = 存在 { } 钩子块；decl_get/decl_set = 接口/抽象仅声明 */
+        AFunc *hook_get; AFunc *hook_set;
+        bool has_hooks, decl_get, decl_set;
+        bool get_by_ref;         /* &get（解析保留；v1 按普通 get 执行） */
+        bool get_final, set_final; /* final 钩子：子类不得覆盖 */
+    } prop;
     struct { TStr **names; int n; AModList *mods; } use;
 } AClassMember;
 
@@ -267,7 +288,8 @@ struct AStmt {
         AClassDecl *cls;      /* S_CLASSDECL */
         TStr *name;           /* S_GOTO / S_LABEL / S_NS_BEGIN / S_NS_END */
         AUseList *use;        /* S_USE */
-        struct { TStr *path; bool is_require; } inc;  /* S_INCLUDE */
+        struct { TStr *path; AExpr *path_expr; bool is_require; bool is_once; } inc;
+        /* S_INCLUDE：同 A_REQUIRE（path_expr 非 NULL 时编译为 OP_REQUIRE） */
     } u;
 };
 

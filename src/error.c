@@ -34,8 +34,7 @@ void tphp_raise(const char *ex_class_name, const char *fmt, ...) {
     va_start(ap, fmt);
     if (tphp_raise_hook) {
         tphp_raise_hook(ex_class_name, fmt, ap);   /* never returns */
-        va_end(ap);
-        return;
+        /* NOT REACHED — hook is declared noreturn */
     }
     va_end(ap);
     va_start(ap, fmt);

@@ -14,6 +14,8 @@
 
 extern void tphp_fatal_src(const char *file, int line, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
+extern void tphp_raise(const char *ex_class_name, const char *fmt, ...)
+    __attribute__((noreturn, format(printf, 2, 3)));
 
 TVal TV_NULL = { .u.i = 0, .t = T_NULL };
 TVal TV_FALSE = { .u.i = 0, .t = T_FALSE };

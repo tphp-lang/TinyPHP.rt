@@ -33,7 +33,8 @@ extern const size_t tphp_cacert_pem_len;
 
 /* sched.c / io.c */
 TStr *tstr_new(const char *s, size_t len);
-void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...);
+void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...)
+    __attribute__((noreturn, format(printf, 3, 4)));
 TObj *tphp_stream_obj_new(TStreamCtx *s);
 TStreamCtx *tphp_stream_from_obj(VM *vm, TVal v, const char *who);
 
@@ -97,6 +98,7 @@ static void dns_cb(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
 
 /* 挂起解析 IPv4 地址；失败 warning + NULL（结果由调用方 uv_freeaddrinfo） */
 static struct addrinfo *dns_resolve(VM *vm, const char *host) {
+    (void)vm;
     DnsOp op;
     memset(&op, 0, sizeof op);
     op.req.data = &op;

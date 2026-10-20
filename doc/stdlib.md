@@ -129,9 +129,20 @@ $w->id();
 - `lib/std.php`：`str_title` `arr_second` `clamp_num`、常量 `TPHP_LIB`
 - `require "std"` 按 bundle 名解析（无路径无扩展名）
 
+## require / include
+
+- 四形式：`require` `include` `require_once` `include_once`
+- **字面量路径**：编译期内联；`*_once` 按路径全局去重；普通形式可重复展开（防环栈）
+- **动态路径**（`require $p` / `require __DIR__."/x.php"`）：`OP_REQUIRE` 运行期求值 → bundle → pack zip → 磁盘；独立 parse+compile，函数/类注册进全局表
+- 表达式形态：成功 `1`；`include` 失败 `false`；被包含文件顶层 `return $x` 的值作为 require 结果（动态路径）
+- `require` 文件缺失 → 异常；`include` 文件缺失 → 静默跳过/false
+- 循环 require：字面量加载期 `Circular require/include`；动态路径运行期 Call stack overflow（对齐原生普通 require 循环）
+- 解析顺序：phpc bundle 表 → 磁盘 → pack zip（`source_root` 剥离 / 原样相对路径）
+
 ## 明确未实现（节选）
 
 - `&$ref`、`extract`、`compact`、可变变量、`@`
 - `preg_*`（M7+，需 vendor pcre2）
 - `PDO`/SQLite、HTTP server、REPL（M7+）
-- `require_once` 的「一次」语义（当前按路径去重，所有 require/include 均去重）
+- 被包含文件顶层 `return` 作为**字面量内联**形态的返回值（内联模型下 `return` 归属调用方；表达式固定 1/false；动态路径才支持文件 return 值）
+- Worker 线程内动态 require 的函数对主线程可见性（inc_progs 为 per-VM，跨线程共享后置）

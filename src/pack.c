@@ -14,6 +14,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+/* pack.c 只用 mz_zip_* API；关掉 zlib 兼容包装层，避免 -Wunused-function。
+ * 注意：不可定义 MINIZ_NO_INFLATE_APIS / MINIZ_NO_DEFLATE_APIS——
+ * miniz 会连带 #define MINIZ_NO_ARCHIVE_APIS，把 zip API 一起裁掉。 */
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include "miniz.h"
 
 #ifdef _WIN32
@@ -183,18 +187,6 @@ static bool sha1_file(const char *path, char hex[41]) {
     fclose(fp);
     sha1_final(&s, hex);
     return true;
-}
-
-static bool copy_file(const char *src, const char *dst) {
-    uint8_t *buf = NULL;
-    size_t len = 0;
-    if (!load_file(src, &buf, &len)) return false;
-    FILE *f = fopen(dst, "wb");
-    if (!f) { free(buf); return false; }
-    size_t w = fwrite(buf, 1, len, f);
-    fclose(f);
-    free(buf);
-    return w == len;
 }
 
 /* zip-slip：relpath 归一化后必须仍在根内 */
@@ -774,12 +766,10 @@ int tphp_pack_exe(const char *exe_path,
 
 /* ---- 运行期：查找嵌入 zip ---- */
 
-/* 读自身文件：exe_path 容量 cap */
+/* 读自身文件：exe_path 容量 cap —— Unix 路径专用（Windows 走 GetModuleFileNameW） */
+#ifndef _WIN32
 static bool self_exe_path(char *buf, size_t cap) {
-#ifdef _WIN32
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)cap);
-    return n > 0 && n < cap;
-#elif defined(__linux__)
+#ifdef __linux__
     ssize_t n = readlink("/proc/self/exe", buf, cap - 1);
     if (n <= 0) return false;
     buf[n] = 0;
@@ -796,10 +786,6 @@ static bool self_exe_path(char *buf, size_t cap) {
 
 /* 从 exe 文件读取嵌入 zip（ELF section 或 footer）；成功返回 malloc 缓冲 */
 static bool read_embedded_zip(const char *exe_path, uint8_t **out, size_t *out_len) {
-#ifdef _WIN32
-    (void)exe_path; (void)out; (void)out_len;
-    return false;   /* Windows 走 FindResource，不用文件读 */
-#else
     FILE *fp = fopen(exe_path, "rb");
     if (!fp) return false;
     fseek(fp, 0, SEEK_END);
@@ -871,8 +857,8 @@ static bool read_embedded_zip(const char *exe_path, uint8_t **out, size_t *out_l
 #endif
     fclose(fp);
     return false;
-#endif /* _WIN32 */
 }
+#endif /* !_WIN32 */
 
 /* ---- 运行期释放（跨平台共享） ---- */
 

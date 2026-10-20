@@ -24,6 +24,7 @@
 #include "lex.h"
 #include "class.h"
 #include "bundle.h"
+#include "pack.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -466,15 +467,6 @@ static TVal eval_const2(Ctx *c, AExpr *e, bool *ok) {
     }
 }
 
-static TVal eval_const(Ctx *c, AExpr *e) {
-    bool ok = true;
-    TVal v = eval_const2(c, e, &ok);
-    if (!ok)
-        tphp_fatal_src(c->file, e->line,
-                       "Constant expression contains unknown constants in M1");
-    return v;
-}
-
 /* ============ expressions ============ */
 static Loc compile_expr(Ctx *c, AExpr *e, Loc want);
 static Loc compile_closure_expr(Ctx *c, AExpr *e, Loc want);
@@ -616,6 +608,7 @@ static Loc member_name_loc(Ctx *c, AExpr *aname, TStr *name, int line) {
 }
 
 static Loc compile_lvalue_base(Ctx *c, AExpr *e, WBList **wb, int line) {
+    (void)line;
     if (e->tag == A_VAR) {
         if (!c->is_main && var_is_global(c, e->u.name)) {
             Loc gv = LOC_TMP(tmp_new(c));
@@ -1309,6 +1302,13 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         return dst;
     }
     case A_CAST: {
+        /* PHP 8.5 (void)：求值后丢弃结果，表达式值为 null */
+        if (e->u.cast.ctype == 6) {
+            compile_expr(c, e->u.cast.e, LOC_NONE);
+            Loc dst = tmp_dst(c, want);
+            emit(c, OP_CONST, LOC_CONST(lit_null(c)), LOC_NONE, dst, e->line);
+            return dst;
+        }
         Loc v = compile_expr(c, e->u.cast.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         emit(c, OP_CAST, v, LOC_NONE, dst, e->line);
@@ -2059,9 +2059,46 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         return dst;
     }
     case A_CLONE: {
-        Loc src = compile_expr(c, e->u.e, LOC_NONE);
+        Loc src = compile_expr(c, e->u.clone.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         emit(c, OP_CLONE, src, LOC_NONE, dst, e->line);
+        /* PHP 8.4 clone($o, ['p'=>v])：克隆后逐项写属性（走 ASSIGN_PROP，
+         * 钩子/类型检查生效）。v1 仅支持数组字面量覆盖表。 */
+        if (e->u.clone.overrides) {
+            AExpr *ov = e->u.clone.overrides;
+            if (ov->tag != A_ARRAY)
+                tphp_fatal_src(c->file, e->line,
+                               "clone with property list requires an array literal");
+            for (int i = 0; i < ov->u.alist->n; i++) {
+                AArrayItem *it = &ov->u.alist->items[i];
+                if (it->is_spread)
+                    tphp_fatal_src(c->file, e->line,
+                                   "clone property list does not support spread");
+                if (!it->key || (it->key->tag != A_STR && it->key->tag != A_INT))
+                    tphp_fatal_src(c->file, e->line,
+                                   "clone property keys must be string/int literals");
+                Loc nl = compile_expr(c, it->key, LOC_NONE);
+                Loc vv = compile_expr(c, it->val, LOC_NONE);
+                emit(c, OP_ASSIGN_PROP, dst, nl, vv, e->line);
+            }
+        }
+        return dst;
+    }
+    case A_PROPHOOK: {
+        /* parent::$p::get() / parent::$p::set($v)
+         * SEND 参数后发 OP_PROPHOOK；VM 从帧的 decl_cls->parent 找属性钩子 */
+        Loc dst = tmp_dst(c, want);
+        if (e->u.phook.args) {
+            for (int i = 0; i < e->u.phook.args->n; i++) {
+                AArg *a = &e->u.phook.args->items[i];
+                Loc v = compile_expr(c, a->e, LOC_NONE);
+                emit(c, OP_SEND_VAL, v, LOC_NONE, LOC_NONE, e->line);
+            }
+        }
+        int pc = emit(c, OP_PROPHOOK,
+                      LOC_CONST(lit_str(c, e->u.phook.prop)),
+                      LOC_NONE, dst, e->line);
+        c->fn->ops[pc].ext = (uint16_t)(e->u.phook.is_set ? 1 : 0);
         return dst;
     }
     case A_OBJSTATIC: {
@@ -2089,6 +2126,24 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
     }
     case A_SPREAD:
         tphp_fatal_src(c->file, e->line, "Spread is only allowed inside array literals in M1");
+    case A_REQUIRE:
+        /* 字面量路径已在 expand_includes 内联替换；动态路径 → OP_REQUIRE */
+        if (e->u.inc.path_expr) {
+            Loc path = compile_expr(c, e->u.inc.path_expr, LOC_NONE);
+            Loc dst = tmp_dst(c, want);
+            int pc = emit(c, OP_REQUIRE, path, LOC_NONE, dst, e->line);
+            c->fn->ops[pc].ext = (uint16_t)((e->u.inc.is_require ? 1 : 0) |
+                                            (e->u.inc.is_once ? 2 : 0));
+            return dst;
+        }
+        /* 字面量兜底（expand 应已替换）：成功 1 */
+        {
+            AExpr one = {0};
+            one.tag = A_INT;
+            one.line = e->line;
+            one.u.i = 1;
+            return compile_expr(c, &one, want);
+        }
     default:
         tphp_fatal_src(c->file, e->line, "Internal: unhandled expression node");
     }
@@ -2775,6 +2830,15 @@ static void collect_expr_vars(AExpr *e, AExprList *out, AParam **params, int n_p
     case A_TRUE: case A_FALSE: case A_NULL: case A_CONSTREF:
     case A_FIRSTCLASS:
         return;
+    case A_REQUIRE:
+        if (e->u.inc.path_expr)
+            collect_expr_vars(e->u.inc.path_expr, out, params, n_params);
+        return;
+    case A_PROPHOOK:
+        if (e->u.phook.args)
+            for (int i = 0; i < e->u.phook.args->n; i++)
+                collect_expr_vars(e->u.phook.args->items[i].e, out, params, n_params);
+        return;
     case A_FIRSTCLASS_DYN:
         collect_expr_vars(e->u.e, out, params, n_params);
         return;
@@ -2875,7 +2939,9 @@ static void collect_expr_vars(AExpr *e, AExprList *out, AParam **params, int n_p
         collect_expr_vars(e->u.bin.l, out, params, n_params);
         return;
     case A_CLONE:
-        collect_expr_vars(e->u.e, out, params, n_params);
+        collect_expr_vars(e->u.clone.e, out, params, n_params);
+        if (e->u.clone.overrides)
+            collect_expr_vars(e->u.clone.overrides, out, params, n_params);
         return;
     }
 }
@@ -2965,6 +3031,175 @@ static void collect_stmt_vars(AStmt *s, AExprList *out, AParam **params, int n_p
     }
 }
 
+/* ---- PHP 8.4 property hooks ----
+ * 钩子体编译为 TFunc（is_method，$this 可用）；存到 TProp.hook_get/set。
+ * 虚拟属性：钩子体 AST 中没有任何 `$this->propName` 直接引用。 */
+static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
+                                bool is_closure, bool auto_capture,
+                                bool is_method, void *decl_cls,
+                                const char *file);
+
+/* 递归扫描表达式/语句中是否出现 $this->propName（A_PROP + A_VAR this + 同名） */
+static bool expr_uses_self_prop(AExpr *e, TStr *pname);
+
+static bool stmt_uses_self_prop(AStmt *s, TStr *pname) {
+    if (!s) return false;
+    switch (s->tag) {
+    case S_ECHO:
+        for (int i = 0; i < s->u.exprs->n; i++)
+            if (expr_uses_self_prop(s->u.exprs->items[i], pname)) return true;
+        return false;
+    case S_EXPR: case S_RETURN: case S_THROW:
+        return expr_uses_self_prop(s->u.e, pname);
+    case S_IF:
+        if (!s->u.ifs) return false;
+        for (int b = 0; b < s->u.ifs->n; b++) {
+            if (expr_uses_self_prop(s->u.ifs->branches[b].cond, pname)) return true;
+            for (int j = 0; j < s->u.ifs->branches[b].body->n; j++)
+                if (stmt_uses_self_prop(s->u.ifs->branches[b].body->stmts[j], pname)) return true;
+        }
+        for (int j = 0; j < s->u.ifs->else_body->n; j++)
+            if (stmt_uses_self_prop(s->u.ifs->else_body->stmts[j], pname)) return true;
+        return false;
+    case S_WHILE: case S_DOWHILE:
+        if (expr_uses_self_prop(s->u.wh.cond, pname)) return true;
+        for (int j = 0; j < s->u.wh.body->n; j++)
+            if (stmt_uses_self_prop(s->u.wh.body->stmts[j], pname)) return true;
+        return false;
+    case S_BLOCK:
+        for (int j = 0; j < s->u.stmts->n; j++)
+            if (stmt_uses_self_prop(s->u.stmts->stmts[j], pname)) return true;
+        return false;
+    case S_TRY:
+        if (!s->u.trys) return false;
+        for (int j = 0; j < s->u.trys->body->n; j++)
+            if (stmt_uses_self_prop(s->u.trys->body->stmts[j], pname)) return true;
+        for (int c = 0; c < s->u.trys->n_catches; c++)
+            for (int j = 0; j < s->u.trys->catches[c]->body->n; j++)
+                if (stmt_uses_self_prop(s->u.trys->catches[c]->body->stmts[j], pname)) return true;
+        if (s->u.trys->finally)
+            for (int j = 0; j < s->u.trys->finally->n; j++)
+                if (stmt_uses_self_prop(s->u.trys->finally->stmts[j], pname)) return true;
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool expr_uses_self_prop(AExpr *e, TStr *pname) {
+    if (!e) return false;
+    switch (e->tag) {
+    case A_PROP:
+        if (e->u.prop.obj && e->u.prop.obj->tag == A_VAR &&
+            tstr_eq(e->u.prop.obj->u.name, tstr_intern("this", 4)) &&
+            tstr_eq(e->u.prop.name, pname))
+            return true;
+        return expr_uses_self_prop(e->u.prop.obj, pname) ||
+               expr_uses_self_prop(e->u.prop.aname, pname);
+    case A_METHODCALL:
+        if (expr_uses_self_prop(e->u.mcall.obj, pname)) return true;
+        if (expr_uses_self_prop(e->u.mcall.aname, pname)) return true;
+        for (int i = 0; i < e->u.mcall.args->n; i++)
+            if (expr_uses_self_prop(e->u.mcall.args->items[i].e, pname)) return true;
+        return false;
+    case A_ASSIGN: case A_ASSIGN_OP: case A_BINARY: case A_INSTANCEOF:
+        return expr_uses_self_prop(e->u.bin.l, pname) ||
+               expr_uses_self_prop(e->u.bin.r, pname);
+    case A_TERNARY: case A_COALESCE:
+        return expr_uses_self_prop(e->u.tern.c, pname) ||
+               expr_uses_self_prop(e->u.tern.m, pname) ||
+               expr_uses_self_prop(e->u.tern.e, pname);
+    case A_DIM:
+        return expr_uses_self_prop(e->u.dim.base, pname) ||
+               expr_uses_self_prop(e->u.dim.idx, pname);
+    case A_UNARY: case A_INCDEC: case A_CAST: case A_SPREAD:
+        return expr_uses_self_prop(e->u.un.e, pname);
+    case A_CLONE:
+        return expr_uses_self_prop(e->u.clone.e, pname) ||
+               expr_uses_self_prop(e->u.clone.overrides, pname);
+    case A_ARRAY: {
+        for (int i = 0; i < e->u.alist->n; i++) {
+            if (expr_uses_self_prop(e->u.alist->items[i].key, pname)) return true;
+            if (expr_uses_self_prop(e->u.alist->items[i].val, pname)) return true;
+        }
+        return false;
+    }
+    case A_CALL:
+        if (e->u.call.dyn && expr_uses_self_prop(e->u.call.dyn, pname)) return true;
+        if (e->u.call.args)
+            for (int i = 0; i < e->u.call.args->n; i++)
+                if (expr_uses_self_prop(e->u.call.args->items[i].e, pname)) return true;
+        return false;
+    case A_STATICCALL:
+        for (int i = 0; i < e->u.scall.args->n; i++)
+            if (expr_uses_self_prop(e->u.scall.args->items[i].e, pname)) return true;
+        return expr_uses_self_prop(e->u.scall.aname, pname);
+    case A_ISSET: case A_EMPTY:
+        for (int i = 0; i < e->u.args->n; i++)
+            if (expr_uses_self_prop(e->u.args->items[i], pname)) return true;
+        return false;
+    case A_MATCH: {
+        if (expr_uses_self_prop(e->u.match.cond, pname)) return true;
+        for (int i = 0; i < e->u.match.arms->n; i++) {
+            AMatchArm *arm = &e->u.match.arms->arms[i];
+            for (int k = 0; k < arm->n_conds; k++)
+                if (expr_uses_self_prop(arm->conds[k], pname)) return true;
+            if (expr_uses_self_prop(arm->body, pname)) return true;
+        }
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
+static bool hook_uses_backing(AFunc *fn, TStr *pname) {
+    if (!fn || !fn->body) return false;
+    for (int i = 0; i < fn->body->n; i++)
+        if (stmt_uses_self_prop(fn->body->stmts[i], pname)) return true;
+    return false;
+}
+
+/* 编译一个钩子 AFunc → TFunc（方法形态：$this 在 slot 0） */
+static TFunc *compile_hook_fn(Program *p, AFunc *af, TClass *cls,
+                              const char *file, TStr *pname, bool is_set) {
+    /* 钩子方法名仅用于栈追踪：`propname::get` / `propname::set` */
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s::%s", tstr_val(pname), is_set ? "set" : "get");
+    af->name = tstr_intern(buf, strlen(buf));
+    uint16_t idx = compile_fn_like(p, af, NULL, false, false, true, cls, file);
+    return p->funcs[idx];
+}
+
+/* 编译类成员里的属性钩子；成功填 prop.hook_*，并判定 is_virtual */
+static void compile_prop_hooks(Program *p, TClass *cls, TProp *prop,
+                               AClassMember *mem, const char *file) {
+    if (!mem->prop.has_hooks) return;
+    prop->has_hooks = true;
+    if (mem->prop.hook_get) {
+        prop->hook_get = compile_hook_fn(p, mem->prop.hook_get, cls, file,
+                                         prop->name, false);
+    }
+    if (mem->prop.hook_set) {
+        prop->hook_set = compile_hook_fn(p, mem->prop.hook_set, cls, file,
+                                         prop->name, true);
+    }
+    /* 仅声明（接口/抽象）：无 TFunc，保持 NULL */
+    bool uses = hook_uses_backing(mem->prop.hook_get, prop->name) ||
+                hook_uses_backing(mem->prop.hook_set, prop->name);
+    prop->is_virtual = !uses;
+    prop->hook_get_final = mem->prop.get_final;
+    prop->hook_set_final = mem->prop.set_final;
+    /* 虚拟属性不允许默认值 */
+    if (prop->is_virtual && prop->defval.t != T_UNDEF) {
+        tphp_fatal_src(file, mem->line,
+                       "Cannot declare default value for virtual property %s::$%s",
+                       tstr_val(cls->name), tstr_val(prop->name));
+    }
+    /* 短形式 set => expr 隐含 backing（AST 已含 $this->prop = …），
+     * uses 检测会把它判为非虚拟 —— 与 RFC 一致 */
+}
+
 /* compile one function-like body (named fn, closure, arrow, thunk, method) */
 
 /* B3: 闭包体是否引用 $this（复用 capture 收集器的遍历；临时列表用后即弃，
@@ -2989,6 +3224,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
     TFunc *f = tm_malloc(sizeof *f);
     memset(f, 0, sizeof *f);
     f->name = af->name;
+    f->file = file;
     f->ret_type = af->ret_type;   /* P1-1 */
     f->is_closure = is_closure;
     f->is_method = is_method;
@@ -3229,6 +3465,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                     prop.set_visibility = (uint8_t)(par->set_vis ? par->set_vis
                                                                  : par->vis);
                     prop.is_readonly = par->is_readonly;
+                    prop.is_final = par->is_final;   /* PHP 8.5 final 提升属性 */
                     prop.defval = (TVal){ .u.i = 0, .t = T_UNDEF };
                     /* readonly class：提升的实例属性同样必须带类型 */
                     if ((cls->flags & CLS_READONLY) && !prop.type)
@@ -3322,6 +3559,8 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                 }
                 else prop.def_thunk = compile_thunk(p, mem->prop.def, file, cls);
             }
+            /* PHP 8.4 property hooks：编译 get/set 钩子体 + 虚拟属性判定 */
+            compile_prop_hooks(p, cls, &prop, mem, file);
             if (prop.is_static) {
                 cls->sprops = tm_realloc(cls->sprops, sizeof(TProp) * (size_t)(cls->n_sprops + 1));
                 cls->sprops[cls->n_sprops++] = prop;
@@ -3552,13 +3791,18 @@ static void pass_funcs(AStmtList *l, Program *p, const char *file) {
     }
 }
 
-/* ---- M6: require/include 编译期内联 ----
- * S_INCLUDE 在编译入口展开：读文件 → parse → 语句列表原地替换。
- * 路径相对当前文件目录；全部 require/include 按路径去重（防循环）。
- * 非字面量路径 parse 阶段已拒绝。 */
+/* ---- M6/M+: require/include 编译期内联 ----
+ * S_INCLUDE 与 A_REQUIRE 在编译入口展开：读源 → parse → 语句列表原地替换。
+ * 路径相对当前文件目录；*_once 按路径全局去重；普通 require/include 可重复
+ * 展开（PHP 语义），但用展开栈防循环。非字面量路径 parse 阶段已拒绝。
+ * 读取顺序：bundle 表 → 磁盘 → pack zip（source_root 剥离 / 原样 rel）。 */
 
-static char **s_inc_seen;
-static int s_n_inc_seen, s_cap_inc_seen;
+/* *_once 已加载路径（永久） */
+static char **s_inc_once;
+static int s_n_inc_once, s_cap_inc_once;
+/* 当前展开栈（防循环 require/include） */
+static char **s_inc_busy;
+static int s_n_inc_busy, s_cap_inc_busy;
 
 static char *dir_of(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -3587,20 +3831,20 @@ static char *join_path(const char *dir, const char *rel) {
     return r;
 }
 
-static bool inc_seen(const char *path) {
-    for (int i = 0; i < s_n_inc_seen; i++)
-        if (strcmp(s_inc_seen[i], path) == 0) return true;
+static bool str_list_has(char **list, int n, const char *path) {
+    for (int i = 0; i < n; i++)
+        if (strcmp(list[i], path) == 0) return true;
     return false;
 }
 
-static void inc_mark(const char *path) {
-    if (s_n_inc_seen >= s_cap_inc_seen) {
-        s_cap_inc_seen = s_cap_inc_seen ? s_cap_inc_seen * 2 : 16;
-        s_inc_seen = tm_realloc(s_inc_seen, sizeof(char *) * (size_t)s_cap_inc_seen);
+static void str_list_push(char ***list, int *n, int *cap, const char *path) {
+    if (*n >= *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *list = tm_realloc(*list, sizeof(char *) * (size_t)*cap);
     }
-    s_inc_seen[s_n_inc_seen] = tm_malloc(strlen(path) + 1);
-    strcpy(s_inc_seen[s_n_inc_seen], path);
-    s_n_inc_seen++;
+    (*list)[*n] = tm_malloc(strlen(path) + 1);
+    strcpy((*list)[*n], path);
+    (*n)++;
 }
 
 static char *read_file_all(const char *path, size_t *out_len) {
@@ -3618,7 +3862,58 @@ static char *read_file_all(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* 递归展开 stmts 中的 S_INCLUDE（顶层 + 控制流块内） */
+/* pack zip 回落：full 为拼好的绝对/相对路径，rel 为 require 里写的原样路径。
+ * 成功返回 tm_malloc 缓冲（NUL 结尾），失败 NULL。 */
+static char *pack_fallback_read(const char *full, const char *rel) {
+    if (!tphp_pack_has_bundle()) return NULL;
+    void *data = NULL;
+    size_t len = 0;
+    char key[1024];
+    /* 1) source_root 剥离：打包时记录的根 + 相对路径 → zip key */
+    const char *root = tphp_pack_source_root();
+    if (root && root[0] && full) {
+        size_t rn = strlen(root);
+        while (rn > 0 && (root[rn - 1] == '/' || root[rn - 1] == '\\')) rn--;
+        if (strncmp(full, root, rn) == 0 &&
+            (full[rn] == '/' || full[rn] == '\\')) {
+            const char *p = full + rn;
+            while (*p == '/' || *p == '\\') p++;
+            if (p[0]) {
+                snprintf(key, sizeof key, "%s", p);
+                for (char *q = key; *q; q++) if (*q == '\\') *q = '/';
+                if (tphp_pack_read(key, &data, &len)) {
+                    char *cp = tm_malloc(len + 1);
+                    memcpy(cp, data, len);
+                    cp[len] = 0;
+                    free(data);
+                    return cp;
+                }
+            }
+        }
+    }
+    /* 2) require 原样相对路径作 key */
+    if (rel && rel[0]) {
+        snprintf(key, sizeof key, "%s", rel);
+        for (char *q = key; *q; q++) if (*q == '\\') *q = '/';
+        if (tphp_pack_read(key, &data, &len)) {
+            char *cp = tm_malloc(len + 1);
+            memcpy(cp, data, len);
+            cp[len] = 0;
+            free(data);
+            return cp;
+        }
+    }
+    return NULL;
+}
+
+/* 读被包含源码：磁盘 → pack zip。成功返回 tm_malloc 源码。 */
+static char *read_inc_source(const char *full, const char *rel) {
+    char *src = read_file_all(full, NULL);
+    if (src) return src;
+    return pack_fallback_read(full, rel);
+}
+
+/* 递归展开 stmts 中的 S_INCLUDE / 表达式 A_REQUIRE */
 static void expand_includes(AStmtList *stmts, const char *cur_file);
 
 static void expand_list(AStmtList *l, const char *cur_file) {
@@ -3626,8 +3921,309 @@ static void expand_list(AStmtList *l, const char *cur_file) {
     expand_includes(l, cur_file);
 }
 
+/* 加载并 parse 一个 include；成功返回展开后的语句列表（调用方接管）。
+ * fail_ok：include 失败时返回 NULL 不 fatal；require 一律 fatal。 */
+static AStmtList *load_include(const char *full, const char *rel,
+                               bool is_require, bool is_once,
+                               const char *cur_file, int line) {
+    const char *key = full ? full : rel;
+    if (is_once) {
+        if (str_list_has(s_inc_once, s_n_inc_once, key)) return NULL; /* 已加载 */
+    }
+    if (str_list_has(s_inc_busy, s_n_inc_busy, key)) {
+        if (!is_require) {
+            /* include 循环：跳过（PHP 运行期会栈溢出；编译期内联直接断） */
+            return NULL;
+        }
+        tphp_fatal_src(cur_file ? cur_file : "<main>", line,
+                       "Circular require/include of '%s'", rel);
+    }
+    str_list_push(&s_inc_busy, &s_n_inc_busy, &s_cap_inc_busy, key);
+
+    char *src = read_inc_source(full, rel);
+    if (!src) {
+        s_n_inc_busy--;   /* pop */
+        if (is_require)
+            tphp_fatal_src(cur_file ? cur_file : "<main>", line,
+                           "Failed opening required file '%s'",
+                           full ? full : rel);
+        return NULL;      /* include 失败：静默跳过（表达式形态给 false） */
+    }
+    const char *parse_name = full ? full : rel;
+    AStmtList *inc = tphp_parse_script(src, parse_name);
+    tm_free(src);
+    expand_includes(inc, parse_name);
+    s_n_inc_busy--;   /* pop */
+    /* 成功加载后才记入 once 表 */
+    if (is_once) str_list_push(&s_inc_once, &s_n_inc_once, &s_cap_inc_once, key);
+    return inc;
+}
+
+/* 把 A_REQUIRE 表达式就地展开：文件语句收集到 *pre，节点替换为 1/false。
+ * 返回 pre 是否有内容需要前置。 */
+static bool expand_expr_require(AExpr *e, const char *cur_file,
+                                AStmt ***pre, int *n_pre, int *cap_pre);
+
+static void expand_expr_tree(AExpr *e, const char *cur_file,
+                             AStmt ***pre, int *n_pre, int *cap_pre);
+
+static void expand_expr_list(AExprList *l, const char *cur_file,
+                             AStmt ***pre, int *n_pre, int *cap_pre) {
+    if (!l) return;
+    for (int i = 0; i < l->n; i++)
+        expand_expr_tree(l->items[i], cur_file, pre, n_pre, cap_pre);
+}
+
+static void expand_arg_list(AArgList *l, const char *cur_file,
+                            AStmt ***pre, int *n_pre, int *cap_pre) {
+    if (!l) return;
+    for (int i = 0; i < l->n; i++)
+        expand_expr_tree(l->items[i].e, cur_file, pre, n_pre, cap_pre);
+}
+
+static void expand_expr_tree(AExpr *e, const char *cur_file,
+                             AStmt ***pre, int *n_pre, int *cap_pre) {
+    if (!e) return;
+    switch (e->tag) {
+    case A_REQUIRE:
+        expand_expr_require(e, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_PROPHOOK:
+        if (e->u.phook.args)
+            expand_arg_list(e->u.phook.args, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_INT: case A_FLOAT: case A_STR:
+    case A_TRUE: case A_FALSE: case A_NULL: case A_CONSTREF:
+    case A_FIRSTCLASS:
+        return;
+    case A_FIRSTCLASS_DYN:
+        expand_expr_tree(e->u.e, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_VAR:
+        return;
+    case A_ARRAY: {
+        AArrayList *al = e->u.alist;
+        for (int i = 0; i < al->n; i++) {
+            expand_expr_tree(al->items[i].key, cur_file, pre, n_pre, cap_pre);
+            expand_expr_tree(al->items[i].val, cur_file, pre, n_pre, cap_pre);
+        }
+        return;
+    }
+    case A_BINARY:
+        expand_expr_tree(e->u.bin.l, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.bin.r, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_UNARY: case A_INCDEC: case A_CAST: case A_SPREAD:
+        expand_expr_tree(e->u.un.e, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_CLONE:
+        expand_expr_tree(e->u.clone.e, cur_file, pre, n_pre, cap_pre);
+        if (e->u.clone.overrides)
+            expand_expr_tree(e->u.clone.overrides, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_ASSIGN: case A_ASSIGN_OP: case A_INSTANCEOF:
+        expand_expr_tree(e->u.bin.l, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.bin.r, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_TERNARY: case A_COALESCE:
+        expand_expr_tree(e->u.tern.c, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.tern.m, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.tern.e, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_CALL:
+        expand_expr_tree(e->u.call.dyn, cur_file, pre, n_pre, cap_pre);
+        expand_arg_list(e->u.call.args, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_DIM:
+        expand_expr_tree(e->u.dim.base, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.dim.idx, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_MATCH: {
+        expand_expr_tree(e->u.match.cond, cur_file, pre, n_pre, cap_pre);
+        for (int i = 0; i < e->u.match.arms->n; i++) {
+            AMatchArm *arm = &e->u.match.arms->arms[i];
+            for (int k = 0; k < arm->n_conds; k++)
+                expand_expr_tree(arm->conds[k], cur_file, pre, n_pre, cap_pre);
+            expand_expr_tree(arm->body, cur_file, pre, n_pre, cap_pre);
+        }
+        return;
+    }
+    case A_ISSET: case A_EMPTY:
+        expand_expr_list(e->u.args, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_CLOSURE: case A_ARROW:
+        expand_list(e->u.clo.func->body, cur_file);
+        return;
+    case A_NEW:
+        expand_expr_tree(e->u.newx.dyn, cur_file, pre, n_pre, cap_pre);
+        expand_arg_list(e->u.newx.args, cur_file, pre, n_pre, cap_pre);
+        if (e->u.newx.anon) {
+            AClassDecl *anon = (AClassDecl *)e->u.newx.anon;
+            if (anon->body) {
+                for (int m = 0; m < anon->body->n; m++) {
+                    AClassMember *mem = anon->body->items[m];
+                    if (mem->tag == CM_METHOD && mem->func)
+                        expand_list(mem->func->body, cur_file);
+                }
+            }
+        }
+        return;
+    case A_PIPELINE:
+        expand_expr_tree(e->u.pipe.input, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.pipe.call, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_PROP:
+        expand_expr_tree(e->u.prop.obj, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.prop.aname, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_METHODCALL:
+        expand_expr_tree(e->u.mcall.obj, cur_file, pre, n_pre, cap_pre);
+        expand_expr_tree(e->u.mcall.aname, cur_file, pre, n_pre, cap_pre);
+        expand_arg_list(e->u.mcall.args, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_STATICCALL:
+        expand_expr_tree(e->u.scall.aname, cur_file, pre, n_pre, cap_pre);
+        expand_arg_list(e->u.scall.args, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_STATICGET: case A_OBJSTATIC:
+        expand_expr_tree(e->u.prop.aname, cur_file, pre, n_pre, cap_pre);
+        if (e->tag == A_OBJSTATIC)
+            expand_expr_tree(e->u.prop.obj, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_GETCLASS:
+        expand_expr_tree(e->u.e, cur_file, pre, n_pre, cap_pre);
+        return;
+    }
+}
+
+static bool expand_expr_require(AExpr *e, const char *cur_file,
+                                AStmt ***pre, int *n_pre, int *cap_pre) {
+    /* 动态路径：不内联，留给 OP_REQUIRE；仍展开路径表达式内部的 require */
+    if (!e->u.inc.path) {
+        if (e->u.inc.path_expr)
+            expand_expr_tree(e->u.inc.path_expr, cur_file, pre, n_pre, cap_pre);
+        return false;
+    }
+    const char *rel = tstr_val(e->u.inc.path);
+    char bname[128];
+    tphp_bundle_name_of(rel, bname, sizeof bname);
+    const TBundle *bun = tphp_bundle_find(bname);
+    AStmtList *inc = NULL;
+    bool already = false;   /* once 已加载：算成功 */
+    char *full = NULL;
+    if (bun) {
+        const char *key = bname;
+        if (e->u.inc.is_once &&
+            str_list_has(s_inc_once, s_n_inc_once, key)) {
+            already = true;
+        } else {
+            if (str_list_has(s_inc_busy, s_n_inc_busy, key)) {
+                if (e->u.inc.is_require)
+                    tphp_fatal_src(cur_file ? cur_file : "<main>", e->line,
+                                   "Circular require/include of '%s'", rel);
+                /* include 循环：当失败 */
+            } else {
+                str_list_push(&s_inc_busy, &s_n_inc_busy, &s_cap_inc_busy, key);
+                inc = tphp_parse_script(bun->src, bun->name);
+                expand_includes(inc, bun->name);
+                s_n_inc_busy--;
+                if (e->u.inc.is_once)
+                    str_list_push(&s_inc_once, &s_n_inc_once, &s_cap_inc_once, key);
+            }
+        }
+    } else {
+        char *dir = cur_file ? dir_of(cur_file) : NULL;
+        full = join_path(dir, rel);
+        if (dir) tm_free(dir);
+        if (e->u.inc.is_once &&
+            str_list_has(s_inc_once, s_n_inc_once, full)) {
+            already = true;
+        } else {
+            inc = load_include(full, rel, e->u.inc.is_require, e->u.inc.is_once,
+                               cur_file, e->line);
+            /* load_include 对 once 已加载返回 NULL —— 这里已提前判断过，
+             * 故 NULL 只可能是失败。 */
+        }
+        tm_free(full);
+    }
+    /* 收集前置语句 */
+    if (inc) {
+        for (int k = 0; k < inc->n; k++) {
+            if (*n_pre >= *cap_pre) {
+                *cap_pre = *cap_pre ? *cap_pre * 2 : 8;
+                *pre = tm_realloc(*pre, sizeof(AStmt *) * (size_t)*cap_pre);
+            }
+            (*pre)[(*n_pre)++] = inc->stmts[k];
+        }
+        tm_free(inc->stmts);
+        tm_free(inc);
+    }
+    /* 节点替换：成功/once 已加载 → 1；include 失败 → false */
+    if (!inc && !already && !e->u.inc.is_require) {
+        e->tag = A_FALSE;
+    } else {
+        e->tag = A_INT;
+        e->u.i = 1;
+    }
+    return *n_pre > 0;
+}
+
+/* 遍历语句表达式，展开 A_REQUIRE；返回是否有前置语句 */
+static bool expand_stmt_exprs(AStmt *st, const char *cur_file,
+                              AStmt ***pre, int *n_pre, int *cap_pre) {
+    switch (st->tag) {
+    case S_ECHO:
+        expand_expr_list(st->u.exprs, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_EXPR:
+        expand_expr_tree(st->u.e, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_RETURN: case S_THROW:
+        expand_expr_tree(st->u.e, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_IF:
+        if (st->u.ifs) {
+            for (int b = 0; b < st->u.ifs->n; b++)
+                expand_expr_tree(st->u.ifs->branches[b].cond, cur_file, pre, n_pre, cap_pre);
+        }
+        return *n_pre > 0;
+    case S_WHILE: case S_DOWHILE:
+        expand_expr_tree(st->u.wh.cond, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_FOR:
+        if (st->u.fors) {
+            for (int i = 0; i < st->u.fors->init->n; i++)
+                expand_expr_tree(st->u.fors->init->items[i], cur_file, pre, n_pre, cap_pre);
+            expand_expr_tree(st->u.fors->cond, cur_file, pre, n_pre, cap_pre);
+            for (int i = 0; i < st->u.fors->step->n; i++)
+                expand_expr_tree(st->u.fors->step->items[i], cur_file, pre, n_pre, cap_pre);
+        }
+        return *n_pre > 0;
+    case S_FOREACH:
+        expand_expr_tree(st->u.fe->arr, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_SWITCH:
+        expand_expr_tree(st->u.sw->cond, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_UNSET:
+        expand_expr_list(st->u.exprs, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_DESTRUCT:
+        expand_expr_tree(st->u.des.rhs, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    case S_CONSTDECL:
+        if (st->u.consts.decls)
+            for (int i = 0; i < st->u.consts.n; i++)
+                expand_expr_tree(st->u.consts.decls[i].value, cur_file, pre, n_pre, cap_pre);
+        return *n_pre > 0;
+    default:
+        return false;
+    }
+}
+
 static void expand_includes(AStmtList *stmts, const char *cur_file) {
     if (!stmts || stmts->n == 0) return;
+    /* 1) 递归展开嵌套块 / 函数体 / 类方法体 / 表达式中的闭包体 */
     for (int i = 0; i < stmts->n; i++) {
         AStmt *st = stmts->stmts[i];
         switch (st->tag) {
@@ -3655,71 +4251,96 @@ static void expand_includes(AStmtList *stmts, const char *cur_file) {
                 expand_list(st->u.trys->finally, cur_file);
             }
             break;
+        case S_FUNCDECL:
+            if (st->u.func) expand_list(st->u.func->body, cur_file);
+            break;
+        case S_CLASSDECL:
+            if (st->u.cls && st->u.cls->body) {
+                for (int m = 0; m < st->u.cls->body->n; m++) {
+                    AClassMember *mem = st->u.cls->body->items[m];
+                    if (mem->tag == CM_METHOD && mem->func)
+                        expand_list(mem->func->body, cur_file);
+                    if (mem->tag == CM_USE && mem->prop.def)
+                        ; /* trait use 无表达式体 */
+                }
+            }
+            break;
         default: break;
         }
     }
-    /* 展开顶层 S_INCLUDE：重建语句数组 */
+    /* 2) 重建语句数组：S_INCLUDE 内联 + 表达式 A_REQUIRE 前置展开 */
     int n_out = 0;
     AStmt **out = NULL;
     for (int i = 0; i < stmts->n; i++) {
         AStmt *st = stmts->stmts[i];
+        /* 2a. 表达式里的 A_REQUIRE → 前置语句 + 节点替换为 1/false */
+        AStmt **pre = NULL;
+        int n_pre = 0, cap_pre = 0;
+        expand_stmt_exprs(st, cur_file, &pre, &n_pre, &cap_pre);
+        for (int k = 0; k < n_pre; k++) {
+            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+            out[n_out++] = pre[k];
+        }
+        if (pre) tm_free(pre);
+        /* 2b. 语句级 S_INCLUDE（仅字面量内联；动态路径 parse 已转 S_EXPR） */
         if (st->tag != S_INCLUDE) {
             out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
             out[n_out++] = st;
             continue;
         }
-        const char *rel = tstr_val(st->u.inc.path);
+        const char *rel = st->u.inc.path ? tstr_val(st->u.inc.path) : NULL;
+        if (!rel) {
+            /* 理论上不可达：动态路径在 parse 已转 S_EXPR */
+            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
+            out[n_out++] = st;
+            continue;
+        }
         /* 包含方当前命名空间（out 中最后一个 S_NS_BEGIN）：被包含文件的
          * namespace X; 不得泄漏到 require 之后的语句（PHP 按文件划分） */
         TStr *prev_ns = NULL;
         for (int k = 0; k < n_out; k++)
             if (out[k]->tag == S_NS_BEGIN) prev_ns = out[k]->u.name;
-        /* M6: 先查内嵌 bundle 表（单 exe）；命中用内嵌源码 */
         char bname[128];
         tphp_bundle_name_of(rel, bname, sizeof bname);
         const TBundle *bun = tphp_bundle_find(bname);
+        AStmtList *inc = NULL;
         if (bun) {
-            if (inc_seen(bname)) continue;
-            inc_mark(bname);
-            AStmtList *inc = tphp_parse_script(bun->src, bun->name);
-            expand_includes(inc, bun->name);
-            for (int k = 0; k < inc->n; k++) {
-                out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
-                out[n_out++] = inc->stmts[k];
+            /* bundle：*_once 用 bname 去重；普通 require 可重复（防环栈） */
+            if (st->u.inc.is_once &&
+                str_list_has(s_inc_once, s_n_inc_once, bname)) {
+                continue;   /* already loaded */
             }
-            tm_free(inc->stmts);
-            tm_free(inc);
-            AStmt *restore = as_new_c(S_NS_BEGIN, st->line);
-            restore->u.name = prev_ns;   /* NULL = 回全局 */
-            out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
-            out[n_out++] = restore;
-            continue;
+            if (str_list_has(s_inc_busy, s_n_inc_busy, bname)) {
+                if (st->u.inc.is_require)
+                    tphp_fatal_src(cur_file ? cur_file : "<main>", st->line,
+                                   "Circular require/include of '%s'", rel);
+                continue;
+            }
+            str_list_push(&s_inc_busy, &s_n_inc_busy, &s_cap_inc_busy, bname);
+            inc = tphp_parse_script(bun->src, bun->name);
+            expand_includes(inc, bun->name);
+            s_n_inc_busy--;
+            if (st->u.inc.is_once)
+                str_list_push(&s_inc_once, &s_n_inc_once, &s_cap_inc_once, bname);
+        } else {
+            char *dir = cur_file ? dir_of(cur_file) : NULL;
+            char *full = join_path(dir, rel);
+            if (dir) tm_free(dir);
+            inc = load_include(full, rel, st->u.inc.is_require,
+                               st->u.inc.is_once, cur_file, st->line);
+            tm_free(full);
         }
-        char *dir = cur_file ? dir_of(cur_file) : NULL;
-        char *full = join_path(dir, rel);
-        if (dir) tm_free(dir);
-        /* 全部按路径去重（防循环 require；PHP 普通 require 可重复，
-         * M6 先去重更安全——lib 函数定义场景无影响） */
-        if (inc_seen(full)) { tm_free(full); continue; }
-        char *src = read_file_all(full, NULL);
-        if (!src)
-            tphp_fatal_src(cur_file ? cur_file : "<main>", st->line,
-                           "Failed opening required file '%s'", full);
-        inc_mark(full);
-        AStmtList *inc = tphp_parse_script(src, full);
-        expand_includes(inc, full);
-        tm_free(src);
-        tm_free(full);
+        if (!inc) continue;   /* once 跳过 / include 失败静默 */
         for (int k = 0; k < inc->n; k++) {
             out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
             out[n_out++] = inc->stmts[k];
         }
         tm_free(inc->stmts);
         tm_free(inc);
-        AStmt *restore2 = as_new_c(S_NS_BEGIN, st->line);
-        restore2->u.name = prev_ns;
+        AStmt *restore = as_new_c(S_NS_BEGIN, st->line);
+        restore->u.name = prev_ns;   /* NULL = 回全局 */
         out = tm_realloc(out, sizeof(AStmt *) * (size_t)(n_out + 1));
-        out[n_out++] = restore2;
+        out[n_out++] = restore;
     }
     if (out) {
         stmts->stmts = out;
@@ -3758,6 +4379,7 @@ Program *tphp_compile(AStmtList *ast, const char *file) {
     TFunc *m = tm_malloc(sizeof *m);
     memset(m, 0, sizeof *m);
     m->name = tstr_intern("~main", 5);
+    m->file = file;
     m->is_main = true;
     Ctx c;
     memset(&c, 0, sizeof c);

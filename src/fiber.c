@@ -108,6 +108,7 @@ static void *stack_alloc(size_t total) {
 
 static void stack_free(void *p, size_t total) {
 #ifdef _WIN32
+    (void)total;
     VirtualFree(p, 0, MEM_RELEASE);
 #else
     munmap(p, total);

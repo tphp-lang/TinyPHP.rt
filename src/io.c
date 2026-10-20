@@ -27,7 +27,8 @@
 
 /* sched.c / vm.c */
 TStr *tstr_new(const char *s, size_t len);
-void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...);
+void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...)
+    __attribute__((noreturn, format(printf, 3, 4)));
 
 #define IO_RBUF 8192
 
@@ -85,6 +86,7 @@ TStreamCtx *tphp_stream_from_obj(VM *vm, TVal v, const char *who) {
 
 /* closed 流：PHP8 行为是 warning + false（不致命） */
 static bool stream_live(VM *vm, TStreamCtx *s, const char *who) {
+    (void)vm;
     if (s->closed) {
         fprintf(stderr, "PHP Warning: %s(): supplied resource is not a "
                         "valid stream resource\n", who);
