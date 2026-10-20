@@ -1,7 +1,7 @@
 # TinyPHP.rt 项目记忆（长期）
 
 - 定位：PHP 8 **解释型运行时**（lex→parse→compile→自有 opcode→VM 解释），非 AOT/JIT；与 TinyPHP（AOT 编译器）代码零共享、定位互补。CLI 名 `tphp`，当前 0.0.1。
-- 完成态（2026-10-14 实测）：M0~M6 + M5.5 FFI + M6.1 跨平台打包器全部关闭；tests/run.ps1 **108 passed 0 failed**；CI 5 平台（Win/Linux x64+aarch64/macOS arm64+x64）。
+- 完成态（2026-10-20 实测）：M0~M6 + M5.5 FFI + M6.1 打包器全关；2026-10-20 会话新增 require/include 全家桶、PHP 8.4 属性钩子、(void)/final 提升/clone 列表、编译警告清零；tests/run.ps1 **172 passed 0 failed**；HEAD=1ddbb70；CI 5 平台。记忆目录已迁至项目根 `memory/`（原 `.workbuddy/memory/`）。
 - 核心设计：TExecCtx 每协程 VM 状态整块切换（fiber 抄 php-src Zend/asm）；prog freeze 后字节码跨线程只读共享；异常表驱动 + longjmp unwind；Worker = 独立 TPhpRuntime 全 TLS 隔离 + uv_mutex mailbox + serialize 克隆；bundle 用**源码内嵌**（非 opcode 序列化，TOp 含 handler 指针不可序列化）；pack.c = PE RCDATA / ELF section / macOS footer 三平台资产打包。
 - 环境坑（本项目实测）：src 下自定义头禁叫 io.h/ffi.h（顶掉系统头）；.cmd 纯 ASCII；ffi_prep_cif 不拷贝 arg_types 数组必须堆分配；PS5 写无 BOM UTF-8；build.log 为 UTF-16 需 iconv；PowerShell 传参剥引号用 rsp 响应文件。
 - 用户边界：严格前后端/文档一致性；不为修而修；测试必须真实跑（禁改测试假通过）。
@@ -22,3 +22,43 @@
 - **C1 动态成员全形态**（用户砍掉 C2 eval——"不安全不常用"）：机制=**复用现有 op + 操作数 kind 分派**（CONST=编译期名/非 CONST=运行期名读 op_member_name），零新增实例侧 opcode；AST prop/mcall/scall 加 `aname`；lexer `$$v`→L_VAR("$v")（普通表达式仍拒"Variable-variable"）；静态侧 CCONST/ASSIGN_SPROP 动态=t1=name、t2=类名前缀、**kind 挂 ext**（a1 被 name 占用）；SMCALL 动态名必须放 **t1**（a2 被 argc 复用——曾放 t2 被 n_sent 覆盖读错 CV）；顺带补齐既有缺口：compile_assign_op 的 A_STATICGET 分支（`C::$p += 5` 从来就报 Cannot assign）、新 OP_ISSET_CCONST（enum/handler表/names表三同步）支撑 `isset/empty(C::$x)`。
 - **教训**：①emit_writebacks 曾把互斥 if/else 链拆成两个 if→is_global 节点发完又掉进 else 兜底发垃圾 ASSIGN_DIM（destruct-gc 回归，255）；②member_name_loc 无条件调用且 name=NULL 会 push NULL 字面量→freeze/运行期 AV（oop-static 0xC0000005）；③`lit_str(NULL)`、`a2 双重用途（kind vs argc）`是本类改动的两大坑。
 - §10 已重写：10 项修复闭环注记 + 残留=8 条 A 类设计差异 + eval（用户决策不实现）+ 新增边缘差异"动态静态方法名+命名参数=加载期拒绝"。新增 12 个回归测试（147 passed 0 failed）。
+
+## 2026-10-20 语法批次（HEAD=1ddbb70，172/172）
+
+### 编译警告清零（先行）
+- 根因：`tphp_raise`/`tphp_vm_raise`/`vm_raise` 未声明 `noreturn` → 十余处 `-Wreturn-type`/`-Wsometimes-uninitialized` 连锁
+- 修法：raise 链全标 noreturn（tphp.h/opcode.h/vm.c/lex.c/parse.c + io/net/worker 本地声明）；`tstr_val`/`tstr_len` 参数改 `const TStr*`；miniz 加 `MINIZ_NO_ZLIB_COMPATIBLE_NAMES`（**不可**定义 MINIZ_NO_INFLATE/DEFLATE_APIS——会连带裁掉 archive API）
+- clean rebuild 零警告；此后所有新功能提交前保持零警告
+
+### require/include 全家桶（两阶段）
+- 阶段1：`require_once`/`include_once` 关键字；表达式形态 `$v=require 'x'` 返回 1/false；include 失败静默跳过；expand_includes 增 pack zip 回落（source_root 剥离+原样 rel）；修 expand 不进 S_FUNCDECL/类方法/闭包体的缺口
+- 阶段2：动态路径 `OP_REQUIRE`（ext bit0=is_require bit1=is_once）；运行期 parse+compile 独立 Program 挂 `vm->inc_progs`（resolve_fn 搜索；**inc_progs 来源不写共享 ic**）；被包含文件顶层 return 作为表达式值；TFunc.file/VMFrame.file 支撑嵌套相对路径；运行期 once/busy 线程局部表
+- 关键约束：字面量路径仍编译期内联（性能+freeze 友好）；动态路径才走 OP_REQUIRE；普通 require 可重复展开（防环栈），*_once 才去重
+
+### PHP 8.4 属性钩子（核心完整）
+- parse：全形式 `{ get { } set { } }` + 短形式 `get =>`/`set =>`；隐式 `$value`；接口 `{ get; }` 声明；拒绝 static/readonly+hooks；短形式 `;` 收尾、块后无分号（对齐 php-src hooked_property 文法）
+- compile：钩子编译为 TFunc（is_method，$this slot0）存 TProp.hook_get/set；虚拟属性=钩子体无 `$this->prop` 直接引用（递归 AST 扫描）；虚拟+默认值=加载期 Fatal
+- VM：`call_hook` 设 (hook_obj,hook_prop) 上下文，钩子内 `$this->prop` 绕过钩子直读写 backing；读写路径钩子派发在可见性检查**之后**；isset 调 get 非 null 为 true；unset 任一钩子=Error；虚拟读/写无对应钩子=Error
+- 后续补齐：`__PROPERTY__`（parse 期 g_hook_prop_name 折叠）、`parent::$p::get()/set()`（A_PROPHOOK+OP_PROPHOOK，从 decl_cls->parent 找钩子）、final 钩子覆盖校验（flatten add_prop 时 Fatal）
+
+### 第一梯队小语法
+- `(void)` 转换（8.5）：ctypes id=6，求值后丢弃、表达式值 null
+- `final` 提升属性（8.5）：parse_params 认 KW_FINAL → AParam.is_final → TProp.is_final
+- `clone($o, ['p'=>v])`（8.4）：A_CLONE 改 u.clone{e,overrides}；编译期展开为 clone+ASSIGN_PROP（走钩子/类型检查）；v1 仅数组字面量键
+
+### 跳过决策（用户拍板）
+- 魔法常量 `__CLASS__`/`__FUNCTION__`/`__METHOD__`/`__NAMESPACE__`/`__TRAIT__`：使用频率低，可用 `self::class` 等替代，**不做**
+
+### 包管理器设计（PLAN/pkg-manager.md，待实现）
+- 内置 Git 包管理：`tphp new/add/remove/install/upload`（upload 占位）
+- mod.json（name/version/type/author/description/license/autoload/deps/pack）+ mod.lock（commit SHA）
+- 包 ID `foo/bar` → `vendor/foo/bar/`；全项目共享拍平；禁止嵌套 vendor
+- autoload：PSR-4+files；install 生成 vendor/autoload.php（根项目+依赖合并）；**无 main 字段、无单一 namespace 字段**
+- ref 规格：dev/分支/tag/`^~` semver/latest/SHA；latest=本地 tag semver 排序（不调平台 API）
+- 打包衔接：自动 --with vendor/；排除 .git/系统垃圾/依赖包 tests/；pack.include/exclude 清单字段
+- 实施约 4.5~5 天，四阶段；记忆目录迁至 `memory/`
+
+### 环境/操作备忘
+- Edit 工具改 C 文件中文注释合法 UTF-8；clang 控制台输出乱码只是显示
+- PowerShell 5.1 `Set-Content -Encoding UTF8` 写 BOM——测试 fixture 注意
+- git 提交时 `build/cacert.pem` 是刻意入库的（.gitignore `!` 豁免），勿误删

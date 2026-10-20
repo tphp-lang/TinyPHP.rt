@@ -46,6 +46,7 @@
 | [PLAN/03-architecture.md](PLAN/03-architecture.md) | 实现架构：目录结构、核心数据结构、opcode 64 个、异步/线程/打包的 VM 层落地、构建脚本 |
 | [PLAN/04-milestones-testing.md](PLAN/04-milestones-testing.md) | 里程碑 M0~M6（每阶段绑定语法+功能范围与验收标准）、测试策略、风险与规避 |
 | [PLAN/05-extension-guide.md](PLAN/05-extension-guide.md) | **贡献者规范**：内置扩展（builtin/内部类）开发模式、核心约定红线、错误处理与安全标准、工作流与上线检查清单 |
+| [PLAN/pkg-manager.md](PLAN/pkg-manager.md) | **内置 Git 包管理器**：mod.json/mod.lock、vendor 布局、PSR-4 autoload、new/add/remove/install/upload 命令规格、实施阶段 |
 
 ## 技术栈与环境
 
