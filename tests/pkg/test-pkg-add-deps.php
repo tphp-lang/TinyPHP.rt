@@ -37,8 +37,14 @@ echo "setup-ok\n";
 
 // 应用 add A → 递归装 B
 pkg_new($app, "demo-app");
-pkg_add($app, $adir);
-echo "add-ok\n";
+$add_ok = true;
+try {
+    pkg_add($app, $adir);
+} catch (Throwable $e) {
+    echo "add-ex: ", get_class($e), ": ", $e->getMessage(), "\n";
+    $add_ok = false;
+}
+if ($add_ok) echo "add-ok\n";
 
 $vb = $app . "/vendor/dep/b/mod.json";
 $va = $app . "/vendor/dep/a/mod.json";

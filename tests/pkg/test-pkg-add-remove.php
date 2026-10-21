@@ -33,8 +33,14 @@ echo "src-ok\n";
 
 // 目标应用
 pkg_new($app, "demo-app");
-pkg_add($app, $src);
-echo "add-ok\n";
+$add_ok = true;
+try {
+    pkg_add($app, $src);
+} catch (Throwable $e) {
+    echo "add-ex: ", get_class($e), ": ", $e->getMessage(), "\n";
+    $add_ok = false;
+}
+if ($add_ok) echo "add-ok\n";
 
 // vendor 落盘
 $vend = $app . "/vendor/demo/util/mod.json";

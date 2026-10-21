@@ -32,13 +32,25 @@ $ma["deps"] = ["dep/b" => ["url" => "../pkgtest-inst-b", "ref" => ""]];
 file_put_contents($adir . "/mod.json", json_encode($ma));
 
 pkg_new($app, "demo-app");
-pkg_add($app, $adir);
-echo "setup-ok\n";
+$add_ok = true;
+try {
+    pkg_add($app, $adir);
+} catch (Throwable $e) {
+    echo "add-ex: ", get_class($e), ": ", $e->getMessage(), "\n";
+    $add_ok = false;
+}
+if ($add_ok) echo "setup-ok\n";
 
 // 删 vendor 模拟新机器；lock 仍在
 pkg_rm_tree4($app . "/vendor");
-pkg_install($app);
-echo "install-ok\n";
+$inst_ok = true;
+try {
+    pkg_install($app);
+} catch (Throwable $e) {
+    echo "install-ex: ", get_class($e), ": ", $e->getMessage(), "\n";
+    $inst_ok = false;
+}
+if ($inst_ok) echo "install-ok\n";
 
 $va = file_exists($app . "/vendor/dep/a/mod.json");
 $vb = file_exists($app . "/vendor/dep/b/mod.json");
