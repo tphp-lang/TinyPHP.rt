@@ -990,11 +990,18 @@ static bool is_http_url(const char *s) {
     return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
 }
 
-/* 路径拼接：a/b + c → a/b/c（a 可为空） */
+/* 路径拼接：a/b + c → a/b/c（a 可为空）。out 与 a/b 不得重叠。 */
 static void path_join3(char *out, size_t cap, const char *a, const char *b) {
     if (!a || !a[0]) snprintf(out, cap, "%s", b);
     else snprintf(out, cap, "%s/%s", a, b);
     for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+}
+
+/* 追加一段到路径：buf + seg → buf（buf 可能与 out 相同，故先拼临时区） */
+static void path_append(char *out, size_t cap, const char *seg) {
+    char tmp[1400];
+    snprintf(tmp, sizeof tmp, "%s", out);
+    path_join3(out, cap, tmp, seg);
 }
 
 /* 递归拷贝目录（跳过 .git / .DS_Store） */
@@ -1111,9 +1118,9 @@ static void vendor_path_of(char *out, size_t cap, const char *proj,
     char *p = tmp;
     while (*p) {
         char *slash = strchr(p, '/');
-        if (!slash) { path_join3(out, cap, out, p); break; }
+        if (!slash) { path_append(out, cap, p); break; }
         *slash = 0;
-        path_join3(out, cap, out, p);
+        path_append(out, cap, p);
         p = slash + 1;
     }
 }
