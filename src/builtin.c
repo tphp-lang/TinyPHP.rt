@@ -354,6 +354,55 @@ static TVal bi_pkg_new(VM *vm, TVal *args, int n) {
     return TV_TRUE;
 }
 
+/* pkg_add(string $proj, string $source, string $ref = null) */
+static TVal bi_pkg_add(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_add() expects (string $proj, string $source, string $ref = \"\")");
+    if (n >= 3 && args[2].t != T_STR && args[2].t != T_NULL)
+        RAISE(vm, "TypeError", "pkg_add(): Argument #3 ($ref) must be string or null");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    const char *source = tstr_val((TStr *)args[1].u.p);
+    const char *ref = (n >= 3 && args[2].t == T_STR) ? tstr_val((TStr *)args[2].u.p) : NULL;
+    char err[512] = "";
+    int rc = tphp_pkg_add(proj, source, ref, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_add(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_add(): %s", err);
+    return TV_TRUE;
+}
+
+/* pkg_remove(string $proj, string $name) */
+static TVal bi_pkg_remove(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_remove() expects (string $proj, string $name)");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    const char *name = tstr_val((TStr *)args[1].u.p);
+    char err[512] = "";
+    int rc = tphp_pkg_remove(proj, name, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_remove(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_remove(): %s", err);
+    return TV_TRUE;
+}
+
+/* pkg_install(string $proj) */
+static TVal bi_pkg_install(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "ArgumentCountError", "pkg_install() expects (string $proj)");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    char err[512] = "";
+    int rc = tphp_pkg_install(proj, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_install(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_install(): %s", err);
+    return TV_TRUE;
+}
+
 /* ---- autoload / class inspection ---- */
 static TVal bi_spl_autoload_register(VM *vm, TVal *args, int n) {
     (void)vm;
@@ -2461,6 +2510,9 @@ const Builtin tphp_builtins[] = {
     { "http_get", tphp_net_http_get },
     /* 包管理（pkg.c；tphp new/add/... 的 PHP 可调用层） */
     { "pkg_new", bi_pkg_new },
+    { "pkg_add", bi_pkg_add },
+    { "pkg_remove", bi_pkg_remove },
+    { "pkg_install", bi_pkg_install },
 };
 
 const int tphp_builtin_count = (int)(sizeof tphp_builtins / sizeof tphp_builtins[0]);

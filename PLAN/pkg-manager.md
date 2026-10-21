@@ -217,7 +217,7 @@ echo "Hello, world\n";
 
 ### 4.4 `tphp install`
 
-按 `mod.lock` 逐包恢复（精确 commit checkout）；无 lock 则等效全量解析。vendor 已存在且 commit 匹配则跳过（离线友好）。CI/新机器主入口。
+按 `mod.lock` 逐包恢复（vendor 已存在则跳过，离线友好）；无 lock 则从 `mod.json` deps 全量递归解析。完成后重写 lock + autoload。CI/新机器主入口。
 
 ### 4.5 `tphp upload`（占位）
 
@@ -335,9 +335,9 @@ pack 目录遍历时跳过以下内容，避免垃圾进单文件：
 
 > 用户显式 `--with` 某目录时：不跳过 tests/（尊重显式指定），仅跳过 `.git` 等 VCS/系统垃圾。
 
-#### `.php` 文件必须进 zip
+#### `.php` 文件进 zip（已实现）
 
-确认 `pack.c` 目录遍历**不排除** `.php`——vendor 里的 PHP 源码是 autoload 运行期 `OP_REQUIRE` 的目标，进不了 zip 会在目标机上全部加载失败。实现时加测试锁定此行为。
+`collect_dir` **不再跳过 `.php`**——vendor 里的 PHP 源码是 autoload 运行期 `OP_REQUIRE` 的目标，必须进 zip。VCS/系统垃圾（`.git`/`.DS_Store` 等）仍恒跳过；自动 `--with vendor/` 时额外跳过 `tests/`、`test/`、`*.md`（`tphp_pack_set_vendor_strict`）。
 
 #### 端到端链路（打包应用）
 
@@ -372,23 +372,23 @@ build 时：
 - `remove` + 独占依赖清理
 - 测试：本地 `file://` 仓库 fixture，add/remove/冲突
 
-### 阶段 C — autoload 生成 + `install` + 打包衔接（~1.5 天）
+### 阶段 C — autoload 生成 + `install` + 打包衔接（~1.5 天）✅ 已完成
 
-- autoload.php 生成（根项目 + 依赖合并，psr-4 + files）
-- mod.lock 精确恢复
-- 离线跳过（commit 匹配）
-- `tphp build` 自动检测 mod.json 追加 `--with vendor/`
-- pack 收集排除：`.git`/系统垃圾/`*.md`/依赖包 `tests|test/`
-- 确认 `.php` 进 zip（测试锁定）
-- 测试：use + 自动加载端到端；打包应用在干净目录可运行
+- autoload.php 生成（根项目 + 依赖合并，psr-4 + files）——阶段 A 已有
+- mod.lock 精确恢复：`tphp install` / `pkg_install()`
+- 离线跳过：vendor 已存在则跳过 fetch
+- `tphp build` 自动检测 mod.json + vendor/autoload.php → 追加 `--with vendor/`
+- pack 收集排除：VCS/系统垃圾恒跳过；自动 vendor 时跳 `tests/`、`*.md`（`tphp_pack_set_vendor_strict`）
+- `.php` 进 zip：移除 `collect_dir` 的 .php 跳过
+- 测试：`test-pkg-install.php`（删 vendor → lock 恢复 → autoload → 二次 install 跳过）
 
-### 阶段 D — `upload` 占位 + 文档（~0.5 天）
+### 阶段 D — `upload` 占位 + 文档（~0.5 天）✅ 已完成
 
-- `tphp upload` 打印指引
+- `tphp upload` 打印指引（git tag + push + zip 直链；注册表后置）
 - `doc/package-manager.md` 用户文档
-- 本文档同步
+- 本文档阶段表同步
 
-**总计约 4.5~5 天。**
+**总计约 4.5~5 天（四阶段全部完成）。**
 
 ## 7. 边界与已知决策
 
@@ -415,8 +415,8 @@ build 时：
 | `test-pkg-add-deps.php` | 传递依赖拍平 |
 | `test-pkg-remove.php` | remove + 独占依赖清理 |
 | `test-pkg-autoload.php` | use + 自动加载端到端 |
-| `test-pkg-install-lock.php` | lock 精确恢复 + 离线跳过 |
-| `test-pkg-ref-semver.php` | `^` `~` `latest` tag 解析（fixture tags） |
+| `test-pkg-install-lock.php` | lock 精确恢复 + 离线跳过 → `test-pkg-install.php` |
+| `test-pkg-ref-semver.php` | `^` `~` `latest` tag 解析（fixture tags）——HTTP zip 策略下后置/重写 |
 | `test-pkg-build-vendor.php` | 自动 --with vendor + 排除 tests/.git + 打包应用可运行 |
 
 ## 9. 示例：端到端

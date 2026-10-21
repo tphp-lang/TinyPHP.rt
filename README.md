@@ -78,7 +78,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 | [doc/architecture.md](doc/architecture.md) | 运行时架构 |
 | [doc/ffi.md](doc/ffi.md) | FFI API 与并发约定 |
 | [doc/testing.md](doc/testing.md) | 测试协议与目录 |
-| [PLAN/](PLAN/) | 完整设计规格（语法/功能/里程碑/扩展） |
+| [doc/package-manager.md](doc/package-manager.md) | 内置包管理：new/add/remove/install/upload |
+| [PLAN/](PLAN/) | 完整设计规格（语法/功能/里程碑/扩展/包管理） |
 
 ## 项目结构
 

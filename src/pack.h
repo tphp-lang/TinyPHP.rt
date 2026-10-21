@@ -22,6 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* vendor 自动打包排除模式：额外跳过 tests/、test/、*.md。
+ * 显式 --with 时 main.c 保持关闭（尊重用户指定路径的完整内容）。 */
+void tphp_pack_set_vendor_strict(bool on);
+
 /* 构建：把 assets 打进目标可执行文件（调用前已复制）。
  * exe_path: 目标可执行文件（UTF-8）
  * main_php: 主脚本源码与长度（可 NULL）

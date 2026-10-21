@@ -39,6 +39,7 @@ echo "hello\n";
 | `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong |
 | `tests/ffi/` | FFI：CData/struct/union/系统库/拒绝预处理 |
 | `tests/lib/` | stdlib：json/date/array/require/bundle |
+| `tests/pkg/` | 包管理：new/add/remove/install 骨架与依赖图 |
 | `tests/bench/` | 性能基线：fib(28)、1e6 push、读改写（耗时走 stderr） |
 | `tests/php-compat/` | php-src `.phpt` 对拍种子（见目录内 README） |
 

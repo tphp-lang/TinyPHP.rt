@@ -8,6 +8,7 @@
  *  - vendor/autoload.php：根项目 + vendor 下各包清单合并生成；
  *    PSR-4 按前缀长度降序（长前缀优先匹配）
  *  - PHP builtin pkg_new 走本模块同一入口（测试缝）
+ *  - 阶段 B：add/remove（本地目录/zip + HTTP(S) zip；fetch 回调由 main.c 注册）
  */
 #include "pkg.h"
 #include "value.h"
@@ -16,7 +17,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <uv.h>
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#include "miniz.h"
 
 /* ---- 小工具 ---- */
 
@@ -973,4 +977,678 @@ io_fail:
     set_err(err, errcap, "IO failure while scaffolding %s", dir);
     fs_rm_rf(dir);
     return 2;
+}
+
+/* ================================================================
+ * 阶段 B：add / remove（HTTP zip URL + 本地路径；无 git）
+ * ================================================================ */
+
+static TphpPkgFetchFn g_fetch;
+void tphp_pkg_set_fetch(TphpPkgFetchFn fn) { g_fetch = fn; }
+
+static bool is_http_url(const char *s) {
+    return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
+}
+
+/* 路径拼接：a/b + c → a/b/c（a 可为空） */
+static void path_join3(char *out, size_t cap, const char *a, const char *b) {
+    if (!a || !a[0]) snprintf(out, cap, "%s", b);
+    else snprintf(out, cap, "%s/%s", a, b);
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+}
+
+/* 递归拷贝目录（跳过 .git / .DS_Store） */
+static int fs_copy_tree(const char *src, const char *dst) {
+    if (fs_mkdir_p(dst) < 0) return -1;
+    uv_fs_t req;
+    int r = uv_fs_scandir(NULL, &req, src, 0, NULL);
+    if (r < 0) { uv_fs_req_cleanup(&req); return -1; }
+    uv_dirent_t ent;
+    int rc = 0;
+    while (uv_fs_scandir_next(&req, &ent) == 0) {
+        if (ent.name[0] == '.') continue;   /* .git .DS_Store .gitignore 等 */
+        char sp[1200], dp[1200];
+        snprintf(sp, sizeof sp, "%s/%s", src, ent.name);
+        snprintf(dp, sizeof dp, "%s/%s", dst, ent.name);
+        if (fs_isdir(sp)) {
+            rc = fs_copy_tree(sp, dp);
+        } else {
+            size_t len = 0;
+            char *data = fs_read(sp, &len);
+            if (!data) { rc = -1; break; }
+            rc = fs_write(dp, data, len);
+            tm_free(data);
+            if (rc < 0) break;
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    return rc;
+}
+
+/* zip 解压到 dest（miniz；拒绝 .. 路径防 zip-slip）。返回 0 成功 */
+static int zip_extract_mem(const void *data, size_t len, const char *dest,
+                           char *err, size_t errcap) {
+    mz_zip_archive zip;
+    memset(&zip, 0, sizeof zip);
+    if (!mz_zip_reader_init_mem(&zip, data, len, 0)) {
+        set_err(err, errcap, "invalid zip archive");
+        return 2;
+    }
+    if (fs_mkdir_p(dest) < 0) {
+        mz_zip_reader_end(&zip);
+        set_err(err, errcap, "cannot create %s", dest);
+        return 2;
+    }
+    mz_uint n = mz_zip_reader_get_num_files(&zip);
+    for (mz_uint i = 0; i < n; i++) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+        if (mz_zip_reader_is_file_a_directory(&zip, i)) continue;
+        if (strstr(st.m_filename, "..") || st.m_filename[0] == '/') {
+            mz_zip_reader_end(&zip);
+            set_err(err, errcap, "unsafe path in zip: %s", st.m_filename);
+            return 2;
+        }
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dest, st.m_filename);
+        /* 建父目录 */
+        for (char *q = path + strlen(dest) + 1; *q; q++) {
+            if (*q == '/') {
+                *q = 0;
+                fs_mkdir_p(path);
+                *q = '/';
+            }
+        }
+        size_t sz = 0;
+        void *buf = mz_zip_reader_extract_to_heap(&zip, i, &sz, 0);
+        if (!buf) continue;
+        fs_write(path, (const char *)buf, sz);
+        free(buf);   /* miniz 用 malloc */
+    }
+    mz_zip_reader_end(&zip);
+    return 0;
+}
+
+/* 在解压目录里找含 mod.json 的包根：直接命中，或唯一一级子目录命中
+ * （GitHub archive 常见 repo-tag/ 前缀）。成功时 root 写入 out。 */
+static int find_pkg_root(const char *dir, char *out, size_t cap) {
+    char mj[1200];
+    snprintf(mj, sizeof mj, "%s/mod.json", dir);
+    if (fs_exists(mj)) { snprintf(out, cap, "%s", dir); return 0; }
+
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, dir, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&req);
+        return -1;
+    }
+    char found[1200] = "";
+    int hits = 0;
+    uv_dirent_t ent;
+    while (uv_fs_scandir_next(&req, &ent) == 0) {
+        if (ent.name[0] == '.') continue;
+        char sub[1250];
+        snprintf(sub, sizeof sub, "%s/%s", dir, ent.name);
+        if (!fs_isdir(sub)) continue;
+        char smj[1300];
+        snprintf(smj, sizeof smj, "%s/mod.json", sub);
+        if (fs_exists(smj)) {
+            snprintf(found, sizeof found, "%s", sub);
+            hits++;
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    if (hits == 1) { snprintf(out, cap, "%s", found); return 0; }
+    return -1;
+}
+
+/* 包 ID → vendor 路径：foo/bar → <proj>/vendor/foo/bar */
+static void vendor_path_of(char *out, size_t cap, const char *proj,
+                           const char *name) {
+    path_join3(out, cap, proj, "vendor");
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s", name);
+    for (char *q = tmp; *q; q++) if (*q == '\\') *q = '/';
+    char *p = tmp;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (!slash) { path_join3(out, cap, out, p); break; }
+        *slash = 0;
+        path_join3(out, cap, out, p);
+        p = slash + 1;
+    }
+}
+
+/* ---- mod.lock ---- */
+
+static int lock_save(const char *proj_dir, char *err, size_t errcap) {
+    char root_mj[1200];
+    snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
+    TMod root;
+    if (!tmod_load(root_mj, &root, err, errcap)) return 2;
+
+    PkgBuf b;
+    pb_init(&b);
+    pb_puts(&b, "{\n");
+
+    /* BFS：root deps → 各包 manifest deps */
+    char **names = NULL; char **urls = NULL; char **refs = NULL;
+    int n = 0, cap = 0;
+    time_t now = time(NULL);
+    struct tm *gmt = gmtime(&now);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%SZ", gmt);
+
+    for (int i = 0; i < root.n_deps; i++) {
+        if (n >= cap) {
+            cap = cap ? cap * 2 : 16;
+            names = tm_realloc(names, sizeof(char *) * (size_t)cap);
+            urls = tm_realloc(urls, sizeof(char *) * (size_t)cap);
+            refs = tm_realloc(refs, sizeof(char *) * (size_t)cap);
+        }
+        names[n] = xstrdup(root.deps[i].name);
+        urls[n] = xstrdup(root.deps[i].url ? root.deps[i].url : "");
+        refs[n] = xstrdup(root.deps[i].ref ? root.deps[i].ref : "");
+        n++;
+    }
+    /* 展开传递依赖 */
+    for (int i = 0; i < n; i++) {
+        char vp[1400], pmj[1450];
+        vendor_path_of(vp, sizeof vp, proj_dir, names[i]);
+        snprintf(pmj, sizeof pmj, "%s/mod.json", vp);
+        TMod pm;
+        if (!tmod_load(pmj, &pm, NULL, 0)) continue;
+        for (int j = 0; j < pm.n_deps; j++) {
+            bool dup = false;
+            for (int k = 0; k < n; k++)
+                if (strcmp(names[k], pm.deps[j].name) == 0) { dup = true; break; }
+            if (dup) continue;
+            if (n >= cap) {
+                cap = cap ? cap * 2 : 16;
+                names = tm_realloc(names, sizeof(char *) * (size_t)cap);
+                urls = tm_realloc(urls, sizeof(char *) * (size_t)cap);
+                refs = tm_realloc(refs, sizeof(char *) * (size_t)cap);
+            }
+            names[n] = xstrdup(pm.deps[j].name);
+            urls[n] = xstrdup(pm.deps[j].url ? pm.deps[j].url : "");
+            refs[n] = xstrdup(pm.deps[j].ref ? pm.deps[j].ref : "");
+            n++;
+        }
+        tmod_free(&pm);
+    }
+
+    for (int i = 0; i < n; i++) {
+        pb_puts(&b, "  ");
+        pb_json_str(&b, names[i]);
+        pb_puts(&b, ": {\n    \"url\": ");
+        pb_json_str(&b, urls[i]);
+        pb_puts(&b, ",\n    \"ref\": ");
+        pb_json_str(&b, refs[i]);
+        pb_puts(&b, ",\n    \"resolved\": ");
+        pb_json_str(&b, ts);
+        pb_puts(&b, "\n  }");
+        pb_puts(&b, (i + 1 < n) ? ",\n" : "\n");
+        tm_free(names[i]); tm_free(urls[i]); tm_free(refs[i]);
+    }
+    tm_free(names); tm_free(urls); tm_free(refs);
+    tmod_free(&root);
+
+    pb_puts(&b, "}\n");
+    char lockp[1250];
+    snprintf(lockp, sizeof lockp, "%s/mod.lock", proj_dir);
+    int rc = fs_write(lockp, b.p, b.len);
+    tm_free(b.p);
+    if (rc < 0) { set_err(err, errcap, "cannot write mod.lock"); return 2; }
+    return 0;
+}
+
+/* ---- add ---- */
+
+/* 内部安装：物化到 vendor/<name> + 递归传递依赖；不写根 deps。
+ * out_name 可为 NULL；非 NULL 时写入包名（malloc，调用方 free）。 */
+static int pkg_install_core(const char *proj_dir, const char *source,
+                            char **out_name, char *err, size_t errcap);
+
+/* 递归安装依赖：url 为绝对 http(s) 或相对 proj_dir 的路径 */
+static int install_deps(const char *proj_dir, const TMod *parent,
+                        char *err, size_t errcap) {
+    for (int i = 0; i < parent->n_deps; i++) {
+        const char *durl = parent->deps[i].url;
+        if (!durl || !durl[0]) continue;
+
+        char exist[1400], emj[1450];
+        vendor_path_of(exist, sizeof exist, proj_dir, parent->deps[i].name);
+        snprintf(emj, sizeof emj, "%s/mod.json", exist);
+        if (fs_exists(emj)) continue;
+
+        char absurl[1400];
+        if (is_http_url(durl) || durl[0] == '/' ||
+            (strlen(durl) > 1 && durl[1] == ':')) {
+            snprintf(absurl, sizeof absurl, "%s", durl);
+        } else {
+            path_join3(absurl, sizeof absurl, proj_dir, durl);
+        }
+
+        char e2[512] = "";
+        int rc = pkg_install_core(proj_dir, absurl, NULL, e2, sizeof e2);
+        if (rc != 0) {
+            set_err(err, errcap, "failed to install dependency %s: %s",
+                    parent->deps[i].name, e2);
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* 核心安装：把已物化的包目录 src 装到 vendor/<name> + 递归 deps。
+ * out_name 可为 NULL；非 NULL 时写入包名（malloc，调用方 free）。 */
+static int install_from_src(const char *proj_dir, const char *src,
+                            char **out_name,
+                            char *err, size_t errcap) {
+    char smj[1300];
+    snprintf(smj, sizeof smj, "%s/mod.json", src);
+    TMod pkg;
+    if (!tmod_load(smj, &pkg, err, errcap)) return 1;
+    if (out_name) *out_name = xstrdup(pkg.name);
+
+    char dest[1400];
+    vendor_path_of(dest, sizeof dest, proj_dir, pkg.name);
+
+    /* 覆盖安装：先删旧目录 */
+    fs_rm_rf(dest);
+
+    char src_fwd[1200];
+    snprintf(src_fwd, sizeof src_fwd, "%s", src);
+    path_fwd(src_fwd);
+    if (strcmp(src_fwd, dest) != 0) {
+        if (fs_copy_tree(src, dest) < 0) {
+            set_err(err, errcap, "cannot copy package to %s", dest);
+            tmod_free(&pkg);
+            return 2;
+        }
+    }
+
+    int rc = install_deps(proj_dir, &pkg, err, errcap);
+    tmod_free(&pkg);
+    return rc;
+}
+
+static int pkg_install_core(const char *proj_dir, const char *source,
+                            char **out_name, char *err, size_t errcap) {
+    char staging[1250];
+    snprintf(staging, sizeof staging, "%s/.pkg-staging", proj_dir);
+    fs_rm_rf(staging);
+
+    int rc;
+    if (is_http_url(source)) {
+        if (!g_fetch) {
+            set_err(err, errcap, "HTTP fetch not available");
+            return 2;
+        }
+        char *buf = NULL;
+        size_t blen = 0;
+        rc = g_fetch(source, &buf, &blen, err, errcap);
+        if (rc != 0) { fs_rm_rf(staging); return rc; }
+        char zdir[1300];
+        snprintf(zdir, sizeof zdir, "%s/zip", staging);
+        rc = zip_extract_mem(buf, blen, zdir, err, errcap);
+        free(buf);
+        if (rc != 0) { fs_rm_rf(staging); return rc; }
+        char root[1300];
+        if (find_pkg_root(zdir, root, sizeof root) != 0) {
+            set_err(err, errcap, "no mod.json found in downloaded package");
+            fs_rm_rf(staging);
+            return 2;
+        }
+        rc = install_from_src(proj_dir, root, out_name, err, errcap);
+        fs_rm_rf(staging);
+        return rc;
+    }
+
+    if (fs_isdir(source)) {
+        char mj[1300];
+        snprintf(mj, sizeof mj, "%s/mod.json", source);
+        if (!fs_exists(mj)) {
+            set_err(err, errcap, "no mod.json in %s", source);
+            return 1;
+        }
+        return install_from_src(proj_dir, source, out_name, err, errcap);
+    }
+
+    if (fs_exists(source)) {
+        size_t zlen = 0;
+        char *zbuf = fs_read(source, &zlen);
+        if (!zbuf) {
+            set_err(err, errcap, "cannot read %s", source);
+            return 2;
+        }
+        char zdir[1300];
+        snprintf(zdir, sizeof zdir, "%s/zip", staging);
+        rc = zip_extract_mem(zbuf, zlen, zdir, err, errcap);
+        tm_free(zbuf);
+        if (rc != 0) { fs_rm_rf(staging); return rc; }
+        char root[1300];
+        if (find_pkg_root(zdir, root, sizeof root) != 0) {
+            set_err(err, errcap, "no mod.json found in zip %s", source);
+            fs_rm_rf(staging);
+            return 2;
+        }
+        rc = install_from_src(proj_dir, root, out_name, err, errcap);
+        fs_rm_rf(staging);
+        return rc;
+    }
+
+    set_err(err, errcap, "source not found: %s", source);
+    return 1;
+}
+
+int tphp_pkg_add(const char *proj_dir, const char *source, const char *ref,
+                 char *err, size_t errcap) {
+    if (!proj_dir || !proj_dir[0] || !source || !source[0]) {
+        set_err(err, errcap, "add requires project dir and source");
+        return 1;
+    }
+    char root_mj[1200];
+    snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
+    if (!fs_exists(root_mj)) {
+        set_err(err, errcap, "no mod.json in %s (not a package project?)", proj_dir);
+        return 1;
+    }
+
+    char *pkg_name = NULL;
+    int rc = pkg_install_core(proj_dir, source, &pkg_name, err, errcap);
+    if (rc != 0) { tm_free(pkg_name); return rc; }
+
+    /* 写入根 deps（若尚无） */
+    TMod root;
+    if (!tmod_load(root_mj, &root, err, errcap)) {
+        tm_free(pkg_name);
+        return 2;
+    }
+    bool found = false;
+    for (int i = 0; i < root.n_deps; i++)
+        if (strcmp(root.deps[i].name, pkg_name) == 0) { found = true; break; }
+    if (!found) {
+        root.deps = tm_realloc(root.deps,
+            sizeof(ModDep) * (size_t)(root.n_deps + 1));
+        root.deps[root.n_deps].name = pkg_name;   /* 所有权转移 */
+        root.deps[root.n_deps].url = xstrdup(source);
+        root.deps[root.n_deps].ref = xstrdup(ref ? ref : "");
+        root.n_deps++;
+        pkg_name = NULL;
+        if (tmod_save(root_mj, &root, err, errcap) != 0) {
+            tmod_free(&root);
+            tm_free(pkg_name);
+            return 2;
+        }
+    } else {
+        tm_free(pkg_name);
+    }
+    tmod_free(&root);
+
+    lock_save(proj_dir, err, errcap);
+    tphp_pkg_gen_autoload(proj_dir, err, errcap);
+    return 0;
+}
+
+/* ---- remove ---- */
+
+/* 从 proj 的 vendor 与 root deps 移除 name；清理不可达的传递依赖 */
+int tphp_pkg_remove(const char *proj_dir, const char *name,
+                    char *err, size_t errcap) {
+    if (!proj_dir || !proj_dir[0] || !name || !name[0]) {
+        set_err(err, errcap, "remove requires project dir and package name");
+        return 1;
+    }
+    char root_mj[1200];
+    snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
+    TMod root;
+    if (!tmod_load(root_mj, &root, err, errcap)) return 1;
+
+    bool found = false;
+    for (int i = 0; i < root.n_deps; i++) {
+        if (strcmp(root.deps[i].name, name) != 0) continue;
+        found = true;
+        tm_free(root.deps[i].name);
+        tm_free(root.deps[i].url);
+        tm_free(root.deps[i].ref);
+        for (int j = i; j + 1 < root.n_deps; j++)
+            root.deps[j] = root.deps[j + 1];
+        root.n_deps--;
+        break;
+    }
+    if (!found) {
+        set_err(err, errcap, "\"%s\" is not a dependency", name);
+        tmod_free(&root);
+        return 1;
+    }
+
+    /* 标记删除：从 root deps 出发 BFS 可达集；不在集内的 vendor 包删掉 */
+    char **keep = NULL;
+    int nkeep = 0, ckeep = 0;
+    for (int i = 0; i < root.n_deps; i++) {
+        if (nkeep >= ckeep) {
+            ckeep = ckeep ? ckeep * 2 : 16;
+            keep = tm_realloc(keep, sizeof(char *) * (size_t)ckeep);
+        }
+        keep[nkeep++] = root.deps[i].name;
+    }
+    /* 展开 keep（各包 deps） */
+    for (int i = 0; i < nkeep; i++) {
+        char vp[1400], pmj[1450];
+        vendor_path_of(vp, sizeof vp, proj_dir, keep[i]);
+        snprintf(pmj, sizeof pmj, "%s/mod.json", vp);
+        TMod pm;
+        if (!tmod_load(pmj, &pm, NULL, 0)) continue;
+        for (int j = 0; j < pm.n_deps; j++) {
+            bool dup = false;
+            for (int k = 0; k < nkeep; k++)
+                if (strcmp(keep[k], pm.deps[j].name) == 0) { dup = true; break; }
+            if (dup) continue;
+            if (nkeep >= ckeep) {
+                ckeep = ckeep ? ckeep * 2 : 16;
+                keep = tm_realloc(keep, sizeof(char *) * (size_t)ckeep);
+            }
+            keep[nkeep++] = xstrdup(pm.deps[j].name);
+        }
+        tmod_free(&pm);
+    }
+
+    /* 删除目标 + 所有不在 keep 里的 vendor 包 */
+    char tgt[1400];
+    vendor_path_of(tgt, sizeof tgt, proj_dir, name);
+    fs_rm_rf(tgt);
+
+    char vdir[1250];
+    snprintf(vdir, sizeof vdir, "%s/vendor", proj_dir);
+    /* 先收集待删路径，再统一删除（scandir 迭代中删目录会丢条目） */
+    char **todel = NULL;
+    int ntodel = 0, ctodel = 0;
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, vdir, 0, NULL) >= 0) {
+        uv_dirent_t ent;
+        while (uv_fs_scandir_next(&req, &ent) == 0) {
+            if (ent.name[0] == '.') continue;
+            char sub[1300];
+            snprintf(sub, sizeof sub, "%s/%s", vdir, ent.name);
+            if (!fs_isdir(sub)) continue;
+            /* 一级：vendor/<a> —— 可能是单段包或两级包的 vendor 段 */
+            char amj[1350];
+            snprintf(amj, sizeof amj, "%s/mod.json", sub);
+            if (fs_exists(amj)) {
+                /* 单段包名 */
+                bool in_keep = false;
+                char id[1300];
+                snprintf(id, sizeof id, "%s", ent.name);
+                for (int k = 0; k < nkeep; k++)
+                    if (strcmp(keep[k], id) == 0) { in_keep = true; break; }
+                if (!in_keep) {
+                    if (ntodel >= ctodel) {
+                        ctodel = ctodel ? ctodel * 2 : 8;
+                        todel = tm_realloc(todel, sizeof(char *) * (size_t)ctodel);
+                    }
+                    todel[ntodel++] = xstrdup(sub);
+                }
+                continue;
+            }
+            uv_fs_t r2;
+            if (uv_fs_scandir(NULL, &r2, sub, 0, NULL) < 0) {
+                uv_fs_req_cleanup(&r2);
+                continue;
+            }
+            uv_dirent_t e2;
+            while (uv_fs_scandir_next(&r2, &e2) == 0) {
+                if (e2.name[0] == '.') continue;
+                char pkg[1400];
+                snprintf(pkg, sizeof pkg, "%s/%s", sub, e2.name);
+                char pmj[1450];
+                snprintf(pmj, sizeof pmj, "%s/mod.json", pkg);
+                if (!fs_exists(pmj)) continue;
+                char id[1300];
+                snprintf(id, sizeof id, "%s/%s", ent.name, e2.name);
+                bool in_keep = false;
+                for (int k = 0; k < nkeep; k++)
+                    if (strcmp(keep[k], id) == 0) { in_keep = true; break; }
+                if (!in_keep) {
+                    if (ntodel >= ctodel) {
+                        ctodel = ctodel ? ctodel * 2 : 8;
+                        todel = tm_realloc(todel, sizeof(char *) * (size_t)ctodel);
+                    }
+                    todel[ntodel++] = xstrdup(pkg);
+                }
+            }
+            uv_fs_req_cleanup(&r2);
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    for (int i = 0; i < ntodel; i++) {
+        fs_rm_rf(todel[i]);
+        tm_free(todel[i]);
+    }
+    if (todel) tm_free(todel);
+    for (int i = 0; i < nkeep; i++) {
+        /* keep[0..nkeep) 中 root.deps 的指针归 root 所有；xstrdup 的需释放 */
+        for (int j = 0; j < root.n_deps; j++)
+            if (keep[i] == root.deps[j].name) { keep[i] = NULL; break; }
+        if (keep[i]) tm_free(keep[i]);
+    }
+    tm_free(keep);
+
+    /* 保存 + lock + autoload */
+    if (tmod_save(root_mj, &root, err, errcap) != 0) {
+        tmod_free(&root);
+        return 2;
+    }
+    tmod_free(&root);
+    lock_save(proj_dir, err, errcap);
+    tphp_pkg_gen_autoload(proj_dir, err, errcap);
+    return 0;
+}
+
+/* ---- install（按 mod.lock 恢复；无 lock 则从 mod.json deps 全量） ---- */
+
+int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
+    if (!proj_dir || !proj_dir[0]) {
+        set_err(err, errcap, "install requires project dir");
+        return 1;
+    }
+    char root_mj[1200], lockp[1250];
+    snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
+    snprintf(lockp, sizeof lockp, "%s/mod.lock", proj_dir);
+    if (!fs_exists(root_mj)) {
+        set_err(err, errcap, "no mod.json in %s (not a package project?)", proj_dir);
+        return 1;
+    }
+
+    /* lock 存在：逐条恢复缺失包；否则从 mod.json deps 递归 */
+    if (fs_exists(lockp)) {
+        size_t llen = 0;
+        char *lraw = fs_read(lockp, &llen);
+        if (!lraw) {
+            set_err(err, errcap, "cannot read mod.lock");
+            return 2;
+        }
+        char *lstripped = jsonc_strip(lraw, llen);
+        tm_free(lraw);
+        TVal lv;
+        bool ok = tphp_json_decode_c(lstripped, strlen(lstripped), &lv);
+        tm_free(lstripped);
+        if (!ok || lv.t != T_ARR) {
+            set_err(err, errcap, "mod.lock: invalid JSON");
+            return 2;
+        }
+        TArr *lock = (TArr *)lv.u.p;
+        for (uint32_t i = 0; i < lock->dused; i++) {
+            if (lock->data[i].t != T_ARR) continue;
+            TVal key = TV_NULL;
+            for (uint32_t b = 0; b < lock->bcap; b++) {
+                ABucket *bk = &lock->buckets[b];
+                if (bk->key.t != T_NULL && bk->val_off == i) { key = bk->key; break; }
+            }
+            if (key.t != T_STR) continue;
+            TStr *ks = (TStr *)key.u.p;
+            TArr *ent = (TArr *)lock->data[i].u.p;
+            char *url = mget_str(ent, "url");
+            char *ref = mget_str(ent, "ref");
+            if (!url || !url[0]) { tm_free(url); tm_free(ref); continue; }
+
+            /* 已安装则跳过（离线友好） */
+            char exist[1400], emj[1450];
+            vendor_path_of(exist, sizeof exist, proj_dir, tstr_val(ks));
+            snprintf(emj, sizeof emj, "%s/mod.json", exist);
+            if (fs_exists(emj)) {
+                tm_free(url); tm_free(ref);
+                continue;
+            }
+
+            char absurl[1400];
+            if (is_http_url(url) || url[0] == '/' ||
+                (strlen(url) > 1 && url[1] == ':')) {
+                snprintf(absurl, sizeof absurl, "%s", url);
+            } else {
+                path_join3(absurl, sizeof absurl, proj_dir, url);
+            }
+            char e2[512] = "";
+            int rc = pkg_install_core(proj_dir, absurl, NULL, e2, sizeof e2);
+            if (rc != 0) {
+                set_err(err, errcap, "install %s failed: %s", tstr_val(ks), e2);
+                tval_release(&lv);
+                tm_free(url); tm_free(ref);
+                return rc;
+            }
+            tm_free(url); tm_free(ref);
+        }
+        tval_release(&lv);
+    } else {
+        /* 无 lock：从 mod.json deps 递归安装 */
+        TMod root;
+        if (!tmod_load(root_mj, &root, err, errcap)) return 2;
+        for (int i = 0; i < root.n_deps; i++) {
+            char exist[1400], emj[1450];
+            vendor_path_of(exist, sizeof exist, proj_dir, root.deps[i].name);
+            snprintf(emj, sizeof emj, "%s/mod.json", exist);
+            if (fs_exists(emj)) continue;
+            char absurl[1400];
+            const char *durl = root.deps[i].url;
+            if (!durl || !durl[0]) continue;
+            if (is_http_url(durl) || durl[0] == '/' ||
+                (strlen(durl) > 1 && durl[1] == ':')) {
+                snprintf(absurl, sizeof absurl, "%s", durl);
+            } else {
+                path_join3(absurl, sizeof absurl, proj_dir, durl);
+            }
+            char e2[512] = "";
+            int rc = pkg_install_core(proj_dir, absurl, NULL, e2, sizeof e2);
+            if (rc != 0) {
+                set_err(err, errcap, "install %s failed: %s",
+                        root.deps[i].name, e2);
+                tmod_free(&root);
+                return rc;
+            }
+        }
+        tmod_free(&root);
+    }
+
+    lock_save(proj_dir, err, errcap);
+    tphp_pkg_gen_autoload(proj_dir, err, errcap);
+    return 0;
 }

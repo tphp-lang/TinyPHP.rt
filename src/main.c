@@ -93,6 +93,10 @@ static void print_usage(FILE *out) {
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
         "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
+        "  tphp add <source> [ref]         add dependency (URL/zip/path)\n"
+        "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
+        "  tphp install                    restore deps from mod.lock (or mod.json)\n"
+        "  tphp upload                     print package publishing instructions\n"
         "  tphp -v, --version              print version\n",
         TPHP_VERSION);
 }
@@ -500,6 +504,61 @@ static int run_source(const char *src, const char *name, bool dump) {
     return rc;
 }
 
+/* ---- HTTP(S) zip 下载（pkg add 用；复用 http_get + 全量 VM） ---- */
+
+static void php_sq_escape(const char *s, char *out, size_t cap) {
+    size_t n = 0;
+    for (; *s && n + 2 < cap; s++) {
+        if (*s == '\\' || *s == '\'') out[n++] = '\\';
+        out[n++] = *s;
+    }
+    out[n] = 0;
+}
+
+static int fetch_http(const char *url, char **out, size_t *out_len,
+                      char *err, size_t errcap) {
+    char dest[1024];
+    snprintf(dest, sizeof dest, ".tphp-pkg-dl.tmp");
+    char eu[2048], ed[2048];
+    php_sq_escape(url, eu, sizeof eu);
+    php_sq_escape(dest, ed, sizeof ed);
+    char code[4608];
+    snprintf(code, sizeof code,
+        "<?php $d = http_get('%s'); "
+        "if ($d === false) exit(1); "
+        "file_put_contents('%s', $d);",
+        eu, ed);
+    int rc = run_source(code, "<pkg-fetch>", false);
+    if (rc != 0) {
+        snprintf(err, errcap, "download failed: %s", url);
+        remove(dest);
+        return 2;
+    }
+    FILE *f = fopen(dest, "rb");
+    if (!f) {
+        snprintf(err, errcap, "download wrote no data: %s", url);
+        return 2;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        remove(dest);
+        snprintf(err, errcap, "empty download: %s", url);
+        return 2;
+    }
+    char *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); remove(dest); return 2; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    remove(dest);
+    if (got != (size_t)sz) { free(buf); return 2; }
+    *out = buf;
+    *out_len = got;
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     /* binary stdout: PHP CLI parity — echo "\n" must emit LF, not CRLF.
@@ -518,6 +577,9 @@ int main(int argc, char **argv) {
     /* --debug 可出现在任意位置，故先全量预扫（不消耗 argv） */
     for (int di = 1; di < argc; di++)
         if (strcmp(argv[di], "--debug") == 0) { g_debug = true; break; }
+
+    /* pkg add 的 HTTP(S) zip 下载回调 */
+    tphp_pkg_set_fetch(fetch_http);
 
     /* M6.1: 启动最早期——释放内嵌原生资产 + 检测嵌入主脚本（跨平台） */
     char *embedded_main = NULL;
@@ -573,6 +635,20 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "tphp: build requires a script path\n");
                 return (int)TPHP_E_ARGS;
             }
+            /* 自动打包 vendor：有 mod.json 且 vendor/ 存在、且未显式 --with 时追加 */
+            bool vendor_auto = false;
+            if (nwith == 0) {
+                FILE *mj = fopen("mod.json", "rb");
+                FILE *vd = fopen("vendor/autoload.php", "rb");
+                if (mj && vd && nwith < 32) {
+                    withs[nwith++] = "vendor";
+                    vendor_auto = true;
+                }
+                if (mj) fclose(mj);
+                if (vd) fclose(vd);
+            }
+            /* 自动 vendor 时启用排除（tests/ 与 *.md）；显式 --with 尊重用户路径 */
+            tphp_pack_set_vendor_strict(vendor_auto);
             char *php = read_file(script);
             if (!php) return (int)TPHP_E_IO;
             /* 复制自身 → out_exe 再注入 */
@@ -626,6 +702,7 @@ int main(int argc, char **argv) {
             main_dirname(script_abs, src_root, sizeof src_root);
             int rc = tphp_pack_exe(out_exe, php, strlen(php), withs, nwith,
                                    src_root[0] ? src_root : NULL, script_abs);
+            tphp_pack_set_vendor_strict(false);
             free(php);
             return rc == 0 ? (int)TPHP_OK : (int)TPHP_E_IO;
         }
@@ -692,6 +769,65 @@ int main(int argc, char **argv) {
             }
             printf("Created %s package \"%s\" in %s\n", lib ? "lib" : "app",
                    name, dir);
+            return (int)TPHP_OK;
+        }
+        if (strcmp(a, "add") == 0) {
+            /* tphp add <source> [ref]：URL/zip 路径/目录；cwd 须含 mod.json */
+            if (i + 1 >= argc) {
+                fprintf(stderr, "tphp: add requires a source (URL, zip, or path)\n");
+                return (int)TPHP_E_ARGS;
+            }
+            const char *source = argv[i + 1];
+            const char *ref = (i + 2 < argc && argv[i + 2][0] != '-')
+                             ? argv[i + 2] : NULL;
+            char err[512] = "";
+            int rc = tphp_pkg_add(".", source, ref, err, sizeof err);
+            if (rc != 0) {
+                fprintf(stderr, "tphp: %s\n", err);
+                return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+            }
+            printf("Added %s\n", source);
+            return (int)TPHP_OK;
+        }
+        if (strcmp(a, "remove") == 0) {
+            /* tphp remove <name>：包 ID 如 foo/bar */
+            if (i + 1 >= argc) {
+                fprintf(stderr, "tphp: remove requires a package name\n");
+                return (int)TPHP_E_ARGS;
+            }
+            char err[512] = "";
+            int rc = tphp_pkg_remove(".", argv[i + 1], err, sizeof err);
+            if (rc != 0) {
+                fprintf(stderr, "tphp: %s\n", err);
+                return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+            }
+            printf("Removed %s\n", argv[i + 1]);
+            return (int)TPHP_OK;
+        }
+        if (strcmp(a, "install") == 0) {
+            /* tphp install：按 mod.lock 恢复缺失包；无 lock 从 mod.json deps */
+            char err[512] = "";
+            int rc = tphp_pkg_install(".", err, sizeof err);
+            if (rc != 0) {
+                fprintf(stderr, "tphp: %s\n", err);
+                return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+            }
+            printf("Installed dependencies\n");
+            return (int)TPHP_OK;
+        }
+        if (strcmp(a, "upload") == 0) {
+            /* tphp upload：占位——发布即 git push + tag（注册表后置） */
+            printf(
+                "Upload is a placeholder: publishing a package means pushing to your git host.\n"
+                "\n"
+                "  1. Bump \"version\" in mod.json\n"
+                "  2. git add mod.json && git commit -m \"release <version>\"\n"
+                "  3. git tag v<version> && git push --tags\n"
+                "\n"
+                "Consumers add your package with:\n"
+                "  tphp add <zip-url-or-path> [ref]\n"
+                "\n"
+                "A central registry may come later; see PLAN/pkg-manager.md.\n");
             return (int)TPHP_OK;
         }
         if (strcmp(a, "-e") == 0) {

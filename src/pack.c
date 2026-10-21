@@ -216,6 +216,24 @@ static bool ends_with_ci(const char *s, const char *suf) {
     return true;
 }
 
+/* vendor 自动打包排除（PLAN/pkg-manager §5.3）：
+ * 恒跳过 VCS/系统垃圾；strict（自动 --with vendor/）再跳 tests/、*.md。
+ * 显式 --with 时 strict=false，仅保留 VCS/系统垃圾跳过。 */
+static bool g_vendor_strict = false;
+void tphp_pack_set_vendor_strict(bool on) { g_vendor_strict = on; }
+
+static bool pack_skip_name(const char *name) {
+    if (strcmp(name, ".git") == 0 || strcmp(name, ".gitignore") == 0 ||
+        strcmp(name, ".gitattributes") == 0 || strcmp(name, ".DS_Store") == 0 ||
+        strcmp(name, "Thumbs.db") == 0)
+        return true;
+    if (g_vendor_strict) {
+        if (strcmp(name, "tests") == 0 || strcmp(name, "test") == 0) return true;
+        if (ends_with_ci(name, ".md")) return true;
+    }
+    return false;
+}
+
 /* ---- 收集 --with 条目 ---- */
 
 typedef struct {
@@ -267,13 +285,10 @@ static void collect_dir(PackList *l, const char *base_abs, const char *base_rel,
             snprintf(rel, sizeof rel, "%s/%s", base_rel, fname);
         else
             snprintf(rel, sizeof rel, "%s", fname);
+        if (pack_skip_name(fname)) continue;   /* VCS/垃圾/vendor 排除 */
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             collect_dir(l, abs, rel, depth + 1);
         } else {
-            if (ends_with_ci(fname, ".php")) {
-                fprintf(stderr, "tphp: warning: skipping .php file '%s'\n", rel);
-                continue;
-            }
             if (!relpath_safe(rel)) {
                 fprintf(stderr, "tphp: warning: unsafe path skipped '%s'\n", rel);
                 continue;
@@ -299,15 +314,12 @@ static void collect_dir(PackList *l, const char *base_abs, const char *base_rel,
             snprintf(rel, sizeof rel, "%s/%s", base_rel, e->d_name);
         else
             snprintf(rel, sizeof rel, "%s", e->d_name);
+        if (pack_skip_name(e->d_name)) continue;   /* VCS/垃圾/vendor 排除 */
         struct stat st;
         if (stat(abs, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
             collect_dir(l, abs, rel, depth + 1);
         } else {
-            if (ends_with_ci(e->d_name, ".php")) {
-                fprintf(stderr, "tphp: warning: skipping .php file '%s'\n", rel);
-                continue;
-            }
             if (!relpath_safe(rel)) {
                 fprintf(stderr, "tphp: warning: unsafe path skipped '%s'\n", rel);
                 continue;
@@ -438,10 +450,7 @@ static void collect_with(PackList *l, const char *p) {
         } else {
             path_to_rel_base(p, rel, sizeof rel);
         }
-        if (ends_with_ci(rel, ".php")) {
-            fprintf(stderr, "tphp: warning: skipping .php file '%s'\n", rel);
-            return;
-        }
+        if (pack_skip_name(rel)) return;   /* VCS/垃圾/vendor 排除 */
         if (!relpath_safe(rel)) {
             fprintf(stderr, "tphp: unsafe filename '%s'\n", rel);
             exit(1);
