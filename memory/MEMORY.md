@@ -51,14 +51,13 @@
 ### 跳过决策（用户拍板）
 - 魔法常量 `__CLASS__`/`__FUNCTION__`/`__METHOD__`/`__NAMESPACE__`/`__TRAIT__`：使用频率低，可用 `self::class` 等替代，**不做**
 
-### 包管理器设计（PLAN/pkg-manager.md，待实现）
-- 内置 Git 包管理：`tphp new/add/remove/install/upload`（upload 占位）
-- mod.json（name/version/type/author/description/license/autoload/deps/pack）+ mod.lock（commit SHA）
-- 包 ID `foo/bar` → `vendor/foo/bar/`；全项目共享拍平；禁止嵌套 vendor
-- autoload：PSR-4+files；install 生成 vendor/autoload.php（根项目+依赖合并）；**无 main 字段、无单一 namespace 字段**
-- ref 规格：dev/分支/tag/`^~` semver/latest/SHA；latest=本地 tag semver 排序（不调平台 API）
-- 打包衔接：自动 --with vendor/；排除 .git/系统垃圾/依赖包 tests/；pack.include/exclude 清单字段
-- 实施约 4.5~5 天，四阶段；记忆目录迁至 `memory/`
+### 包管理器（PLAN/pkg-manager.md；**四阶段已实现**，2026-10-21）
+- **无外部工具/无 git**（用户拍板）：包源 = GitHub 仓库 URL（zipball；无 ref → 匿名 API 解析最新发布**固化进 mod.json**）/ HTTP(S) zip 直链 / 本地路径或 zip；纯 C：http_get + miniz 解压
+- `tphp new/add/remove/install/upload` + builtin `pkg_new/add/remove/install`；mod.json + mod.lock（`{url, ref, resolved}`，无 commit）
+- 包 ID `foo/bar` → `vendor/foo/bar/`；全项目共享拍平；禁止嵌套 vendor；覆盖前 fail-closed 检查
+- autoload：PSR-4（长前缀优先，substr 匹配）+ files；install/add/remove 生成 vendor/autoload.php；**无 main 字段、无单一 namespace 字段**
+- 打包衔接：build 自动 --with vendor/（strict 跳 tests/*.md）；`.php` 进 zip；pack.include/exclude 解析保留、build 消费后置
+- 用户文档 doc/package-manager.md；CLI 入口 doc/cli.md；测试 tests/pkg/ 7 个
 
 ### 环境/操作备忘
 - Edit 工具改 C 文件中文注释合法 UTF-8；clang 控制台输出乱码只是显示
@@ -66,8 +65,8 @@
 - git 提交时 `build/cacert.pem` 是刻意入库的（.gitignore `!` 豁免），勿误删
 
 ## 2026-10-20 会话二：包管理阶段 A（174/174，HEAD=8fcee3f 未提交）
-- **决策变更（用户拍板）：包管理不依赖 git 应用**——来源=HTTP(S) zip 直链 + 本地路径/zip（http_get+miniz）；ref 精确定位（无 ls-remote，不做 ^~ /latest）；deps=`{url, ref}`（读兼容旧 git 键）。PLAN/pkg-manager.md 待阶段 D 改写
+- **决策变更（用户拍板）：包管理不依赖 git 应用**——来源=HTTP(S) zip 直链 + 本地路径/zip（http_get+miniz）；ref 精确定位（无 ls-remote，不做 ^~ /latest）；deps=`{url, ref}`（读兼容旧 git 键）。~~PLAN 待阶段 D 改写~~ **10-21 已完成**（PLAN 主体/索引/cli/stdlib/package-manager 边界表全部同步无 git 版）
 - 阶段 A 完成：src/pkg.{c,h}（jsonc 剥离→json.c C API `tphp_json_decode_c`→TMod；libuv 同步 fs；tmod pretty writer；autoload 生成=根+vendor 扫描+PSR-4 长前缀排序+首版 stub；`tphp new`；builtin `pkg_new` 测试缝）；tests/pkg/ 2 个；run.ps1 目录表 +"pkg"；零警告
 - 附带运行时修复（锚点）：①class_resolve_lc2(lc,orig)——spl_autoload 收原始大小写类名（PSR-4 必需，全调用点已换）②TFunc.prog 反查——动态 require 的独立 Program funcs 表，CLOSURE_INIT 用 vm->prog 会越界 0xC0000005 ③嵌套循环两套语义：默认 run_frame_until_pop 保持旧"帧切换即退出"（改深=析构/magic 时序崩、大面积 0xC0000005）；仅 autoload 用 run_frame_until_pop_deep，且**必须先缓存 stop=f->prev（f 弹出即 free，条件读 f->prev 是 UAF）**
 - 杂项坑：stdlib 无 strncmp（生成代码用 substr）；build 每次重生成 bundle_data.c——stash/checkout 撞它先 restore；PS 把 `stash@{0}` 的花括号剥掉
-- 下次：阶段 B add/remove（zip 下载/本地拷贝+传递依赖+mod.lock，fixture 改本地 zip 目录）→ C（install+build 衔接）→ D（upload/文档/PLAN 同步）；工作区改动未提交
+- ~~下次：阶段 B → C → D~~ **已完成（2026-10-21，HEAD 见 1b57f0c 之后的 pkg 提交）**：add/remove/install/upload + 失败诊断测试 + path_join3 修复 + Windows Root 信任库 + GitHub URL v2 语义 + 覆盖 fail-closed；基线 179/179

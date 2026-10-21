@@ -176,10 +176,10 @@ tphp build main.php --with assets/ --with vendor/ -o app
 
 | 项 | 说明 |
 |---|---|
-| 私有仓库 | 不自建认证；https 走系统 credential helper，ssh 走 key（git 源时） |
-| 版本解析 | 不调平台 API；`ref` 为记录用，版本锚点是 URL 本身 |
+| 私有仓库 | 不自建认证、不依赖 git；HTTPS 信任链 = 内嵌 Mozilla CA ∪ 系统 Root 存储（Windows 系统证书库） |
+| 版本解析 | GitHub 裸仓库 URL 无 ref 时调匿名 API 解析最新发布（限流 60 次/小时/IP）并固化 ref；zip 直链以 URL 为版本锚点，`ref` 仅记录 |
 | 嵌套 vendor | 禁止（全项目共享扁平 vendor） |
-| `pack` 字段 | 设计中的 `pack.include`/`pack.exclude` 见 PLAN/pkg-manager §5.3（后续实现） |
+| `pack` 字段 | `pack.include`/`pack.exclude` 已在 mod.json 解析与保留，`tphp build` 消费后置 |
 | autoload.classmap | 未支持（PSR-4 + files 覆盖主流） |
 
 ## 相关文档

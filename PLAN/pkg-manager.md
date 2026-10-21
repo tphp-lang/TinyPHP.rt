@@ -1,11 +1,11 @@
-# pkg-manager · 内置 Git 包管理器
+# pkg-manager · 内置包管理器（无外部工具）
 
-> 状态：设计定稿，待实现。定稿时间：2026-10-20。
-> 上级索引：[../PLAN.md](../PLAN.md)。本文档是包管理子系统的权威规格。
+> 状态：**四阶段已实现**（A 2026-10-20 / B·C·D 2026-10-21）。定稿 2026-10-20；2026-10-21 演进为**无 git 版**（用户拍板：不要求用户机器安装 git）。
+> 上级索引：[../PLAN.md](../PLAN.md)。本文档是包管理子系统的权威规格。用户文档见 [../doc/package-manager.md](../doc/package-manager.md)。
 
 ## 1. 定位与决策
 
-内置到 `tphp` CLI 的 Git 包管理。**不调用任何托管平台 API**（GitHub/Gitee/GitCode/自建 Gitea 同构，纯 `git` 子进程）；**不做远程注册表**，发布即「git push + tag」。
+内置到 `tphp` CLI 的包管理。**不依赖 git 或任何外部可执行程序**：包源为 HTTP(S) zip 直链、GitHub 仓库页 URL（zipball 下载，无 ref 时经 GitHub 匿名 API 解析最新发布）、本地路径（目录或 zip）。**不做远程注册表**，发布即「git tag + 可下载 zip」（发布者侧用 git 不影响消费者侧）。
 
 | 决策点 | 结论 |
 |---|---|
@@ -13,8 +13,9 @@
 | 包 ID | `foo/bar`（斜杠分层，Composer/npm 同款） |
 | vendor 布局 | `vendor/foo/bar/` 嵌套；全项目共享拍平，禁止嵌套 vendor |
 | 自动加载 | PSR-4 + `files`；`install` 生成 `vendor/autoload.php` |
-| 版本解析 | tag + 本地 semver 排序；不调平台 Release API |
-| 私有仓库 | 不自建 auth；https 走 credential helper，ssh 走 key |
+| 包源 | zip 直链 / GitHub 仓库 URL（zipball）/ 本地路径或 zip；纯 C 下载+miniz 解压 |
+| 版本解析 | GitHub 裸仓库 URL 无 ref → 匿名 API 解析最新发布并**固化进 mod.json**；zip URL 以 URL 为锚点（详见 §3、§7） |
+| 私有仓库 | 不自建 auth；HTTPS 信任链 = 内嵌 Mozilla ∪ 系统 Root 存储 |
 | 远程注册表 | 不做；`tphp upload` 占位打印发布指引 |
 | `main` 字段 | 不设（autoload 覆盖库加载；应用入口命令行指定） |
 | 单一 `namespace` 字段 | 不设（包可多命名空间，用 `autoload.psr-4` 映射表） |
@@ -43,8 +44,8 @@
   },
   "deps": {                      // 可选
     "acme/utils": {
-      "git": "https://gitee.com/acme/utils.git",
-      "ref": "^1.0"             // 见 §3 版本规格
+      "url": "https://github.com/acme/utils",  // GitHub 仓库 URL / zip 直链 / 本地路径
+      "ref": "v1.2.0"             // 解析或声明的版本；见 §3
     }
   }
 }
@@ -62,7 +63,7 @@
 | `license` | 建议 | 建议 | `tphp build` 再分发时追溯 |
 | `autoload` | 可选 | 可选 | `psr-4` + `files`；应用自身类同样可用 |
 | `pack` | 可选 | 可选 | `include`/`exclude`，控制 `tphp build` 打包集 |
-| `deps` | 可选 | 可选 | `"foo/bar": { git, ref }` |
+| `deps` | 可选 | 可选 | `"foo/bar": { url, ref }`（读取兼容旧 `git` 键） |
 
 **无 `main`**：autoload 覆盖库的类加载；应用入口由 CLI 指定（`tphp run src/index.php`）。
 **无单一 `namespace`**：包可含多个命名空间，由 `autoload.psr-4` 映射表声明。
@@ -72,13 +73,14 @@
 ```jsonc
 {
   "foo/bar": {
-    "git": "https://github.com/foo/bar.git",
-    "ref": "v1.2.0",            // 用户声明的原始规格
-    "commit": "a1b2c3d4e5f6…",  // 解析后的精确 SHA
-    "resolved": "2026-10-20T16:30:00Z"
+    "url": "https://github.com/foo/bar",  // 来源（GitHub 裸 URL 已剥 :ref 后缀）
+    "ref": "v1.2.0",            // 解析/声明的版本（GitHub 裸 URL 的解析结果已固化）
+    "resolved": "2026-10-20T16:30:00Z"  // 解析时间
   }
 }
 ```
+
+无 `commit` 字段（无 git，SHA 不可得）；可复现性由「固化 ref + URL」保证。
 
 ### 2.3 目录布局
 
@@ -124,14 +126,15 @@ $psr4 = [
 ];
 
 // 3) 注册 autoloader（走 TinyPHP 已有 spl_autoload_register）
+//    前缀匹配用 substr+strlen（stdlib 无 strncmp）；长前缀在生成时已排前
 spl_autoload_register(function (string $class) use ($psr4) {
     $norm = str_replace("\\", "/", $class) . ".php";
     foreach ($psr4 as $prefix => $dirs) {
-        if (strncmp($class, $prefix, strlen($prefix)) !== 0) continue;
+        if (substr($class, 0, strlen($prefix)) !== $prefix) continue;
         $rel = substr($norm, strlen(str_replace("\\", "/", $prefix)));
         foreach ($dirs as $dir) {
             $f = $dir . "/" . $rel;
-            if (is_file($f)) { require $f; return; }
+            if (file_exists($f)) { require $f; return; }
         }
     }
 });
@@ -148,16 +151,26 @@ use Acme\Http\Client;
 
 ## 3. `ref` 版本规格
 
-| 写法 | 解析方式 | 说明 |
-|---|---|---|
-| `dev` | 默认分支 tip | `git clone` / `checkout` 默认分支 |
-| 分支名（`main`/`develop`） | 该分支 tip | |
-| `v1.2.0` / `1.2.0` | 精确 tag | `ls-remote --tags` 匹配，自动试 `v` 前缀 |
-| `^1.0` / `~1.2` | 最高兼容 semver tag | 本地对 tag 列表 semver 排序 |
-| 省略 / `latest` | 最高 semver tag | 无 tag 则回退默认分支 + 警告 |
-| 40 位 SHA | 该 commit | `git fetch <sha> && checkout` |
+包源三类，ref 语义各异（2026-10-21 无 git 版重写；原 git 时代「dev/分支/SHA/`^~` 约束」表已废弃）：
 
-「最新发布版」= tag + 本地 semver 排序，**不调 GitHub/Gitee Release API**——tag 是发布事实，Release 只是展示层；且避免为每个平台写一套认证与响应解析。无 tag 仓库回退默认分支并对齐 Composer `dev-main` 行为。
+### GitHub 仓库页 URL
+
+| 写法 | 解析方式 |
+|---|---|
+| 裸仓库 URL（无 ref） | 匿名 API 查最新发布：`releases/latest` → 失败回退 `tags` 列表本地 semver 排序 → 再失败回退默认分支 + stderr warning；**解析出的 ref 固化进 mod.json**（可复现） |
+| `url:ref` 后缀 / CLI `ref` 参数 | 直接下 `zipball/<ref>`（tag/分支皆可；CLI 参数优先；含 `/` 的 ref 只能用 CLI 参数形式；`:ref` 只在 path 内最后一个 `/` 之后切，ref 限 `[A-Za-z0-9._-]`） |
+
+支持 `owner/repo`、可选 `.git` 尾缀、`/tree/<分支>` 路径（优先级低于 `:ref`）。API 匿名限流 60 次/小时/IP（文档已注明）。
+
+### HTTP(S) zip 直链 / 本地 zip
+
+URL 或路径**本身就是版本锚点**；`ref` 字段仅记录（可省）。
+
+### 本地目录（开发中互指）
+
+直接拷贝进 vendor；`ref` 可空。
+
+> 原「不调 Release API」是 git 时代决策（`ls-remote` 免费拿 tag）；无 git 时 API 是唯一可靠来源，已在 §7 记录推翻。
 
 ## 4. 命令规格
 
@@ -195,12 +208,14 @@ echo "Hello, world\n";
 
 `name` 校验：应用允许单段名（无斜杠）作为项目名；库包必须 `^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*$`（小写，斜杠分层）。
 
-### 4.2 `tphp add <git-url>[:ref]`
+### 4.2 `tphp add <source> [ref]`
 
-1. 解析 URL + ref（缺省 `latest`）
-2. 查 `mod.json` `deps`：同名已存在则更新 ref；否则新增
-3. `git ls-remote` 解析 commit SHA
-4. `git clone --depth 1` 到临时目录 → 检出 → 拷贝到 `vendor/<name>/`（排除 `.git`）
+source = GitHub 仓库 URL / HTTP(S) zip 直链 / 本地路径（目录或 zip）。
+
+1. 解析 source + ref（GitHub 裸 URL 无 ref → 按 §3 解析最新发布并固化）
+2. 查 `mod.json` `deps`：同名已存在则更新 ref 并重装；否则新增
+3. 获取内容：HTTP 下载 zip（miniz 解压）/ 本地 zip 解压 / 本地目录拷贝
+4. **覆盖前 fail-closed 安全检查**（§7 vendor 覆盖保护）→ 落盘 `vendor/<name>/`
 5. 读包内 `mod.json` 取真实 `name`（与 URL 推导不一致时以包内为准，调整路径）
 6. 递归处理包的 `deps`（传递依赖拍平；同名冲突：semver 兼容取最高，不兼容 Fatal 并打印依赖链）
 7. 写 `mod.json` + `mod.lock`
@@ -237,27 +252,29 @@ echo "Hello, world\n";
 ```
 src/
 ├── pkg.c / pkg.h      # 包管理核心
-│   ├── mod.json 解析/序列化（轻量专用，不必通用 JSON 引擎）
-│   ├── git 子进程封装（ls-remote / clone --depth 1 / checkout）
-│   ├── vendor 布局管理
+│   ├── mod.json 解析/序列化（轻量专用 + json.c 的 tphp_json_decode_c C API）
+│   ├── 获取：HTTP(S) zip 下载（net.c http_get）+ miniz 解压 / 本地目录拷贝
+│   ├── GitHub 仓库 URL 改写（gh_repo_to_zip）+ 匿名 API 解析最新发布
+│   ├── vendor 布局管理 + 覆盖前 fail-closed 检查
 │   ├── mod.lock 读写
 │   ├── autoload.php 生成
 │   └── 依赖图：递归解析、拍平、冲突检测
 │
 ├── main.c             # CLI 路由：new/add/remove/install/upload
-└── (现有) pack.c      # build 时 --with vendor/ 无需改
+└── (现有) pack.c      # build 自动 --with vendor/（tphp_pack_set_vendor_strict）
 ```
 
 ### 5.1 关键实现点
 
 | 点 | 方案 |
 |---|---|
-| JSON | 现有 `json.c` 编解码到 TVal。新增轻量 `mod_json` 读写（name/version/type/autoload/deps 五段） |
-| git 调用 | `system()` / `_popen`；Windows/Unix 分支处理引号与路径；失败透传 git stderr |
-| semver | 简单比较器：`major.minor.patch`；支持 `^` `~` `latest` |
+| JSON | 现有 `json.c` 编解码到 TVal；新增 `tphp_json_decode_c`（无 VM、静默）；写回为 pkg.c 手写 pretty printer |
+| 内容获取 | `net.c http_get` 下载 zip → miniz 解压；本地目录/zip 直接拷贝/解压；全程无外部进程 |
+| GitHub 解析 | `gh_split_url_ref`（`:ref` 切分）→ `gh_latest_ref`（releases/latest → tags semver → 默认分支）→ `zipball/<ref>` |
+| semver | 本地比较器：`major.minor.patch`；tags 列表排序用于「最新发布」回退 |
 | 传递依赖 | DFS + visited 集；冲突：宽版本约束满足取最高，否则 Fatal 列两条链 |
-| autoload 生成 | 遍历 `vendor/*/mod.json` autoload 段，拼接 PHP |
-| 路径分隔符 | 统一 `/`；Windows 下 git 输出转换 |
+| autoload 生成 | 遍历 `vendor/*/*/mod.json` autoload 段，拼接 PHP（PSR-4 长前缀优先） |
+| 路径分隔符 | 统一 `/`（libuv 同步 fs，Windows UTF-8 路径安全） |
 
 ### 5.2 与现有系统衔接
 
@@ -356,21 +373,21 @@ build 时：
 
 ## 6. 实施阶段
 
-### 阶段 A — 骨架与 `new`（~1 天）
+### 阶段 A — 骨架与 `new`（~1 天）✅ 已完成（2026-10-20）
 
-- `pkg.h` / `pkg.c` 骨架
-- mod.json 最小读写（name/version/type/license）
-- `tphp new` / `tphp new --lib`
-- 测试：生成骨架可 `tphp run`
+- `pkg.h` / `pkg.c` 骨架（jsonc 剥离、libuv 同步 fs、autoload 生成）
+- mod.json 读写（name/version/type/license + autoload/deps/pack 全段）
+- `tphp new` / `tphp new --lib` + builtin `pkg_new`
+- 测试：生成骨架可 `tphp run`（`test-pkg-new-app/lib.php`）
 
-### 阶段 B — `add` / `remove` 本地 Git（~2 天）
+### 阶段 B — `add` / `remove`（~2 天）✅ 已完成（2026-10-21，无 git 版）
 
-- git 封装：ls-remote、clone --depth 1、checkout
-- ref 解析（dev / 分支 / tag / SHA / latest）
-- vendor 落盘 + mod.json/lock 写入
+- 内容获取：zip 下载+miniz 解压 / 本地目录、zip 拷贝；GitHub 仓库 URL 改写与最新发布解析
+- ref 解析（§3 三类语义；`url:ref` 后缀 + CLI ref）
+- vendor 落盘（fail-closed 覆盖检查）+ mod.json/lock 写入
 - 传递依赖递归 + 拍平
 - `remove` + 独占依赖清理
-- 测试：本地 `file://` 仓库 fixture，add/remove/冲突
+- 测试：本地目录/zip fixture，add/remove/deps/overwrite-guard（无网络依赖）
 
 ### 阶段 C — autoload 生成 + `install` + 打包衔接（~1.5 天）✅ 已完成
 
@@ -395,31 +412,30 @@ build 时：
 | 项 | 决策 |
 |---|---|
 | 远程注册表 | 不做；`upload` 占位。未来若做：`upload` 只传 manifest + tarball；`add <pkg>` 无 URL 时才走注册表，lock 结构不变 |
-| 私有仓库 | 不自建 auth；https 走 credential helper，ssh 走 key；add 失败透传 git 错误 |
+| 私有仓库 | 不自建 auth 不依赖 git；HTTPS 信任链 = 内嵌 Mozilla CA ∪ 系统 Root 存储（Windows `CertOpenSystemStoreW`）；add 失败透传错误 |
 | 包名冲突 | 传递依赖同名：semver 兼容取最高，不兼容 Fatal 报依赖链 |
 | vendor 与 git | `tphp new` 默认写 `vendor/` 进 `.gitignore`；`mod.lock` 建议提交（可复现） |
 | PHP 版本约束 | 暂不支持 `require.php` 字段（TinyPHP 自身版本即约束） |
 | `autoload.classmap` | 暂不做（PSR-4 + files 覆盖主流）；后置 |
-| Windows | git 可执行检测 + 路径分隔符归一 |
+| Windows | 无外部工具依赖；路径经 libuv UTF-8 归一 |
 | 嵌套 vendor | 禁止（拍平共享，Composer 同款） |
 | GitHub 仓库页 URL | `add https://github.com/o/r[.git][/tree/x][:ref] [ref]`：无 ref → GitHub 匿名 API 解析最新发布（releases/latest → tags semver 排序 → 默认分支回退）并**把 ref 固化进 mod.json**；有 ref → `zipball/<ref>`。无 git。原「不调 Release API」决策（§3，git 版时代）已被用户新语义推翻（2026-10-21）：无 git 拿不到 `ls-remote`，API 是唯一可靠来源；限流 60/h/IP 文档已注明 |
 | vendor 覆盖保护 | install 覆盖前 fail-closed（对齐 vpm）：目标无 mod.json / 含 .git / 包名不符 → 拒绝 rm -rf，提示手动删除。已实现（2026-10-21） |
 
 ## 8. 测试策略
 
-沿用 `tests/` EXPECT 体系；git fixture 用测试内 `git init` 造本地仓库，不依赖网络。
+沿用 `tests/` EXPECT 体系；fixture 用本地目录/zip（`pkg_add` 全程无外部工具、可离线），GitHub 形态靠 URL 规则单测 + 实测验证，不打网络。
 
 | 测试 | 内容 |
 |---|---|
-| `test-pkg-new-app.php` | new 生成文件列表 + mod.json 字段 |
-| `test-pkg-new-lib.php` | --lib 骨架含 tests/ |
-| `test-pkg-add-local.php` | file:// 本地仓库 add → vendor 落盘 + lock |
+| `test-pkg-new-app.php` | new 生成文件列表 + mod.json 字段 + 重跑/非法名拒绝 |
+| `test-pkg-new-lib.php` | --lib 骨架 + psr-4 自动加载端到端（use + 首次引用触发） |
+| `test-pkg-add-remove.php` | 本地源 add → vendor 落盘 + lock + remove + 孤儿清理 |
 | `test-pkg-add-deps.php` | 传递依赖拍平 |
-| `test-pkg-remove.php` | remove + 独占依赖清理 |
-| `test-pkg-autoload.php` | use + 自动加载端到端 |
-| `test-pkg-install-lock.php` | lock 精确恢复 + 离线跳过 → `test-pkg-install.php` |
-| `test-pkg-ref-semver.php` | `^` `~` `latest` tag 解析（fixture tags）——HTTP zip 策略下后置/重写 |
-| `test-pkg-build-vendor.php` | 自动 --with vendor + 排除 tests/.git + 打包应用可运行 |
+| `test-pkg-install.php` | lock 恢复 + 离线跳过（二次 install 不重取） |
+| `test-pkg-overwrite-guard.php` | vendor 覆盖 fail-closed 四分支 + 手动删除后可重装 |
+| `test-pkg-upload-placeholder.php` | upload 占位输出 |
+| （后置）`test-pkg-build-vendor.php` | 自动 --with vendor + 排除 tests/.md + 打包应用可运行 |
 
 ## 9. 示例：端到端
 
@@ -428,11 +444,18 @@ build 时：
 tphp new demo-app
 cd demo-app
 
-# 添加依赖（GitHub tag）
-tphp add https://github.com/foo/bar.git:v1.2.0
+# 添加依赖（GitHub 仓库 URL，解析最新发布并固化 ref）
+tphp add https://github.com/foo/bar
 
-# 添加依赖（Gitee dev 分支）
-tphp add https://gitee.com/acme/utils.git:dev
+# 指定 tag / 分支
+tphp add https://github.com/foo/bar:v1.2.0
+tphp add https://github.com/foo/bar master
+
+# HTTP zip 直链（URL 即版本锚点）
+tphp add https://example.com/releases/acme-utils-1.2.0.zip
+
+# 本地目录（开发中互指）
+tphp add ../acme-utils
 
 # 业务代码写在 main.php（或自建 src/ 后改入口路径）
 # main.php:

@@ -40,6 +40,16 @@ tphp phpc <dir> -o <out.c>        # 把 lib\*.php 源码编进 bundle_data.c
 ```
 `build.cmd` 会自动在链接前调用（若 `lib\` 存在）。
 
+### 包管理（内置，无需 git）
+```bash
+tphp new <name> [--lib]           # 创建应用 / 库包骨架（mod.json + autoload）
+tphp add <source> [ref]           # 添加依赖：GitHub 仓库 URL / zip 直链 / 本地路径
+tphp remove <name>                # 移除依赖（如 foo/bar），含孤儿传递依赖清理
+tphp install                      # 按 mod.lock 恢复缺失依赖（CI/新机器）
+tphp upload                       # 打印发布指引（占位）
+```
+所有命令在项目根（含 `mod.json` 的目录）执行。详见 [package-manager.md](package-manager.md)。
+
 ### 构建单文件应用（跨平台）
 ```bash
 # Windows
@@ -49,7 +59,8 @@ tphp build app.php --with vendor/ --with bar.dll -o app
 ```
 
 - **`--with`**：文件或目录（可重复）
-  - 目录递归收**非 .php** 文件（.php 排除并警告——PHP 走 phpc）
+  - 目录递归收集**全部文件**（含 `.php`——vendor 源码是 autoload 运行期 `OP_REQUIRE` 的目标）；恒跳过 VCS/系统垃圾（`.git`/`.DS_Store` 等）
+  - **项目含 `mod.json` + `vendor/autoload.php` 且未显式 `--with vendor/` 时自动打包 `vendor/`**，并额外跳过 `tests/`、`*.md`（strict 模式）；显式 `--with` 不启用 strict（尊重显式指定）
   - **key 相对源码根**（主脚本所在目录）：`--with data` 且主脚本在 `src/` 下
     → zip 内 `data/…`；这让 `__DIR__` 相对读能在打包后自动映射进 zip
   - 绝对路径无法表达包内等效名：单文件退回文件名、目录退回目录内部相对
