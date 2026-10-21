@@ -69,6 +69,7 @@ typedef struct TCont {
  * thread runs its own loop/fiber/ready-queue instance; fiber switches stay
  * inside one OS thread so TLS is stable across switches */
 static _Thread_local uv_loop_t g_loop;
+static _Thread_local bool g_loop_inited;            /* loop 是否有效（cleanup 后复位） */
 static _Thread_local TFiber *g_sched;          /* 调度器 fiber */
 static _Thread_local TCont *g_ready_head, *g_ready_tail;
 static _Thread_local TCont *g_cur;             /* 正在运行的协程（协程视角=self） */
@@ -1028,9 +1029,9 @@ static void sched_cleanup(void) {
     g_any_uncaught = false;
     g_sched_active = false;
     uv_loop_close(&g_loop);           /* 句柄已清空；EBUSY 则随进程退出 */
+    g_loop_inited = false;            /* 复位：允许下一次 tphp_sched_run 重建
+                                       * loop（pkg fetch 会多次 run_source） */
 }
-
-static _Thread_local bool g_loop_inited;
 
 /* 独立 loop 初始化（幂等）：Worker 子线程在 bind async 前调用 */
 void tphp_sched_loop_init(void) {

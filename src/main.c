@@ -93,7 +93,7 @@ static void print_usage(FILE *out) {
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
         "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
-        "  tphp add <source> [ref]         add dependency (GitHub repo URL / zip URL / path)\n"
+        "  tphp add <source> [ref]         add dependency (GitHub repo URL[:ref] / zip URL / path)\n"
         "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
         "  tphp install                    restore deps from mod.lock (or mod.json)\n"
         "  tphp upload                     print package publishing instructions\n"
@@ -481,13 +481,19 @@ static char *read_file(const char *path) {
 }
 
 static int run_source(const char *src, const char *name, bool dump) {
-    tphp_worker_init();           /* tphp\Worker 内部类先于编译注册 */
-    tphp_async_init();            /* 内部类先于编译期类检查注册 */
-    tphp_io_init();
-    tphp_ffi_init();              /* M5.5 FFI 内部类 */
-    tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
-    tphp_closure_class_init();    /* P1-3: Closure 内部类 */
-    if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
+    /* 内部类注册只做一次：pkg add/install 的 fetch 回调会多次进入本函数
+     *（每次 run_source 一个微型脚本），二次注册会重复挂载内置类崩溃 */
+    static bool s_inited = false;
+    if (!s_inited) {
+        s_inited = true;
+        tphp_worker_init();           /* tphp\Worker 内部类先于编译注册 */
+        tphp_async_init();            /* 内部类先于编译期类检查注册 */
+        tphp_io_init();
+        tphp_ffi_init();              /* M5.5 FFI 内部类 */
+        tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
+        tphp_closure_class_init();    /* P1-3: Closure 内部类 */
+        if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
+    }
     AStmtList *ast = tphp_parse_script(src, name);
     if (g_debug) fprintf(stderr, "DIAG:parse-ok stmts=%d\n", ast ? ast->n : -1);
     Program *prog = tphp_compile(ast, name);

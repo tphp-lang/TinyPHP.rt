@@ -402,7 +402,7 @@ build 时：
 | `autoload.classmap` | 暂不做（PSR-4 + files 覆盖主流）；后置 |
 | Windows | git 可执行检测 + 路径分隔符归一 |
 | 嵌套 vendor | 禁止（拍平共享，Composer 同款） |
-| GitHub 仓库页 URL | `add https://github.com/o/r[.git][/tree/x] [ref]` 在 fetch 时改写为 zip 直链（有 ref → `zipball/<ref>`，无 ref → `archive/HEAD.zip`）；无 API、无 git；mod.json 存原始 URL。已实现（2026-10-21） |
+| GitHub 仓库页 URL | `add https://github.com/o/r[.git][/tree/x][:ref] [ref]`：无 ref → GitHub 匿名 API 解析最新发布（releases/latest → tags semver 排序 → 默认分支回退）并**把 ref 固化进 mod.json**；有 ref → `zipball/<ref>`。无 git。原「不调 Release API」决策（§3，git 版时代）已被用户新语义推翻（2026-10-21）：无 git 拿不到 `ls-remote`，API 是唯一可靠来源；限流 60/h/IP 文档已注明 |
 | vendor 覆盖保护 | install 覆盖前 fail-closed（对齐 vpm）：目标无 mod.json / 含 .git / 包名不符 → 拒绝 rm -rf，提示手动删除。已实现（2026-10-21） |
 
 ## 8. 测试策略

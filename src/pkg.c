@@ -991,14 +991,48 @@ static bool is_http_url(const char *s) {
     return strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0;
 }
 
-/* GitHub 仓库页 URL → zip 直链（无需 API）：
- *   https://github.com/<owner>/<repo>[.git][/tree/<ref>]
- *   有 ref（参数优先于 /tree/）→ …/zipball/<ref>（tag/branch 皆可）
- *   无 ref                   → …/archive/HEAD.zip（默认分支）
- * mod.json/lock 里仍存用户原始 URL；本函数只在 fetch 时改写。
- * 不匹配（其它主机/更深路径/已是 zip 直链）返回 false，原样处理。 */
-static bool gh_repo_to_zip(const char *source, const char *ref,
-                           char *out, size_t cap) {
+/* GitHub 仓库页 URL 解析（含 `:ref` 后缀语法）：
+ *   https://github.com/<owner>/<repo>[.git][/tree/<ref>][:ref]
+ *   ref 优先级：CLI 参数 > URL `:ref` > /tree/<ref> > 最新发布版解析
+ *   无任何 ref → releases/latest → tags semver 排序 → 默认分支回退
+ * mod.json 存剥掉 `:ref` 的仓库 URL + ref 字段（解析结果固化，可复现）。 */
+
+typedef struct GhRepo {
+    char owner[128], repo[128], treeref[128];
+} GhRepo;
+
+/* 剥离 URL 末段内嵌的 `:ref` 后缀：`:` 必须位于 scheme `//` 之后 path 内
+ * 最后一个 '/' 之后；ref 只允许 [A-Za-z0-9._-]（含 '/' 的 ref 请用 CLI
+ * 第二参数）。带 query/fragment 的 URL 不做剥离（`:` 可能属于 query）。 */
+static void gh_split_url_ref(const char *source, char *url, size_t urlcap,
+                             char *ref, size_t refcap) {
+    snprintf(url, urlcap, "%s", source);
+    ref[0] = 0;
+    if (strpbrk(source, "?#")) return;
+    const char *sch = strstr(source, "//");
+    if (!sch) return;
+    const char *p = sch + 2;
+    const char *slash = strrchr(p, '/');
+    const char *colon = strrchr(p, ':');
+    if (!colon || (slash && colon < slash)) return;
+    const char *r = colon + 1;
+    size_t n = strlen(r);
+    if (n == 0 || n >= refcap || strchr(r, '/')) return;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)r[i]) && r[i] != '-' && r[i] != '_' &&
+            r[i] != '.')
+            return;
+    size_t keep = (size_t)(colon - source);
+    if (keep >= urlcap) return;
+    memcpy(url, source, keep);
+    url[keep] = 0;
+    memcpy(ref, r, n + 1);
+}
+
+/* 解析（剥离后的）仓库页 URL → GhRepo。不匹配（其它主机/更深路径/
+ * 已是 zip 直链）返回 false。 */
+static bool gh_parse_repo(const char *source, GhRepo *g) {
+    g->owner[0] = g->repo[0] = g->treeref[0] = 0;
     const char *p = source;
     if (strncmp(p, "https://", 8) == 0) p += 8;
     else if (strncmp(p, "http://", 7) == 0) p += 7;
@@ -1008,66 +1042,196 @@ static bool gh_repo_to_zip(const char *source, const char *ref,
     p += hlen;
     while (*p == '/') p++;
 
-    char owner[128], repo[128];
     size_t n = strcspn(p, "/?#");
-    if (n == 0 || n >= sizeof owner) return false;
+    if (n == 0 || n >= sizeof g->owner) return false;
     for (size_t i = 0; i < n; i++)
         if (!isalnum((unsigned char)p[i]) && p[i] != '-' && p[i] != '_' &&
             p[i] != '.')
             return false;
-    memcpy(owner, p, n);
-    owner[n] = 0;
+    memcpy(g->owner, p, n);
+    g->owner[n] = 0;
     p += n;
     if (*p == '/') p++;
 
     n = strcspn(p, "/?#");
-    if (n == 0 || n >= sizeof repo) return false;
+    if (n == 0 || n >= sizeof g->repo) return false;
     for (size_t i = 0; i < n; i++)
         if (!isalnum((unsigned char)p[i]) && p[i] != '-' && p[i] != '_' &&
             p[i] != '.')
             return false;
-    memcpy(repo, p, n);
-    repo[n] = 0;
+    memcpy(g->repo, p, n);
+    g->repo[n] = 0;
     p += n;
-    size_t rn = strlen(repo);
-    if (rn > 4 && strcmp(repo + rn - 4, ".git") == 0) repo[rn - 4] = 0;
-    if (!repo[0]) return false;
+    size_t rn = strlen(g->repo);
+    if (rn > 4 && strcmp(g->repo + rn - 4, ".git") == 0)
+        g->repo[rn - 4] = 0;
+    if (!g->repo[0]) return false;
 
     /* 剩余路径：允许空或 /tree/<ref>（单段）；其它一律不算仓库页 */
-    char treeref[128] = "";
     if (*p == '/') {
         p++;
         if (strncmp(p, "tree/", 5) != 0) return false;
         p += 5;
         n = strcspn(p, "/?#");
-        if (n == 0 || n >= sizeof treeref) return false;
-        memcpy(treeref, p, n);
-        treeref[n] = 0;
+        if (n == 0 || n >= sizeof g->treeref) return false;
+        memcpy(g->treeref, p, n);
+        g->treeref[n] = 0;
         p += n;
         if (*p && *p != '?' && *p != '#') return false;   /* /tree/x/deeper */
     }
-
-    const char *use = (ref && ref[0]) ? ref : (treeref[0] ? treeref : NULL);
-    if (use) {
-        char enc[256];
-        size_t j = 0;
-        for (size_t i = 0; use[i] && j + 4 < sizeof enc; i++) {
-            unsigned char c = (unsigned char)use[i];
-            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '/') {
-                enc[j++] = (char)c;
-            } else {
-                snprintf(enc + j, sizeof enc - j, "%%%02X", c);
-                j += 3;
-            }
-        }
-        enc[j] = 0;
-        snprintf(out, cap, "https://github.com/%s/%s/zipball/%s",
-                 owner, repo, enc);
-    } else {
-        snprintf(out, cap, "https://github.com/%s/%s/archive/HEAD.zip",
-                 owner, repo);
-    }
     return true;
+}
+
+/* 识别 GitHub 仓库页 URL（含 :ref 剥离）。匹配 → true 且写出规范化
+ * url/ref（ref 可能为空）；不匹配 → url_out=source、ref_out 空。 */
+static bool gh_classify(const char *source, char *url_out, size_t urlcap,
+                        char *ref_out, size_t refcap, GhRepo *g) {
+    char url[1400], ref[128];
+    gh_split_url_ref(source, url, sizeof url, ref, sizeof ref);
+    if (gh_parse_repo(url, g)) {
+        snprintf(url_out, urlcap, "%s", url);
+        snprintf(ref_out, refcap, "%s", ref);
+        return true;
+    }
+    snprintf(url_out, urlcap, "%s", source);
+    ref_out[0] = 0;
+    return false;
+}
+
+/* 生成 zip 直链：有 ref → zipball/<ref>（tag/分支皆可）；
+ * 无 ref → archive/HEAD.zip（默认分支）。ref 做百分号编码。 */
+static void gh_zip_url(const GhRepo *g, const char *ref,
+                       char *out, size_t cap) {
+    if (!ref || !ref[0]) {
+        snprintf(out, cap, "https://github.com/%s/%s/archive/HEAD.zip",
+                 g->owner, g->repo);
+        return;
+    }
+    char enc[256];
+    size_t j = 0;
+    for (size_t i = 0; ref[i] && j + 4 < sizeof enc; i++) {
+        unsigned char c = (unsigned char)ref[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '/') {
+            enc[j++] = (char)c;
+        } else {
+            snprintf(enc + j, sizeof enc - j, "%%%02X", c);
+            j += 3;
+        }
+    }
+    enc[j] = 0;
+    snprintf(out, cap, "https://github.com/%s/%s/zipball/%s",
+             g->owner, g->repo, enc);
+}
+
+/* 解析 "v?X.Y.Z[-pre]"；-pre 后缀排在同号正式版之后。失败返回 false。 */
+static bool semver_parse(const char *s, int *maj, int *min, int *pat,
+                         int *pre) {
+    if (!s) return false;
+    if (*s == 'v' || *s == 'V') s++;
+    char *end;
+    long a = strtol(s, &end, 10);
+    if (end == s || *end != '.') return false;
+    s = end + 1;
+    long b = strtol(s, &end, 10);
+    if (end == s || *end != '.') return false;
+    s = end + 1;
+    long c = strtol(s, &end, 10);
+    if (end == s) return false;
+    if (*end == '-' || *end == '_') *pre = 0;
+    else if (*end == 0 || *end == '+' || *end == ' ' || *end == '\t')
+        *pre = 1;
+    else return false;
+    if (a < 0 || a > 1000000 || b < 0 || b > 1000000 ||
+        c < 0 || c > 1000000)
+        return false;
+    *maj = (int)a; *min = (int)b; *pat = (int)c;
+    return true;
+}
+
+/* 从 tags JSON（[{"name":...}]）本地 semver 排序取最高 */
+static bool gh_latest_from_tags(const char *json, size_t len,
+                                char *out, size_t cap) {
+    TVal v;
+    if (!tphp_json_decode_c(json, len, &v)) return false;
+    bool found = false;
+    int bm = 0, bn = 0, bp = 0, bpre = 0;
+    char best[128] = "";
+    if (v.t == T_ARR) {
+        TArr *arr = (TArr *)v.u.p;
+        for (uint32_t i = 0; i < arr->dused; i++) {
+            if (arr->data[i].t != T_ARR) continue;
+            char *name = mget_str((TArr *)arr->data[i].u.p, "name");
+            if (!name) continue;
+            int m, n, p, pre;
+            if (semver_parse(name, &m, &n, &p, &pre) &&
+                (!found || m > bm || (m == bm && n > bn) ||
+                 (m == bm && n == bn && p > bp) ||
+                 (m == bm && n == bn && p == bp && pre > bpre))) {
+                found = true;
+                bm = m; bn = n; bp = p; bpre = pre;
+                snprintf(best, sizeof best, "%s", name);
+            }
+            tm_free(name);
+        }
+    }
+    tval_release(&v);
+    if (!found) return false;
+    snprintf(out, cap, "%s", best);
+    return true;
+}
+
+/* 解析 GitHub 最新发布 ref（匿名 API，无认证；限流 60/h/IP）：
+ * releases/latest 的 tag_name → 回退 tags 列表 semver 排序 → 都失败 false
+ * （调用方回退默认分支）。网络/解析失败不致命。 */
+static bool gh_latest_ref(const char *owner, const char *repo,
+                          char *out, size_t cap) {
+    if (!g_fetch) return false;
+    char url[512], e2[256], *buf = NULL;
+    size_t len = 0;
+
+    snprintf(url, sizeof url,
+             "https://api.github.com/repos/%s/%s/releases/latest",
+             owner, repo);
+    if (g_fetch(url, &buf, &len, e2, sizeof e2) == 0 && buf) {
+        char *z = tm_malloc(len + 1);
+        memcpy(z, buf, len);
+        z[len] = 0;
+        free(buf);
+        buf = NULL;
+        TVal v;
+        if (tphp_json_decode_c(z, len, &v)) {
+            if (v.t == T_ARR) {
+                char *tag = mget_str((TArr *)v.u.p, "tag_name");
+                if (tag && tag[0]) {
+                    snprintf(out, cap, "%s", tag);
+                    tm_free(tag);
+                    tval_release(&v);
+                    tm_free(z);
+                    return true;
+                }
+                tm_free(tag);
+            }
+            tval_release(&v);
+        }
+        tm_free(z);
+    } else if (buf) {
+        free(buf);
+        buf = NULL;
+    }
+
+    snprintf(url, sizeof url, "https://api.github.com/repos/%s/%s/tags",
+             owner, repo);
+    if (g_fetch(url, &buf, &len, e2, sizeof e2) == 0 && buf) {
+        char *z = tm_malloc(len + 1);
+        memcpy(z, buf, len);
+        z[len] = 0;
+        free(buf);
+        bool ok = gh_latest_from_tags(z, len, out, cap);
+        tm_free(z);
+        return ok;
+    }
+    if (buf) free(buf);
+    return false;
 }
 
 /* 路径拼接：a/b + c → a/b/c（a 可为空）。out 与 a/b 不得重叠。 */
@@ -1291,9 +1455,12 @@ static int lock_save(const char *proj_dir, char *err, size_t errcap) {
 /* ---- add ---- */
 
 /* 内部安装：物化到 vendor/<name> + 递归传递依赖；不写根 deps。
- * out_name 可为 NULL；非 NULL 时写入包名（malloc，调用方 free）。 */
+ * out_name 可为 NULL；非 NULL 时写入包名（malloc，调用方 free）。
+ * out_resolved_ref 可为 NULL；非 NULL 指向 128 字节缓冲，写入最终
+ * 解析出的 ref（GitHub 无显式 ref 时 = 最新发布版）。 */
 static int pkg_install_core(const char *proj_dir, const char *source,
                             const char *ref, char **out_name,
+                            char *out_resolved_ref,
                             char *err, size_t errcap);
 
 /* 递归安装依赖：url 为绝对 http(s) 或相对 proj_dir 的路径 */
@@ -1318,7 +1485,7 @@ static int install_deps(const char *proj_dir, const TMod *parent,
 
         char e2[512] = "";
         int rc = pkg_install_core(proj_dir, absurl, parent->deps[i].ref,
-                                  NULL, e2, sizeof e2);
+                                  NULL, NULL, e2, sizeof e2);
         if (rc != 0) {
             set_err(err, errcap, "failed to install dependency %s: %s",
                     parent->deps[i].name, e2);
@@ -1399,6 +1566,7 @@ static int install_from_src(const char *proj_dir, const char *src,
 
 static int pkg_install_core(const char *proj_dir, const char *source,
                             const char *ref, char **out_name,
+                            char *out_resolved_ref,
                             char *err, size_t errcap) {
     char staging[1250];
     snprintf(staging, sizeof staging, "%s/.pkg-staging", proj_dir);
@@ -1410,11 +1578,32 @@ static int pkg_install_core(const char *proj_dir, const char *source,
             set_err(err, errcap, "HTTP fetch not available");
             return 2;
         }
-        /* GitHub 仓库页 URL 在 fetch 时改写为 zip 直链；mod.json 仍存原始 URL */
-        char ghurl[1400];
+        /* GitHub 仓库页 URL：`:ref` 剥离 + 最新发布解析 → zip 直链改写；
+         * mod.json 存规范化后的仓库 URL，ref 见 out_resolved_ref */
+        char url_only[1400], urlref[128], ghurl[1400], latest[128];
+        GhRepo g;
+        bool is_gh = gh_classify(source, url_only, sizeof url_only,
+                                 urlref, sizeof urlref, &g);
+        /* 空 ref 统一为 NULL（urlref 是栈数组，空串指针非 NULL 会骗过 !ref） */
+        const char *eff_ref = (ref && ref[0]) ? ref
+                              : (urlref[0] ? urlref : NULL);
         const char *to_get = source;
-        if (gh_repo_to_zip(source, ref, ghurl, sizeof ghurl))
+        if (is_gh) {
+            if (!eff_ref && g.treeref[0]) eff_ref = g.treeref;
+            if (!eff_ref) {
+                if (gh_latest_ref(g.owner, g.repo, latest, sizeof latest)) {
+                    eff_ref = latest;
+                } else {
+                    fprintf(stderr, "PHP Warning: pkg: cannot resolve "
+                            "latest release for %s/%s, using default "
+                            "branch\n", g.owner, g.repo);
+                }
+            }
+            gh_zip_url(&g, eff_ref, ghurl, sizeof ghurl);
             to_get = ghurl;
+        }
+        if (out_resolved_ref)
+            snprintf(out_resolved_ref, 128, "%s", eff_ref ? eff_ref : "");
         char *buf = NULL;
         size_t blen = 0;
         rc = g_fetch(to_get, &buf, &blen, err, errcap);
@@ -1494,34 +1683,51 @@ int tphp_pkg_add(const char *proj_dir, const char *source, const char *ref,
         return 1;
     }
 
+    /* 规范化：剥 `:ref` 后缀；ref 优先级 CLI > URL 后缀；GitHub 无 ref
+     * 时 install core 解析最新发布并回填 resolved */
+    char url_only[1400], urlref[128], resolved[128] = "";
+    GhRepo g;
+    gh_classify(source, url_only, sizeof url_only, urlref, sizeof urlref, &g);
+    const char *eff = (ref && ref[0]) ? ref : urlref;
+
     char *pkg_name = NULL;
-    int rc = pkg_install_core(proj_dir, source, ref, &pkg_name, err, errcap);
+    int rc = pkg_install_core(proj_dir, source, eff, &pkg_name, resolved,
+                              err, errcap);
     if (rc != 0) { tm_free(pkg_name); return rc; }
 
-    /* 写入根 deps（若尚无） */
+    const char *store_ref = (ref && ref[0]) ? ref
+                            : (urlref[0] ? urlref : resolved);
+
+    /* 写入根 deps（已存在 = 更新该包，url/ref 同步刷新为本次解析结果） */
     TMod root;
     if (!tmod_load(root_mj, &root, err, errcap)) {
         tm_free(pkg_name);
         return 2;
     }
     bool found = false;
-    for (int i = 0; i < root.n_deps; i++)
-        if (strcmp(root.deps[i].name, pkg_name) == 0) { found = true; break; }
+    for (int i = 0; i < root.n_deps; i++) {
+        if (strcmp(root.deps[i].name, pkg_name) != 0) continue;
+        found = true;
+        tm_free(root.deps[i].url);
+        tm_free(root.deps[i].ref);
+        root.deps[i].url = xstrdup(url_only);
+        root.deps[i].ref = xstrdup(store_ref);
+        break;
+    }
     if (!found) {
         root.deps = tm_realloc(root.deps,
             sizeof(ModDep) * (size_t)(root.n_deps + 1));
         root.deps[root.n_deps].name = pkg_name;   /* 所有权转移 */
-        root.deps[root.n_deps].url = xstrdup(source);
-        root.deps[root.n_deps].ref = xstrdup(ref ? ref : "");
+        root.deps[root.n_deps].url = xstrdup(url_only);
+        root.deps[root.n_deps].ref = xstrdup(store_ref);
         root.n_deps++;
         pkg_name = NULL;
-        if (tmod_save(root_mj, &root, err, errcap) != 0) {
-            tmod_free(&root);
-            tm_free(pkg_name);
-            return 2;
-        }
     } else {
         tm_free(pkg_name);
+    }
+    if (tmod_save(root_mj, &root, err, errcap) != 0) {
+        tmod_free(&root);
+        return 2;
     }
     tmod_free(&root);
 
@@ -1748,8 +1954,8 @@ int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
                 path_join3(absurl, sizeof absurl, proj_dir, url);
             }
             char e2[512] = "";
-            int rc = pkg_install_core(proj_dir, absurl, ref, NULL, e2,
-                                      sizeof e2);
+            int rc = pkg_install_core(proj_dir, absurl, ref, NULL, NULL,
+                                      e2, sizeof e2);
             if (rc != 0) {
                 set_err(err, errcap, "install %s failed: %s", tstr_val(ks), e2);
                 tval_release(&lv);
@@ -1779,7 +1985,7 @@ int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
             }
             char e2[512] = "";
             int rc = pkg_install_core(proj_dir, absurl, root.deps[i].ref,
-                                      NULL, e2, sizeof e2);
+                                      NULL, NULL, e2, sizeof e2);
             if (rc != 0) {
                 set_err(err, errcap, "install %s failed: %s",
                         root.deps[i].name, e2);

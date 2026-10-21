@@ -46,7 +46,7 @@ tphp upload                  # 打印发布指引（占位，见下）
 | `type` | `app` \| `lib` |
 | `autoload.psr-4` | 命名空间前缀 → 目录，可多条 |
 | `autoload.files` | 加载 autoload 时无条件 require 的文件（函数库等） |
-| `deps` | 依赖：`url` 可为 GitHub 仓库页 URL、http(s) zip URL 或相对/绝对路径；`ref` 对仓库 URL 生效（tag/分支名） |
+| `deps` | 依赖：`url` 可为 GitHub 仓库 URL（支持 `:ref` 后缀）、http(s) zip URL 或相对/绝对路径；`ref` = 显式指定或解析固化的版本 |
 
 **无 `main` 字段**：应用入口由命令行指定（`tphp run main.php`）。
 
@@ -81,9 +81,11 @@ cd demo-app
 ### 添加依赖
 
 ```bash
-# GitHub 仓库页 URL（fetch 时自动改写为 zip，无需 git/API）
-tphp add https://github.com/tphp-lang/lib_rt
-tphp add https://github.com/tphp-lang/lib_rt v0.1.0   # 锁定 tag 或分支
+# GitHub 仓库链接
+tphp add https://github.com/tphp-lang/lib_rt              # 解析最新发布版并固化 ref
+tphp add https://github.com/tphp-lang/lib_rt:master       # URL 后缀指定分支
+tphp add https://github.com/tphp-lang/lib_rt:v0.0.1       # URL 后缀指定 tag
+tphp add https://github.com/tphp-lang/lib_rt v0.0.1       # CLI 参数指定 ref
 
 # HTTP zip（URL 即版本锚点）
 tphp add https://example.com/releases/foo-bar-1.2.0.zip
@@ -95,7 +97,12 @@ tphp add ../my-lib
 tphp add ./foo-bar.zip
 ```
 
-GitHub 仓库 URL 支持 `owner/repo`（可带 `.git` 尾缀或 `/tree/<分支>` 路径）。fetch 时改写为 zip 直链：有 `ref` → `…/zipball/<ref>`（tag/分支皆可）；无 `ref` → `…/archive/HEAD.zip`（默认分支）。**mod.json 里仍存你输入的原始 URL**；不带 `ref` 时默认分支随上游漂移，建议锁定。
+GitHub 仓库链接规则（无 git、无外网工具依赖；解析最新发布版用 GitHub 匿名 API，限流 60 次/小时/IP）：
+
+- **无 ref**：查 `releases/latest`（失败回退 `tags` 本地 semver 排序，再失败回退默认分支）→ 下载该版本 zip → **把解析出的 ref 固化进 `mod.json`**（可复现）
+- **`:ref` 后缀或 CLI ref 参数**：直接下 `zipball/<ref>`（tag/分支皆可；冲突时 CLI 参数优先；含 `/` 的 ref 只能用 CLI 参数形式）
+- mod.json 存**剥掉 `:ref` 后缀的仓库 URL** + `ref` 字段；再次 `add` 同名依赖 = 重新解析并刷新 ref（无 ref 的裸链接 = 跟最新发布升级）
+- 支持 `owner/repo`、可选 `.git` 尾缀、`/tree/<分支>` 路径（优先级低于 `:ref`）
 
 `add` 会：装入 `vendor/<name>/` → 递归安装传递依赖 → 更新 `mod.json` deps → 重写 `mod.lock` → 重新生成 `vendor/autoload.php`。
 
