@@ -35,7 +35,7 @@ tphp_vm_run
 
 ### 透明 I/O
 
-libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步。HTTPS 用 mbedtls，根证书内嵌 `cacert.c`。
+libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步。HTTPS 用 mbedtls，根证书内嵌 `cacert.c`（Mozilla 包）；Windows 上额外并入系统 Root 证书库（与 Go/Node 一致，覆盖企业代理/加速器类 MITM 安装的私有 CA）。校验失败时 warning 打印 verify 标志位明细。
 
 死锁判据：`uv_run` 返回 0 且仍有挂起协程 → `DeadlockError`。
 

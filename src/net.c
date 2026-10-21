@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <wincrypt.h>   /* uv.h 已拉入 windows.h；系统 Root 证书库枚举 */
+#endif
 
 /* cacert.c（脚本生成：Mozilla CA bundle 内嵌） */
 extern const unsigned char tphp_cacert_pem[];
@@ -778,6 +781,23 @@ static TStr *http_fetch(VM *vm, const char *url, TArr *extra_headers,
 static mbedtls_x509_crt *g_tls_cacert;
 static uv_once_t g_tls_ca_once = UV_ONCE_INIT;
 
+#ifdef _WIN32
+/* 追加系统 Root 证书库到信任链：内嵌 Mozilla 包不含用户/第三方工具
+ * 安装的私有 CA（企业代理、加速器类 MITM 会伪造 github.com 等域名，
+ * 其 CA 只存在于系统库）。与 Go/Node 在 Windows 上的行为一致。
+ * 单张证书解析失败（怪异扩展等）忽略，不拖垮整个加载。 */
+static void tls_cacert_load_win_store(mbedtls_x509_crt *ca) {
+    HCERTSTORE store = CertOpenSystemStoreW(0, L"ROOT");
+    if (!store) return;
+    PCCERT_CONTEXT ctx = NULL;
+    while ((ctx = CertEnumCertificatesInStore(store, ctx)) != NULL) {
+        mbedtls_x509_crt_parse_der(ca, ctx->pbCertEncoded,
+                                   (size_t)ctx->cbCertEncoded);
+    }
+    CertCloseStore(store, 0);
+}
+#endif
+
 static void tls_cacert_load(void) {
     mbedtls_x509_crt *ca = tm_malloc(sizeof *ca);
     mbedtls_x509_crt_init(ca);
@@ -787,6 +807,9 @@ static void tls_cacert_load(void) {
         tm_free(ca);
         return;                   /* g_tls_cacert 保持 NULL：调用方报错 */
     }
+#ifdef _WIN32
+    tls_cacert_load_win_store(ca);
+#endif
     g_tls_cacert = ca;
 }
 
@@ -897,6 +920,18 @@ static TlsSession *tls_connect(VM *vm, const char *host, int port) {
                 fprintf(stderr,
                         "PHP Warning: https: handshake with %s failed: %s\n",
                         host, err);
+                /* 校验失败（MBEDTLS_ERR_X509_CERT_VERIFY_FAILED）时打印
+                 * verify 标志位：mbedtls_strerror 只给笼统文案，排查证书
+                 * 问题（过期/域名不符/链不受信）必须看标志位。 */
+                if (rc == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+                    uint32_t vf = mbedtls_ssl_get_verify_result(&ts->ssl);
+                    char vbuf[512];
+                    mbedtls_x509_crt_verify_info(vbuf, sizeof vbuf, "  ! ",
+                                                 vf);
+                    fprintf(stderr,
+                            "PHP Warning: https: verify flags 0x%08x: %s",
+                            vf, vbuf);
+                }
                 goto fail;
             }
         }
