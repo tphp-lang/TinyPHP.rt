@@ -402,6 +402,7 @@ build 时：
 | `autoload.classmap` | 暂不做（PSR-4 + files 覆盖主流）；后置 |
 | Windows | git 可执行检测 + 路径分隔符归一 |
 | 嵌套 vendor | 禁止（拍平共享，Composer 同款） |
+| GitHub 仓库页 URL | `add https://github.com/o/r[.git][/tree/x] [ref]` 在 fetch 时改写为 zip 直链（有 ref → `zipball/<ref>`，无 ref → `archive/HEAD.zip`）；无 API、无 git；mod.json 存原始 URL。已实现（2026-10-21） |
 
 ## 8. 测试策略
 

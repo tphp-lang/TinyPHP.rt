@@ -93,7 +93,7 @@ static void print_usage(FILE *out) {
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
         "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
-        "  tphp add <source> [ref]         add dependency (URL/zip/path)\n"
+        "  tphp add <source> [ref]         add dependency (GitHub repo URL / zip URL / path)\n"
         "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
         "  tphp install                    restore deps from mod.lock (or mod.json)\n"
         "  tphp upload                     print package publishing instructions\n"

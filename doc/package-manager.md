@@ -1,6 +1,6 @@
 # 包管理
 
-`tphp` 内置包管理，无需安装外部工具。包源为 **HTTP(S) zip 直链 / 本地路径**（目录或 zip）。
+`tphp` 内置包管理，无需安装外部工具（也无需 git）。包源为 **GitHub 仓库页 URL / HTTP(S) zip 直链 / 本地路径**（目录或 zip）。
 
 ## 命令
 
@@ -8,7 +8,7 @@
 tphp new <name>              # 创建应用项目（main.php + mod.json）
 tphp new --lib <name>        # 创建库包（src/ + tests/ + autoload）
 
-tphp add <source> [ref]      # 添加依赖；source 为 URL / zip 路径 / 目录
+tphp add <source> [ref]      # 添加依赖；source 为 GitHub 仓库 URL / zip URL / 路径
 tphp remove <name>           # 移除依赖（如 foo/bar）
 tphp install                 # 按 mod.lock 恢复缺失依赖（CI/新机器）
 tphp upload                  # 打印发布指引（占位，见下）
@@ -46,7 +46,7 @@ tphp upload                  # 打印发布指引（占位，见下）
 | `type` | `app` \| `lib` |
 | `autoload.psr-4` | 命名空间前缀 → 目录，可多条 |
 | `autoload.files` | 加载 autoload 时无条件 require 的文件（函数库等） |
-| `deps` | 依赖：`url` 可为 http(s) zip URL 或相对/绝对路径；`ref` 记录用（URL 本身即版本锚点） |
+| `deps` | 依赖：`url` 可为 GitHub 仓库页 URL、http(s) zip URL 或相对/绝对路径；`ref` 对仓库 URL 生效（tag/分支名） |
 
 **无 `main` 字段**：应用入口由命令行指定（`tphp run main.php`）。
 
@@ -81,6 +81,10 @@ cd demo-app
 ### 添加依赖
 
 ```bash
+# GitHub 仓库页 URL（fetch 时自动改写为 zip，无需 git/API）
+tphp add https://github.com/tphp-lang/lib_rt
+tphp add https://github.com/tphp-lang/lib_rt v0.1.0   # 锁定 tag 或分支
+
 # HTTP zip（URL 即版本锚点）
 tphp add https://example.com/releases/foo-bar-1.2.0.zip
 
@@ -90,6 +94,8 @@ tphp add ../my-lib
 # 本地 zip
 tphp add ./foo-bar.zip
 ```
+
+GitHub 仓库 URL 支持 `owner/repo`（可带 `.git` 尾缀或 `/tree/<分支>` 路径）。fetch 时改写为 zip 直链：有 `ref` → `…/zipball/<ref>`（tag/分支皆可）；无 `ref` → `…/archive/HEAD.zip`（默认分支）。**mod.json 里仍存你输入的原始 URL**；不带 `ref` 时默认分支随上游漂移，建议锁定。
 
 `add` 会：装入 `vendor/<name>/` → 递归安装传递依赖 → 更新 `mod.json` deps → 重写 `mod.lock` → 重新生成 `vendor/autoload.php`。
 
