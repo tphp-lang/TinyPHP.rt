@@ -5,7 +5,7 @@
 - 核心设计：TExecCtx 每协程 VM 状态整块切换（fiber 抄 php-src Zend/asm）；prog freeze 后字节码跨线程只读共享；异常表驱动 + longjmp unwind；Worker = 独立 TPhpRuntime 全 TLS 隔离 + uv_mutex mailbox + serialize 克隆；bundle 用**源码内嵌**（非 opcode 序列化，TOp 含 handler 指针不可序列化）；pack.c = PE RCDATA / ELF section / macOS footer 三平台资产打包。
 - 环境坑（本项目实测）：src 下自定义头禁叫 io.h/ffi.h（顶掉系统头）；.cmd 纯 ASCII；ffi_prep_cif 不拷贝 arg_types 数组必须堆分配；PS5 写无 BOM UTF-8；build.log 为 UTF-16 需 iconv；PowerShell 传参剥引号用 rsp 响应文件。
 - HTTPS 信任面：内嵌 Mozilla `cacert.c` + **Windows 额外并入系统 Root 证书库**（net.c `tls_cacert_load_win_store`，build.cmd 加 `-lcrypt32`）；github.com 在国内用户机器上可能被加速器类工具 MITM（假 CA 在系统库、浏览器正常），tphp 拒绝是正确行为，握手失败会打 verify 标志位明细（永久诊断）。
-- `tphp add` 源形态（2026-10-21）：**GitHub 仓库页 URL**（`gh_repo_to_zip` fetch 时改写：ref → `zipball/<ref>`，无 ref → `archive/HEAD.zip`，mod.json 存原始 URL）/ zip 直链 / 本地路径；无 git、无 GitHub API；lib_rt 默认分支是 master。
+- `tphp add` 源形态（2026-10-21）：**GitHub 仓库页 URL**（`gh_repo_to_zip` fetch 时改写：ref → `zipball/<ref>`，无 ref → `archive/HEAD.zip`，mod.json 存原始 URL）/ zip 直链 / 本地路径；无 git、无 GitHub API；lib_rt 默认分支是 master。vendor 覆盖前 fail-closed 安全检查（无 mod.json / 含 .git / 包名不符 → 拒绝 rm -rf，`vendor_overwrite_blocked`）。
 - 用户边界：严格前后端/文档一致性；不为修而修；测试必须真实跑（禁改测试假通过）。
 - OOP 审计（2026-10-15，~70 探针 vs PHP 8.6-dev 对拍）：主体与 PHP 逐字节一致；**P0：①跨帧 catch 断裂（调用是 try 体最后一条 op 时接不住，compile.c ex 表 end_pc 差一 + vm.c:1162 压帧前推 pc；修法 end_pc=end+1）②__destruct 永不触发**；P1：typed 属性全线 Parse error（与文档矛盾）、用户异常类不可 extends/catch（TExClass 与 TClass 两套系统）、Closure 类缺失；P2：nullsafe/new 命名参数/方法命名参数/方法 first-class callable 均为 "lands in M3" 占位桩（PLAN/01 §11 示例自相矛盾）、类常量表达式全拒、trait 常量不导入、子类静态属性重声明失效、数组/字符串 callable ❌；P3：override 签名/私有 ctor 不校验、接口方法体被接受、ValueError 缺失。测试盲区：现有套件只测同帧 catch、无 typed 属性/析构测试。
 

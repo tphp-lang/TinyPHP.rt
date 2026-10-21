@@ -1328,6 +1328,36 @@ static int install_deps(const char *proj_dir, const TMod *parent,
     return 0;
 }
 
+/* 覆盖安装前的安全检查（对齐 vpm fail-closed 思路）：目标目录不是
+ * 「本包管理器装出来的包」就拒绝 rm -rf。
+ *  - 不存在 → 可覆盖（首次安装）
+ *  - 无 mod.json → 可能是用户数据/半成品，不是安装产物
+ *  - 含 .git → 用户可能把它变成了手动 clone 的工作区，冲掉=丢代码
+ *  - mod.json 的 name 与目标不符 → 同路径被换成了别的东西
+ * 返回 NULL 可覆盖；否则返回拒绝原因（静态串）。 */
+static const char *vendor_overwrite_blocked(const char *dest,
+                                            const char *expect_name) {
+    if (!fs_exists(dest)) return NULL;
+    char mj[1450], git[1500];
+    snprintf(mj, sizeof mj, "%s/mod.json", dest);
+    if (!fs_exists(mj))
+        return "no mod.json (not an installed package; delete it manually "
+               "if sure)";
+    snprintf(git, sizeof git, "%s/.git", dest);
+    if (fs_exists(git))
+        return "contains a .git work tree (commit or move your work, "
+               "then delete the directory manually)";
+    TMod cur;
+    char e2[256];
+    if (!tmod_load(mj, &cur, e2, sizeof e2))
+        return "unreadable mod.json (delete the directory manually to proceed)";
+    bool mismatch = strcmp(cur.name, expect_name) != 0;
+    tmod_free(&cur);
+    if (mismatch)
+        return "holds a different package name (delete it manually to proceed)";
+    return NULL;
+}
+
 /* 核心安装：把已物化的包目录 src 装到 vendor/<name> + 递归 deps。
  * out_name 可为 NULL；非 NULL 时写入包名（malloc，调用方 free）。 */
 static int install_from_src(const char *proj_dir, const char *src,
@@ -1342,7 +1372,13 @@ static int install_from_src(const char *proj_dir, const char *src,
     char dest[1400];
     vendor_path_of(dest, sizeof dest, proj_dir, pkg.name);
 
-    /* 覆盖安装：先删旧目录 */
+    /* 覆盖安装：先删旧目录（有用户工作区嫌疑则拒绝，见上） */
+    const char *block = vendor_overwrite_blocked(dest, pkg.name);
+    if (block) {
+        set_err(err, errcap, "refusing to overwrite %s: %s", dest, block);
+        tmod_free(&pkg);
+        return 2;
+    }
     fs_rm_rf(dest);
 
     char src_fwd[1200];

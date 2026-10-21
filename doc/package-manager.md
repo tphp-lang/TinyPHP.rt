@@ -99,7 +99,7 @@ GitHub 仓库 URL 支持 `owner/repo`（可带 `.git` 尾缀或 `/tree/<分支>`
 
 `add` 会：装入 `vendor/<name>/` → 递归安装传递依赖 → 更新 `mod.json` deps → 重写 `mod.lock` → 重新生成 `vendor/autoload.php`。
 
-同名依赖已存在时 = 更新（覆盖 vendor 目录）。
+同名依赖已存在时 = 更新（覆盖 vendor 目录）。**覆盖前有安全检查**（fail-closed，对齐 vpm）：目标目录无 `mod.json`、含 `.git` 工作区、或 `mod.json` 包名不符时拒绝覆盖并报错——防止误删你手动放进 vendor 的工作区；确认无用后手动删除该目录即可继续。
 
 ### 使用依赖
 
