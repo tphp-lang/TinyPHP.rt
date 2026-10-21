@@ -75,12 +75,28 @@
   "foo/bar": {
     "url": "https://github.com/foo/bar",  // 来源（GitHub 裸 URL 已剥 :ref 后缀）
     "ref": "v1.2.0",            // 解析/声明的版本（GitHub 裸 URL 的解析结果已固化）
-    "resolved": "2026-10-20T16:30:00Z"  // 解析时间
+    "resolved": "2026-10-20T16:30:00Z",  // 解析时间
+    "integrity": {              // 落盘快照（阶段 E，待实现）：安装完成时
+      "mod.json": "da39a3ee…",  //   vendor/<name>/ 全文件 sha1（相对路径，/ 分隔）
+      "src/Str.php": "a94a8fe5…",
+      "bin/foo.dll": "2fd4e1c6…"
+    }
   }
 }
 ```
 
 无 `commit` 字段（无 git，SHA 不可得）；可复现性由「固化 ref + URL」保证。
+
+**`integrity`（设计，阶段 E 待实现）**——防篡改快照，回答"我装的是不是我审过的那个"：
+
+- **全文件**逐条 sha1（含 `.php`——它就是代码执行面，DLL 天然包含）；排除 `vendor/autoload.php` 等项目级生成物
+- 逐文件明细而非整树单哈希：精确报错（"哪个文件被改"），树哈希留作日后大包优化
+- 算法 **SHA-1**，复用 `pack.c` 实现（与 build 的 DLL manifest 校验同构；防篡改非防伪造，足够）
+- 写入单点：`lock_save`（add/remove/install 尾部统一调用时顺手扫描生成）
+- 校验点只有两个：**install 的 skip 判断**与 **build 打包 vendor 时**；运行时（`tphp run`）不校验
+- 不匹配 = fail-closed 报错（列出文件）+ 显式 `tphp install --force` 才重装，不静默冲掉用户本地改动
+- 新增文件也算不匹配（挡"侧载 DLL 进 vendor"）；旧 lock 无 `integrity` 段 = 不校验，下次 install 成功后自动补写（向后兼容）
+- 本机制不引入密钥/标识/配置面——与 ffi-security.md 的结论一致（不做 FFI 标识、不做运行时总闸）
 
 ### 2.3 目录布局
 
@@ -234,6 +250,8 @@ source = GitHub 仓库 URL / HTTP(S) zip 直链 / 本地路径（目录或 zip�
 
 按 `mod.lock` 逐包恢复（vendor 已存在则跳过，离线友好）；无 lock 则从 `mod.json` deps 全量递归解析。完成后重写 lock + autoload。CI/新机器主入口。
 
+**integrity 校验（阶段 E）**：vendor 已存在时不再只看 `mod.json` 在不在——逐文件对照 lock 的 `integrity` 快照；全部匹配才 skip；不匹配（含**新增文件**）→ 报错列出差异文件，`tphp install --force` 显式重装。
+
 ### 4.5 `tphp upload`（占位）
 
 不实现远程。输出：
@@ -356,6 +374,10 @@ pack 目录遍历时跳过以下内容，避免垃圾进单文件：
 
 `collect_dir` **不再跳过 `.php`**——vendor 里的 PHP 源码是 autoload 运行期 `OP_REQUIRE` 的目标，必须进 zip。VCS/系统垃圾（`.git`/`.DS_Store` 等）仍恒跳过；自动 `--with vendor/` 时额外跳过 `tests/`、`test/`、`*.md`（`tphp_pack_set_vendor_strict`）。
 
+#### 打包前 integrity 校验（阶段 E，待实现）
+
+自动打包 vendor 时先对照 lock 的 `integrity` 快照逐文件校验：不匹配（含新增文件）→ **拒绝打包**（防止把被篡改的依赖打进 exe 分发，与既有 DLL manifest sha1 校验同点位同性质）；无 lock 的手搓项目警告放行。全量 sha1 毫秒级，build 低频不敏感。
+
 #### 端到端链路（打包应用）
 
 ```
@@ -407,6 +429,15 @@ build 时：
 
 **总计约 4.5~5 天（四阶段全部完成）。**
 
+### 阶段 E — lock integrity 快照（防篡改，后置待实现）
+
+设计定稿 2026-10-21（详见 §2.2 `integrity`）；动机见 [../doc/ffi-security.md](../doc/ffi-security.md)：不走"动态库标识/签名"路线（公开标识可复制、签名需密钥+豁免名单且被系统库调用绕穿），改走"哈希固定 = 我装的是不是我审过的那个"。
+
+- **E1 核心闭环**：`pack.c` SHA1 去 static 导出 → `lock_save` 扫包写 `integrity` → `install` skip 升级为逐文件校验（fail-closed + 新增文件算不匹配）→ `test-pkg-integrity.php`
+- **E2 出口把关**：`tphp install --force`；`tphp build` 收集 vendor 前校验 lock，不匹配拒绝打包（对齐既有 DLL manifest sha1 校验点位）
+- **E3 可选后置**：zip 源字节哈希（下载先验再解压）、树哈希压缩优化、`tphp verify` 独立命令
+- 不做：运行时（`tphp run`）校验、密钥/标识机制、配置开关（与 ffi-security.md 结论一致）
+
 ## 7. 边界与已知决策
 
 | 项 | 决策 |
@@ -421,6 +452,7 @@ build 时：
 | 嵌套 vendor | 禁止（拍平共享，Composer 同款） |
 | GitHub 仓库页 URL | `add https://github.com/o/r[.git][/tree/x][:ref] [ref]`：无 ref → GitHub 匿名 API 解析最新发布（releases/latest → tags semver 排序 → 默认分支回退）并**把 ref 固化进 mod.json**；有 ref → `zipball/<ref>`。无 git。原「不调 Release API」决策（§3，git 版时代）已被用户新语义推翻（2026-10-21）：无 git 拿不到 `ls-remote`，API 是唯一可靠来源；限流 60/h/IP 文档已注明 |
 | vendor 覆盖保护 | install 覆盖前 fail-closed（对齐 vpm）：目标无 mod.json / 含 .git / 包名不符 → 拒绝 rm -rf，提示手动删除。已实现（2026-10-21） |
+| lock integrity | **哈希固定而非动态库标识**（2026-10-21 定稿）：lock 逐文件 sha1 快照，install/build 两校验点，运行时不查；公开标识防不住恶意包（可复制）、签名制被系统库豁免绕穿 → 都不做（阶段 E，见 §2.2/§6） |
 
 ## 8. 测试策略
 
@@ -436,6 +468,7 @@ build 时：
 | `test-pkg-overwrite-guard.php` | vendor 覆盖 fail-closed 四分支 + 手动删除后可重装 |
 | `test-pkg-upload-placeholder.php` | upload 占位输出 |
 | （后置）`test-pkg-build-vendor.php` | 自动 --with vendor + 排除 tests/.md + 打包应用可运行 |
+| （阶段 E）`test-pkg-integrity.php` | 装 → 改文件 → install 报错列文件；改回 → skip；新增文件 → 报错；`--force` 恢复；无 lock 项目不受影响 |
 
 ## 9. 示例：端到端
 

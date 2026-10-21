@@ -37,6 +37,7 @@ TinyPHP.rt 是一个用 **C11** 实现的小型 **PHP 8 解释型运行时**：�
 | [cli.md](cli.md) | CLI 命令手册 |
 | [architecture.md](architecture.md) | 运行时架构 |
 | [ffi.md](ffi.md) | FFI 使用与约定 |
+| [ffi-security.md](ffi-security.md) | FFI 安全分析（PHP/txiki/Bun 对照） |
 | [package-manager.md](package-manager.md) | 内置包管理：new/add/remove/install/upload |
 | [testing.md](testing.md) | 测试体系与跑法 |
 | [../PLAN/](../PLAN/) | 完整设计规格（语法/功能/里程碑/扩展指南/包管理） |

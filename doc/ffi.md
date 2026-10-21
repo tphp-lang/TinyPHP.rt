@@ -1,6 +1,7 @@
 # FFI
 
 设计规格：[../PLAN/02-runtime-features.md §4.5](../PLAN/02-runtime-features.md)。
+安全分析（PHP/txiki/Bun 三方对照与建议）：[ffi-security.md](ffi-security.md)。
 
 通过 **libffi** 调用 C 动态库，API 语义对齐 PHP `ext/ffi`。
 
