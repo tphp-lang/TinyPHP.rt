@@ -38,7 +38,7 @@ $ffi->sprintf($s, "hi %d", 7);   // 变参
 | `FFI::memcpy($dst, $src, $n)` | 原生内存拷贝 |
 | `FFI::sizeof($typeOrCData)` | 类型/对象字节大小 |
 | `FFI::alignof($type)` | 对齐 |
-| `FFI::cast($type, $ptr)` | 指针重解释为 CData 视图 |
+| `FFI::cast($type, $ptr)` | 指针重解释为 CData 视图；`$ptr` 只接受 CData / null（**拒裸 int**，见 ffi-security.md §8） |
 
 ### CData（实例）
 
