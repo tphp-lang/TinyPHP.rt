@@ -26,6 +26,11 @@
  * 显式 --with 时 main.c 保持关闭（尊重用户指定路径的完整内容）。 */
 void tphp_pack_set_vendor_strict(bool on);
 
+/* SHA1（与 DLL manifest 校验同实现；pkg lock integrity 复用）。
+ * hex 输出 40 位小写 + NUL。路径 UTF-8。 */
+bool tphp_sha1_buf(const void *data, size_t n, char hex[41]);
+bool tphp_sha1_file(const char *path, char hex[41]);
+
 /* 构建：把 assets 打进目标可执行文件（调用前已复制）。
  * exe_path: 目标可执行文件（UTF-8）
  * main_php: 主脚本源码与长度（可 NULL）

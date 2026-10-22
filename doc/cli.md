@@ -45,7 +45,7 @@ tphp phpc <dir> -o <out.c>        # 把 lib\*.php 源码编进 bundle_data.c
 tphp new <name> [--lib]           # 创建应用 / 库包骨架（mod.json + autoload）
 tphp add <source> [ref]           # 添加依赖：GitHub 仓库 URL / zip 直链 / 本地路径
 tphp remove <name>                # 移除依赖（如 foo/bar），含孤儿传递依赖清理
-tphp install                      # 按 mod.lock 恢复缺失依赖（CI/新机器）
+tphp install [--force]           # 按 mod.lock 恢复缺失依赖（--force 重装 integrity 不匹配的包）
 tphp upload                       # 打印发布指引（占位）
 ```
 所有命令在项目根（含 `mod.json` 的目录）执行。详见 [package-manager.md](package-manager.md)。

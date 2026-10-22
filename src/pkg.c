@@ -11,6 +11,7 @@
  *  - 阶段 B：add/remove（本地目录/zip + HTTP(S) zip；fetch 回调由 main.c 注册）
  */
 #include "pkg.h"
+#include "pack.h"       /* tphp_sha1_buf / tphp_sha1_file（lock integrity） */
 #include "value.h"
 #include "tphp.h"
 #include <ctype.h>
@@ -1371,6 +1372,132 @@ static void vendor_path_of(char *out, size_t cap, const char *proj,
 
 /* ---- mod.lock ---- */
 
+/* ============================================================
+ * lock integrity 快照（阶段 E）：vendor/<name>/ 全文件 sha1。
+ * 写入单点 lock_save；校验点 = install 的 skip 判断 + build 打包
+ * vendor 前（tphp_pkg_verify_vendor）。运行时不查。
+ * ============================================================ */
+
+typedef struct { char rel[1024]; char sha1[41]; } IntEntry;
+typedef struct { IntEntry *v; int n, cap; } IntList;
+
+static void intlist_push(IntList *l, const char *rel, const char *sha1) {
+    if (l->n >= l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 32;
+        l->v = tm_realloc(l->v, sizeof(IntEntry) * (size_t)l->cap);
+    }
+    snprintf(l->v[l->n].rel, sizeof l->v[l->n].rel, "%s", rel);
+    snprintf(l->v[l->n].sha1, sizeof l->v[l->n].sha1, "%s", sha1);
+    l->n++;
+}
+
+static void intlist_free(IntList *l) {
+    tm_free(l->v);
+    l->v = NULL;
+    l->n = l->cap = 0;
+}
+
+/* 递归扫描 dir：全部文件（跳过 '.' 开头条目）→ (rel, sha1)。rel 相对 dir
+ * 根、'/' 分隔。返回 0；scandir 失败 -1。 */
+static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, dir, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&req);
+        return -1;
+    }
+    uv_dirent_t ent;
+    while (uv_fs_scandir_next(&req, &ent) == 0) {
+        if (ent.name[0] == '.') continue;
+        char sub[1500], rel[1024];
+        snprintf(sub, sizeof sub, "%s/%s", dir, ent.name);
+        if (prefix[0]) snprintf(rel, sizeof rel, "%s/%s", prefix, ent.name);
+        else snprintf(rel, sizeof rel, "%s", ent.name);
+        if (fs_isdir(sub)) {
+            if (integrity_scan(sub, rel, l) != 0) {
+                uv_fs_req_cleanup(&req);
+                return -1;
+            }
+        } else {
+            char hex[41];
+            if (tphp_sha1_file(sub, hex))
+                intlist_push(l, rel, hex);
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    return 0;
+}
+
+/* 把 lock 条目里的 integrity 对象展开成 IntList（拷贝，脱离 TArr 生命周期） */
+static void integrity_from_snap(TArr *snap, IntList *l) {
+    for (uint32_t i = 0; i < snap->dused; i++) {
+        if (snap->data[i].t != T_STR) continue;
+        TVal key = TV_NULL;
+        for (uint32_t b = 0; b < snap->bcap; b++) {
+            ABucket *bk = &snap->buckets[b];
+            if (bk->key.t != T_NULL && bk->val_off == i) { key = bk->key; break; }
+        }
+        if (key.t != T_STR) continue;
+        char rel[1024], hex[41];
+        snprintf(rel, sizeof rel, "%s", tstr_val((TStr *)key.u.p));
+        snprintf(hex, sizeof hex, "%s", tstr_val((TStr *)snap->data[i].u.p));
+        intlist_push(l, rel, hex);
+    }
+}
+
+/* 对照快照校验 vdir：快照每文件存在且 sha1 一致；磁盘无快照外新文件。
+ * snap=NULL → 不校验（旧 lock 向后兼容）。0 通过；-1 不匹配（err 列出）。 */
+static int integrity_check(const char *vdir, TArr *snap,
+                           char *err, size_t errcap) {
+    if (!snap) return 0;
+    IntList expect = {0}, actual = {0};
+    integrity_from_snap(snap, &expect);
+    if (integrity_scan(vdir, "", &actual) != 0) {
+        intlist_free(&expect);
+        set_err(err, errcap, "cannot scan %s", vdir);
+        return -1;
+    }
+    int bad = 0, shown_n = 0;
+    char shown[512] = "";
+    size_t sl = 0;
+    /* 缺失 / 被改 */
+    for (int i = 0; i < expect.n; i++) {
+        const char *rel = expect.v[i].rel;
+        const char *hex = expect.v[i].sha1;
+        int j = 0;
+        for (; j < actual.n; j++)
+            if (strcmp(actual.v[j].rel, rel) == 0) break;
+        bool mismatch;
+        if (j >= actual.n) mismatch = true;              /* 缺失 */
+        else mismatch = strcmp(actual.v[j].sha1, hex) != 0;
+        if (!mismatch) continue;
+        bad++;
+        if (sl + strlen(rel) + 4 < sizeof shown) {
+            sl += (size_t)snprintf(shown + sl, sizeof shown - sl, "%s%s",
+                                   sl ? ", " : "", rel);
+            shown_n++;
+        }
+    }
+    /* 新增（快照外文件，挡侧载） */
+    for (int i = 0; i < actual.n; i++) {
+        int j = 0;
+        for (; j < expect.n; j++)
+            if (strcmp(expect.v[j].rel, actual.v[i].rel) == 0) break;
+        if (j < expect.n) continue;
+        bad++;
+        if (sl + strlen(actual.v[i].rel) + 4 < sizeof shown) {
+            sl += (size_t)snprintf(shown + sl, sizeof shown - sl, "%s%s",
+                                   sl ? ", " : "", actual.v[i].rel);
+            shown_n++;
+        }
+    }
+    intlist_free(&expect);
+    intlist_free(&actual);
+    if (bad == 0) return 0;
+    set_err(err, errcap, "%d file(s) mismatched: %s%s", bad, shown,
+            bad > shown_n ? ", ..." : "");
+    return -1;
+}
+
 static int lock_save(const char *proj_dir, char *err, size_t errcap) {
     char root_mj[1200];
     snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
@@ -1436,6 +1563,24 @@ static int lock_save(const char *proj_dir, char *err, size_t errcap) {
         pb_json_str(&b, refs[i]);
         pb_puts(&b, ",\n    \"resolved\": ");
         pb_json_str(&b, ts);
+        /* integrity：vendor/<name>/ 已安装才写（阶段 E；旧 lock 无此段
+         * = 不校验，下次成功 install/lock_save 自动补写） */
+        char vp[1400];
+        vendor_path_of(vp, sizeof vp, proj_dir, names[i]);
+        if (fs_isdir(vp)) {
+            IntList snap = {0};
+            if (integrity_scan(vp, "", &snap) == 0 && snap.n > 0) {
+                pb_puts(&b, ",\n    \"integrity\": {");
+                for (int k = 0; k < snap.n; k++) {
+                    pb_puts(&b, k ? ",\n      " : "\n      ");
+                    pb_json_str(&b, snap.v[k].rel);
+                    pb_puts(&b, ": ");
+                    pb_json_str(&b, snap.v[k].sha1);
+                }
+                pb_puts(&b, "\n    }");
+            }
+            intlist_free(&snap);
+        }
         pb_puts(&b, "\n  }");
         pb_puts(&b, (i + 1 < n) ? ",\n" : "\n");
         tm_free(names[i]); tm_free(urls[i]); tm_free(refs[i]);
@@ -1892,7 +2037,8 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
 
 /* ---- install（按 mod.lock 恢复；无 lock 则从 mod.json deps 全量） ---- */
 
-int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
+int tphp_pkg_install(const char *proj_dir, bool force,
+                     char *err, size_t errcap) {
     if (!proj_dir || !proj_dir[0]) {
         set_err(err, errcap, "install requires project dir");
         return 1;
@@ -1937,13 +2083,29 @@ int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
             char *ref = mget_str(ent, "ref");
             if (!url || !url[0]) { tm_free(url); tm_free(ref); continue; }
 
-            /* 已安装则跳过（离线友好） */
+            /* 已安装：有 integrity 快照则逐文件校验（阶段 E；旧 lock 无
+             * 快照 = 不校验，向后兼容）。不匹配 fail-closed：--force 重装，
+             * 否则报错（不静默冲掉本地改动）。 */
             char exist[1400], emj[1450];
             vendor_path_of(exist, sizeof exist, proj_dir, tstr_val(ks));
             snprintf(emj, sizeof emj, "%s/mod.json", exist);
             if (fs_exists(emj)) {
-                tm_free(url); tm_free(ref);
-                continue;
+                TArr *snap = mget_obj(ent, "integrity");
+                char e2[512] = "";
+                if (!snap || integrity_check(exist, snap, e2, sizeof e2) == 0) {
+                    tm_free(url); tm_free(ref);
+                    continue;                       /* 校验通过 → skip */
+                }
+                if (!force) {
+                    set_err(err, errcap,
+                            "integrity check failed for %s: %s "
+                            "(use install --force to reinstall)",
+                            tstr_val(ks), e2);
+                    tval_release(&lv);
+                    tm_free(url); tm_free(ref);
+                    return 2;
+                }
+                fs_rm_rf(exist);                    /* --force：删了重装 */
             }
 
             char absurl[1400];
@@ -1999,4 +2161,52 @@ int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap) {
     lock_save(proj_dir, err, errcap);
     tphp_pkg_gen_autoload(proj_dir, err, errcap);
     return 0;
+}
+
+/* build 自动打包 vendor 前的 integrity 卡口（阶段 E）：读 mod.lock，
+ * 对每个带 integrity 快照的已装包逐文件校验。无 lock / 条目无快照 →
+ * 跳过（向后兼容与手搓项目警告放行）。0 通过；2 不匹配。 */
+int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap) {
+    char lockp[1250];
+    snprintf(lockp, sizeof lockp, "%s/mod.lock", proj_dir);
+    if (!fs_exists(lockp)) return 0;                 /* 无 lock：放行 */
+    size_t llen = 0;
+    char *lraw = fs_read(lockp, &llen);
+    if (!lraw) {
+        set_err(err, errcap, "cannot read mod.lock");
+        return 2;
+    }
+    char *lstripped = jsonc_strip(lraw, llen);
+    tm_free(lraw);
+    TVal lv;
+    bool ok = tphp_json_decode_c(lstripped, strlen(lstripped), &lv);
+    tm_free(lstripped);
+    if (!ok || lv.t != T_ARR) return 0;              /* lock 坏：放行交给 install 流程 */
+    TArr *lock = (TArr *)lv.u.p;
+    int rc = 0;
+    for (uint32_t i = 0; i < lock->dused; i++) {
+        if (lock->data[i].t != T_ARR) continue;
+        TVal key = TV_NULL;
+        for (uint32_t b = 0; b < lock->bcap; b++) {
+            ABucket *bk = &lock->buckets[b];
+            if (bk->key.t != T_NULL && bk->val_off == i) { key = bk->key; break; }
+        }
+        if (key.t != T_STR) continue;
+        TArr *ent = (TArr *)lock->data[i].u.p;
+        TArr *snap = mget_obj(ent, "integrity");
+        if (!snap) continue;
+        char exist[1400];
+        vendor_path_of(exist, sizeof exist, proj_dir, tstr_val((TStr *)key.u.p));
+        if (!fs_isdir(exist)) continue;              /* 未装：不在此拦 */
+        char e2[512] = "";
+        if (integrity_check(exist, snap, e2, sizeof e2) != 0) {
+            set_err(err, errcap, "vendor integrity check failed for %s: %s "
+                    "(re-run tphp install --force before building)",
+                    tstr_val((TStr *)key.u.p), e2);
+            rc = 2;
+            break;
+        }
+    }
+    tval_release(&lv);
+    return rc;
 }

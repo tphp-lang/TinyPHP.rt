@@ -10,7 +10,7 @@ tphp new --lib <name>        # 创建库包（src/ + tests/ + autoload）
 
 tphp add <source> [ref]      # 添加依赖；source 为 GitHub 仓库 URL / zip URL / 路径
 tphp remove <name>           # 移除依赖（如 foo/bar）
-tphp install                 # 按 mod.lock 恢复缺失依赖（CI/新机器）
+tphp install [--force]      # 按 mod.lock 恢复缺失依赖（CI/新机器）；--force 重装校验不过的包
 tphp upload                  # 打印发布指引（占位，见下）
 ```
 
@@ -129,11 +129,13 @@ require "vendor/foo/bar/src/util.php";
 
 ```bash
 git clone ... && cd project
-tphp install        # 按 mod.lock 恢复；已装跳过（离线友好）
+tphp install        # 按 mod.lock 恢复；已装且 integrity 校验通过则跳过（离线友好）
 tphp run main.php
 ```
 
 无 `mod.lock` 时从 `mod.json` deps 全量递归解析。
+
+**integrity 校验（防篡改）**：`mod.lock` 为每个包记录逐文件 SHA-1 快照（含 `.php`）。`install` 跳过已装包前先对照快照校验——文件被改、缺失、或出现快照外新文件（挡侧载）都算不匹配，**fail-closed 报错并列出差异文件**，需显式 `tphp install --force` 删除重装；不会静默冲掉你对 vendor 的本地改动。旧 lock 无 `integrity` 段 = 不校验，下次成功 install 自动补写。快照在 `add`/`remove`/`install` 写 lock 时统一生成。
 
 ### 移除依赖
 
@@ -163,6 +165,7 @@ tphp build main.php -o app
 
 - 工作目录有 `mod.json` 且存在 `vendor/autoload.php`、且未显式 `--with` → **自动打包 `vendor/`**
 - 自动 vendor 时排除：`.git` 等 VCS/系统垃圾、`tests/`、`*.md`
+- **打包前 integrity 卡口**：自动打包 vendor 前对照 `mod.lock` 快照逐文件校验，不匹配**拒绝打包**（防止把被篡改的依赖打进 exe 分发）；修复：`tphp install --force` 后重试。无 lock 的手搓项目警告放行
 - 显式 `--with <dir>` 不启用上述扩展排除（仅跳过 VCS/系统垃圾）
 - vendor 内 `.php` 源码进 zip（autoload 运行期 `OP_REQUIRE` 依赖它）
 

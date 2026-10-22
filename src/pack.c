@@ -107,6 +107,17 @@ static bool sha1_buf(const void *data, size_t n, char hex[41]) {
     return true;
 }
 
+static bool sha1_file(const char *path, char hex[41]);   /* 定义见下 */
+
+/* ---- 对外导出（pkg lock integrity 复用；DLL manifest 同实现） ---- */
+bool tphp_sha1_buf(const void *data, size_t n, char hex[41]) {
+    return sha1_buf(data, n, hex);
+}
+
+bool tphp_sha1_file(const char *path, char hex[41]) {
+    return sha1_file(path, hex);
+}
+
 /* ---- 通用 IO（接口一律 UTF-8；Windows 落宽字符 API） ---- */
 
 #ifdef _WIN32

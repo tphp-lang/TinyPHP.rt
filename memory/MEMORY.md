@@ -1,7 +1,7 @@
 # TinyPHP.rt 项目记忆（长期）
 
 - 定位：PHP 8 **解释型运行时**（lex→parse→compile→自有 opcode→VM 解释），非 AOT/JIT；与 TinyPHP（AOT 编译器）代码零共享、定位互补。CLI 名 `tphp`，当前 0.0.1。
-- 完成态（2026-10-20 实测）：M0~M6 + M5.5 FFI + M6.1 打包器全关；2026-10-20 会话新增 require/include 全家桶、PHP 8.4 属性钩子、(void)/final 提升/clone 列表、编译警告清零；**包管理器四阶段全部完成**（new/add/remove/install/upload + doc/package-manager.md）；tests/run.ps1 **178 passed 0 failed**；CI 5 平台。记忆目录已迁至项目根 `memory/`（原 `.workbuddy/memory/`）。
+- 完成态（2026-10-21 实测）：M0~M6 + M5.5 FFI + M6.1 打包器全关；包管理**五阶段 A–E 全部完成**（阶段 E = lock integrity：`pack.c` 导出 SHA1、`lock_save` 写逐文件快照、install fail-closed 校验 + `--force`、build 打包前 `tphp_pkg_verify_vendor` 卡口）；tests/run.ps1 **180 passed 0 failed**；CI 5 平台。
 - 核心设计：TExecCtx 每协程 VM 状态整块切换（fiber 抄 php-src Zend/asm）；prog freeze 后字节码跨线程只读共享；异常表驱动 + longjmp unwind；Worker = 独立 TPhpRuntime 全 TLS 隔离 + uv_mutex mailbox + serialize 克隆；bundle 用**源码内嵌**（非 opcode 序列化，TOp 含 handler 指针不可序列化）；pack.c = PE RCDATA / ELF section / macOS footer 三平台资产打包。
 - 环境坑（本项目实测）：src 下自定义头禁叫 io.h/ffi.h（顶掉系统头）；.cmd 纯 ASCII；ffi_prep_cif 不拷贝 arg_types 数组必须堆分配；PS5 写无 BOM UTF-8；build.log 为 UTF-16 需 iconv；PowerShell 传参剥引号用 rsp 响应文件。
 - HTTPS 信任面：内嵌 Mozilla `cacert.c` + **Windows 额外并入系统 Root 证书库**（net.c `tls_cacert_load_win_store`，build.cmd 加 `-lcrypt32`）；github.com 在国内用户机器上可能被加速器类工具 MITM（假 CA 在系统库、浏览器正常），tphp 拒绝是正确行为，握手失败会打 verify 标志位明细（永久诊断）。

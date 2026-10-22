@@ -389,13 +389,18 @@ static TVal bi_pkg_remove(VM *vm, TVal *args, int n) {
     return TV_TRUE;
 }
 
-/* pkg_install(string $proj) */
+/* pkg_install(string $proj, bool $force = false) */
 static TVal bi_pkg_install(VM *vm, TVal *args, int n) {
     if (n < 1 || args[0].t != T_STR)
-        RAISE(vm, "ArgumentCountError", "pkg_install() expects (string $proj)");
+        RAISE(vm, "ArgumentCountError",
+              "pkg_install() expects (string $proj, bool $force = false)");
+    if (n >= 2 && args[1].t != T_TRUE && args[1].t != T_FALSE &&
+        args[1].t != T_NULL)
+        RAISE(vm, "TypeError", "pkg_install(): Argument #2 ($force) must be bool or null");
     const char *proj = tstr_val((TStr *)args[0].u.p);
+    bool force = (n >= 2 && args[1].t == T_TRUE);
     char err[512] = "";
-    int rc = tphp_pkg_install(proj, err, sizeof err);
+    int rc = tphp_pkg_install(proj, force, err, sizeof err);
     if (rc == 1)
         RAISE(vm, "ValueError", "pkg_install(): %s", err);
     if (rc != 0)

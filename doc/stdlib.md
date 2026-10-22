@@ -77,7 +77,7 @@
 `call_user_func` `call_user_func_array`
 
 ### 包管理（开发期；CLI 命令的 PHP 可调用层，见 package-manager.md）
-`pkg_new($dir, $name, $lib = false)` `pkg_add($proj, $source, $ref = "")` `pkg_remove($proj, $name)` `pkg_install($proj)`
+`pkg_new($dir, $name, $lib = false)` `pkg_add($proj, $source, $ref = "")` `pkg_remove($proj, $name)` `pkg_install($proj, $force = false)`
 
 名字/条件非法抛 `ValueError`，IO 失败抛 `RuntimeException`；成功返回 `true`。
 

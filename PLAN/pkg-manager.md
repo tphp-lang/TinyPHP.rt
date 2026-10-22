@@ -76,7 +76,7 @@
     "url": "https://github.com/foo/bar",  // 来源（GitHub 裸 URL 已剥 :ref 后缀）
     "ref": "v1.2.0",            // 解析/声明的版本（GitHub 裸 URL 的解析结果已固化）
     "resolved": "2026-10-20T16:30:00Z",  // 解析时间
-    "integrity": {              // 落盘快照（阶段 E，待实现）：安装完成时
+    "integrity": {              // 落盘快照（阶段 E）：安装完成时
       "mod.json": "da39a3ee…",  //   vendor/<name>/ 全文件 sha1（相对路径，/ 分隔）
       "src/Str.php": "a94a8fe5…",
       "bin/foo.dll": "2fd4e1c6…"
@@ -87,7 +87,7 @@
 
 无 `commit` 字段（无 git，SHA 不可得）；可复现性由「固化 ref + URL」保证。
 
-**`integrity`（设计，阶段 E 待实现）**——防篡改快照，回答"我装的是不是我审过的那个"：
+**`integrity`（阶段 E 已实现）**——防篡改快照，回答"我装的是不是我审过的那个"：
 
 - **全文件**逐条 sha1（含 `.php`——它就是代码执行面，DLL 天然包含）；排除 `vendor/autoload.php` 等项目级生成物
 - 逐文件明细而非整树单哈希：精确报错（"哪个文件被改"），树哈希留作日后大包优化
@@ -374,7 +374,7 @@ pack 目录遍历时跳过以下内容，避免垃圾进单文件：
 
 `collect_dir` **不再跳过 `.php`**——vendor 里的 PHP 源码是 autoload 运行期 `OP_REQUIRE` 的目标，必须进 zip。VCS/系统垃圾（`.git`/`.DS_Store` 等）仍恒跳过；自动 `--with vendor/` 时额外跳过 `tests/`、`test/`、`*.md`（`tphp_pack_set_vendor_strict`）。
 
-#### 打包前 integrity 校验（阶段 E，待实现）
+#### 打包前 integrity 校验（阶段 E）
 
 自动打包 vendor 时先对照 lock 的 `integrity` 快照逐文件校验：不匹配（含新增文件）→ **拒绝打包**（防止把被篡改的依赖打进 exe 分发，与既有 DLL manifest sha1 校验同点位同性质）；无 lock 的手搓项目警告放行。全量 sha1 毫秒级，build 低频不敏感。
 
@@ -429,7 +429,7 @@ build 时：
 
 **总计约 4.5~5 天（四阶段全部完成）。**
 
-### 阶段 E — lock integrity 快照（防篡改，后置待实现）
+### 阶段 E — lock integrity 快照（防篡改）✅ 已完成（2026-10-21）
 
 设计定稿 2026-10-21（详见 §2.2 `integrity`）；动机见 [../doc/ffi-security.md](../doc/ffi-security.md)：不走"动态库标识/签名"路线（公开标识可复制、签名需密钥+豁免名单且被系统库调用绕穿），改走"哈希固定 = 我装的是不是我审过的那个"。
 

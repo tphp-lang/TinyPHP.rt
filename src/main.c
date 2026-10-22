@@ -653,6 +653,15 @@ int main(int argc, char **argv) {
                 if (mj) fclose(mj);
                 if (vd) fclose(vd);
             }
+            /* 阶段 E 卡口：自动打包 vendor 前对照 mod.lock integrity 快照
+             * 逐文件校验，不匹配拒绝打包（防把被篡改的依赖打进 exe） */
+            if (vendor_auto) {
+                char ierr[512] = "";
+                if (tphp_pkg_verify_vendor(".", ierr, sizeof ierr) != 0) {
+                    fprintf(stderr, "tphp: %s\n", ierr);
+                    return (int)TPHP_E_IO;
+                }
+            }
             /* 自动 vendor 时启用排除（tests/ 与 *.md）；显式 --with 尊重用户路径 */
             tphp_pack_set_vendor_strict(vendor_auto);
             char *php = read_file(script);
@@ -811,9 +820,13 @@ int main(int argc, char **argv) {
             return (int)TPHP_OK;
         }
         if (strcmp(a, "install") == 0) {
-            /* tphp install：按 mod.lock 恢复缺失包；无 lock 从 mod.json deps */
+            /* tphp install [--force]：按 mod.lock 恢复；integrity 不匹配时
+             * --force 删除重装，否则 fail-closed 报错（阶段 E） */
+            bool force = false;
+            for (int j = i + 1; j < argc; j++)
+                if (strcmp(argv[j], "--force") == 0) force = true;
             char err[512] = "";
-            int rc = tphp_pkg_install(".", err, sizeof err);
+            int rc = tphp_pkg_install(".", force, err, sizeof err);
             if (rc != 0) {
                 fprintf(stderr, "tphp: %s\n", err);
                 return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;

@@ -43,7 +43,13 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
                     char *err, size_t errcap);
 
 /* tphp install：按 mod.lock 恢复缺失包（vendor 已存在则跳过，离线友好）；
- * 无 lock 时从 mod.json deps 全量解析。完成后重写 lock + autoload。 */
-int tphp_pkg_install(const char *proj_dir, char *err, size_t errcap);
+ * 无 lock 时从 mod.json deps 全量解析。完成后重写 lock + autoload。
+ * force：已装包 integrity 校验不通过时删除重装（--force）；否则 fail-closed。 */
+int tphp_pkg_install(const char *proj_dir, bool force,
+                     char *err, size_t errcap);
+
+/* build 自动打包 vendor 前的 integrity 卡口：对照 mod.lock 快照逐文件
+ * 校验已装包（无 lock / 旧 lock 无快照 = 放行）。0 通过；2 不匹配。 */
+int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap);
 
 #endif /* TPHP_PKG_H */
