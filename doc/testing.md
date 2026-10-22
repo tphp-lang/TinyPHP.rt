@@ -42,6 +42,7 @@ echo "hello\n";
 | `tests/pkg/` | 包管理：new/add/remove/install 骨架与依赖图 |
 | `tests/bench/` | 性能基线：fib(28)、1e6 push、读改写（耗时走 stderr） |
 | `tests/php-compat/` | php-src `.phpt` 对拍种子（见目录内 README） |
+| `tests/standard/` | ext/standard 对拍（strpos 族 offset 语义 / nl2br / basename / dirname / is_file，基准 php-8.5.1） |
 
 ## 写新测试
 

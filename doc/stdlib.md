@@ -120,7 +120,7 @@
 
 ## 文件 I/O
 
-`file_get_contents` `file_put_contents` `fopen` `fread` `fwrite` `fgets` `fclose` `feof` `fseek` `file_exists` `filesize` `unlink` `rename` `mkdir` `rmdir` `scandir`
+`file_get_contents` `file_put_contents` `fopen` `fread` `fwrite` `fgets` `fclose` `feof` `fseek` `file_exists` `is_file` `is_dir` `filesize` `unlink` `rename` `mkdir` `rmdir` `scandir`
 
 `fopen` 返回 TStream 对象；网络读写透明挂起（libuv 线程池/事件循环）。
 
