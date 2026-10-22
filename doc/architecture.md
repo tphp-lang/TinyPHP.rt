@@ -55,7 +55,8 @@ libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步
 ## 目录
 
 ```
-src/     运行时核心（lex/parse/compile/vm/sched/fiber/io/net/ffi/...）
+src/     运行时核心引擎（lex/parse/compile/vm/sched/fiber/value/class/pack/...）
+ext/     内置扩展层（一扩展一子目录：builtin/ ffi/ net/ io/ worker/ json/ serialize/ pkg/）
 lib/     PHP 层 stdlib（phpc 打进 bundle）
 tests/   测试（见 testing.md）
 deps/    vendor 依赖

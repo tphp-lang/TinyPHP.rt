@@ -85,7 +85,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 ## 项目结构
 
 ```
-src/     运行时核心（~3 万行 C）
+src/     运行时核心引擎（~2 万行 C）
+ext/     内置扩展层（builtin/ ffi/ net/ io/ worker/ json/ serialize/ pkg/）
 lib/     PHP 层 stdlib（phpc 打进 exe）
 tests/   测试套件
 deps/    vendor：libuv mimalloc mbedtls libffi miniz asm

@@ -13,7 +13,15 @@
 
 判断标准：需要持有 OS 资源（fd/socket/timer/线程）或跨调用状态 → 内部类；一次调用完成 → builtin；C 标准库没有现成实现且纯 PHP 性能可接受 → lib。**禁止**为了"快"把纯逻辑下沉到 C（先测性能，bench 有证据再说）。
 
-## 2. builtin 函数开发（builtin.c 模式）
+### 1.1 目录布局（`src/` vs `ext/`）
+
+- **`src/` = 引擎**：lex/parse/compile/vm/sched/fiber/value/class/exclass/mem/error/bundle/pack/main——解释器本体与基础设施
+- **`ext/` = 内置扩展层**：一扩展一子目录，PHP 可见能力都落这里——
+  `ext/builtin/`（无状态函数大表）、`ext/ffi/`、`ext/net/`（含 cacert.c）、`ext/io/`、`ext/worker/`、`ext/json/`、`ext/serialize/`、`ext/pkg/`
+- 新扩展**建子目录**（`ext/<name>/*.c|h`），不要往 `src/` 平铺，也不要把新函数继续堆进 `builtin.c` 大表（达到拆分阈值时按域拆 `ext/builtin/`）
+- 构建：`build.cmd` / `build.sh` 自动扫 `src/*.c` + `ext/*/*.c`，无需登记；头文件经 `-Iext/<name>` 引用（**-I 列表在 deps/libffi/include 之后**，且子目录内头文件禁止叫 `ffi.h`/`io.h`——会顶掉系统头，见 §4.10）
+
+## 2. builtin 函数开发（`ext/builtin/builtin.c` 模式）
 
 ```c
 static TVal bi_myfunc(VM *vm, TVal *args, int n) {
@@ -28,7 +36,7 @@ static TVal bi_myfunc(VM *vm, TVal *args, int n) {
 - **args 所有权归调用方**：DO_FCALL 调用后统一 release——builtin 内部对 refcounted 参数只读；要长期保存必须 `tval_addref`；返回值所有权转移给调用方
 - 参数个数/类型错误 → `ArgumentCountError`/`TypeError`（RAISE 宏）；运行条件不满足按 PHP 语义 Warning(stderr) + false，而不是抛异常（对齐 PHP 8，见 §5）
 
-## 3. 内部类开发（worker.c 模式）
+## 3. 内部类开发（`ext/worker/worker.c` 模式）
 
 ```c
 /* 1. 建类：属性 + 方法（方法名必须 tstr_intern，防 GC） */
@@ -60,7 +68,7 @@ static TVal nm_read(VM *vm, void *self, TVal *args, int n) { ... }
 7. **异常安全**：`vm_raise` 是 longjmp——native 中途 raise 会跳过后续 C 代码：资源先登记后使用、已分配内存在 raise 前释放或入注册表；挂起型 native 抛出路径由 cont_check_cancel 统一弹 rec（不要自己处理）
 8. **跨线程**：Worker 模型无共享——只读共享限 prog 冻结数据（ic 已急解析）；可变数据一律走消息（serialize 克隆）；新全局缓存默认禁止跨线程
 9. **阻塞**：native 里禁止自旋等事件（挂死全调度器）；CPU 密集/长阻塞操作 → Worker 线程，或查 uv 异步 API
-10. **CRT 头名**：自定义头避开 CRT 系统头名（`io.h`→`tio.h` 教训——-Isrc 优先级顶掉 CRT 声明，clang 新版按硬错误处理）
+10. **CRT 头名**：自定义头避开 CRT 系统头名（`io.h`→`tio.h` 教训——-I 优先级顶掉 CRT/依赖声明，clang 新版按硬错误处理）；`ext/` 各子目录的 -I 一律排在 `deps/libffi/include` 之后，且 `ext/ffi/` 内头文件禁叫 `ffi.h`（顶掉 libffi 公共头）
 
 ## 5. 错误处理标准（对齐 PHP 8 语义）
 

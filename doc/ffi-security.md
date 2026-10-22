@@ -109,4 +109,4 @@ FFI 的功能承诺就是"直接调用 C、直接读写原生内存"。以下能
 | PHP FFI | php-src `ext/ffi/ffi.c`（本机 `C:\Users\kllxs\Desktop\php-src-php-8.5.7`）：`zend_ffi_validate_api_restriction` / `ZEND_FFI_VALIDATE_API_RESTRICTION` / `zend_ffi_cdata_read_dim` / `zend_ffi_create_callback` |
 | txiki.js FFI | 本机 `C:\Users\kllxs\Desktop\txiki.js`：`src/mod_ffi.c`、`src/js/stdlib/ffi/ffi.js` |
 | Bun FFI | 本机 `C:\Users\kllxs\Desktop\bun-bun-v1.3.14`：`src/js/bun/ffi.ts`、`src/runtime/ffi/ffi.zig`、`FFIObject.zig` |
-| 本项目 | `src/ffi.c`、`doc/ffi.md`、`PLAN/02-runtime-features.md §4.5` |
+| 本项目 | `ext/ffi/ffi.c`、`doc/ffi.md`、`PLAN/02-runtime-features.md §4.5` |

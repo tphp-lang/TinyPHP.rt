@@ -10,7 +10,10 @@ set OBJ=build\obj
 rem ---- flags ----
 set CFLAGS=-O2 -std=c11 -g -fno-omit-frame-pointer
 set CFLAGS_US=-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE -DTPHP_USE_MIMALLOC
-set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz
+rem ext\* include dirs MUST come after deps\libffi\include: libffi's public
+rem header is <ffi.h>; an -Iext\ffi earlier in the list with an ffi.h inside
+rem would shadow it (same trap as the historic src\ffi.h naming ban).
+set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz -Iext\ffi -Iext\net -Iext\io -Iext\worker -Iext\json -Iext\serialize -Iext\pkg -Iext\builtin
 set DEFS=-DTPHP_TARGET="\"x86_64-w64-windows-gnu\""
 
 if not exist build mkdir build
@@ -36,8 +39,9 @@ for %%f in (deps\mbedtls\library\*.c) do %CC% -w %CFLAGS% %INC% -c "%%f" -o "%OB
 echo [3b/5] compiling miniz...
 %CC% -w %CFLAGS% %INC% -c deps\miniz\miniz.c -o "%OBJ%\miniz.o" || goto :fail
 
-echo [4/5] compiling tphp sources...
+echo [4/5] compiling tphp sources (src + ext)...
 for %%f in (src\*.c) do %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~nf.o" || goto :fail
+for /d %%d in (ext\*) do for %%f in ("%%d\*.c") do if exist "%%f" %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~nf.o" || goto :fail
 
 echo [5/6] linking...
 %CC% %OBJ%\*.o deps\libffi\lib\libffi.a -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 || goto :fail

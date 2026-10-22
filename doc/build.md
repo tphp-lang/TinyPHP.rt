@@ -2,6 +2,8 @@
 
 纯命令行脚本，无 Make/CMake。所有脚本为 **ASCII-only**。
 
+源码扫描：`src/*.c`（引擎）+ `ext/*/*.c`（内置扩展，一扩展一子目录）；扩展头文件经 `-Iext/<name>` 引用（排在 libffi include 之后）。
+
 ## Windows（msys2 clang64）
 
 前置：安装 [MSYS2](https://www.msys2.org/)，`CLANG64` 环境含 `clang`。

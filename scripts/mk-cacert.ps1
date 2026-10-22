@@ -1,9 +1,9 @@
-# mk-cacert.ps1: convert build/cacert.pem into src/cacert.c (embedded CA bundle)
+# mk-cacert.ps1: convert build/cacert.pem into ext/net/cacert.c (embedded CA bundle)
 # Usage: powershell -File scripts/mk-cacert.ps1
 # (ASCII comments only: PS5 reads BOM-less UTF-8 scripts as ANSI and a CJK
 #  comment can swallow the newline, hiding the next line.)
 $pem = Join-Path $PSScriptRoot "..\build\cacert.pem"
-$out = Join-Path $PSScriptRoot "..\src\cacert.c"
+$out = Join-Path $PSScriptRoot "..\ext\net\cacert.c"
 $bytes = [System.IO.File]::ReadAllBytes($pem)
 $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("/* 自动生成：scripts/mk-cacert.ps1 <- build/cacert.pem (curl.se/ca)")

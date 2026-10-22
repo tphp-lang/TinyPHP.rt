@@ -65,6 +65,11 @@ if [ -z "$FFI_LIBS" ]; then
   FFI_LIBS="-lffi"
 fi
 
+# ext\* include dirs MUST come after any libffi include: libffi's public
+# header is <ffi.h>; an -Iext/ffi earlier in the list with an ffi.h inside
+# would shadow it (same trap as the historic src/ffi.h naming ban).
+INC="$INC -Iext/ffi -Iext/net -Iext/io -Iext/worker -Iext/json -Iext/serialize -Iext/pkg -Iext/builtin"
+
 # normalize arch: arm64 -> aarch64 for target string (Linux); keep arm64 on Darwin
 case "$TARCH" in
   arm64) TARCH_N=arm64 ;;
@@ -167,10 +172,16 @@ done
 # under POSIX feature macros; macOS libc declares them by default
 $CC -w $CFLAGS -D_DEFAULT_SOURCE $INC -c deps/miniz/miniz.c -o "$OBJ/miniz.o"
 
-# ---- [5/6] tphp sources ----
+# ---- [5/6] tphp sources (src + ext) ----
 echo "[5/6] compiling tphp sources..."
 for f in src/*.c; do
   $CC $CFLAGS_US $DEFS $INC -c "$f" -o "$OBJ/src_$(basename "$f" .c).o"
+done
+for d in ext/*/; do
+  for f in "$d"*.c; do
+    [ -e "$f" ] || continue
+    $CC $CFLAGS_US $DEFS $INC -c "$f" -o "$OBJ/src_$(basename "$f" .c).o"
+  done
 done
 
 # ---- [6/6] link ----
