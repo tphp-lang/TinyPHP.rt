@@ -168,7 +168,7 @@ static TClosure *tclo_alloc_builtin(BuiltinFn bfn) {
 }
 
 static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
-                         TExObj *previous) {
+                         const char *file, TExObj *previous) {
     TExObj *x = tm_malloc(sizeof *x);
     x->h.rc = 1; x->h.color = GC_COLOR_UNMARKED; x->h.kind = GC_KIND_EX;
     x->h.flags = 0;
@@ -179,22 +179,28 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
     x->code = code;
     x->previous = previous;
     x->line = line;
+    x->file = file;           /* 抛出点文件（NULL = 未知，打印回落 prog） */
     x->wrap = NULL;      /* P1-2: 用户异常类包装；引擎异常为 NULL */
     return x;
 }
 
 /* ---- engine raise: store the exception and longjmp to the main loop ---- */
 static void vm_raise_at(VM *vm, const TExClass *cls, int line,
-                        const char *fmt, va_list ap)
+                        const char *file, const char *fmt, va_list ap)
     __attribute__((noreturn));
 
 static void vm_raise_at(VM *vm, const TExClass *cls, int line,
-                        const char *fmt, va_list ap) {
+                        const char *file, const char *fmt, va_list ap) {
     char buf[512];
     vsnprintf(buf, sizeof buf, fmt, ap);
     TStr *msg = tstr_new(buf, strlen(buf));
-    vm->x.exception = tex_alloc(cls, msg, 0, line, NULL);
+    vm->x.exception = tex_alloc(cls, msg, 0, line, file, NULL);
     longjmp(vm->x.unwind, 1);
+}
+
+/* 抛出点文件 = 当前帧的源文件（行号与文件同属一个 fn->file） */
+static const char *raise_file(VM *vm) {
+    return (vm->x.frame && vm->x.frame->file) ? vm->x.frame->file : NULL;
 }
 
 static void vm_raise(VM *vm, const TExClass *cls, TOp *op,
@@ -208,7 +214,7 @@ static void vm_raise(VM *vm, const TExClass *cls, TOp *op,
     int line = op ? op->line : 0;
     if (!line && vm->x.n_calls > 0)
         line = vm->x.calls[vm->x.n_calls - 1].line;
-    vm_raise_at(vm, cls, line, fmt, ap);
+    vm_raise_at(vm, cls, line, raise_file(vm), fmt, ap);
     va_end(ap);
 }
 
@@ -221,7 +227,7 @@ void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...) {
         line = vm->x.frame->fn->ops[vm->x.frame->pc].line;
     if (!line && vm->x.n_calls > 0)
         line = vm->x.calls[vm->x.n_calls - 1].line;
-    vm_raise_at(vm, ex_class(cls), line, fmt, ap);
+    vm_raise_at(vm, ex_class(cls), line, raise_file(vm), fmt, ap);
     va_end(ap);
 }
 
@@ -236,7 +242,8 @@ static void vm_value_raise(const char *cls_name, const char *fmt, va_list ap) {
         line = vm->x.frame->fn->ops[vm->x.frame->pc].line;
     if (!line && vm && vm->x.n_calls > 0)
         line = vm->x.calls[vm->x.n_calls - 1].line;
-    vm_raise_at(vm, ex_class(cls_name), line, fmt, ap);
+    vm_raise_at(vm, ex_class(cls_name), line, vm ? raise_file(vm) : NULL,
+                fmt, ap);
 }
 
 /* internal: evaluate a zero-arg compiled thunk (runtime default values) */
@@ -993,6 +1000,7 @@ static void init_method_callable(VM *vm, TOp *op, VMCallRec *rec,
             rec->nm_fn = m->native;
         } else {
             rec->uf = m->fn;
+            rec->scope_decl = m->decl;
         }
         return;
     }
@@ -1008,6 +1016,7 @@ static void init_method_callable(VM *vm, TOp *op, VMCallRec *rec,
         rec->is_method = true;
         rec->called_cls = cls;
         rec->uf = m->fn;
+        rec->scope_decl = m->decl;
     }
 }
 
@@ -1039,6 +1048,7 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
             rec->this_obj = o;
             tval_addref(clo->captures[0]);   /* frame slot 0 owns a reference */
             rec->uf = m->fn;
+            rec->scope_decl = m->decl;
             return 1;
         }
         rec->clo = clo;
@@ -1055,6 +1065,7 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
                 rec->this_obj = o;
                 tval_addref(fv);          /* frame slot 0 owns a reference */
                 rec->uf = m->fn;
+                rec->scope_decl = m->decl;
                 return 1;
             }
         }
@@ -1469,7 +1480,15 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
     vm->x.n_args = (int)rec->args_base;
     VMFrame *f = tm_malloc(sizeof *f);
-    f->vis_scope = NULL;
+    /* 可见性 scope（PHP EG(scope)）优先级：
+     *   1. rec->scope_decl = TMethod.decl——普通方法=声明类（B::f() 执行 A
+     *      的方法体 scope=A，A 的 private 可见）；trait 拷贝=使用类（TU）
+     *   2. fn->decl_cls ——兜底（无 TMethod 路径，方法形态门控）
+     *   3. NULL → frame_scope_cls fallback called_cls——闭包 bindTo 重绑
+     *      scope 走这里（与 called_cls 的 static:: 后绑定分离） */
+    f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
+                 : ((fn->is_method && fn->decl_cls)
+                        ? (TClass *)fn->decl_cls : NULL);
     f->fn = fn;
     f->file = fn->file;
     f->pc = 0;
@@ -1732,7 +1751,8 @@ static int32_t op_new_ex(VM *vm, TOp *op) {
             tval_release(&args[i]);
     vm->x.n_args = (int)base;
     if (rec) vm->x.n_calls--;              /* pop INIT_NEW rec */
-    wtake(vm, op, TV_OBJ(tex_alloc(cls, msg, code, op->line, prev)));
+    wtake(vm, op, TV_OBJ(tex_alloc(cls, msg, code, op->line, raise_file(vm),
+                                   prev)));
     return 1;
 }
 
@@ -1925,7 +1945,7 @@ static int32_t op_throw(VM *vm, TOp *op) {
         if (sm >= 0 && o->props[sm].t == T_STR) msg = (TStr *)o->props[sm].u.p;
         int sc = tphp_class_find_prop(o->cls, "code");
         if (sc >= 0 && o->props[sc].t == T_INT) code = o->props[sc].u.i;
-        TExObj *w = tex_alloc(ecls, msg, code, op->line, NULL);
+        TExObj *w = tex_alloc(ecls, msg, code, op->line, raise_file(vm), NULL);
         tval_addref(TV_OBJ(o));
         w->wrap = o;                  /* 包装器持一份用户对象引用 */
         vm->x.exception = w;
@@ -1936,6 +1956,7 @@ static int32_t op_throw(VM *vm, TOp *op) {
                  "Can only throw objects");
     TExObj *x = (TExObj *)v.u.p;
     x->line = op->line;
+    x->file = raise_file(vm);         /* 抛出点文件（同 line 归因） */
     tval_addref(v);
     vm->x.exception = x;
     longjmp(vm->x.unwind, 1);
@@ -2114,9 +2135,12 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     rec->is_method = true;
     rec->is_thunk = true;         /* RETURN stores into vm->x.thunk_ret */
     rec->uf = m->fn;
+    rec->scope_decl = m->decl;
     TFunc *fn = m->fn;
     VMFrame *f = tm_malloc(sizeof *f);
-    f->vis_scope = NULL;
+    f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
+                 : ((fn->is_method && fn->decl_cls)
+                        ? (TClass *)fn->decl_cls : NULL);
     f->fn = fn;
     f->file = fn->file;
     f->pc = 0;
@@ -2393,6 +2417,7 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
     rec->this_obj = o;
     tval_addref(objv);            /* frame slot 0 owns a reference */
     rec->uf = m->fn;
+    rec->scope_decl = m->decl;
     return 1;
 }
 
@@ -2465,11 +2490,14 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         rec->is_ctor = true;
         rec->this_obj = NULL;      /* $this moves straight into the frame */
         rec->uf = cls->methods[cls->m_ctor].fn;
+        rec->scope_decl = cls->methods[cls->m_ctor].decl;
         rec->dst_kind = op->tr;
         rec->dst_slot = op->ar;
         TFunc *fn = rec->uf;
         VMFrame *f = tm_malloc(sizeof *f);
-    f->vis_scope = NULL;
+        f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
+                     : ((fn->is_method && fn->decl_cls)
+                            ? (TClass *)fn->decl_cls : NULL);
         f->fn = fn;
         f->file = fn->file;
         f->pc = 0;
@@ -2950,6 +2978,7 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
             rec->nm_fn = m->native;
         } else {
             rec->uf = m->fn;
+            rec->scope_decl = m->decl;
         }
         if (vm->x.frame->slots[0].t == T_OBJ) {
             TObj *o = (TObj *)vm->x.frame->slots[0].u.p;
@@ -2995,6 +3024,7 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
                 rec->nm_fn = m->native;
             } else {
                 rec->uf = m->fn;
+                rec->scope_decl = m->decl;
             }
             return 1;
         }
@@ -3024,6 +3054,7 @@ static int32_t op_init_smcall(VM *vm, TOp *op) {
     rec->is_method = true;
     rec->called_cls = cls;
     rec->uf = m->fn;
+    rec->scope_decl = m->decl;
     return 1;
 }
 
@@ -3091,11 +3122,16 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
             vm_raise(vm, ex_class("Error"), op,
                      "Access to undeclared static property %s::$%s",
                      tstr_val(cls->name), tstr_val(cname) + 1);
-        if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
-            vm_raise(vm, ex_class("Error"), op,
-                     "Cannot access %s property %s::$%s",
-                     vis_name(sp->visibility), tstr_val(cls->name),
-                     tstr_val(cname) + 1);
+        /* 可见性按属性声明类判（PHP：static:: LSB 只定解析不改 scope——
+         * 8.5.1 对拍 B::vs() 读父 private static 放行）；消息同报声明类 */
+        {
+            TClass *sowner = sp->decl ? sp->decl : cls;
+            if (!tphp_vis_ok(sp->visibility, sowner, frame_scope_cls(vm)))
+                vm_raise(vm, ex_class("Error"), op,
+                         "Cannot access %s property %s::$%s",
+                         vis_name(sp->visibility), tstr_val(sowner->name),
+                         tstr_val(cname) + 1);
+        }
         TVal r = sprop_slot(cls, sp)[0];
         tval_addref(r);
         wtake(vm, op, r);
@@ -3182,7 +3218,8 @@ static int32_t op_isset_cconst(VM *vm, TOp *op) {
     tphp_class_ensure_flat(cls);
     if (tstr_val(cname)[0] == '$') {
         TProp *sp = tphp_class_find_sprop(cls, tstr_val(cname) + 1);
-        if (sp && tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm))) {
+        if (sp && tphp_vis_ok(sp->visibility, sp->decl ? sp->decl : cls,
+                              frame_scope_cls(vm))) {
             TVal v = sprop_slot(cls, sp)[0];
             set = v.t != T_UNDEF;
         }
@@ -3258,11 +3295,14 @@ static int32_t op_assign_sprop(VM *vm, TOp *op) {
                      tstr_val(pname) + 1, asym_scope(vm, sb, sizeof sb));
         }
     }
-    if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
-        vm_raise(vm, ex_class("Error"), op,
-                 "Cannot access %s property %s::$%s",
-                 vis_name(sp->visibility), tstr_val(cls->name),
-                 tstr_val(pname) + 1);
+    {
+        TClass *sowner = sp->decl ? sp->decl : cls;
+        if (!tphp_vis_ok(sp->visibility, sowner, frame_scope_cls(vm)))
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot access %s property %s::$%s",
+                     vis_name(sp->visibility), tstr_val(sowner->name),
+                     tstr_val(pname) + 1);
+    }
     TVal val = rdv(vm, op, 3);
     /* P1-1: typed 静态属性赋值校验 */
     if (sp->type) {
@@ -3325,11 +3365,14 @@ static int32_t op_fetch_osprop(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Access to undeclared static property %s::$%s",
                  tstr_val(cls->name), tstr_val(pname) + 1);
-    if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
-        vm_raise(vm, ex_class("Error"), op,
-                 "Cannot access %s property %s::$%s",
-                 vis_name(sp->visibility), tstr_val(cls->name),
-                 tstr_val(pname) + 1);
+    {
+        TClass *sowner = sp->decl ? sp->decl : cls;
+        if (!tphp_vis_ok(sp->visibility, sowner, frame_scope_cls(vm)))
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot access %s property %s::$%s",
+                     vis_name(sp->visibility), tstr_val(sowner->name),
+                     tstr_val(pname) + 1);
+    }
     TVal r = sprop_slot(cls, sp)[0];
     tval_addref(r);
     wtake(vm, op, r);
@@ -3358,11 +3401,14 @@ static int32_t op_assign_osprop(VM *vm, TOp *op) {
                      tstr_val(pname) + 1, asym_scope(vm, sb, sizeof sb));
         }
     }
-    if (!tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm)))
-        vm_raise(vm, ex_class("Error"), op,
-                 "Cannot access %s property %s::$%s",
-                 vis_name(sp->visibility), tstr_val(cls->name),
-                 tstr_val(pname) + 1);
+    {
+        TClass *sowner = sp->decl ? sp->decl : cls;
+        if (!tphp_vis_ok(sp->visibility, sowner, frame_scope_cls(vm)))
+            vm_raise(vm, ex_class("Error"), op,
+                     "Cannot access %s property %s::$%s",
+                     vis_name(sp->visibility), tstr_val(sowner->name),
+                     tstr_val(pname) + 1);
+    }
     TVal val = rdv(vm, op, 3);
     /* P1-1: typed 静态属性赋值校验 */
     if (sp->type) {
@@ -3389,7 +3435,8 @@ static int32_t op_isset_osprop(VM *vm, TOp *op) {
     TClass *cls = osprop_cls(vm, op, base);
     tphp_class_ensure_flat(cls);
     TProp *sp = tphp_class_find_sprop(cls, tstr_val(pname) + 1);
-    if (!sp || !tphp_vis_ok(sp->visibility, cls, frame_scope_cls(vm))) {
+    if (!sp || !tphp_vis_ok(sp->visibility, sp->decl ? sp->decl : cls,
+                            frame_scope_cls(vm))) {
         wtake(vm, op, TV_FALSE);
         return 1;
     }
@@ -3842,7 +3889,10 @@ static void vm_unwind(VM *vm) {
     vm->x.done = true;
     vm->x.uncaught = true;
     if (!vm->x.coro_result) {
-        const char *file = vm->prog->file ? vm->prog->file : "-";
+        /* Uncaught 报告的文件 = 抛出点帧的源文件（ex->file，PHP 对拍：
+         * "in Base.php:19" 而非主脚本）；旧异常无记录时回落主 prog */
+        const char *file = ex->file ? ex->file
+                         : (vm->prog->file ? vm->prog->file : "-");
         const char *cls_name = ex->wrap && ex->wrap->cls->name
             ? tstr_val(ex->wrap->cls->name) : ex->cls->name;
         fprintf(stderr, "PHP Fatal error:  Uncaught %s: %s in %s:%d\n",
@@ -3870,7 +3920,9 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     rec->args_base = (uint32_t)vm->x.n_args;
     rec->is_thunk = true;
     VMFrame *f = tm_malloc(sizeof *f);
-    f->vis_scope = NULL;
+    f->vis_scope = (fn->is_method && fn->decl_cls)
+        ? (TClass *)fn->decl_cls : NULL;
+    f->called_cls = NULL;             /* thunk 帧无类作用域（补未初始化） */
     f->fn = fn;
     f->file = fn->file;
     f->pc = 0;
@@ -4485,7 +4537,8 @@ void tphp_obj_run_dtor(TObj *o) {
         memcpy(vm->x.unwind, saved, sizeof(jmp_buf));
     } else {
         TExObj *ex = vm->x.exception;
-        const char *file = (vm->prog && vm->prog->file) ? vm->prog->file : "-";
+        const char *file = (ex && ex->file) ? ex->file
+                         : ((vm->prog && vm->prog->file) ? vm->prog->file : "-");
         fprintf(stderr, "PHP Fatal error:  Uncaught %s: %s in %s:%d\n",
                 (ex && ex->cls) ? ex->cls->name : "Error",
                 (ex && ex->message) ? tstr_val(ex->message) : "",

@@ -12,6 +12,7 @@
 // EXPECT: dirname-value-err
 // EXPECT: argcount-ok
 // EXPECT: coerce-ok
+// EXPECT: isfile-isdir-ok
 
 // ext/standard 对拍基准：php-8.5.1（本机 NTS Win32）
 // —— strpos 族 ——
@@ -154,3 +155,13 @@ echo ($e1 && $e2 && $e3) ? "argcount-ok\n" : "argcount-FAIL\n";
 //     有意差异不在此测（php-compat 目录另管） ——
 $ok = strpos("123", "2") === 1 && strtoupper("x9") === "X9";
 echo $ok ? "coerce-ok\n" : "coerce-FAIL\n";
+
+// —— is_file / is_dir（ext/io；PHP：不发警告，不存在/false ——
+$base = __DIR__;
+$ok = is_file($base . "/test-standard.php") === true
+    && is_dir($base) === true
+    && is_file($base) === false
+    && is_dir($base . "/test-standard.php") === false
+    && is_file($base . "/no-such-file") === false
+    && is_dir($base . "/no-such-dir") === false;
+echo $ok ? "isfile-isdir-ok\n" : "isfile-isdir-FAIL\n";

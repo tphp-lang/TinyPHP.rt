@@ -63,6 +63,8 @@ TVal tphp_io_fclose(VM *vm, TVal *args, int n);
 TVal tphp_io_feof(VM *vm, TVal *args, int n);
 TVal tphp_io_fseek(VM *vm, TVal *args, int n);
 TVal tphp_io_file_exists(VM *vm, TVal *args, int n);
+TVal tphp_io_is_file(VM *vm, TVal *args, int n);
+TVal tphp_io_is_dir(VM *vm, TVal *args, int n);
 TVal tphp_io_filesize(VM *vm, TVal *args, int n);
 TVal tphp_io_unlink(VM *vm, TVal *args, int n);
 TVal tphp_io_rename(VM *vm, TVal *args, int n);

@@ -2427,6 +2427,8 @@ const Builtin tphp_builtins[] = {
     { "feof", tphp_io_feof },
     { "fseek", tphp_io_fseek },
     { "file_exists", tphp_io_file_exists },
+    { "is_file", tphp_io_is_file },
+    { "is_dir", tphp_io_is_dir },
     { "filesize", tphp_io_filesize },
     { "unlink", tphp_io_unlink },
     { "rename", tphp_io_rename },

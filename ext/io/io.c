@@ -145,6 +145,7 @@ typedef struct FsOp {
     SchedEvent ev;
     ssize_t result;        /* req.result 快照（cleanup 后仍可读） */
     int64_t stat_size;     /* stat/fstat 的 st_size 快照（cleanup 前取） */
+    int stat_mode;         /* stat 的 st_mode 快照（is_file/is_dir 用） */
     bool want_names;       /* scandir：回调里拷贝目录项 */
     char **names;
     int n_names;
@@ -153,8 +154,9 @@ typedef struct FsOp {
 static void fs_cb(uv_fs_t *req) {
     FsOp *op = (FsOp *)req->data;
     op->result = req->result;
-    /* statbuf 在 uv_fs_req_cleanup 后失效：st_size 先快照 */
+    /* statbuf 在 uv_fs_req_cleanup 后失效：st_size/st_mode 先快照 */
     op->stat_size = req->result >= 0 ? (int64_t)req->statbuf.st_size : 0;
+    op->stat_mode = req->result >= 0 ? (int)req->statbuf.st_mode : 0;
     if (op->want_names) {
         uv_dirent_t ent;
         while (uv_fs_scandir_next(req, &ent) == 0) {
@@ -188,6 +190,7 @@ static void fs_cb(uv_fs_t *req) {
     do {                                                             \
         (op)->result = -1;                                           \
         (op)->stat_size = 0;                                         \
+        (op)->stat_mode = 0;                                         \
         (op)->req.data = (op);                                       \
         if (tphp_sched_active()) {                                   \
             tphp_sched_event_reset(&(op)->ev);                       \
@@ -198,6 +201,8 @@ static void fs_cb(uv_fs_t *req) {
             (op)->result = (op)->req.result;                         \
             (op)->stat_size = (op)->result >= 0                      \
                 ? (int64_t)(op)->req.statbuf.st_size : 0;            \
+            (op)->stat_mode = (op)->result >= 0                      \
+                ? (int)(op)->req.statbuf.st_mode : 0;                \
             if ((op)->want_names) {                                  \
                 uv_dirent_t ent;                                     \
                 while (uv_fs_scandir_next(&(op)->req, &ent) == 0) {  \
@@ -689,6 +694,36 @@ TVal tphp_io_file_exists(VM *vm, TVal *args, int n) {
     if (src_root_rel(path, srel, sizeof srel))
         return tphp_pack_stat(srel, NULL) ? TV_TRUE : TV_FALSE;
     return TV_FALSE;
+}
+
+/* is_file：存在且是普通文件（PHP：不发警告；打包 zip 内条目即文件） */
+TVal tphp_io_is_file(VM *vm, TVal *args, int n) {
+    (void)n;
+    const char *path = arg_str(vm, args, n, 0, "is_file");
+    const char *rel = asset_rel(path);
+    if (rel) return tphp_pack_stat(rel, NULL) ? TV_TRUE : TV_FALSE;
+    FsOp op;
+    memset(&op, 0, sizeof op);
+    FS_DO(&op, uv_fs_stat, path);
+    if (op.result != 0) {
+        char srel[1024];
+        if (src_root_rel(path, srel, sizeof srel))
+            return tphp_pack_stat(srel, NULL) ? TV_TRUE : TV_FALSE;
+        return TV_FALSE;
+    }
+    return S_ISREG(op.stat_mode) ? TV_TRUE : TV_FALSE;
+}
+
+/* is_dir：存在且是目录（zip 资源包无目录条目 → 资产路径恒 false） */
+TVal tphp_io_is_dir(VM *vm, TVal *args, int n) {
+    (void)n;
+    const char *path = arg_str(vm, args, n, 0, "is_dir");
+    if (asset_rel(path)) return TV_FALSE;
+    FsOp op;
+    memset(&op, 0, sizeof op);
+    FS_DO(&op, uv_fs_stat, path);
+    if (op.result != 0) return TV_FALSE;
+    return S_ISDIR(op.stat_mode) ? TV_TRUE : TV_FALSE;
 }
 
 TVal tphp_io_filesize(VM *vm, TVal *args, int n) {

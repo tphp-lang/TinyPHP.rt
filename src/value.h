@@ -73,6 +73,9 @@ typedef struct TExObj {
     int64_t code;
     struct TExObj *previous;
     int line;                 /* throw site (0 = raised without an op line) */
+    const char *file;         /* throw-site source file（帧 fn->file，program-
+                               * lifetime 只读串；跨线程序列化可丢，打印端回
+                               * 落 prog->file） */
     struct TObj *wrap;        /* P1-2: 用户异常类实例（throw 的 TObj 包装成
                                * TExObj 走统一异常机制；catch 绑定/取消息
                                * 时解包回用户对象）。NULL = 引擎异常 */

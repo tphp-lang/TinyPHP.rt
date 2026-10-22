@@ -184,6 +184,9 @@ typedef struct VMCallRec {
                             ($ffi->symbol(...); is_builtin is set) */
     void *this_obj;      /* TObj* receiver when is_method */
     void *called_cls;    /* TClass*: static-call resolution for static:: */
+    void *scope_decl;    /* TClass*: 可见性作用域 = TMethod.decl（普通方法=
+                            声明类、trait 拷贝=使用类）；0 = 由 fn->decl_cls
+                            / called_cls 兜底（闭包 bindTo 走 fallback） */
     TVal getter_val;     /* precomputed exception-getter result */
     uint8_t magic_kind;  /* 0 none / 1 __call / 2 __callStatic (deferred to
                             DO_FCALL where all args are SENDed) */
