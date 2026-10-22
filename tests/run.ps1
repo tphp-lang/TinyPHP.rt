@@ -39,7 +39,7 @@ $fail = 0
 $skip = 0
 $failed = @()
 
-foreach ($dir in @("lang", "oop", "async", "worker", "ffi", "lib", "pkg", "bench", "php-compat")) {
+foreach ($dir in @("lang", "oop", "async", "worker", "ffi", "lib", "pkg", "bench", "php-compat", "standard")) {
     $dirPath = Join-Path $PSScriptRoot $dir
     if (-not (Test-Path $dirPath)) { continue }
     $files = Get-ChildItem -Path $dirPath -Filter "*.php" -ErrorAction SilentlyContinue |

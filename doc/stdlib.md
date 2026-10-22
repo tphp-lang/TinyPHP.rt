@@ -77,7 +77,10 @@
 `count` `array_key_exists` `in_array` `array_push` `array_pop` `array_shift` `array_unshift` `array_keys` `array_values` `array_merge` `array_slice` `array_reverse` `array_sum` `sort` `rsort` `array_map` `array_filter` `array_reduce` `usort` `array_flip` `array_unique` `array_search` `array_key_first` `array_key_last` `array_column` `array_combine` `array_chunk` `array_fill` `range`
 
 ### 字符串
-`strlen` `substr` `str_replace` `strpos` `stripos` `strrpos` `trim` `ltrim` `rtrim` `strtolower` `strtoupper` `str_repeat` `str_pad` `implode`/`join` `explode` `str_split` `strrev` `strtr` `ucwords` `nl2br` `strip_tags` `htmlspecialchars` `str_contains` `str_starts_with` `str_ends_with` `sprintf` `number_format` `chr` `ord`
+`strlen` `substr` `str_replace` `strpos` `stripos` `strrpos` `strripos` `trim` `ltrim` `rtrim` `strtolower` `strtoupper` `str_repeat` `str_pad` `implode`/`join` `explode` `str_split` `strrev` `strtr` `ucwords` `nl2br` `strip_tags` `htmlspecialchars` `str_contains` `str_starts_with` `str_ends_with` `sprintf` `number_format` `chr` `ord`
+
+### 路径
+`basename` `dirname`
 
 ### 数学
 `abs` `min` `max` `intdiv` `pow` `round` `floor` `ceil` `sqrt` `mt_rand`/`rand` `gc_collect_cycles`

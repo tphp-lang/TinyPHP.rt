@@ -12,6 +12,8 @@
 #include "tsched.h"
 #include "tio.h"
 #include "pkg.h"
+#include "builtin.h"     /* need_str/need_int/str_find 导出（ext/standard 复用） */
+#include "standard.h"    /* 迁至 ext/standard 的函数表引用 */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -543,14 +545,14 @@ static TArr *need_arr(VM *vm, TVal *v, const char *fn, const char *arg) {
     return (TArr *)v->u.p;
 }
 
-static TStr *need_str(VM *vm, TVal *v, const char *fn, const char *arg) {
+TStr *need_str(VM *vm, TVal *v, const char *fn, const char *arg) {
     if (v->t != T_STR)
         RAISE(vm, "TypeError", "%s(): Argument %s must be of type string, %s given",
               fn, arg, type_name(v->t));
     return (TStr *)v->u.p;
 }
 
-static int64_t need_int(VM *vm, TVal *v, const char *fn, const char *arg) {
+int64_t need_int(VM *vm, TVal *v, const char *fn, const char *arg) {
     if (v->t != T_INT)
         RAISE(vm, "TypeError", "%s(): Argument %s must be of type int, %s given",
               fn, arg, type_name(v->t));
@@ -1073,7 +1075,7 @@ static TVal bi_str_replace(VM *vm, TVal *args, int n) {
     return TV_STR(out);
 }
 
-static int64_t str_find(TStr *hay, TStr *needle, int64_t from, bool ci, bool reverse) {
+int64_t str_find(TStr *hay, TStr *needle, int64_t from, bool ci, bool reverse) {
     int64_t hl = (int64_t)hay->len, nl = (int64_t)needle->len;
     if (nl == 0) return from <= hl ? from : -1;
     if (nl > hl) return -1;
@@ -1107,36 +1109,7 @@ static int64_t str_find(TStr *hay, TStr *needle, int64_t from, bool ci, bool rev
     return -1;
 }
 
-static TVal bi_strpos(VM *vm, TVal *args, int n) {
-    (void)vm;
-    if (n < 2) RAISE(vm, "ArgumentCountError", "strpos() expects at least 2 arguments");
-    TStr *hay = need_str(vm, &args[0], "strpos", "#1 ($haystack)");
-    TStr *needle = need_str(vm, &args[1], "strpos", "#2 ($needle)");
-    int64_t off = n >= 3 ? need_int(vm, &args[2], "strpos", "#3 ($offset)") : 0;
-    if (off < 0) off = 0;
-    int64_t r = str_find(hay, needle, off, false, false);
-    return r < 0 ? TV_FALSE : TV_INT(r);
-}
-
-static TVal bi_stripos(VM *vm, TVal *args, int n) {
-    (void)vm;
-    if (n < 2) RAISE(vm, "ArgumentCountError", "stripos() expects at least 2 arguments");
-    TStr *hay = need_str(vm, &args[0], "stripos", "#1 ($haystack)");
-    TStr *needle = need_str(vm, &args[1], "stripos", "#2 ($needle)");
-    int64_t off = n >= 3 ? need_int(vm, &args[2], "stripos", "#3 ($offset)") : 0;
-    if (off < 0) off = 0;
-    int64_t r = str_find(hay, needle, off, true, false);
-    return r < 0 ? TV_FALSE : TV_INT(r);
-}
-
-static TVal bi_strrpos(VM *vm, TVal *args, int n) {
-    (void)vm;
-    if (n < 2) RAISE(vm, "ArgumentCountError", "strrpos() expects at least 2 arguments");
-    TStr *hay = need_str(vm, &args[0], "strrpos", "#1 ($haystack)");
-    TStr *needle = need_str(vm, &args[1], "strrpos", "#2 ($needle)");
-    int64_t r = str_find(hay, needle, 0, false, true);
-    return r < 0 ? TV_FALSE : TV_INT(r);
-}
+/* bi_strpos/bi_stripos/bi_strrpos → ext/standard/standard.c */
 
 static TVal bi_trim_impl(VM *vm, TVal *args, int n, bool left, bool right,
                          const char *defmask) {
@@ -1168,29 +1141,7 @@ static TVal bi_rtrim(VM *vm, TVal *args, int n) {
     return bi_trim_impl(vm, args, n, false, true, " \t\n\r\013\000");
 }
 
-static TVal bi_strtolower(VM *vm, TVal *args, int n) {
-    (void)vm; (void)n;
-    TStr *s = need_str(vm, &args[0], "strtolower", "#1 ($string)");
-    TStr *out = tstr_alloc_raw(s->len, false);
-    for (uint32_t i = 0; i < s->len; i++) {
-        char c = s->c[i];
-        out->c[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-    }
-    out->c[s->len] = 0;
-    return TV_STR(out);
-}
-
-static TVal bi_strtoupper(VM *vm, TVal *args, int n) {
-    (void)vm; (void)n;
-    TStr *s = need_str(vm, &args[0], "strtoupper", "#1 ($string)");
-    TStr *out = tstr_alloc_raw(s->len, false);
-    for (uint32_t i = 0; i < s->len; i++) {
-        char c = s->c[i];
-        out->c[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-    }
-    out->c[s->len] = 0;
-    return TV_STR(out);
-}
+/* bi_strtolower/bi_strtoupper → ext/standard/standard.c */
 
 static TVal bi_str_pad(VM *vm, TVal *args, int n) {
     (void)vm;
@@ -1295,14 +1246,7 @@ static TVal bi_str_split(VM *vm, TVal *args, int n) {
     return TV_ARR(a);
 }
 
-static TVal bi_strrev(VM *vm, TVal *args, int n) {
-    (void)vm; (void)n;
-    TStr *s = need_str(vm, &args[0], "strrev", "#1 ($string)");
-    TStr *out = tstr_alloc_raw(s->len, false);
-    for (uint32_t i = 0; i < s->len; i++) out->c[i] = s->c[s->len - 1 - i];
-    out->c[s->len] = 0;
-    return TV_STR(out);
-}
+/* bi_strrev → ext/standard/standard.c */
 
 static TVal bi_number_format(VM *vm, TVal *args, int n) {
     (void)vm;
@@ -2264,27 +2208,7 @@ static TVal bi_ucwords(VM *vm, TVal *args, int n) {
     return TV_STR(r);
 }
 
-/* nl2br(string): \n → <br />\n（PHP 语义：标签在换行前） */
-static TVal bi_nl2br(VM *vm, TVal *args, int n) {
-    if (n != 1) RAISE(vm, "ArgumentCountError", "nl2br() expects exactly 1 argument");
-    TStr *s = need_str(vm, &args[0], "nl2br", "#1 ($string)");
-    size_t nl = 0;
-    for (size_t i = 0; i < s->len; i++) if (s->c[i] == '\n') nl++;
-    char *b = tm_malloc(s->len + nl * 6 + 1);
-    size_t o = 0;
-    for (size_t i = 0; i < s->len; i++) {
-        if (s->c[i] == '\n') {
-            memcpy(b + o, "<br />", 6);
-            o += 6;
-            b[o++] = '\n';
-        } else {
-            b[o++] = s->c[i];
-        }
-    }
-    TStr *r = tstr_new(b, o);
-    tm_free(b);
-    return TV_STR(r);
-}
+/* bi_nl2br → ext/standard/standard.c */
 
 /* strip_tags(string) — 去掉 HTML 标签 */
 static TVal bi_strip_tags(VM *vm, TVal *args, int n) {
@@ -2450,6 +2374,9 @@ const Builtin tphp_builtins[] = {
     { "strpos", bi_strpos },
     { "stripos", bi_stripos },
     { "strrpos", bi_strrpos },
+    { "strripos", bi_strripos },
+    { "basename", bi_basename },
+    { "dirname", bi_dirname },
     { "trim", bi_trim },
     { "ltrim", bi_ltrim },
     { "rtrim", bi_rtrim },

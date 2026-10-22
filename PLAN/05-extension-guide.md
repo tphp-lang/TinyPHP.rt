@@ -17,7 +17,7 @@
 
 - **`src/` = 引擎**：lex/parse/compile/vm/sched/fiber/value/class/exclass/mem/error/bundle/pack/main——解释器本体与基础设施
 - **`ext/` = 内置扩展层**：一扩展一子目录，PHP 可见能力都落这里——
-  `ext/builtin/`（无状态函数大表）、`ext/ffi/`、`ext/net/`（含 cacert.c）、`ext/io/`、`ext/worker/`、`ext/json/`、`ext/serialize/`、`ext/pkg/`
+  `ext/builtin/`（无状态函数大表）、`ext/standard/`（PHP ext/standard 对齐：string/path 函数，对拍 php-8.5.1）、`ext/ffi/`、`ext/net/`（含 cacert.c）、`ext/io/`、`ext/worker/`、`ext/json/`、`ext/serialize/`、`ext/pkg/`
 - 新扩展**建子目录**（`ext/<name>/*.c|h`），不要往 `src/` 平铺，也不要把新函数继续堆进 `builtin.c` 大表（达到拆分阈值时按域拆 `ext/builtin/`）
 - 构建：`build.cmd` / `build.sh` 自动扫 `src/*.c` + `ext/*/*.c`，无需登记；头文件经 `-Iext/<name>` 引用（**-I 列表在 deps/libffi/include 之后**，且子目录内头文件禁止叫 `ffi.h`/`io.h`——会顶掉系统头，见 §4.10）
 

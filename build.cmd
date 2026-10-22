@@ -13,7 +13,7 @@ set CFLAGS_US=-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURC
 rem ext\* include dirs MUST come after deps\libffi\include: libffi's public
 rem header is <ffi.h>; an -Iext\ffi earlier in the list with an ffi.h inside
 rem would shadow it (same trap as the historic src\ffi.h naming ban).
-set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz -Iext\ffi -Iext\net -Iext\io -Iext\worker -Iext\json -Iext\serialize -Iext\pkg -Iext\builtin
+set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz -Iext\ffi -Iext\net -Iext\io -Iext\worker -Iext\json -Iext\serialize -Iext\pkg -Iext\builtin -Iext\standard
 set DEFS=-DTPHP_TARGET="\"x86_64-w64-windows-gnu\""
 
 if not exist build mkdir build
