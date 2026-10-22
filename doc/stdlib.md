@@ -47,6 +47,23 @@
 
 **不支持**：`&$ref` 引用传值、`extract`/`compact`/`$$var` 可变变量、`@` 错误抑制、`foreach &$v` 引用、交叉类型/DNF（后置）。
 
+### 内置常量
+
+| 常量 | 值 |
+|---|---|
+| `PHP_EOL` | 行尾符（Windows `"\r\n"`，其余 `"\n"`） |
+| `DIRECTORY_SEPARATOR` | 路径分隔符（Windows `"\"`，其余 `"/"`） |
+| `PATH_SEPARATOR` | PATH 分隔符（Windows `";"`，其余 `":"`） |
+| `PHP_OS_FAMILY` | 系统家族：`"Windows"` / `"Linux"` / `"Darwin"` / `"BSD"`（对齐 PHP，macOS 归 Darwin） |
+| `PHP_VERSION` | 运行时版本号（如 `"0.0.1"`，来自 `TPHP_VERSION`） |
+| `PHP_PACK` | **tphp 扩展**：是否运行在打包 exe 内（bool；`tphp run`/源码执行恒 false） |
+| `PHP_INT_MAX` / `PHP_INT_MIN` | int64 边界 |
+| `FILE_APPEND` / `LOCK_EX` | `file_put_contents` 选项位 |
+| `SEEK_SET` / `SEEK_CUR` / `SEEK_END` | `fseek` whence |
+| `ASSET_ROOT` | `"tphp://asset"`——打包应用资源根（io 层直读内存 zip；未打包时读取告警） |
+
+`PHP_PACK` 配合 `ASSET_ROOT` 的典型用法：开发期读磁盘、打包后读内存 zip，同一份代码两个运行形态。
+
 ## 内置函数（C 原生，builtin.c）
 
 ### 输出与调试
