@@ -38,6 +38,7 @@
 #include "bundle.h"
 #include "pack.h"
 #include "ast.h"
+#include <uv.h>        /* uv_os_uname → PHP_UNAME */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4378,6 +4379,36 @@ static void vm_seed_consts(VM *vm) {
         vm->consts[vm->n_consts].v =
             tphp_pack_has_bundle() ? TV_TRUE : TV_FALSE;
         vm->n_consts++;
+    }
+    /* PHP_UNAME：uname(2) 五字段关联数组（sysname/nodename/release/
+     * version/machine），数据源 libuv uv_os_uname（跨平台，Windows 同样
+     * 提供）。数组常量走 GC 无根算法：rc=1 超出内部引用和 → 外部可达；
+     * op_fetch_const addref/release 配平，表内这份永不到 0。
+     * 字符串键值全 intern，不入 GC 注册表。 */
+    if (vm->n_consts < 256) {
+        uv_utsname_t un;
+        if (uv_os_uname(&un) == 0) {
+            /* libuv 的 uv_utsname_t 特意不含 nodename（其文档称无意义），
+             * 但 PHP_UNAME 按用户约定保留该字段 → uv_os_gethostname 补齐 */
+            char host[256] = "unknown";
+            size_t hsz = sizeof host;
+            uv_os_gethostname(host, &hsz);
+            static const char *keys[5] = {
+                "sysname", "nodename", "release", "version", "machine",
+            };
+            const char *vals[5] = {
+                un.sysname, host, un.release, un.version, un.machine,
+            };
+            TArr *ua = tarr_new();
+            for (int i = 0; i < 5; i++) {
+                tarr_set(ua,
+                         TV_STR(tstr_intern(keys[i], strlen(keys[i]))),
+                         TV_STR(tstr_intern(vals[i], strlen(vals[i]))));
+            }
+            vm->consts[vm->n_consts].name = tstr_intern("PHP_UNAME", 9);
+            vm->consts[vm->n_consts].v = TV_ARR(ua);
+            vm->n_consts++;
+        }
     }
 }
 

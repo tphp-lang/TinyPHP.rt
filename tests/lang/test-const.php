@@ -49,3 +49,12 @@ echo strlen(PHP_VERSION) >= 5 && strpos(PHP_VERSION, ".") !== false
 // PHP_PACK：测试以源码脚本运行（非打包 exe），恒为 false
 // EXPECT: bool(false)
 var_dump(PHP_PACK);
+// PHP_UNAME：uname(2) 五字段关联数组（uv_os_uname），全字符串值
+// EXPECT: uname-ok
+$uk = ["sysname", "nodename", "release", "version", "machine"];
+$uok = is_array(PHP_UNAME) && count(PHP_UNAME) === 5;
+foreach ($uk as $k) {
+    if (!isset(PHP_UNAME[$k]) || !is_string(PHP_UNAME[$k])
+        || PHP_UNAME[$k] === "") $uok = false;
+}
+echo $uok ? "uname-ok\n" : "uname-FAIL\n";
