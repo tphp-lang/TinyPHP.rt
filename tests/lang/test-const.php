@@ -29,8 +29,12 @@ echo GREETING . " there", "\n";
 const NEG = -5;
 // EXPECT: int(-5)
 var_dump(NEG);
-// DIRECTORY_SEPARATOR：单字符路径分隔符（平台相关，断言形态而非字面值）
+// DIRECTORY_SEPARATOR / PATH_SEPARATOR：平台相关，断言形态而非字面值
 // EXPECT: ds-ok
 echo strlen(DIRECTORY_SEPARATOR) === 1
     && (DIRECTORY_SEPARATOR === "\\" || DIRECTORY_SEPARATOR === "/")
     ? "ds-ok\n" : "ds-FAIL\n";
+// EXPECT: ps-ok
+echo strlen(PATH_SEPARATOR) === 1
+    && (PATH_SEPARATOR === ";" || PATH_SEPARATOR === ":")
+    ? "ps-ok\n" : "ps-FAIL\n";

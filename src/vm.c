@@ -4335,9 +4335,11 @@ static void vm_seed_consts(VM *vm) {
 #ifdef _WIN32
         { "PHP_EOL",     "\r\n", 0 },
         { "DIRECTORY_SEPARATOR", "\\", 0 },
+        { "PATH_SEPARATOR",      ";",  0 },
 #else
         { "PHP_EOL",     "\n",  0 },
         { "DIRECTORY_SEPARATOR", "/",  0 },
+        { "PATH_SEPARATOR",      ":",  0 },
 #endif
         { "PHP_INT_MAX", NULL, INT64_MAX },
         { "PHP_INT_MIN", NULL, INT64_MIN },
