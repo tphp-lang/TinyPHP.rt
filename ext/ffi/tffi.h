@@ -33,4 +33,8 @@ bool tphp_ffi_is_ffi_cls(struct TClass *cls);
 /* 内部：包一层 CData（ffi.c 内部使用也经此符号） */
 TVal tphp_ffi_wrap_ptr(void *ptr, void *type, bool owned, void *scope);
 
+/* 回调深度（ffi.c 定义）：>0 时 VM raise 禁止 longjmp（回调内 throw
+ * → Fatal exit，防止 unwind 穿过 ffi_call 的 C 栈帧） */
+extern _Thread_local int tphp_ffi_cb_depth;
+
 #endif /* TPHP_TFFI_H */

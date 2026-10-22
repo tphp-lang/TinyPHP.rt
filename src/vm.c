@@ -185,6 +185,23 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
 }
 
 /* ---- engine raise: store the exception and longjmp to the main loop ---- */
+/* FFI 回调上下文中禁止 longjmp：unwind 会跳过 ffi_call 的 C 栈帧毁掉
+ * libffi/C 库状态（PLAN/02 §4.5.1；PHP bailout 同病所以同样硬禁）。
+ * 所有 vm->x.unwind 跳转必须经此（op_throw 直接 longjmp 曾绕过检查）。 */
+static void vm_unwind_jump(VM *vm) __attribute__((noreturn));
+static void vm_unwind_jump(VM *vm) {
+    extern _Thread_local int tphp_ffi_cb_depth;
+    if (tphp_ffi_cb_depth > 0) {
+        const char *m = (vm->x.exception && vm->x.exception->message)
+            ? tstr_val(vm->x.exception->message) : "exception";
+        fprintf(stderr,
+                "PHP Fatal error: Throwing from FFI callbacks is not allowed: %s\n",
+                m);
+        exit(255);
+    }
+    longjmp(vm->x.unwind, 1);
+}
+
 static void vm_raise_at(VM *vm, const TExClass *cls, int line,
                         const char *file, const char *fmt, va_list ap)
     __attribute__((noreturn));
@@ -195,7 +212,7 @@ static void vm_raise_at(VM *vm, const TExClass *cls, int line,
     vsnprintf(buf, sizeof buf, fmt, ap);
     TStr *msg = tstr_new(buf, strlen(buf));
     vm->x.exception = tex_alloc(cls, msg, 0, line, file, NULL);
-    longjmp(vm->x.unwind, 1);
+    vm_unwind_jump(vm);
 }
 
 /* 抛出点文件 = 当前帧的源文件（行号与文件同属一个 fn->file） */
@@ -1949,7 +1966,7 @@ static int32_t op_throw(VM *vm, TOp *op) {
         tval_addref(TV_OBJ(o));
         w->wrap = o;                  /* 包装器持一份用户对象引用 */
         vm->x.exception = w;
-        longjmp(vm->x.unwind, 1);
+        vm_unwind_jump(vm);
     }
     if (v.t != T_OBJ || ((GCHead *)v.u.p)->kind != GC_KIND_EX)
         vm_raise(vm, ex_class("TypeError"), op,
@@ -1959,7 +1976,7 @@ static int32_t op_throw(VM *vm, TOp *op) {
     x->file = raise_file(vm);         /* 抛出点文件（同 line 归因） */
     tval_addref(v);
     vm->x.exception = x;
-    longjmp(vm->x.unwind, 1);
+    vm_unwind_jump(vm);
 }
 
 static int32_t op_bind_ex(VM *vm, TOp *op) {
@@ -2175,7 +2192,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
          * the normal unwind path */
         for (int i = 0; i < n; i++)
             tval_release(&vm->x.args[base + (uint32_t)i]);
-        longjmp(vm->x.unwind, 1);
+        vm_unwind_jump(vm);
     }
     *out = vm->x.thunk_ret;
     return true;
@@ -2236,7 +2253,7 @@ static bool call_hook(VM *vm, TOp *op, TObj *o, TStr *pname, TFunc *fn,
     if (vm->x.exception && vm->x.exception != pre_ex) {
         for (int i = 0; i < nargs; i++)
             tval_release(&vm->x.args[base + (uint32_t)i]);
-        longjmp(vm->x.unwind, 1);
+        vm_unwind_jump(vm);
     }
     *out = vm->x.thunk_ret;
     return true;
@@ -3768,7 +3785,7 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
 static int32_t op_rethrow(VM *vm, TOp *op) {
     if (!vm->x.exception)
         vm_raise(vm, ex_class("Error"), op, "Internal: rethrow without exception");
-    longjmp(vm->x.unwind, 1);
+    vm_unwind_jump(vm);
 }
 
 /* ---- unwinding ---- */
@@ -4266,7 +4283,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
         tval_release(&r);
         if (vm->x.args[base].t != T_UNDEF) tval_release(&vm->x.args[base]);
         vm->x.n_args = (int)base;
-        if (vm->x.exception) longjmp(vm->x.unwind, 1);
+        if (vm->x.exception) vm_unwind_jump(vm);
         return;
     }
     VMFrame *f = tm_malloc(sizeof *f);
@@ -4789,8 +4806,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             int32_t d = ((OpHandler)cop->handler)(vm, cop);
             if (d) f->pc += (uint32_t)d;
         }
-        if (vm->x.exception)
-            longjmp(vm->x.unwind, 1);
+        if (vm->x.exception) vm_unwind_jump(vm);
         return vm->x.thunk_ret;
     }
     if (vm->x.n_args + n > VM_MAX_ARGS)
@@ -4844,8 +4860,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         int32_t d = ((OpHandler)cop->handler)(vm, cop);
         if (d) f->pc += (uint32_t)d;
     }
-    if (vm->x.exception)
-        longjmp(vm->x.unwind, 1);
+    if (vm->x.exception) vm_unwind_jump(vm);
     return vm->x.thunk_ret;
 }
 

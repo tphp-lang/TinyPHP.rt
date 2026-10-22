@@ -56,9 +56,40 @@ $ffi->sprintf($s, "hi %d", 7);   // 变参
 ## cdef 支持的子集
 
 - 函数声明、基本类型、指针、平铺 struct/enum、简单 typedef、变参 `...`
+- **函数指针**（回调签名）：`int (*compar)(const void *, const void *)`（参数位置；v1 不支持 struct 字段/数组元素赋值形态）
 - **拒绝**：`#include`/`#define` 等预处理（`ValueError`）
-- **拒绝**：bitfield、union（union 解析已支持布局，按值 ABI 用最大成员近似）
-- 不支持：完整 C 类型系统、回调函数指针、`wchar_t` 赋值长期缓冲（调用参数侧已支持 UTF-16 转换）
+- **拒绝**：bitfield（union 解析已支持布局，按值 ABI 用最大成员近似）
+- 不支持：完整 C 类型系统、变参回调、数组参数
+
+## 回调（C 函数指针 → PHP 闭包）
+
+闭包直接传给函数指针类型的参数，**隐式**建 libffi trampoline（无新类型）：
+
+```php
+$libc = FFI::cdef("
+    void qsort(void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
+", "msvcrt.dll");
+
+$a = FFI::new("int[3]");
+$a[0] = 9; $a[1] = 1; $a[2] = 5;
+$libc->qsort($a, 3, 4, function ($x, $y) {
+    return $x->cast("int*")[0] <=> $y->cast("int*")[0];  // void* 先 cast 再解引用
+});
+```
+
+语义（设计规格：[../PLAN/02-runtime-features.md §4.5.1](../PLAN/02-runtime-features.md)，四家对照分析见 [ffi-security.md](ffi-security.md)）：
+
+| 项 | 行为 |
+|---|---|
+| 参数编组 | 标量直转；`char*`/`int8*` → string **拷贝**（防悬空）；其他指针/`void*` → 非 owned CData 视图；struct → CData 别名（**回调返回后失效**） |
+| 返回值 | 标量宽松转换；同尺寸 CData memcpy；**类型不匹配 → 警告 + 零值** |
+| 生命周期 | trampoline + 闭包保活到**脚本/线程结束**（传给 C 后长期持有安全，如 qsort）；无显式 free |
+| **回调内 throw** | **硬 Fatal**（"Throwing from FFI callbacks is not allowed"，不可 catch）——unwind 不能穿过 ffi_call 的 C 栈帧 |
+| 重入 | 回调内允许再调 FFI |
+| 线程 | 同线程同步；C 跨线程调回调 = 未定义（文档禁止）；多线程场景把整个 FFI 交互放 Worker |
+| 地址面 | trampoline 不暴露裸地址（配合 `cast` 拒裸 int） |
+| v2 后置 | struct 字段/数组元素的闭包赋值形态、同闭包 trampoline 去重、延迟异常传播（可 catch 版）——见 PLAN/02 §4.5.1 |
 
 ## 内存与生命周期
 

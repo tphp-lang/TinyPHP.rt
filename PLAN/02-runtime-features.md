@@ -126,6 +126,25 @@ class Worker {
 - **与并发**：FFI 调用是阻塞 native 调用（不挂起调度器、事件循环停摆）——CPU 密集/长阻塞调用放 Worker 线程（M5），文档示例承载此约定
 - **参考**：txiki.js src/mod_ffi.c（libffi + Pointer/External）、php-src ext/ffi（API 语义对齐目标，实现不照搬）
 
+### 4.5.1 FFI 回调（C 函数指针 → PHP 闭包；v1 设计定稿 2026-10-22）
+
+四家对照（php-src 8.5.7 / txiki / Bun / V 0.5.2，详见会话分析）后的取舍：**API 形态与生命周期抄 PHP，异常抄 PHP 语义但用干净 exit 实现，编组抄 PHP 但修返回值垃圾坑，线程走 Worker 路线，地址面比三家严**。
+
+- **API**：零新类型。cdef 参数位置支持函数指针声明 `int (*compar)(const void *, const void *)`；闭包/可调用传给函数指针参数时**隐式**建 libffi trampoline（`ffi_closure_alloc` + `ffi_prep_closure_loc`）。v1 仅参数位置；struct 字段/数组元素赋值形态 v2 后置
+- **生命周期**：trampoline + 闭包（addref）进入**线程局部回调表**，脚本/线程结束释放——CLI 单脚本 ≈ PHP 单请求"整请求有效"；无显式 close（学 PHP 非 Bun）；Worker 每线程独立表
+- **编组（C→PHP 参数）**：标量直转；`const char*` → 拷贝 TStr；其他指针 → 非 owned CData 视图；struct 参数 → 非 owned CData 别名 libffi 栈（回调返回后失效，文档红字）；varargs 回调与 array 参数**不支持**（对齐 PHP）
+- **编组（PHP→C 返回）**：标量宽松转换 + 同尺寸 CData memcpy；**类型不匹配 → stderr 警告 + 返回类型零值**（修 PHP 的"吞异常返回垃圾"坑）
+- **异常**：回调内 throw = **硬禁止**（对齐 PHP 措辞 "Throwing from FFI callbacks is not allowed"）——tphp 的 raise 是 longjmp，unwind 穿 trampoline 会跳过 ffi_call 的 C 栈帧毁掉 libffi/C 库状态；实现 = raise 钩子查 `tphp_ffi_cb_depth` >0 → 打印 + exit（比 PHP bailout 干净）。回调内允许嵌套 ffi_call（重入）
+- **线程**：同线程同步；C 跨线程调回调 = 未定义（文档禁止）；不做 Bun 式 threadsafe 投递——Worker 隔离是官方答案
+- **地址面**：trampoline 不暴露裸地址（传参只认 Closure 值），配合既有 `cast` 拒裸 int
+- **验收**：`tests/ffi/test-ffi-callback.php` —— msvcrt/libc `qsort` + 捕获闭包端到端
+- **v1 已完成**（2026-10-22，184/184）：FFI_FUNC_PTR 真解析 + trampoline + TLS 保活 + `vm_unwind_jump` 全量收口（op_throw 曾直接 longjmp 绕过 depth 检查——所有 unwind 出口必须经它）
+- **v2 后置清单**（按优先级）：
+  1. **struct 字段/数组元素的闭包赋值**（`$s->callback = function(...){}`）——PHP 全形态支持的第二触发点；v1 仅参数位置（覆盖 qsort 类 90% 场景）。实现：cdata 写路径识别 FFI_FUNC_PTR 字段 → closure_create 写入槽
+  2. **同闭包复用去重**——同 TVal 闭包 + 同签名复用同一 trampoline（PHP 也是每传建一、泄漏到请求末；循环传闭包场景的内存优化）
+  3. **延迟异常传播**（txiki 式：回调内 throw → 返回值置 0、C 跑完、ffi_call 边界后可 catch）——需 trampoline 级 catch-all 保护帧改 unwind 语义，复杂度高收益有限；与 v1 的硬 Fatal 是语义取舍，做则切换默认并保留 Fatal 于无法安全传播的场景
+- 验收测试追加项（v2）：字段赋值回调、去重后内存平稳、延迟传播可 catch
+
 ## 5. CLI
 
 ```

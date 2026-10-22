@@ -38,7 +38,8 @@ typedef enum {
     FFI_INT32, FFI_UINT32, FFI_INT64, FFI_UINT64,
     FFI_FLOAT, FFI_DOUBLE,
     FFI_PTR, FFI_STRUCT, FFI_ARRAY, FFI_ENUM,
-    FFI_WCHAR          /* Windows: UTF-16 (2B)；Linux: UTF-32 (4B) */
+    FFI_WCHAR,          /* Windows: UTF-16 (2B)；Linux: UTF-32 (4B) */
+    FFI_FUNC_PTR        /* 函数指针（回调签名；v1 仅参数位置） */
 } FFICode;
 
 typedef struct FFIType FFIType;
@@ -52,6 +53,10 @@ struct FFIType {
     int n_fields;
     bool is_union;                    /* union：全部字段 offset=0 */
     ffi_type *ffi;                    /* STRUCT 的 libffi 描述（惰性） */
+    /* FFI_FUNC_PTR 签名（v1 回调）：返回类型 + 参数表；libffi 表示 = pointer */
+    struct FFIType *fn_ret;
+    struct FFIType **fn_params;
+    int fn_n;
 };
 
 typedef struct FFIFunc {
@@ -177,6 +182,7 @@ static ffi_type *to_ffi_type(FFIType *t) {
     case FFI_FLOAT: return &ffi_type_float;
     case FFI_DOUBLE:return &ffi_type_double;
     case FFI_PTR:   return &ffi_type_pointer;
+    case FFI_FUNC_PTR: return &ffi_type_pointer;
     case FFI_ENUM:  return &ffi_type_sint32;
     case FFI_WCHAR:
 #ifdef _WIN32
@@ -323,6 +329,8 @@ static FFIType *parse_type(CParser *cp, FFIScope *sc);
 static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
                                  char *name_out, size_t name_cap,
                                  bool unnamed_ok);
+static void parse_param_list(CParser *cp, FFIScope *sc,
+                             FFIType **params, int max, int *np, bool *variadic);
 static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                                  const char *sname);
 
@@ -453,8 +461,8 @@ static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
                                  bool unnamed_ok) {
     (void)sc;
     FFIType *t = apply_pointers(cp, base);
-    /* 函数指针：(*name)(params) —— 占位为指针大小。参数表整段跳过
-     * （深度平衡），嵌套声明无需展开；C 回调 trampoline 留待后续。 */
+    /* 函数指针：(*name)(params) —— base 是返回类型；解析完整签名存入
+     * FFI_FUNC_PTR（v1 回调：闭包传入该位置时建 libffi trampoline） */
     if (cp->tkind == 3 && cp->tok[0] == '(') {
         const char *save = cp->p;
         int skind = cp->tkind;
@@ -470,15 +478,21 @@ static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
                     cnext(cp);
                     if (cis(cp, "(")) {
                         cnext(cp);
-                        int depth = 1;
-                        while (cp->tkind != 0 && depth > 0) {
-                            if (cp->tkind == 3 && cp->tok[0] == '(') depth++;
-                            else if (cp->tkind == 3 && cp->tok[0] == ')') depth--;
-                            if (depth == 0) break;
+                        FFIType *fp = type_new(FFI_FUNC_PTR,
+                                               sizeof(void *), sizeof(void *));
+                        fp->fn_ret = t;          /* base = 返回类型 */
+                        FFIType *ps[32];
+                        int nps = 0;
+                        bool varg = false;
+                        if (!cis(cp, ")"))
+                            parse_param_list(cp, sc, ps, 32, &nps, &varg);
+                        else
                             cnext(cp);
-                        }
-                        cexpect(cp, ")");
-                        return type_new(FFI_PTR, sizeof(void *), sizeof(void *));
+                        fp->fn_n = nps;
+                        fp->fn_params = nps
+                            ? tm_malloc(sizeof(FFIType *) * (size_t)nps) : NULL;
+                        for (int i = 0; i < nps; i++) fp->fn_params[i] = ps[i];
+                        return fp;
                     }
                 }
             }
@@ -517,6 +531,35 @@ static FFIType *parse_declarator(CParser *cp, FFIScope *sc, FFIType *base,
         t = at;
     }
     return t;
+}
+
+/* 参数表（函数声明与函数指针签名共用）：进入时已消费 "("，返回时已消费 ")"。
+ * 数组参数按 C 规则退化为指针。 */
+static void parse_param_list(CParser *cp, FFIScope *sc,
+                             FFIType **params, int max, int *np, bool *variadic) {
+    *np = 0;
+    *variadic = false;
+    for (;;) {
+        if (cis(cp, "...")) {
+            *variadic = true;
+            cnext(cp);
+            break;
+        }
+        FFIType *pb = parse_type(cp, sc);
+        if (!pb)
+            tphp_raise("ValueError", "FFI::cdef(): bad parameter type near \"%s\"", cp->tok);
+        char pn[128] = {0};
+        FFIType *pt = parse_declarator(cp, sc, pb, pn, sizeof pn, true);
+        if (pt->code == FFI_ARRAY) {
+            FFIType *p = type_new(FFI_PTR, sizeof(void *), sizeof(void *));
+            p->array_elem = pt->array_elem;
+            pt = p;
+        }
+        if (*np < max) params[(*np)++] = pt;
+        if (cis(cp, ",")) { cnext(cp); continue; }
+        break;
+    }
+    cexpect(cp, ")");
 }
 
 static FFIType *parse_type(CParser *cp, FFIScope *sc) {
@@ -636,27 +679,7 @@ static void parse_function(CParser *cp, FFIScope *sc, FFIType *ret, const char *
             cp->p = save; cp->tkind = skind;
             memcpy(cp->tok, stok, sizeof cp->tok);
         }
-        for (;;) {
-            if (cis(cp, "...")) {
-                variadic = true;
-                cnext(cp);
-                break;
-            }
-            FFIType *pb = parse_type(cp, sc);
-            if (!pb)
-                tphp_raise("ValueError", "FFI::cdef(): bad parameter type near \"%s\"", cp->tok);
-            char pn[128] = {0};
-            FFIType *pt = parse_declarator(cp, sc, pb, pn, sizeof pn, true);
-            if (pt->code == FFI_ARRAY) {
-                FFIType *p = type_new(FFI_PTR, sizeof(void *), sizeof(void *));
-                p->array_elem = pt->array_elem;
-                pt = p;
-            }
-            if (np < 32) params[np++] = pt;
-            if (cis(cp, ",")) { cnext(cp); continue; }
-            break;
-        }
-        cexpect(cp, ")");
+        parse_param_list(cp, sc, params, 32, &np, &variadic);
     } else {
         cnext(cp);   /* 空参数表 () */
     }
@@ -1169,6 +1192,229 @@ static void wbuf_free_all(void) {
     g_n_wbuf = 0;
 }
 
+/* ============================================================
+ * 回调 trampoline（v1，PLAN/02 §4.5.1）：闭包 → C 函数指针。
+ * 生命周期：trampoline + 闭包（addref）进线程局部表，脚本/线程结束释放
+ * （CLI 单脚本 ≈ PHP 单请求"整请求有效"）。回调内 throw = 硬 Fatal
+ * （raise 钩子查 tphp_ffi_cb_depth——longjmp 穿 trampoline 会跳过
+ * ffi_call 的 C 栈帧毁掉 libffi/C 库状态）。
+ * ============================================================ */
+
+typedef struct FFIClosure {
+    ffi_closure *cl;
+    void *exec;              /* 可执行地址（传给 C 的值） */
+    ffi_cif cif;             /* 回调签名 */
+    ffi_type **cif_atypes;
+    TVal fn;                 /* PHP 闭包（已 addref） */
+    FFIType *sig;            /* FFI_FUNC_PTR（借用 scope 类型，活到线程结束） */
+} FFIClosure;
+
+static _Thread_local FFIClosure **g_closures;
+static _Thread_local int g_n_closures, g_cap_closures;
+
+/* vm.c vm_raise_at 查询：>0 时禁止 longjmp（回调内 throw → Fatal exit） */
+_Thread_local int tphp_ffi_cb_depth = 0;
+
+/* 宽松标量转换（回调返回路径；不 raise——非数值当 0） */
+static int64_t loose_int(TVal v) {
+    if (v.t == T_INT) return v.u.i;
+    if (v.t == T_FLOAT) return (int64_t)v.u.d;
+    if (v.t == T_TRUE) return 1;
+    return 0;
+}
+static double loose_float(TVal v) {
+    if (v.t == T_FLOAT) return v.u.d;
+    if (v.t == T_INT) return (double)v.u.i;
+    return 0.0;
+}
+
+/* C → PHP 参数解码（libffi trampoline args[i]：标量/指针指向值槽，
+ * struct 指向栈上数据——struct 视图仅回调期间有效，与 PHP 同款约定） */
+static TVal cb_decode_arg(FFIType *t, void *p) {
+    switch (t->code) {
+    case FFI_BOOL:  return *(uint8_t *)p ? TV_TRUE : TV_FALSE;
+    case FFI_INT8:  return TV_INT(*(int8_t *)p);
+    case FFI_UINT8: return TV_INT(*(uint8_t *)p);
+    case FFI_INT16: return TV_INT(*(int16_t *)p);
+    case FFI_UINT16:return TV_INT(*(uint16_t *)p);
+    case FFI_INT32: return TV_INT(*(int32_t *)p);
+    case FFI_UINT32:return TV_INT(*(uint32_t *)p);
+    case FFI_INT64: return TV_INT(*(int64_t *)p);
+    case FFI_UINT64:return TV_INT((int64_t)*(uint64_t *)p);
+    case FFI_FLOAT: return TV_FLOAT(*(float *)p);
+    case FFI_DOUBLE:return TV_FLOAT(*(double *)p);
+    case FFI_ENUM:  return TV_INT(*(int32_t *)p);
+    case FFI_WCHAR:
+#ifdef _WIN32
+        return TV_INT(*(uint16_t *)p);
+#else
+        return TV_INT(*(uint32_t *)p);
+#endif
+    case FFI_PTR: {
+        void *q = *(void **)p;
+        if (!q) return TV_NULL;
+        /* char / int8 指针 → string 拷贝（PHP const char* 语义；tphp 无
+         * const 标记，统一拷贝防悬空——与 PHP 的 char*=CData 视图有意差异） */
+        if (t->array_elem && t->array_elem->code == FFI_INT8) {
+            size_t ln = 0;
+            while (((char *)q)[ln]) ln++;
+            return TV_STR(tstr_new((char *)q, ln));
+        }
+        return cdata_wrap(q, t->array_elem ? t->array_elem : bt_void,
+                          false, NULL);
+    }
+    case FFI_STRUCT:
+        /* 别名 libffi 栈参数：回调返回后失效（PHP 同款；文档红字） */
+        return cdata_wrap(p, t, false, NULL);
+    case FFI_ARRAY:
+        return cdata_wrap(p, t, false, NULL);
+    case FFI_FUNC_PTR: {
+        void *q = *(void **)p;
+        return q ? cdata_wrap(q, t, false, NULL) : TV_NULL;
+    }
+    case FFI_VOID: break;
+    }
+    return TV_NULL;
+}
+
+/* PHP → C 返回值（类型不匹配 → stderr 警告 + 零值；修 PHP 的"吞异常
+ * 返回未初始化垃圾"坑）。r 的所有权仍归调用方。 */
+static void cb_encode_ret(FFIType *t, void *ret, TVal r) {
+    if (t->code == FFI_VOID) return;
+    memset(ret, 0, t->size ? t->size : 1);
+    switch (t->code) {
+    case FFI_BOOL:  *(uint8_t *)ret = loose_int(r) ? 1 : 0; return;
+    case FFI_INT8:  *(int8_t *)ret = (int8_t)loose_int(r); return;
+    case FFI_UINT8: *(uint8_t *)ret = (uint8_t)loose_int(r); return;
+    case FFI_INT16: *(int16_t *)ret = (int16_t)loose_int(r); return;
+    case FFI_UINT16:*(uint16_t *)ret = (uint16_t)loose_int(r); return;
+    case FFI_INT32: *(int32_t *)ret = (int32_t)loose_int(r); return;
+    case FFI_UINT32:*(uint32_t *)ret = (uint32_t)loose_int(r); return;
+    case FFI_INT64: *(int64_t *)ret = loose_int(r); return;
+    case FFI_UINT64:*(uint64_t *)ret = (uint64_t)loose_int(r); return;
+    case FFI_FLOAT: *(float *)ret = (float)loose_float(r); return;
+    case FFI_DOUBLE:*(double *)ret = loose_float(r); return;
+    case FFI_ENUM:  *(int32_t *)ret = (int32_t)loose_int(r); return;
+    case FFI_WCHAR:
+#ifdef _WIN32
+        *(uint16_t *)ret = (uint16_t)loose_int(r);
+#else
+        *(uint32_t *)ret = (uint32_t)loose_int(r);
+#endif
+        return;
+    case FFI_PTR:
+        if (r.t == T_NULL) { *(void **)ret = NULL; return; }
+        if (r.t == T_OBJ) {
+            TObj *o = (TObj *)r.u.p;
+            if (o->cls == g_cdata_cls && o->props[0].t == T_INT) {
+                *(void **)ret = g_cdatas[o->props[0].u.i]->ptr;
+                return;
+            }
+        }
+        if (r.t == T_STR) { *(void **)ret = ((TStr *)r.u.p)->c; return; }
+        fprintf(stderr, "PHP Warning: FFI callback return: "
+                        "expected pointer-compatible value\n");
+        return;
+    case FFI_STRUCT:
+        if (r.t == T_OBJ) {
+            TObj *o = (TObj *)r.u.p;
+            if (o->cls == g_cdata_cls && o->props[0].t == T_INT) {
+                FFCData *d = g_cdatas[o->props[0].u.i];
+                if (d->type->size == t->size) {
+                    memcpy(ret, d->ptr, t->size);
+                    return;
+                }
+            }
+        }
+        fprintf(stderr, "PHP Warning: FFI callback return: "
+                        "struct return requires a same-size CData\n");
+        return;
+    default:
+        fprintf(stderr, "PHP Warning: FFI callback return: "
+                        "unsupported return type\n");
+        return;
+    }
+}
+
+#define CB_MAX_ARGS 16
+
+/* vm.c（非公共头）：以 callable 调用一帧——回调 trampoline 用 */
+extern TVal tphp_vm_call_callable(struct VM *vm, TVal callable,
+                                  TVal *args, int n);
+
+static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
+                          void *user_data) {
+    (void)cif;
+    FFIClosure *fc = (FFIClosure *)user_data;
+    FFIType *sig = fc->sig;
+    VM *vm = (VM *)tphp_vm_current;
+    tphp_ffi_cb_depth++;
+    int n = sig->fn_n > CB_MAX_ARGS ? CB_MAX_ARGS : sig->fn_n;
+    TVal argv[CB_MAX_ARGS];
+    for (int i = 0; i < n; i++)
+        argv[i] = cb_decode_arg(sig->fn_params[i], args[i]);
+    TVal r = TV_NULL;
+    if (vm) {
+        r = tphp_vm_call_callable(vm, fc->fn, argv, n);
+    } else {
+        fprintf(stderr, "PHP Warning: FFI callback invoked without a VM\n");
+    }
+    for (int i = 0; i < n; i++) tval_release(&argv[i]);
+    cb_encode_ret(sig->fn_ret, ret, r);
+    tval_release(&r);
+    tphp_ffi_cb_depth--;
+}
+
+/* 闭包 → 可执行 trampoline 地址；失败 raise */
+static void *closure_create(VM *vm, FFIType *sig, TVal fn,
+                            const char *fname, int idx) {
+    if (sig->fn_n > CB_MAX_ARGS)
+        tphp_vm_raise(vm, "Error",
+                      "%s(): Argument #%d callback has too many parameters "
+                      "(max %d)", fname, idx + 1, CB_MAX_ARGS);
+    FFIClosure *fc = tm_malloc(sizeof *fc);
+    memset(fc, 0, sizeof *fc);
+    fc->sig = sig;
+    fc->fn = fn;
+    tval_addref(fn);
+    ffi_type **ats = tm_malloc(sizeof(ffi_type *) *
+                               (size_t)(sig->fn_n > 0 ? sig->fn_n : 1));
+    fc->cif_atypes = ats;
+    for (int i = 0; i < sig->fn_n; i++) {
+        if (sig->fn_params[i]->code == FFI_STRUCT)
+            prepare_struct_ffi(sig->fn_params[i]);
+        ats[i] = to_ffi_type(sig->fn_params[i]);
+    }
+    if (sig->fn_ret->code == FFI_STRUCT) prepare_struct_ffi(sig->fn_ret);
+    if (ffi_prep_cif(&fc->cif, FFI_DEFAULT_ABI, (unsigned)sig->fn_n,
+                     to_ffi_type(sig->fn_ret), ats) != FFI_OK) {
+        tphp_vm_raise(vm, "Error",
+                      "%s(): Argument #%d ffi_prep_cif failed for callback",
+                      fname, idx + 1);
+    }
+    void *code = NULL;
+    fc->cl = ffi_closure_alloc(sizeof(ffi_closure), &code);
+    if (!fc->cl || !code)
+        tphp_vm_raise(vm, "Error",
+                      "%s(): Argument #%d ffi_closure_alloc failed",
+                      fname, idx + 1);
+    fc->exec = code;
+    if (ffi_prep_closure_loc(fc->cl, &fc->cif, cb_trampoline, fc, code)
+        != FFI_OK) {
+        tphp_vm_raise(vm, "Error",
+                      "%s(): Argument #%d ffi_prep_closure_loc failed",
+                      fname, idx + 1);
+    }
+    /* 线程局部表保活（脚本/线程结束释放；不做去重——对齐 PHP 每传建一） */
+    if (g_n_closures >= g_cap_closures) {
+        g_cap_closures = g_cap_closures ? g_cap_closures * 2 : 8;
+        g_closures = tm_realloc(g_closures,
+                                sizeof(FFIClosure *) * (size_t)g_cap_closures);
+    }
+    g_closures[g_n_closures++] = fc;
+    return code;
+}
+
 static void encode_arg(VM *vm, FFIType *t, TVal v, void *slot,
                        const char *fname, int idx) {
     switch (t->code) {
@@ -1232,6 +1478,25 @@ static void encode_arg(VM *vm, FFIType *t, TVal v, void *slot,
         tphp_vm_raise(vm, "TypeError",
                       "%s(): Argument #%d expects pointer-compatible value",
                       fname, idx + 1);
+        break;
+    }
+    case FFI_FUNC_PTR: {
+        if (v.t == T_NULL) { *(void **)slot = NULL; break; }
+        if (v.t == T_CLOSURE) {
+            *(void **)slot = closure_create(vm, t, v, fname, idx);
+            break;
+        }
+        /* 已有函数指针 CData 透传（如回调参数里收到的指针再传下去） */
+        if (v.t == T_OBJ) {
+            TObj *o = (TObj *)v.u.p;
+            if (o->cls == g_cdata_cls && o->props[0].t == T_INT) {
+                *(void **)slot = g_cdatas[o->props[0].u.i]->ptr;
+                break;
+            }
+        }
+        tphp_vm_raise(vm, "TypeError",
+                      "%s(): Argument #%d expects a closure or null for "
+                      "function pointer type", fname, idx + 1);
         break;
     }
     case FFI_STRUCT: {
@@ -1610,6 +1875,10 @@ static TVal nm_cdata_getvalue(VM *vm, void *self, TVal *args, int n) {
     case FFI_FLOAT: return TV_FLOAT(*(float *)d->ptr);
     case FFI_DOUBLE:return TV_FLOAT(*(double *)d->ptr);
     case FFI_ENUM:  return TV_INT(*(int32_t *)d->ptr);
+    case FFI_FUNC_PTR: {
+        void *p = *(void **)d->ptr;
+        return p ? cdata_wrap(p, t, false, d->scope) : TV_NULL;
+    }
     case FFI_VOID:  return TV_NULL;
     case FFI_WCHAR:
 #if defined(_WIN32)

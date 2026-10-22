@@ -64,11 +64,22 @@
 - PowerShell 5.1 `Set-Content -Encoding UTF8` 写 BOM——测试 fixture 注意
 - git 提交时 `build/cacert.pem` 是刻意入库的（.gitignore `!` 豁免），勿误删
 
+## 2026-10-22 FFI 回调 v1 已完成（184/184，PLAN/02 §4.5.1）
+- 实现：cdef 参数位函数指针真解析（FFI_FUNC_PTR）+ libffi trampoline（FFIClosure+TLS 表脚本/线程保活，无 close）+ cb_decode/encode（char* 拷贝 string、struct 别名失效、返回不匹配=警告+零值）；test-ffi-callback.php qsort 端到端
+- **异常硬禁收口**：`vm_unwind_jump`（src/vm.c）统一所有 `longjmp(vm->x.unwind)`——op_throw 曾直接 longjmp 绕过 depth 检查；tphp_ffi_cb_depth>0 → Fatal "Throwing from FFI callbacks is not allowed"
+- 坑：tphp 无 by-ref 捕获；void* 下标须 cast("int*")（PHP 同款）；cdef 函数指针原是占位 void*（"trampoline 留待后续"注释已删）
+
+## 2026-10-22 FFI 回调四家对照与 v1 设计定稿（PLAN/02 §4.5.1）
+- 四家对照（PHP/txiki/Bun/V）定稿：API 隐式对齐 PHP、TLS 表脚本期保活、编组修 PHP 返回值垃圾坑、**回调内 throw=Fatal**（raise 钩子查 tphp_ffi_cb_depth——longjmp 穿 trampoline 会毁 C 栈，PHP bailout 同病所以才禁）、同线程允许重入、不做 threadsafe、trampoline 不暴露裸地址
+- 实现落点：ext/ffi/ffi.c（parser 函数指针类型 + FFIClosure + trampoline_cb + TLS 表 + encode 分支）+ vm raise 路径 depth 检查 + tests/ffi/test-ffi-callback.php（qsort）
+- v2 后置（下次候选，规格见 PLAN/02 §4.5.1）：①struct 字段/数组元素闭包赋值（cdata 写路径识别 FFI_FUNC_PTR）②同闭包 trampoline 去重 ③延迟异常传播（catchable 版，改 unwind 保护帧——复杂度高，与硬 Fatal 是语义取舍）
+- 其他待办余项：doc/ffi.md 信任声明（装包即信任一句话）、E3 可选（zip 源哈希/树哈希/verify）、pack.include/exclude 的 build 消费
+
 ## 2026-10-21 FFI 安全分析 + lock integrity 设计（docs 已提交待开工）
 - **doc/ffi-security.md**：PHP 8.5.7/txiki/Bun 三方对照（只有 PHP 做安全模型=ffi.enable 入口门控+preload；txiki/Bun/tphp=本地可信全开放）。用户拍板：❌ffi.enable 总闸（php.ini 大爆炸）、❌动态库标识/签名（可复制/密钥+系统库豁免被 system() 一行绕穿）；✅信任=声明+包管理层边界
 - **lock integrity（PLAN/pkg-manager.md 阶段 E，待实现）**：lock 逐文件 sha1 快照（字段 `integrity`，全文件含 php、明细非树、SHA-1 复用 pack.c static→导出、lock_save 单点写入）；校验点仅 install skip（pkg.c:1944 现只看 emj 存在→升级）与 build 打包；运行时不查；fail-closed 报文件 + `--force`；新增文件算不匹配；旧 lock 兼容自动补写；测试 test-pkg-integrity.php
 - 小项待做：`FFI::cast` 拒裸 int（getAddress 保留单向阀）——比三方都严的点
-- 下次开工顺序建议：阶段 E1（SHA1 导出+lock_save 快照+install 校验+测试）→ E2（--force+build 校验）→ cast 收紧 → doc/ffi.md 信任声明
+- ~~下次开工顺序建议：阶段 E1 → E2 → cast 收紧~~ **均已完成**（E 8da368a / cast 69bb2ed / 回调 v1 本会话）；当前候选：FFI 回调 v2（见上）或 M7 方向（preg_*/PDO/HTTP server/REPL——均需先立规格）
 
 ## 2026-10-20 会话二：包管理阶段 A（174/174，HEAD=8fcee3f 未提交）
 - **决策变更（用户拍板）：包管理不依赖 git 应用**——来源=HTTP(S) zip 直链 + 本地路径/zip（http_get+miniz）；ref 精确定位（无 ls-remote，不做 ^~ /latest）；deps=`{url, ref}`（读兼容旧 git 键）。~~PLAN 待阶段 D 改写~~ **10-21 已完成**（PLAN 主体/索引/cli/stdlib/package-manager 边界表全部同步无 git 版）
