@@ -4336,11 +4336,24 @@ static void vm_seed_consts(VM *vm) {
         { "PHP_EOL",     "\r\n", 0 },
         { "DIRECTORY_SEPARATOR", "\\", 0 },
         { "PATH_SEPARATOR",      ";",  0 },
+        { "PHP_OS_FAMILY", "Windows", 0 },
+#elif defined(__APPLE__)
+        { "PHP_EOL",     "\n",  0 },
+        { "DIRECTORY_SEPARATOR", "/",  0 },
+        { "PATH_SEPARATOR",      ":",  0 },
+        { "PHP_OS_FAMILY", "Darwin", 0 },   /* 对齐 PHP：macOS 归 Darwin */
+#elif defined(__linux__)
+        { "PHP_EOL",     "\n",  0 },
+        { "DIRECTORY_SEPARATOR", "/",  0 },
+        { "PATH_SEPARATOR",      ":",  0 },
+        { "PHP_OS_FAMILY", "Linux", 0 },
 #else
         { "PHP_EOL",     "\n",  0 },
         { "DIRECTORY_SEPARATOR", "/",  0 },
         { "PATH_SEPARATOR",      ":",  0 },
+        { "PHP_OS_FAMILY", "BSD", 0 },      /* FreeBSD/OpenBSD/NetBSD 等 */
 #endif
+        { "PHP_VERSION", TPHP_VERSION, 0 },
         { "PHP_INT_MAX", NULL, INT64_MAX },
         { "PHP_INT_MIN", NULL, INT64_MIN },
         /* 打包应用资源根（io 层 tphp://asset/ 前缀直读内存 zip）；
@@ -4356,6 +4369,14 @@ static void vm_seed_consts(VM *vm) {
                                                             strlen(seeds[i].str)));
         else
             vm->consts[vm->n_consts].v = TV_INT(seeds[i].i);
+        vm->n_consts++;
+    }
+    /* PHP_PACK：是否运行在打包 exe 内（tphp_pack_startup 已在 main 最
+     * 早期跑过，此处查状态即可）。seeds 表只承载 str/int，bool 单独补。 */
+    if (vm->n_consts < 256) {
+        vm->consts[vm->n_consts].name = tstr_intern("PHP_PACK", 8);
+        vm->consts[vm->n_consts].v =
+            tphp_pack_has_bundle() ? TV_TRUE : TV_FALSE;
         vm->n_consts++;
     }
 }

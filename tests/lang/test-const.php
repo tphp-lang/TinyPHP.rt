@@ -38,3 +38,14 @@ echo strlen(DIRECTORY_SEPARATOR) === 1
 echo strlen(PATH_SEPARATOR) === 1
     && (PATH_SEPARATOR === ";" || PATH_SEPARATOR === ":")
     ? "ps-ok\n" : "ps-FAIL\n";
+// PHP_OS_FAMILY：平台相关家族名（形态断言，CI 多平台通用）
+// EXPECT: osf-ok
+echo in_array(PHP_OS_FAMILY, ["Windows", "Linux", "Darwin", "BSD"])
+    ? "osf-ok\n" : "osf-FAIL\n";
+// PHP_VERSION：非空 x.y.z 形态
+// EXPECT: ver-ok
+echo strlen(PHP_VERSION) >= 5 && strpos(PHP_VERSION, ".") !== false
+    ? "ver-ok\n" : "ver-FAIL\n";
+// PHP_PACK：测试以源码脚本运行（非打包 exe），恒为 false
+// EXPECT: bool(false)
+var_dump(PHP_PACK);
