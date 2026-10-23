@@ -3,12 +3,17 @@
 // EXPECT: capture=ok
 // EXPECT: ok
 // FFI 回调 v1（PLAN/02 §4.5.1）：闭包 → 函数指针参数位置，libffi trampoline。
-// Windows msvcrt qsort（Linux/macOS 走 libc，符号相同）。
+// Windows msvcrt qsort（Linux libc.so.6 / macOS libSystem.B.dylib，符号同名）
 if (PHP_OS_FAMILY === "Windows") {
     $libc = FFI::cdef("
         void qsort(void *base, size_t nmemb, size_t size,
                    int (*compar)(const void *, const void *));
     ", "msvcrt.dll");
+} elseif (PHP_OS_FAMILY === "Darwin") {
+    $libc = FFI::cdef("
+        void qsort(void *base, size_t nmemb, size_t size,
+                   int (*compar)(const void *, const void *));
+    ", "libSystem.B.dylib");
 } else {
     $libc = FFI::cdef("
         void qsort(void *base, size_t nmemb, size_t size,
