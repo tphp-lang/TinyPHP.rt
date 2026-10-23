@@ -139,11 +139,11 @@ class Worker {
 - **地址面**：trampoline 不暴露裸地址（传参只认 Closure 值），配合既有 `cast` 拒裸 int
 - **验收**：`tests/ffi/test-ffi-callback.php` —— msvcrt/libc `qsort` + 捕获闭包端到端
 - **v1 已完成**（2026-10-22，184/184）：FFI_FUNC_PTR 真解析 + trampoline + TLS 保活 + `vm_unwind_jump` 全量收口（op_throw 曾直接 longjmp 绕过 depth 检查——所有 unwind 出口必须经它）
-- **v2 后置清单**（按优先级）：
-  1. **struct 字段/数组元素的闭包赋值**（`$s->callback = function(...){}`）——PHP 全形态支持的第二触发点；v1 仅参数位置（覆盖 qsort 类 90% 场景）。实现：cdata 写路径识别 FFI_FUNC_PTR 字段 → closure_create 写入槽
-  2. **同闭包复用去重**——同 TVal 闭包 + 同签名复用同一 trampoline（PHP 也是每传建一、泄漏到请求末；循环传闭包场景的内存优化）
-  3. **延迟异常传播**（txiki 式：回调内 throw → 返回值置 0、C 跑完、ffi_call 边界后可 catch）——需 trampoline 级 catch-all 保护帧改 unwind 语义，复杂度高收益有限；与 v1 的硬 Fatal 是语义取舍，做则切换默认并保留 Fatal 于无法安全传播的场景
-- 验收测试追加项（v2）：字段赋值回调、去重后内存平稳、延迟传播可 catch
+- **v2 已完成**（2026-10-22，185/185）：
+  1. **struct 字段/数组元素的闭包赋值**——写路径走既有 encode_arg（FUNC_PTR→closure_create）；补 fetch_prop/assign_dim 读回为非 owned 函数指针视图；`FFI::new("struct S")` 静态调用（sc=NULL）由 AV 改为明确 ValueError（结构体类型需 `$ffi->new`）
+  2. **同闭包复用去重**——closure_create 按「T_CLOSURE 对象指针 + 签名 FFIType*」查 TLS 表复用同一 trampoline；失败路径（prep_cif/alloc/prep_loc）raise 前释放 fc/ats/closure（不学 PHP 静默泄漏）
+  3. ~~延迟异常传播~~ 后置：与硬 Fatal 是语义取舍，复杂度高收益有限；做则切换默认并保留 Fatal 于无法安全传播的场景
+- 验收测试：`tests/ffi/test-ffi-callback.php`（v1 qsort）+ `tests/ffi/test-ffi-callback-struct.php`（v2 字段赋值/读回/去重同地址/静态 new 抛错/读回指针传 qsort/200 次循环平稳）
 
 ## 5. CLI
 

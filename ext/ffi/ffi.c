@@ -345,6 +345,13 @@ static FFIType *parse_struct_body(CParser *cp, FFIScope *sc, bool is_enum) {
         cnext(cp);
         if (cis(cp, "{"))
             return parse_named_body(cp, sc, is_enum, nbuf);
+        /* sc==NULL（FFI::new 静态调用）时无注册表可查——明确报错，
+         * 不允许 NULL 解引用（v2：曾 AV） */
+        if (!sc)
+            tphp_raise("ValueError",
+                       "FFI: struct/union/enum \"%s\" needs an FFI instance "
+                       "scope (use $ffi->new / $ffi->type); FFI::new() "
+                       "static call cannot see cdef types", nbuf);
         for (int i = 0; i < sc->n_types; i++)
             if (sc->types[i]->name && strcmp(sc->types[i]->name, nbuf) == 0)
                 return sc->types[i];
@@ -446,7 +453,7 @@ static FFIType *lookup_type_name(CParser *cp, FFIScope *sc) {
     }
     if (sc) {
         for (int i = 0; i < sc->n_types; i++) {
-            if (strcmp(sc->types[i]->name, n) == 0) {
+            if (sc->types[i]->name && strcmp(sc->types[i]->name, n) == 0) {
                 FFIType *t = sc->types[i];
                 cnext(cp);
                 return t;
@@ -1365,13 +1372,26 @@ static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
     tphp_ffi_cb_depth--;
 }
 
-/* 闭包 → 可执行 trampoline 地址；失败 raise */
+/* 闭包 → 可执行 trampoline 地址；失败 raise。
+ * v2②：同一闭包（TVal 指针）+ 同一签名（FFIType*）复用同一 trampoline
+ * ——PHP 每传建一、泄漏到请求末；tphp 脚本级保活下循环传闭包会线性堆
+ * 积 libffi closure，去重后平稳。复用键：fn 对象指针 + sig 指针（同一
+ * cdef 作用域的同名声明恒为同一 FFIType*）。非闭包 callable（字符串等）
+ * 不去重（v1 范围外）。 */
 static void *closure_create(VM *vm, FFIType *sig, TVal fn,
                             const char *fname, int idx) {
     if (sig->fn_n > CB_MAX_ARGS)
         tphp_vm_raise(vm, "Error",
                       "%s(): Argument #%d callback has too many parameters "
                       "(max %d)", fname, idx + 1, CB_MAX_ARGS);
+    if (fn.t == T_CLOSURE) {
+        for (int i = 0; i < g_n_closures; i++) {
+            if (g_closures[i]->fn.t == T_CLOSURE &&
+                g_closures[i]->fn.u.p == fn.u.p &&
+                g_closures[i]->sig == sig)
+                return g_closures[i]->exec;
+        }
+    }
     FFIClosure *fc = tm_malloc(sizeof *fc);
     memset(fc, 0, sizeof *fc);
     fc->sig = sig;
@@ -1388,24 +1408,36 @@ static void *closure_create(VM *vm, FFIType *sig, TVal fn,
     if (sig->fn_ret->code == FFI_STRUCT) prepare_struct_ffi(sig->fn_ret);
     if (ffi_prep_cif(&fc->cif, FFI_DEFAULT_ABI, (unsigned)sig->fn_n,
                      to_ffi_type(sig->fn_ret), ats) != FFI_OK) {
+        /* raise 前收尾（longjmp 不会回来——不学 PHP 的静默泄漏） */
+        tval_release(&fc->fn);
+        tm_free(ats);
+        tm_free(fc);
         tphp_vm_raise(vm, "Error",
                       "%s(): Argument #%d ffi_prep_cif failed for callback",
                       fname, idx + 1);
     }
     void *code = NULL;
     fc->cl = ffi_closure_alloc(sizeof(ffi_closure), &code);
-    if (!fc->cl || !code)
+    if (!fc->cl || !code) {
+        tval_release(&fc->fn);
+        tm_free(ats);
+        tm_free(fc);
         tphp_vm_raise(vm, "Error",
                       "%s(): Argument #%d ffi_closure_alloc failed",
                       fname, idx + 1);
+    }
     fc->exec = code;
     if (ffi_prep_closure_loc(fc->cl, &fc->cif, cb_trampoline, fc, code)
         != FFI_OK) {
+        ffi_closure_free(fc->cl);
+        tval_release(&fc->fn);
+        tm_free(ats);
+        tm_free(fc);
         tphp_vm_raise(vm, "Error",
                       "%s(): Argument #%d ffi_prep_closure_loc failed",
                       fname, idx + 1);
     }
-    /* 线程局部表保活（脚本/线程结束释放；不做去重——对齐 PHP 每传建一） */
+    /* 线程局部表保活（脚本/线程结束释放） */
     if (g_n_closures >= g_cap_closures) {
         g_cap_closures = g_cap_closures ? g_cap_closures * 2 : 8;
         g_closures = tm_realloc(g_closures,
@@ -2022,6 +2054,13 @@ bool tphp_ffi_fetch_prop(VM *vm, TObj *o, TStr *name, TVal *out) {
         case FFI_FLOAT: *out = TV_FLOAT(*(float *)fp); return true;
         case FFI_DOUBLE:*out = TV_FLOAT(*(double *)fp); return true;
         case FFI_ENUM:  *out = TV_INT(*(int32_t *)fp); return true;
+        case FFI_FUNC_PTR: {
+            /* v2①：字段里的函数指针读回为非 owned CData 视图（同
+             * getValue；trampoline 地址由 TLS 表保活到线程结束） */
+            void *p = *(void **)fp;
+            *out = p ? cdata_wrap(p, ft, false, d->scope) : TV_NULL;
+            return true;
+        }
         case FFI_WCHAR:
 #ifdef _WIN32
             *out = TV_INT(*(uint16_t *)fp);
@@ -2135,6 +2174,12 @@ bool tphp_ffi_fetch_dim(VM *vm, TVal base, TVal key, TVal *out) {
     char *ep = (char *)d->ptr + (size_t)idx * (ptrdiff_t)stride;
     if (el->code == FFI_ARRAY || el->code == FFI_STRUCT) {
         *out = cdata_wrap(ep, el, false, d->scope);
+        return true;
+    }
+    if (el->code == FFI_FUNC_PTR) {
+        /* v2①：函数指针数组元素读回（同字段；非 owned 视图） */
+        void *p = *(void **)ep;
+        *out = p ? cdata_wrap(p, el, false, d->scope) : TV_NULL;
         return true;
     }
     if (el->code == FFI_PTR) {
