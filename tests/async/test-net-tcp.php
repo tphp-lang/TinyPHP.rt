@@ -1,8 +1,8 @@
 <?php
 // M4-d: DNS + TCP —— gethostbyname、fsockopen、stream_socket_server/accept、
 // fgets/fread/fwrite/fclose 对 TCP 流、双协程挂起交互
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 // 1) DNS
 var_dump(gethostbyname("localhost") === "127.0.0.1" ||

@@ -249,6 +249,11 @@ struct VM {
 typedef int32_t (*OpHandler)(void *vm, TOp *op);
 extern const OpHandler tphp_op_handlers[OP_MAX];
 
+/* PHP callable 判定：closure / 函数名字符串 / [obj|'Cls','m'] / 带 __invoke
+ * 的对象。不触发 autoload、不报错（调用点才解析）。is_callable 与
+ * need_callable 共用，保证"判定"与"调用"两处语义一致。 */
+bool tphp_vm_is_callable(TVal v);
+
 const char *tphp_op_name(uint8_t op);
 
 #endif /* TPHP_OPCODE_H */

@@ -280,6 +280,7 @@ static const char *type_name(TType t) {
     case T_FLOAT: return "double";
     case T_STR: return "string";
     case T_ARR: return "array";
+    case T_OBJ: return "object";
     default: return "unknown";
     }
 }
@@ -1485,9 +1486,8 @@ static TVal bi_mt_rand(VM *vm, TVal *args, int n) {
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);
 
 static void need_callable(VM *vm, TVal *v, const char *fn, const char *arg) {
-    if (v->t == T_CLOSURE) return;
-    if (v->t == T_STR) return;   /* 函数名或 'Cls::m' */
-    if (v->t == T_ARR) return;   /* P2-B: [$obj,'m'] / ['Cls','m'] */
+    /* 统一判定：closure / 函数名 / [obj|'Cls','m'] / 带 __invoke 的对象 */
+    if (tphp_vm_is_callable(*v)) return;
     RAISE(vm, "TypeError", "%s(): Argument %s must be callable, %s given",
           fn, arg, type_name(v->t));
 }
@@ -1850,17 +1850,7 @@ static TVal bi_call_user_func_array(VM *vm, TVal *args, int n) {
 static TVal bi_is_callable(VM *vm, TVal *args, int n) {
     (void)vm;
     if (n < 1) RAISE(vm, "ArgumentCountError", "is_callable() expects at least 1 argument");
-    TVal v = args[0];
-    if (v.t == T_CLOSURE) return TV_TRUE;
-    if (v.t == T_STR) {
-        TStr *s = (TStr *)v.u.p;
-        /* 粗判：内置名或已定义用户函数——这里只查内置表+简单启发 */
-        for (int i = 0; i < tphp_builtin_count; i++)
-            if (strcmp(tphp_builtins[i].name, s->c) == 0) return TV_TRUE;
-        /* 用户函数：留给 VM 的 resolve——简化返回 true（调用时再报错） */
-        return TV_TRUE;
-    }
-    return TV_FALSE;
+    return tphp_vm_is_callable(args[0]) ? TV_TRUE : TV_FALSE;
 }
 
 /* time() */
@@ -2409,13 +2399,16 @@ const Builtin tphp_builtins[] = {
     /* M4: 协程与时间（sched.c；sleep/usleep 透明挂起，不占 CPU） */
     { "sleep", tphp_async_sleep },
     { "usleep", tphp_async_usleep },
-    { "Async\\spawn", tphp_async_spawn },
-    { "Async\\await", tphp_async_await },
-    { "Async\\suspend", tphp_async_suspend },
-    { "Async\\current", tphp_async_current },
-    { "Async\\all", tphp_async_all },
-    { "Async\\any", tphp_async_any },
-    { "Async\\run", tphp_async_run },
+    /* Tphp\ 命名空间：协程 API 的唯一入口（async(EXPR) 的调用形态由
+     * parser 改写为 Tphp\spawn(fn() => EXPR)，不经过这里的 async 表项） */
+    { "Tphp\\spawn", tphp_async_spawn },
+    { "Tphp\\async", tphp_async_wrap },
+    { "Tphp\\await", tphp_async_await },
+    { "Tphp\\suspend", tphp_async_suspend },
+    { "Tphp\\current", tphp_async_current },
+    { "Tphp\\all", tphp_async_all },
+    { "Tphp\\any", tphp_async_any },
+    { "Tphp\\run", tphp_async_run },
     /* M4-b: 透明文件 I/O（io.c；uv_fs 线程池，协程内自动挂起） */
     { "file_get_contents", tphp_io_file_get_contents },
     { "file_put_contents", tphp_io_file_put_contents },

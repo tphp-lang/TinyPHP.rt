@@ -35,7 +35,7 @@
 ### 语法与语义
 
 - 过程式 + 完整 OOP：`class` / `interface` / `trait` / `enum`（含 backing value、`match`）
-- 命名空间：`namespace`、`use` / `use as` / `use function` / `use const`
+- 命名空间：`namespace`、`use` / `use as` / `use function` / `use const`、**组 use** `use A\B\{C, D as E}`
 - 函数：顶层/嵌套、闭包 `function() use`、箭头 `fn()`、命名参数、变参 `...`、默认值、first-class callable `$f(...)`
 - 控制流：`if/while/do/for/foreach/switch/match`、`break N` / `continue N`、`goto`（受限）
 - 异常：`try/catch/finally/throw`，内置异常层级（`Throwable` → `Error`/`Exception` → …）
@@ -105,18 +105,54 @@
 ### 其他
 `exit`/`die` `spl_autoload_register`
 
-## 透明异步 API（`Async\`）
+## 透明异步 API（`Tphp\`）
 
 | 函数 | 说明 |
 |---|---|
-| `Async\spawn($fn, ...$args)` | 启动协程，返回 `Async\Coroutine` |
-| `Async\await($coro\|$chan)` | 等待完成/取值 |
-| `Async\suspend($ms)` | 挂起当前协程 |
-| `Async\current()` | 当前协程对象 |
-| `Async\all($arr)` / `Async\any($arr)` | 聚合等待 |
-| `Async\run($fn)` | 跑到全部完成返回 |
+| `Tphp\spawn($fn, ...$args)` | 启动协程，返回 `Tphp\Coroutine` |
+| `Tphp\await($coro\|$chan)` | 等待完成/取值 |
+| `Tphp\suspend($ms)` | 挂起当前协程 |
+| `Tphp\current()` | 当前协程对象 |
+| `Tphp\all($arr)` / `Tphp\any($arr)` | 聚合等待 |
+| `Tphp\run($fn)` | 跑到全部完成返回 |
+| `Tphp\async($callable)` | 包装成 `Tphp\Task`：调用即启动 |
 
-**内置类**：`Async\Coroutine`（`isdone`/`getresult`/`cancel`…）、`Async\Channel`（`send`/`recv`/`close`/`len`，`new Channel(cap)`）。
+### `async(EXPR)`：语法结构
+
+`async(...)` 的**唯一实参是调用表达式**时，parser 把它改写成
+`Tphp\spawn(fn() => EXPR)`——表达式整体在协程里执行，**不会先执行**；
+自由变量按 spawn 那一刻按值捕获。
+
+```php
+async(p1(3, 4));                 // 等价 spawn(fn() => p1(3, 4))
+$c = async(fetchUser($id));      // $id 在此刻取值
+echo await($c);
+$obj->spawn(task(1, 500));       // ->spawn(...) 同规则（spawn 为保留方法名）
+```
+
+单实参不是调用形态时（`async($callable)`）退化为包装，返回可复用的 `Task`：
+
+```php
+$p1 = async(p1(...));        // 包装一次
+$p1(3, 4);                   // 每次调用 = 一次并发启动
+$p1(3, 4)->wait();           // 启动并等待
+```
+
+**内置类**（均在 `Tphp\` 下）：
+- `Tphp\Coroutine`（`isdone`/`getresult`/`cancel`/**`wait`**…）——`wait()` 是 `await()` 的对象式别名
+- `Tphp\Channel`（`send`/`recv`/`close`/`len`，`new Tphp\Channel(cap)`）——支持多消费者/多生产者（等待者 FIFO 唤醒），可直接当信号量做并发限流
+- `Tphp\TaskGroup` / `Tphp\Thread`（`spawn`/`wait`/`count`）——协程任务组，`wait()` 按登记序返回结果数组；`Thread` 是同义短名（注意语义是单线程内并发，真 OS 线程用 `tphp\Worker`）
+- `Tphp\Task`——`async()` 的返回物，`__invoke` 每次调用新建一个协程
+
+```php
+use function Tphp\{async, await};
+use Tphp\Thread;
+
+$threads = new Thread();
+$threads->spawn(task(1, 500));   // 自动包 thunk，task 不会先执行
+$threads->spawn(task(2, 900));
+$threads->wait();
+```
 
 ## 文件 I/O
 

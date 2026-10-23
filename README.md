@@ -43,11 +43,21 @@ tphp -v
 
 ```php
 <?php
-// 无感异步
-spawn(function () {
-    sleep(1);
-    echo "woken\n";
-});
+use function Tphp\{async, await};
+use Tphp\Thread;
+
+// 无感异步：async(调用) 整体搬进协程，不阻塞主流程
+async(sleep(1));
+echo "main continues\n";
+
+// 要结果就 await
+$n = await(async(time()));
+
+// 任务组：并发跑、统一收口
+$t = new Thread();
+$t->spawn(sleep(1));
+$t->spawn(sleep(2));
+$t->wait();
 
 // FFI
 $ffi = FFI::cdef("int abs(int j);", "msvcrt.dll");
@@ -65,7 +75,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 ./build/tphp test tests/lib
 ```
 
-当前 **107 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
+当前 **194 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
 
 ## 文档
 

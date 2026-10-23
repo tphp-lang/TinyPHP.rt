@@ -1,7 +1,7 @@
 <?php
-// M4-a: Async\spawn / await 基础 —— 返回值、实参、命名函数、Coroutine 对象
-use function Async\spawn;
-use function Async\await;
+// M4-a: Tphp\spawn / await 基础 —— 返回值、实参、命名函数、Coroutine 对象
+use function Tphp\spawn;
+use function Tphp\await;
 
 $c1 = spawn(function () { return 42; });
 var_dump(await($c1));
@@ -24,7 +24,7 @@ var_dump($c3->getException());      // null
 var_dump(await($c3));
 
 // instanceof 与类型
-var_dump($c3 instanceof Async\Coroutine);
+var_dump($c3 instanceof Tphp\Coroutine);
 
 // await 非协程 → TypeError（fatal，见 EXPECT-EXIT）
 $x = spawn(function () { return 1; });

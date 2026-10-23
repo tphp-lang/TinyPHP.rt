@@ -9,7 +9,7 @@
 |---|---|---|
 | **纯 PHP（lib\*.php）** | 能用现有 builtin/内部类表达的；纯算法/组合逻辑 | date/array_column（M6 打包进 exe） |
 | **builtin 函数（C）** | 单个无状态操作，参数→返回值，不需要对象 | strlen/sort/serialize |
-| **内部类（C）** | 有状态（句柄/上下文）、需要方法调用/生命周期管理 | Async\Channel、tphp\Worker、TStream |
+| **内部类（C）** | 有状态（句柄/上下文）、需要方法调用/生命周期管理 | Tphp\Channel、tphp\Worker、TStream |
 
 判断标准：需要持有 OS 资源（fd/socket/timer/线程）或跨调用状态 → 内部类；一次调用完成 → builtin；C 标准库没有现成实现且纯 PHP 性能可接受 → lib。**禁止**为了"快"把纯逻辑下沉到 C（先测性能，bench 有证据再说）。
 
@@ -52,7 +52,7 @@ static void myext_make_class(void) {
 static TVal nm_read(VM *vm, void *self, TVal *args, int n) { ... }
 ```
 
-- **上下文存取**：轻量状态放对象属性槽（`__handle` 下标模式，见 TStream/Async\Coroutine）；OS 句柄等重资源放进程级注册表 + id（WHandle 模式），对象只存 id——**对象被 GC ≠ 资源被释放**，必须有显式 close 或注册表回收策略
+- **上下文存取**：轻量状态放对象属性槽（`__handle` 下标模式，见 TStream/Tphp\Coroutine）；OS 句柄等重资源放进程级注册表 + id（WHandle 模式），对象只存 id——**对象被 GC ≠ 资源被释放**，必须有显式 close 或注册表回收策略
 - **注册时机**：内部类必须在用户脚本**编译前**注册（`A_NEW` 有编译期类存在性检查）——main.c 里 `tphp_async_init()` 之前/同处挂你的 init，幂等
 - **静态 native**：`is_static=true` 走 op_init_smcall 拦截，DO_FCALL 收到 NULL receiver（Worker::self 先例）
 - 对象比较/序列化/GC 遍历：新增对象 kind 时同步改 `tval_compare`/`tval_clone_deep`/`gc_children`（漏一处就是隐形 bug）

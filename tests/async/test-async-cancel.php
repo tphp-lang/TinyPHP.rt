@@ -2,9 +2,9 @@
 // M4-c: 协作式取消 —— 挂起点抛 AsyncCancelled（继承 Throwable，
 // catch(Exception) 不误吞）、reason 透传、finally/catch 清理、
 // cancel 已完成协程返回 false
-use function Async\spawn;
-use function Async\await;
-use function Async\suspend;
+use function Tphp\spawn;
+use function Tphp\await;
+use function Tphp\suspend;
 
 // 1) suspend 挂起点取消 → catch 捕获 + reason
 $c1 = spawn(function () {

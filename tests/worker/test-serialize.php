@@ -2,7 +2,7 @@
 // M5-b: serialize / unserialize —— 自有二进制格式 round-trip：
 // 标量/数组/嵌套/backref 去重（DAG）/循环引用报错/对象 __cloneState 协议
 // /默认 props 直填/__restoreCloneState 优先/enum 单例/closure 拒绝
-use function Async\spawn;
+use function Tphp\spawn;
 
 // 1) 标量 round-trip
 var_dump(unserialize(serialize(null)));

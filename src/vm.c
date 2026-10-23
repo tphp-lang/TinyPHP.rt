@@ -1076,14 +1076,28 @@ static int32_t op_init_dyn(VM *vm, TOp *op) {
         GCHead *h = (GCHead *)fv.u.p;
         if (h->kind == GC_KIND_OBJ) {
             TObj *o = (TObj *)h;
+            tphp_class_ensure_flat(o->cls);
             TMethod *m = tphp_class_find_method(o->cls, "__invoke");
-            if (m && m->fn && !m->is_abstract) {
-                rec->is_method = true;
-                rec->this_obj = o;
-                tval_addref(fv);          /* frame slot 0 owns a reference */
-                rec->uf = m->fn;
-                rec->scope_decl = m->decl;
-                return 1;
+            if (m && !m->is_abstract && !m->is_static) {
+                if (m->fn) {
+                    rec->is_method = true;
+                    rec->this_obj = o;
+                    tval_addref(fv);      /* frame slot 0 owns a reference */
+                    rec->uf = m->fn;
+                    rec->scope_decl = m->decl;
+                    return 1;
+                }
+                if (m->native) {
+                    /* 内部类的 native __invoke（Async\Task 等）：
+                     * 无字节码帧，走 builtin 分派 */
+                    rec->is_method = true;
+                    rec->is_builtin = true;
+                    rec->this_obj = o;
+                    tval_addref(fv);
+                    rec->nm_fn = m->native;
+                    rec->called_cls = o->cls;
+                    return 1;
+                }
             }
         }
         vm_raise(vm, ex_class("Error"), op, "Value is not callable");
@@ -4628,6 +4642,37 @@ void tphp_prog_freeze(Program *p) {
  * closure（含 first-class builtin 包装）、函数名字符串、数组 callable
  * [$obj,'m']/['Cls','m']、'Cls::m' 字符串、绑定方法闭包（MFCC）。
  * 返回 +1 值；异常沿正常 unwind 传播。 */
+/* PHP callable 判定（is_callable / need_callable 共用）。
+ * 与 tphp_vm_call_callable 的分派分支保持同构：这里判 true 的形态，
+ * 调用点必须能真正调起来（否则 is_callable 会撒谎）。 */
+bool tphp_vm_is_callable(TVal v) {
+    switch (v.t) {
+    case T_CLOSURE:
+        return true;
+    case T_STR:
+        return true;                  /* 函数名 / 'Cls::m'：粗判，调用点解析 */
+    case T_ARR: {
+        TArr *a = (TArr *)v.u.p;
+        if (a->n != 2) return false;
+        TVal e[2];
+        int k = 0;
+        for (uint32_t i = 0; i < a->dused && k < 2; i++)
+            if (a->data[i].t != T_UNDEF) e[k++] = a->data[i];
+        if (k != 2 || e[1].t != T_STR) return false;
+        return e[0].t == T_OBJ || e[0].t == T_STR;
+    }
+    case T_OBJ: {
+        TObj *o = (TObj *)v.u.p;
+        if (o->h.kind == GC_KIND_EX || !o->cls) return false;   /* 异常对象 */
+        tphp_class_ensure_flat(o->cls);
+        TMethod *m = tphp_class_find_method(o->cls, "__invoke");
+        return m && (m->fn || m->native) && !m->is_abstract && !m->is_static;
+    }
+    default:
+        return false;
+    }
+}
+
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     TClosure *clo = NULL;
     BuiltinFn bfn = NULL;
@@ -4748,6 +4793,20 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             vm_raise(vm, ex_class("Error"), NULL,
                      "Call to undefined method %s::%s()",
                      tstr_val(mcls->name), tstr_val(mname));
+        if (m->fn) fn = m->fn;
+        else { nat = (NativeMethodFn)m->native; nat_self = recv; }
+    } else if (callable.t == T_OBJ) {
+        /* PHP: 带 __invoke 的对象是 callable（$obj(...) 与 call_user_func
+         * 走同一条分派，避免"直接调用能跑、is_callable 说不行"的分裂） */
+        TObj *o = (TObj *)callable.u.p;
+        if (o->h.kind == GC_KIND_EX || !o->cls)
+            vm_raise(vm, ex_class("TypeError"), NULL, "Value is not callable");
+        tphp_class_ensure_flat(o->cls);
+        TMethod *m = tphp_class_find_method(o->cls, "__invoke");
+        if (!m || (!m->fn && !m->native) || m->is_abstract || m->is_static)
+            vm_raise(vm, ex_class("TypeError"), NULL, "Value is not callable");
+        recv = o;
+        mcls = o->cls;
         if (m->fn) fn = m->fn;
         else { nat = (NativeMethodFn)m->native; nat_self = recv; }
     } else {

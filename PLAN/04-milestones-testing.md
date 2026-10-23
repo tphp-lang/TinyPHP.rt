@@ -10,7 +10,7 @@
 | **M1 值+表达式**(1.5周) | 词法全量、过程式语句、数组全语义（键规范化冻结，含 `list()`）、`global` 别名读写、运算符全量（`|>` 管道随 M2，依赖函数调用）、插值 | VM + GC(标记-清扫) + var_dump | tests/lang 全绿：fib(30)、数组键专测、== 矩阵、优先级 30+ 用例 | ~3500 |
 | **M2 函数+异常**(1周) | 函数/闭包/箭头函数/命名参数/...、`|>` 管道（PHP 8.5）、heredoc、异常全体系 | builtin 首批、--dump-opcodes | 闭包捕获+递归+调用点缓存；finally 顺序+异常栈打印 | ~2200 |
 | **M3 OOP 完整**(1.5周) | PLAN/01 §11 OOP 示例全量可跑 + 命名空间全套（PLAN/01 §8：`namespace`/`use`(as)/`use function`/`use const`、限定名解析对齐 PHP） | class/iface/trait/enum/静态/构造器提升 + spl_autoload_register | 接口多实现+trait 冲突 as+enum match+静态晚期绑定 全部输出预期；命名空间限定名解析专测 | ~2500 |
-| **M4 协程+无感I/O**(1.5周) | — | 透明 I/O 全表 + HTTPS(mbedtls+cacert 内嵌) + Async\ API | 02 §6 异步示例全输出正确；3 并发 fetch 耗时≈max；sleep CPU 0%；死锁检测 | ~1800 |
+| **M4 协程+无感I/O**(1.5周) | — | 透明 I/O 全表 + HTTPS(mbedtls+cacert 内嵌) + Tphp\ API | 02 §6 异步示例全输出正确；3 并发 fetch 耗时≈max；sleep CPU 0%；死锁检测 | ~1800 |
 | **M5 Worker**(1周) | — | Worker API + 克隆协议 + serialize/unserialize | 02 §6 线程示例：4 worker 满载时主线程 IO 正常；ping-pong 1000 消息有序；stop 退出码 0 | ~1200 |
 | **M5.5 FFI**(0.5~1周) ✅ | — | FFI::cdef（C 声明子集解析）+ libffi 调用 + FFI\CData（new/memcpy/free）；DLL 打包器为后置可选项（PLAN/03 §6.1） | 系统库绑定零配置可用（user32/msvcrt）；struct 传参/返回；FFI\CData 读写与 owned 释放；阻塞性调用走 Worker 的文档示例（02 §4.5） | ~1600 已完成 |
 | **M6 打包+stdlib**(1周) ✅ | — | stdlib 全量 + phpc + test runner | 02 §6 打包示例；单 exe 零依赖；json/sprintf/date 正确；tests/run.cmd 全绿 | 已完成：JSON/date/require/phpc/tphp-test + m6-acceptance |

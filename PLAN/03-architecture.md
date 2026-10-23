@@ -20,7 +20,7 @@ TinyPHP.rt\
 │   ├── compile.c      AST→opcode 两遍      ├── opcode.h    opcode 清单
 │   ├── vm.c           CALL dispatch 引擎   ├── exception.c 抛出/展开/catch
 │   ├── builtin.c      C 原生内置函数       ├── fiber.c     fcontext 协程
-│   ├── sched.c        libuv 三 handle 调度 ├── async.c     Async\spawn/await/all
+│   ├── sched.c        libuv 三 handle 调度 ├── async.c     Tphp\spawn/await/all
 │   ├── worker.c       线程生命周期         ├── channel.c   Channel（同线程+跨线程）
 │   ├── serialize.c    跨线程值克隆         ├── bundle.c    内置 PHP 库装载
 │   ├── io_timer.c io_fs.c io_net.c io_proc.c   无感 I/O 内置实现

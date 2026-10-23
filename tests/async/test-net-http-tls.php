@@ -2,8 +2,8 @@
 // M4-f: http_get https:// —— mbedtls TLS + 内嵌 CA bundle（证书链校验）
 // + chunked / TLS 协程并发 + 失败路径
 // （走外网真实站点 example.com / httpbin.org）
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 // 1) TLS 协程并发：两个 https 同时握手/传输，挂起期间调度器正常推进
 $f1 = spawn(function () { return http_get("https://example.com/"); });

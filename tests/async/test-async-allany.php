@@ -1,11 +1,11 @@
 <?php
-// M4-c: Async\all / any / current / run
-use function Async\spawn;
-use function Async\await;
-use function Async\all;
-use function Async\any;
-use function Async\current;
-use function Async\run;
+// M4-c: Tphp\all / any / current / run
+use function Tphp\spawn;
+use function Tphp\await;
+use function Tphp\all;
+use function Tphp\any;
+use function Tphp\current;
+use function Tphp\run;
 
 // 1) all：按输入序返回（含不同返回类型）
 $cs = [

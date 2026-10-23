@@ -1,11 +1,11 @@
 <?php
 // M4: 死锁检测——全体协程挂起且无待定事件 → DeadlockError fatal（退出码 255）
 // （挂起位置报告：coroutine #N suspended in fn:line）
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 $f = spawn(function () {
-    $ch = new Async\Channel(1);   // 永远没有 send，recv 挂起成死锁
+    $ch = new Tphp\Channel(1);   // 永远没有 send，recv 挂起成死锁
     return $ch->recv();
 });
 var_dump(await($f));

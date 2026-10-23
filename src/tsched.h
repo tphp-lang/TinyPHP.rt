@@ -4,7 +4,7 @@
  * #include <sched.h> which -Isrc would shadow with this header
  * (same class of bug as io.h/tio.h and ffi.h/tffi.h).
  *
- * 把脚本变成 main 协程；Async\spawn 出的协程由调度器 fiber 驱动，
+ * 把脚本变成 main 协程；Tphp\spawn 出的协程由调度器 fiber 驱动，
  * 全部完成后返回退出码。挂起（sleep/await/suspend/无感 I/O）都落在
  * tphp_fiber_suspend()——builtin 深处冻结 C 栈，事件回调唤醒。
  */
@@ -19,7 +19,7 @@ typedef struct TCont TCont;
  * main 协程未捕获异常 → 255；子协程有未捕获异常 → 255。 */
 int tphp_sched_run(void);
 
-/* 内部类注册（Async\Coroutine）：必须在 tphp_compile 之前调用
+/* 内部类注册（Tphp\Coroutine）：必须在 tphp_compile 之前调用
  * （A_NEW 做编译期类存在性检查）；幂等。 */
 void tphp_async_init(void);
 
@@ -52,7 +52,7 @@ struct uv_loop_s *tphp_sched_loop(void);
 bool tphp_sched_active(void);
 void tphp_sched_loop_init(void);   /* 幂等 loop init（Worker 子线程用） */
 
-/* Async\ 内置（注册进 builtin 表；名字走命名空间解析） */
+/* Tphp\ 内置（注册进 builtin 表；名字走命名空间解析） */
 TVal tphp_async_spawn(VM *vm, TVal *args, int n);     /* spawn(callable, ...) */
 TVal tphp_async_await(VM *vm, TVal *args, int n);     /* await(Coroutine)     */
 TVal tphp_async_suspend(VM *vm, TVal *args, int n);   /* suspend(): 让出一次  */
@@ -62,5 +62,6 @@ TVal tphp_async_current(VM *vm, TVal *args, int n);   /* current(): Coroutine */
 TVal tphp_async_all(VM *vm, TVal *args, int n);       /* all(array): array    */
 TVal tphp_async_any(VM *vm, TVal *args, int n);       /* any(array): mixed    */
 TVal tphp_async_run(VM *vm, TVal *args, int n);       /* run(callable): void  */
+TVal tphp_async_wrap(VM *vm, TVal *args, int n);      /* async(callable): Task */
 
 #endif /* TPHP_SCHED_H */

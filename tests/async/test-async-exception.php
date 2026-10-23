@@ -1,8 +1,8 @@
 <?php
 // M4-a: 协程异常 —— await 透传（可捕获）、getResult 透传、
 // 未消费异常在脚本结束时报 fatal（stderr，退出码 255）
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 // 1) await 重抛，主协程捕获
 $c1 = spawn(function () { throw new Exception('boom'); });

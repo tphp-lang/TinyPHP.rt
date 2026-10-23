@@ -44,7 +44,7 @@ typedef struct TCont {
     TExecCtx x;            /* 挂起时的执行状态（与 vm->x 交换） */
     TVal result;           /* 协程返回值（x.coro_result 指向这里） */
     TExObj *exception;     /* 完成时若有未捕获异常则移到这里 */
-    TObj *coro_obj;        /* Async\Coroutine 包装对象（自持 +1 引用） */
+    TObj *coro_obj;        /* Tphp\Coroutine 包装对象（自持 +1 引用） */
     int id;                /* 句柄 id（coro_obj->props[0]，注册表下标） */
     TContState state;
     struct TCont *qnext;   /* 就绪队列链 */
@@ -56,6 +56,10 @@ typedef struct TCont {
     SchedEvent *waiting_on;/* 挂在哪个事件上（cancel 摘除用；NULL=非事件挂起） */
     struct TCont *await_target; /* await 挂起时等待的目标（cancel 摘除用） */
     bool multi_wait;       /* any(): 挂在多个协程的 waiter 槽上（cancel 可唤醒） */
+    /* Channel 等待队列链 + 交接值：recv 挂起时是收到的值，send 挂起时
+     * 是待发值（+1 引用）。一个协程同时只挂在一个 Channel 上，共用一槽。 */
+    struct TCont *chan_next;
+    TVal chan_val;
     /* M4-c: 死锁报告用挂起位置 */
     const char *sus_fn;
     int sus_line;
@@ -78,7 +82,7 @@ static _Thread_local int g_n_conts, g_cap_conts;
 static _Thread_local int g_waiting;            /* WAITING 状态协程数（死锁判据） */
 static _Thread_local bool g_any_uncaught;
 static _Thread_local bool g_sched_active;      /* 事件循环可用（sleep 走 uv_timer） */
-static _Thread_local TClass *g_coro_cls;       /* Async\Coroutine 内部类 */
+static _Thread_local TClass *g_coro_cls;       /* Tphp\Coroutine 内部类 */
 
 /* ---- 就绪队列 ---- */
 
@@ -145,7 +149,7 @@ static void build_root_frame(VM *vm, TCont *c) {
         clo = (TClosure *)c->callable.u.p;
         if (!clo->fn || clo->bfn)
             tphp_vm_raise(vm, "Error",
-                          "Async\\spawn expects a user function or closure");
+                          "Tphp\\spawn expects a user function or closure");
         fn = clo->fn;
     } else {
         TStr *nm = (TStr *)c->callable.u.p;
@@ -162,10 +166,17 @@ static void build_root_frame(VM *vm, TCont *c) {
     }
     VMFrame *f = tm_malloc(sizeof *f);
     f->fn = fn;
+    f->file = fn->file;           /* 根帧源文件：异常归属/raise_file 依赖，
+                                   * tm_malloc 不初始化，漏设会读到已释放填充值 */
+    /* 可见性作用域：闭包 bindTo/bind 重绑优先，否则声明类（闭包体里访问
+     * 声明类的 private 成员依赖它）；按名调用的普通函数无类作用域 */
+    TClass *scope = NULL;
+    if (clo) scope = clo->scope ? clo->scope : (TClass *)fn->decl_cls;
+    f->vis_scope = scope;
     f->pc = 0;
     f->prev = NULL;               /* 协程根：底帧 RETURN → coro_result */
     f->args_base = 0;
-    f->called_cls = NULL;
+    f->called_cls = scope;        /* static:: 后绑定与声明类一致 */
     f->n_calls_at_entry = 0;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
     f->slots = tm_malloc(sizeof(TVal) * nslots);
@@ -375,13 +386,13 @@ static void suspend_for_ms(int64_t ms) {
     tphp_sched_event_wait(&ev);
 }
 
-/* ---- Async\Coroutine 内部类 ----
+/* ---- Tphp\Coroutine 内部类 ----
  * __handle 属性存协程 id（int）；四个方法全部 native。 */
 
 static TCont *cont_of(TObj *o) {
     if (o->props[0].t != T_INT)
         tphp_vm_raise(tphp_vm_instance(), "Error",
-                      "Async\\Coroutine object was not created by Async\\spawn");
+                      "Tphp\\Coroutine object was not created by Tphp\\spawn");
     return g_conts[o->props[0].u.i];
 }
 
@@ -436,19 +447,29 @@ static void add_native_method(TClass *cls, const char *name, void *native) {
 }
 
 static void register_chan_class(void);
-static _Thread_local TClass *g_chan_cls;  /* Async\Channel 内部类（await 分派用） */
+static void register_tg_class(void);
+static void register_task_class(void);
+static _Thread_local TClass *g_chan_cls;  /* Tphp\Channel 内部类（await 分派用） */
+static _Thread_local TClass *g_tg_cls;    /* Tphp\TaskGroup 内部类 */
+static _Thread_local TClass *g_task_cls;  /* Tphp\Task 内部类（async() 包装） */
 /* forward: native 方法（定义在后面的段里） */
 static TVal nm_coro_cancel(VM *vm, void *self, TVal *args, int n);
+static TVal nm_coro_wait(VM *vm, void *self, TVal *args, int n);
 static TVal nm_chan_construct(VM *vm, void *self, TVal *args, int n);
 static TVal nm_chan_send(VM *vm, void *self, TVal *args, int n);
 static TVal nm_chan_recv(VM *vm, void *self, TVal *args, int n);
 static TVal nm_chan_close(VM *vm, void *self, TVal *args, int n);
 static TVal nm_chan_len(VM *vm, void *self, TVal *args, int n);
+static TVal nm_tg_construct(VM *vm, void *self, TVal *args, int n);
+static TVal nm_tg_spawn(VM *vm, void *self, TVal *args, int n);
+static TVal nm_tg_wait(VM *vm, void *self, TVal *args, int n);
+static TVal nm_tg_count(VM *vm, void *self, TVal *args, int n);
+static TVal nm_task_invoke(VM *vm, void *self, TVal *args, int n);
 
 static void register_coro_class(void) {
     TClass *cls = tm_malloc(sizeof *cls);
     memset(cls, 0, sizeof *cls);
-    cls->name = tstr_intern("Async\\Coroutine", 15);
+    cls->name = tstr_intern("Tphp\\Coroutine", 14);
     cls->kind = 0;                /* CK_CLASS */
     cls->flattened = true;
     cls->m_ctor = -1; cls->m_dtor = -1; cls->m_get = -1; cls->m_set = -1;
@@ -468,6 +489,7 @@ static void register_coro_class(void) {
     add_native_method(cls, "getresult", (void *)nm_coro_getresult);
     add_native_method(cls, "getexception", (void *)nm_coro_getexception);
     add_native_method(cls, "cancel", (void *)nm_coro_cancel);
+    add_native_method(cls, "wait", (void *)nm_coro_wait);   /* await 的对象式别名 */
     tphp_class_register(cls);
     g_coro_cls = cls;
 }
@@ -475,7 +497,7 @@ static void register_coro_class(void) {
 static void register_chan_class(void) {
     TClass *cls = tm_malloc(sizeof *cls);
     memset(cls, 0, sizeof *cls);
-    cls->name = tstr_intern("Async\\Channel", 13);
+    cls->name = tstr_intern("Tphp\\Channel", 12);
     cls->kind = 0;                /* CK_CLASS */
     cls->flattened = true;
     cls->m_ctor = -1; cls->m_dtor = -1; cls->m_get = -1; cls->m_set = -1;
@@ -500,6 +522,69 @@ static void register_chan_class(void) {
     g_chan_cls = cls;
 }
 
+/* Tphp\TaskGroup —— 协程任务组（wait 收口）。`Thread` 是全局别名：
+ * 名字叫线程，语义是单线程内并发（真 OS 线程用 tphp\Worker）。 */
+static TClass *make_tg_class(const char *name, size_t len) {
+    TClass *cls = tm_malloc(sizeof *cls);
+    memset(cls, 0, sizeof *cls);
+    cls->name = tstr_intern(name, len);
+    cls->kind = 0;                /* CK_CLASS */
+    cls->flattened = true;
+    cls->m_ctor = -1; cls->m_dtor = -1; cls->m_get = -1; cls->m_set = -1;
+    cls->m_isset = -1; cls->m_unset = -1; cls->m_call = -1;
+    cls->m_callstatic = -1; cls->m_tostring = -1; cls->m_invoke = -1;
+    cls->m_clone = -1; cls->m_debuginfo = -1; cls->m_clonestate = -1;
+    /* __tasks：组内协程对象数组（native ctor 建，spawn 追加） */
+    TProp *p = tm_malloc(sizeof(TProp));
+    memset(p, 0, sizeof *p);
+    p->name = tstr_new("__tasks", 7);
+    p->defval = TV_NULL;
+    p->slot = 0;
+    cls->props = p;
+    cls->n_props = 1;
+    cls->m_ctor = (int16_t)cls->n_methods;   /* ctor 先注册 */
+    add_native_method(cls, "__construct", (void *)nm_tg_construct);
+    add_native_method(cls, "spawn", (void *)nm_tg_spawn);
+    add_native_method(cls, "wait", (void *)nm_tg_wait);
+    add_native_method(cls, "count", (void *)nm_tg_count);
+    tphp_class_register(cls);
+    return cls;
+}
+
+static void register_tg_class(void) {
+    g_tg_cls = make_tg_class("Tphp\\TaskGroup", 14);
+    make_tg_class("Tphp\\Thread", 11);
+}
+
+/* Tphp\Task —— async($callable) 的返回物：调用即启动协程。
+ *   $p1 = async(p1(...));
+ *   $p1(3, 4);              // 等价 spawn(p1(...), 3, 4)
+ *   $p1(3, 4)->wait();      // 启动并等待
+ * 这是"函数调用即并发"唯一不破坏求值顺序的写法：包装一次，调用任意次。 */
+static void register_task_class(void) {
+    TClass *cls = tm_malloc(sizeof *cls);
+    memset(cls, 0, sizeof *cls);
+    cls->name = tstr_intern("Tphp\\Task", 9);
+    cls->kind = 0;
+    cls->flattened = true;
+    cls->m_ctor = -1; cls->m_dtor = -1; cls->m_get = -1; cls->m_set = -1;
+    cls->m_isset = -1; cls->m_unset = -1; cls->m_call = -1;
+    cls->m_callstatic = -1; cls->m_tostring = -1; cls->m_invoke = -1;
+    cls->m_clone = -1; cls->m_debuginfo = -1; cls->m_clonestate = -1;
+    /* __fn：被包装的 callable */
+    TProp *p = tm_malloc(sizeof(TProp));
+    memset(p, 0, sizeof *p);
+    p->name = tstr_new("__fn", 4);
+    p->defval = TV_NULL;
+    p->slot = 0;
+    cls->props = p;
+    cls->n_props = 1;
+    add_native_method(cls, "__invoke", (void *)nm_task_invoke);
+    cls->m_invoke = (int16_t)(cls->n_methods - 1);
+    tphp_class_register(cls);
+    g_task_cls = cls;
+}
+
 /* 内部类注册：必须在 tphp_compile 之前完成（A_NEW 有编译期类存在性
  * 检查）；幂等，tphp_sched_run 里再调一次也无妨 */
 static _Thread_local bool g_async_inited;
@@ -508,6 +593,8 @@ void tphp_async_init(void) {
     g_async_inited = true;
     register_coro_class();
     register_chan_class();
+    register_tg_class();
+    register_task_class();
 }
 
 /* ---- id 注册表 ---- */
@@ -516,6 +603,7 @@ static TCont *cont_new(void) {
     TCont *c = tm_malloc(sizeof *c);
     memset(c, 0, sizeof *c);
     c->state = TCS_READY;
+    c->chan_val = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (g_n_conts >= g_cap_conts) {
         g_cap_conts = g_cap_conts ? g_cap_conts * 2 : 16;
         g_conts = tm_realloc(g_conts, sizeof(TCont *) * (size_t)g_cap_conts);
@@ -525,18 +613,18 @@ static TCont *cont_new(void) {
     return c;
 }
 
-/* ---- Async\ 内置 ---- */
+/* ---- Tphp\ 内置 ---- */
 
-/* forward: Async\Channel recv 实现（Channel 段） */
+/* forward: Tphp\Channel recv 实现（Channel 段） */
 static TVal chan_recv_impl(VM *vm, void *self);
 
 TVal tphp_async_spawn(VM *vm, TVal *args, int n) {
     if (n < 1 || (args[0].t != T_CLOSURE && args[0].t != T_STR))
         tphp_vm_raise(vm, "TypeError",
-                      "Async\\spawn expects a callable as its first argument");
+                      "Tphp\\spawn expects a callable as its first argument");
     if (n - 1 > 8)
         tphp_vm_raise(vm, "ArgumentCountError",
-                      "Async\\spawn supports at most 8 extra arguments");
+                      "Tphp\\spawn supports at most 8 extra arguments");
     TCont *c = cont_new();
     c->callable = args[0];
     tval_addref(c->callable);
@@ -585,14 +673,14 @@ static TVal await_one_coro(VM *vm, TCont *target) {
 TVal tphp_async_await(VM *vm, TVal *args, int n) {
     if (n < 1 || args[0].t != T_OBJ)
         tphp_vm_raise(vm, "TypeError",
-                      "Async\\await expects an Async\\Coroutine or Channel");
+                      "Tphp\\await expects an Tphp\\Coroutine or Channel");
     TObj *o = (TObj *)args[0].u.p;
     if (o->cls == g_coro_cls)
         return await_one_coro(vm, cont_of(o));
     if (o->cls == g_chan_cls)
         return chan_recv_impl(vm, o);
     tphp_vm_raise(vm, "TypeError",
-                  "Async\\await expects an Async\\Coroutine or Channel");
+                  "Tphp\\await expects an Tphp\\Coroutine or Channel");
 }
 
 TVal tphp_async_current(VM *vm, TVal *args, int n) {
@@ -615,7 +703,7 @@ TVal tphp_async_current(VM *vm, TVal *args, int n) {
  * 协程是并发跑的：依次 await 只是顺序收割（总耗时 = 最慢者）。 */
 TVal tphp_async_all(VM *vm, TVal *args, int n) {
     if (n < 1 || args[0].t != T_ARR)
-        tphp_vm_raise(vm, "TypeError", "Async\\all expects an array");
+        tphp_vm_raise(vm, "TypeError", "Tphp\\all expects an array");
     TArr *in = (TArr *)args[0].u.p;
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < in->dused; i++) {
@@ -623,7 +711,7 @@ TVal tphp_async_all(VM *vm, TVal *args, int n) {
         if (v.t == T_UNDEF) { tarr_append(out, TV_NULL); continue; }
         if (v.t != T_OBJ || ((TObj *)v.u.p)->cls != g_coro_cls)
             tphp_vm_raise(vm, "TypeError",
-                          "Async\\all expects an array of Async\\Coroutine");
+                          "Tphp\\all expects an array of Tphp\\Coroutine");
         tarr_append(out, await_one_coro(vm, cont_of((TObj *)v.u.p)));
     }
     return TV_ARR(out);
@@ -633,7 +721,7 @@ TVal tphp_async_all(VM *vm, TVal *args, int n) {
  * 最后一个异常。watcher 登记为每个未完成协程的 waiter（multi_wait）。 */
 TVal tphp_async_any(VM *vm, TVal *args, int n) {
     if (n < 1 || args[0].t != T_ARR)
-        tphp_vm_raise(vm, "TypeError", "Async\\any expects an array");
+        tphp_vm_raise(vm, "TypeError", "Tphp\\any expects an array");
     TArr *in = (TArr *)args[0].u.p;
     int cnt = 0;
     TCont **list = tm_malloc(sizeof(TCont *) * (size_t)(in->dused + 1));
@@ -643,13 +731,13 @@ TVal tphp_async_any(VM *vm, TVal *args, int n) {
         if (v.t != T_OBJ || ((TObj *)v.u.p)->cls != g_coro_cls) {
             tm_free(list);
             tphp_vm_raise(vm, "TypeError",
-                          "Async\\any expects an array of Async\\Coroutine");
+                          "Tphp\\any expects an array of Tphp\\Coroutine");
         }
         list[cnt++] = cont_of((TObj *)v.u.p);
     }
     if (cnt == 0) {
         tm_free(list);
-        tphp_vm_raise(vm, "Error", "Async\\any expects a non-empty array");
+        tphp_vm_raise(vm, "Error", "Tphp\\any expects a non-empty array");
     }
     TVal out = TV_NULL;
     TExObj *last_ex = NULL;
@@ -742,7 +830,7 @@ TVal tphp_async_usleep(VM *vm, TVal *args, int n) {
     return TV_NULL;
 }
 
-/* ---- Async\Channel（M4-c）----
+/* ---- Tphp\Channel（M4-c）----
  * 环形缓冲；cap=0 无界。单等待者模型：满挂 send、空挂 recv。
  * closed 后 send 抛错、recv 耗尽返回 null。 */
 
@@ -752,10 +840,10 @@ typedef struct TChan {
     int cap;               /* 0 = 无界；>0 = 有界上限 */
     int len, head;
     bool closed;
-    TCont *send_waiter;    /* 满挂起的发送者（单等待者） */
-    TVal send_pending;     /* 其待写入的值（+1 引用） */
-    TCont *recv_waiter;    /* 空挂起的接收者 */
-    TVal recv_val;         /* close/直接交接时给 recv 的值 */
+    /* 等待者 FIFO：send 满时入队；recv 空时入队。多消费者/多生产者都支持，
+     * send 直接交接给队首 recv（值走 TCont.chan_val），否则入缓冲。 */
+    TCont *send_head, *send_tail;
+    TCont *recv_head, *recv_tail;
 } TChan;
 
 static _Thread_local TChan **g_chans;
@@ -805,17 +893,34 @@ static TVal chan_pop(TChan *ch) {
     return v;
 }
 
+/* 等待者 FIFO（多生产者/多消费者） */
+static void chan_q_push(TCont **head, TCont **tail, TCont *c) {
+    c->chan_next = NULL;
+    if (*tail) (*tail)->chan_next = c;
+    else *head = c;
+    *tail = c;
+}
+
+static TCont *chan_q_pop(TCont **head, TCont **tail) {
+    TCont *c = *head;
+    if (!c) return NULL;
+    *head = c->chan_next;
+    if (!*head) *tail = NULL;
+    c->chan_next = NULL;
+    return c;
+}
+
 static TVal nm_chan_construct(VM *vm, void *self, TVal *args, int n) {
     TObj *o = (TObj *)self;
     int64_t cap = 0;
     if (n > 0) {
         if (args[0].t != T_INT)
             tphp_vm_raise(vm, "TypeError",
-                          "Async\\Channel::__construct expects an int capacity");
+                          "Tphp\\Channel::__construct expects an int capacity");
         cap = args[0].u.i;
         if (cap < 0)
             tphp_vm_raise(vm, "ValueError",
-                          "Async\\Channel capacity must be >= 0");
+                          "Tphp\\Channel capacity must be >= 0");
     }
     o->props[0] = TV_INT(chan_new((int)cap));
     return TV_NULL;
@@ -826,15 +931,14 @@ static TVal nm_chan_send(VM *vm, void *self, TVal *args, int n) {
     TChan *ch = chan_of(vm, self);
     if (n < 1)
         tphp_vm_raise(vm, "ArgumentCountError",
-                      "Async\\Channel::send expects a value");
+                      "Tphp\\Channel::send expects a value");
     if (ch->closed)
         tphp_vm_raise(vm, "Error", "send to a closed channel");
-    if (ch->recv_waiter) {
-        /* 有接收者在等：直接交接 */
-        TCont *w = ch->recv_waiter;
-        ch->recv_waiter = NULL;
-        ch->recv_val = args[0];
-        tval_addref(ch->recv_val);    /* args 由调用方释放 */
+    TCont *w = chan_q_pop(&ch->recv_head, &ch->recv_tail);
+    if (w) {
+        /* 有接收者在等：直接交接（值走它的 chan_val，args 由调用方释放） */
+        w->chan_val = args[0];
+        tval_addref(w->chan_val);
         g_waiting--;
         sched_ready(w);
         return TV_NULL;
@@ -844,16 +948,16 @@ static TVal nm_chan_send(VM *vm, void *self, TVal *args, int n) {
         tval_addref(args[0]);
         return TV_NULL;
     }
-    /* 满：挂起（单等待者） */
-    if (ch->send_waiter)
-        tphp_vm_raise(vm, "Error", "another send is already waiting");
-    ch->send_waiter = g_cur;
-    ch->send_pending = args[0];
-    tval_addref(ch->send_pending);
+    /* 满：入 send 队列挂起（多生产者 FIFO） */
+    g_cur->chan_val = args[0];
+    tval_addref(g_cur->chan_val);
+    chan_q_push(&ch->send_head, &ch->send_tail, g_cur);
     record_suspend_pos(g_cur);
     g_waiting++;
     sched_suspend(TCS_WAITING);
-    /* 恢复 = 值已被接收（或被 close 拒绝） */
+    /* 恢复：值已被 recv 取走（chan_val 置 UNDEF）或 close 作废，此处收尾 */
+    tval_release(&g_cur->chan_val);
+    g_cur->chan_val = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (ch->closed)
         tphp_vm_raise(vm, "Error", "send to a closed channel");
     cont_check_cancel(vm, g_cur);
@@ -863,12 +967,11 @@ static TVal nm_chan_send(VM *vm, void *self, TVal *args, int n) {
 /* recv 实现（await(Channel) 与 ->recv() 共用；TChan 从对象取） */
 static TVal chan_recv_impl(VM *vm, void *self) {
     TChan *ch = chan_of(vm, self);
-    if (ch->send_waiter) {
+    TCont *s = chan_q_pop(&ch->send_head, &ch->send_tail);
+    if (s) {
         /* 有发送者在等（有界满）：直接交接，缓冲不动 */
-        TVal v = ch->send_pending;
-        ch->send_pending = (TVal){ .u.i = 0, .t = T_UNDEF };
-        TCont *s = ch->send_waiter;
-        ch->send_waiter = NULL;
+        TVal v = s->chan_val;
+        s->chan_val = (TVal){ .u.i = 0, .t = T_UNDEF };
         g_waiting--;
         sched_ready(s);
         return v;
@@ -877,16 +980,15 @@ static TVal chan_recv_impl(VM *vm, void *self) {
         return chan_pop(ch);
     if (ch->closed)
         return TV_NULL;               /* closed 且空 → null */
-    /* 空：挂起（单等待者） */
-    if (ch->recv_waiter)
-        tphp_vm_raise(vm, "Error", "another recv is already waiting");
-    ch->recv_waiter = g_cur;
+    /* 空：入 recv 队列挂起（多消费者 FIFO） */
+    g_cur->chan_val = TV_NULL;
+    chan_q_push(&ch->recv_head, &ch->recv_tail, g_cur);
     record_suspend_pos(g_cur);
     g_waiting++;
     sched_suspend(TCS_WAITING);
     /* 恢复：send 交接值 / close 给 null */
-    TVal v = ch->recv_val;
-    ch->recv_val = (TVal){ .u.i = 0, .t = T_UNDEF };
+    TVal v = g_cur->chan_val;
+    g_cur->chan_val = (TVal){ .u.i = 0, .t = T_UNDEF };
     cont_check_cancel(vm, g_cur);
     return v;
 }
@@ -896,25 +998,21 @@ static TVal nm_chan_recv(VM *vm, void *self, TVal *args, int n) {
     return chan_recv_impl(vm, self);
 }
 
-/* close(): closed 后 send 抛错、recv 耗尽返回 null */
+/* close(): closed 后 send 抛错、recv 耗尽返回 null；唤醒全部等待者 */
 static TVal nm_chan_close(VM *vm, void *self, TVal *args, int n) {
     (void)vm; (void)args; (void)n;
     TChan *ch = chan_of(vm, self);
     if (!ch->closed) {
         ch->closed = true;
-        if (ch->send_waiter) {
-            /* 挂起的 send 恢复后抛 closed；待发值作废 */
-            tval_release(&ch->send_pending);
-            ch->send_pending = (TVal){ .u.i = 0, .t = T_UNDEF };
-            TCont *s = ch->send_waiter;
-            ch->send_waiter = NULL;
+        TCont *s;
+        while ((s = chan_q_pop(&ch->send_head, &ch->send_tail)) != NULL) {
+            /* 恢复后抛 closed；待发值由恢复点释放 */
             g_waiting--;
             sched_ready(s);
         }
-        if (ch->recv_waiter) {
-            ch->recv_val = TV_NULL;   /* recv 恢复返回 null */
-            TCont *w = ch->recv_waiter;
-            ch->recv_waiter = NULL;
+        TCont *w;
+        while ((w = chan_q_pop(&ch->recv_head, &ch->recv_tail)) != NULL) {
+            w->chan_val = TV_NULL;    /* recv 恢复返回 null */
             g_waiting--;
             sched_ready(w);
         }
@@ -966,6 +1064,75 @@ static TVal nm_coro_cancel(VM *vm, void *self, TVal *args, int n) {
     return TV_TRUE;
 }
 
+/* Coroutine::wait() —— await 的对象式别名，返回协程结果（异常照常透传） */
+static TVal nm_coro_wait(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    return await_one_coro(vm, cont_of((TObj *)self));
+}
+
+/* ---- Tphp\TaskGroup ---- */
+
+static TVal nm_tg_construct(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    o->props[0] = TV_ARR(tarr_new());
+    return TV_NULL;
+}
+
+/* spawn(callable $fn, ...$args): Coroutine —— 启动并登记进组，返回句柄。
+ * 接受闭包/函数名，也接受 async() 包装出的 Tphp\Task（走其 __invoke）。 */
+static TVal nm_tg_spawn(VM *vm, void *self, TVal *args, int n) {
+    extern TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int m);
+    TObj *o = (TObj *)self;
+    TVal c;
+    if (n >= 1 && args[0].t == T_OBJ && ((TObj *)args[0].u.p)->cls == g_task_cls)
+        c = tphp_vm_call_callable(vm, args[0], args + 1, n - 1);
+    else
+        c = tphp_async_spawn(vm, args, n);       /* +1 给调用方 */
+    TArr *a = (TArr *)o->props[0].u.p;
+    tval_addref(c);                              /* 组再持一份 */
+    tarr_append(a, c);
+    return c;
+}
+
+/* wait(): array —— 等全部完成，按登记序返回结果数组（幂等） */
+static TVal nm_tg_wait(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    return tphp_async_all(vm, &o->props[0], 1);
+}
+
+static TVal nm_tg_count(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    return TV_INT(((TArr *)o->props[0].u.p)->n);
+}
+
+/* ---- Tphp\Task ---- */
+
+/* __invoke(...$args)：启动协程并返回 Coroutine（参数个数上限同 spawn） */
+static TVal nm_task_invoke(VM *vm, void *self, TVal *args, int n) {
+    TObj *o = (TObj *)self;
+    if (n > 8)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "async task supports at most 8 extra arguments");
+    TVal buf[9];
+    buf[0] = o->props[0];
+    for (int i = 0; i < n; i++) buf[i + 1] = args[i];
+    return tphp_async_spawn(vm, buf, n + 1);
+}
+
+/* async(callable): Tphp\Task —— 内置函数（builtin.c 表项指向这里）。
+ * 包装一次、调用任意次；每次调用都新建协程。 */
+TVal tphp_async_wrap(VM *vm, TVal *args, int n) {
+    if (n != 1 || !tphp_vm_is_callable(args[0]))
+        tphp_vm_raise(vm, "TypeError", "async() expects a callable");
+    TObj *o = tphp_obj_alloc(g_task_cls);
+    o->props[0] = args[0];
+    tval_addref(args[0]);
+    return TV_OBJ(o);
+}
+
 /* ---- 启动/收尾 ---- */
 
 /* 脚本结束时：报告从未被 await/getResult 消费的协程异常 */
@@ -997,6 +1164,7 @@ static void sched_cleanup(void) {
             tval_release(&ov);        /* 归还 TCont 的那份 */
         }
         tval_release(&c->callable);
+        tval_release(&c->chan_val);   /* 挂起在 Channel 队列上未收尾的值 */
         for (int k = 0; k < c->n_start_args; k++)
             tval_release(&c->start_args[k]);
         if (c->cancel_reason) {
@@ -1008,10 +1176,8 @@ static void sched_cleanup(void) {
     }
     for (int i = 0; i < g_n_chans; i++) {
         TChan *ch = g_chans[i];
-        tval_release(&ch->send_pending);
-        tval_release(&ch->recv_val);
         for (int k = 0; k < ch->len; k++) {
-            int idx = (ch->head + k) % (ch->cap ? ch->cap : 1);
+            int idx = (ch->head + k) % (ch->tcap ? ch->tcap : 1);
             tval_release(&ch->buf[idx]);
         }
         tm_free(ch->buf);

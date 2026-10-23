@@ -185,7 +185,7 @@ bool tphp_class_register_compile(TClass *cls) {
     return tphp_class_register(cls);
 }
 
-/* 运行期注册（内部类 Async\Coroutine 等）：只进本线程表 */
+/* 运行期注册（内部类 Tphp\Coroutine 等）：只进本线程表 */
 bool tphp_class_register(TClass *cls) {
     if (cls_n + 1 >= cls_cap - cls_cap / 4) cls_tab_grow();
     char lc[256];

@@ -1,9 +1,9 @@
 <?php
 // M4-a: sleep/usleep 透明挂起 —— 事件循环调度，多协程交错执行
 // （本测试断言确定性交错顺序，不依赖墙钟）
-use function Async\spawn;
-use function Async\await;
-use function Async\suspend;
+use function Tphp\spawn;
+use function Tphp\await;
+use function Tphp\suspend;
 
 // 1) suspend 协作式让出：两个协程交错
 spawn(function () { echo "a1\n"; suspend(); echo "a2\n"; });

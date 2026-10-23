@@ -99,11 +99,54 @@ static TStr *parse_qual_name(Parser *p, TStr *first) {
     return out;
 }
 
+/* use 语句的限定名前缀：与 parse_qual_name 同形，但允许以 `\{` 结尾
+ * （组 use：use A\B\{C, D as E};）。*group 置位时当前 token 是 '{'，
+ * 返回的前缀不含末尾反斜杠。 */
+static TStr *parse_use_prefix(Parser *p, bool *group) {
+    bool abs = false;
+    *group = false;
+    if (p->tok.kind == P_BACKSLASH) { abs = true; advance(p); }
+    if (p->tok.kind != L_IDENT) p_error(p, "Expected name");
+    const char *s0 = tstr_val(p->tok.ident);
+    size_t cap = strlen(s0) + (size_t)abs + 16;
+    char *buf = tm_malloc(cap);
+    size_t n = 0;
+    if (abs) buf[n++] = '\\';
+    memcpy(buf + n, s0, strlen(s0));
+    n += strlen(s0);
+    advance(p);
+    while (p->tok.kind == P_BACKSLASH) {
+        advance(p);
+        if (p->tok.kind == P_LBRACE) {          /* A\B\{ ... } */
+            *group = true;
+            break;
+        }
+        if (p->tok.kind != L_IDENT) p_error(p, "Expected name after '\\'");
+        const char *seg = tstr_val(p->tok.ident);
+        size_t need = n + strlen(seg) + 2;
+        if (need > cap) { cap = need * 2; buf = tm_realloc(buf, cap); }
+        buf[n++] = '\\';
+        memcpy(buf + n, seg, strlen(seg));
+        n += strlen(seg);
+        advance(p);
+    }
+    TStr *out = tstr_intern(buf, n);
+    tm_free(buf);
+    return out;
+}
+
 static TStr *expect_ident(Parser *p, const char *what) {
     if (p->tok.kind != L_IDENT) p_error(p, what);
     TStr *name = p->tok.ident;
     advance(p);
     return name;
+}
+
+/* 成员名位置（`->` / `?->` 之后）：标识符或任意关键字。
+ * PHP 允许 $o->fn / $o->match / $o->class —— 关键字在成员位置退化为
+ * 标识符。lex.c 对所有标识符（含关键字 token）都填了 ident，可直接取用。 */
+static bool tok_is_member_name(LKind k) {
+    return k == L_IDENT || (k >= KW_IF && k <= KW_INSTEADOF);
 }
 
 static AExpr *ae_new(int tag, int line) {
@@ -112,6 +155,55 @@ static AExpr *ae_new(int tag, int line) {
     e->tag = tag;
     e->line = line;
     return e;
+}
+
+/* async(EXPR) 语法结构：当唯一实参是"调用表达式"时，把整个调用搬进
+ * 协程执行（改写为 Tphp\spawn(fn() => EXPR)）。箭头函数自动按值捕获
+ * 自由变量，所以参数里的变量在 spawn 那一刻取值。
+ * 单实参但不是调用形态时（async($callable)）按普通函数调用处理。 */
+static AStmt *as_new(int tag, int line);
+static AStmtList *asl_new(void);
+static void asl_push(AStmtList *l, AStmt *s);
+
+static bool ast_is_call_expr(const AExpr *e) {
+    return e->tag == A_CALL || e->tag == A_METHODCALL || e->tag == A_STATICCALL;
+}
+
+static AExpr *make_async_thunk(AExpr *expr, int line) {
+    AFunc *f = tm_malloc(sizeof(AFunc));
+    memset(f, 0, sizeof *f);
+    f->line = line;
+    AStmtList *body = asl_new();
+    AStmt *ret = as_new(S_RETURN, line);
+    ret->u.e = expr;
+    asl_push(body, ret);
+    f->body = body;
+
+    AExpr *arrow = ae_new(A_ARROW, line);
+    arrow->u.clo.func = f;
+    return arrow;
+}
+
+/* 把调用表达式包成 `fn() => EXPR`（spawn 类方法用，保留原调用） */
+static AExpr *wrap_thunk(AExpr *expr, int line) {
+    return make_async_thunk(expr, line);
+}
+
+/* async(EXPR) → Tphp\spawn(fn() => EXPR) */
+static AExpr *make_async_call(AExpr *expr, int line) {
+    AExpr *arrow = make_async_thunk(expr, line);
+
+    AArgList *args = tm_malloc(sizeof(AArgList));
+    args->items = tm_malloc(sizeof(AArg));
+    args->items[0].e = arrow;
+    args->items[0].name = NULL;
+    args->items[0].is_spread = false;
+    args->n = 1;
+
+    AExpr *call = ae_new(A_CALL, line);
+    call->u.call.name = tstr_intern("Tphp\\spawn", 10);
+    call->u.call.args = args;
+    return call;
 }
 
 /* dirname for __DIR__: strip at last '/' or '\\'; returns NULL at fs root
@@ -492,6 +584,15 @@ static AExpr *parse_primary(Parser *p) {
             AExpr *e = ae_new(A_CALL, line);
             e->u.call.name = name;
             e->u.call.args = parse_arg_list(p);
+            /* async(...)：调用形态 → 整体搬进协程；其余形态 → 统一走
+             * 完全限定名 Tphp\async（免 use） */
+            if (strcmp(tstr_val(name), "async") == 0
+                || strcmp(tstr_val(name), "Tphp\\async") == 0) {
+                if (e->u.call.args->n == 1
+                    && ast_is_call_expr(e->u.call.args->items[0].e))
+                    return make_async_call(e->u.call.args->items[0].e, line);
+                e->u.call.name = tstr_intern("Tphp\\async", 10);
+            }
             return e;
         }
         if (p->tok.kind == P_DOUBLE_COLON) {
@@ -577,6 +678,15 @@ static AExpr *parse_primary(Parser *p) {
             AExpr *e = ae_new(A_CALL, line);
             e->u.call.name = name;
             e->u.call.args = parse_arg_list(p);
+            /* async(...)：调用形态 → 整体搬进协程；其余形态 → 统一走
+             * 完全限定名 Tphp\async（免 use） */
+            if (strcmp(tstr_val(name), "async") == 0
+                || strcmp(tstr_val(name), "Tphp\\async") == 0) {
+                if (e->u.call.args->n == 1
+                    && ast_is_call_expr(e->u.call.args->items[0].e))
+                    return make_async_call(e->u.call.args->items[0].e, line);
+                e->u.call.name = tstr_intern("Tphp\\async", 10);
+            }
             return e;
         }
         if (p->tok.kind == P_DOUBLE_COLON)
@@ -897,12 +1007,7 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 }
                 break;
             }
-            if (p->tok.kind != L_IDENT &&
-                p->tok.kind != KW_NEW &&
-                p->tok.kind != KW_SELF &&
-                p->tok.kind != KW_PARENT &&
-                p->tok.kind != KW_STATIC &&
-                p->tok.kind != KW_CLASS) {
+            if (!tok_is_member_name(p->tok.kind)) {
                 p_error(p, "Variable property access ($obj->$name) is not supported");
             }
             TStr *name = p->tok.ident;
@@ -930,6 +1035,11 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 p->lx = saved;
                 p->tok = saved_tok;
                 AArgList *args = parse_arg_list(p);
+                /* $obj->spawn(EXPR)：与 async(EXPR) 同规则——单实参且是
+                 * 调用表达式时包成 fn() => EXPR（spawn 是并发保留方法名） */
+                if (args->n == 1 && ast_is_call_expr(args->items[0].e)
+                    && strcmp(tstr_val(name), "spawn") == 0)
+                    args->items[0].e = wrap_thunk(args->items[0].e, line);
                 AExpr *m = ae_new(A_METHODCALL, line);
                 m->u.mcall.obj = e;
                 m->u.mcall.name = name;
@@ -981,17 +1091,16 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
                 }
                 break;
             }
-            if (p->tok.kind != L_IDENT &&
-                p->tok.kind != KW_NEW &&
-                p->tok.kind != KW_SELF &&
-                p->tok.kind != KW_PARENT &&
-                p->tok.kind != KW_STATIC) {
+            if (!tok_is_member_name(p->tok.kind)) {
                 p_error(p, "Variable property access ($obj->$name) is not supported");
             }
             TStr *name = p->tok.ident;
             advance(p);
             if (p->tok.kind == P_LPAREN) {
                 AArgList *args = parse_arg_list(p);
+                if (args->n == 1 && ast_is_call_expr(args->items[0].e)
+                    && strcmp(tstr_val(name), "spawn") == 0)
+                    args->items[0].e = wrap_thunk(args->items[0].e, line);
                 AExpr *m = ae_new(A_METHODCALL, line);
                 m->u.mcall.obj = e;
                 m->u.mcall.name = name;
@@ -1824,7 +1933,8 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
 
     if (p->tok.kind == KW_FUNCTION) {
         advance(p);
-        if (p->tok.kind != L_IDENT) p_error(p, "Expected method name");
+        /* 方法名允许关键字（PHP 半保留字：function list()/fn()/match() 合法） */
+        if (!tok_is_member_name(p->tok.kind)) p_error(p, "Expected method name");
         AFunc *f = tm_malloc(sizeof(AFunc));
         memset(f, 0, sizeof *f);
         f->name = p->tok.ident;
@@ -1892,7 +2002,8 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
                     mod.trait = parse_qual_name(p, NULL);   /* qualified trait name */
                 if (p->tok.kind == P_DOUBLE_COLON) {
                     advance(p);
-                    if (p->tok.kind != L_IDENT) p_error(p, "Expected method name after '::'");
+                    if (!tok_is_member_name(p->tok.kind))
+                        p_error(p, "Expected method name after '::'");
                     mod.method = p->tok.ident;
                     advance(p);
                 } else {
@@ -2586,7 +2697,8 @@ static AStmt *parse_statement(Parser *p) {
         return b;
     }
     case KW_USE: {
-        /* use A\B\C; use A\B\C as D; use function f; use const K; */
+        /* use A\B\C; use A\B\C as D; use function f; use const K;
+         * use A\B\{C, D as E};   —— 组 use（PHP 7+），组内 kind 统一 */
         advance(p);
         int kind = 0;
         if (p->tok.kind == KW_FUNCTION) { kind = 1; advance(p); }
@@ -2594,20 +2706,55 @@ static AStmt *parse_statement(Parser *p) {
         AUseList *ul = tm_malloc(sizeof *ul);
         ul->kind = kind; ul->items = NULL; ul->n = 0;
         for (;;) {
-            AUseItem it = { .name = parse_qual_name(p, NULL), .alias = NULL };
-            if (accept(p, KW_AS)) {
-                if (p->tok.kind != L_IDENT) p_error(p, "Expected alias name");
-                it.alias = p->tok.ident;
-                advance(p);
+            bool group = false;
+            TStr *prefix = parse_use_prefix(p, &group);
+            if (group) {
+                advance(p);                     /* '{' */
+                while (p->tok.kind != P_RBRACE) {
+                    TStr *seg = parse_qual_name(p, NULL);
+                    const char *ps = tstr_val(prefix);
+                    const char *ss = tstr_val(seg);
+                    size_t pl = strlen(ps), sl = strlen(ss);
+                    char *full = tm_malloc(pl + sl + 2);
+                    memcpy(full, ps, pl);
+                    full[pl] = '\\';
+                    memcpy(full + pl + 1, ss, sl);
+                    AUseItem it = { .name = tstr_intern(full, pl + sl + 1),
+                                    .alias = NULL };
+                    tm_free(full);
+                    if (accept(p, KW_AS)) {
+                        if (p->tok.kind != L_IDENT)
+                            p_error(p, "Expected alias name");
+                        it.alias = p->tok.ident;
+                        advance(p);
+                    } else {
+                        const char *s = tstr_val(it.name);
+                        const char *last = strrchr(s, '\\');
+                        it.alias = tstr_intern(last ? last + 1 : s,
+                                               last ? strlen(last + 1) : strlen(s));
+                    }
+                    ul->items = tm_realloc(ul->items,
+                                           sizeof(AUseItem) * (size_t)(ul->n + 1));
+                    ul->items[ul->n++] = it;
+                    if (!accept(p, P_COMMA)) break;
+                }
+                expect(p, P_RBRACE, "Expected '}' in group use");
             } else {
-                /* default alias: last segment */
-                const char *s = tstr_val(it.name);
-                const char *last = strrchr(s, '\\');
-                it.alias = tstr_intern(last ? last + 1 : s,
-                                       last ? strlen(last + 1) : strlen(s));
+                AUseItem it = { .name = prefix, .alias = NULL };
+                if (accept(p, KW_AS)) {
+                    if (p->tok.kind != L_IDENT) p_error(p, "Expected alias name");
+                    it.alias = p->tok.ident;
+                    advance(p);
+                } else {
+                    /* default alias: last segment */
+                    const char *s = tstr_val(it.name);
+                    const char *last = strrchr(s, '\\');
+                    it.alias = tstr_intern(last ? last + 1 : s,
+                                           last ? strlen(last + 1) : strlen(s));
+                }
+                ul->items = tm_realloc(ul->items, sizeof(AUseItem) * (size_t)(ul->n + 1));
+                ul->items[ul->n++] = it;
             }
-            ul->items = tm_realloc(ul->items, sizeof(AUseItem) * (size_t)(ul->n + 1));
-            ul->items[ul->n++] = it;
             if (!accept(p, P_COMMA)) break;
         }
         expect(p, P_SEMI, "Expected ';' after use statement");

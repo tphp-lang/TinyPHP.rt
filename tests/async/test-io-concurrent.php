@@ -1,8 +1,8 @@
 <?php
 // M4-b: 协程内并发文件 I/O —— file_get_contents 挂起期间其他协程推进；
 // 大内容读写（跨多块）；scandir 含 "." ".."
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 mkdir("_io_t");
 

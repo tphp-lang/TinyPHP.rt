@@ -20,10 +20,10 @@
 
 **无感的含义**：`sleep(1)` 期间其他协程照常跑、CPU 占用 0%；`file_get_contents` 阻塞等待期间事件循环照常调度——用户写的是同步代码，得到的是 JS 式并发。
 
-## 2. `Async\` 显式 API（M4）
+## 2. `Tphp\` 显式 API（M4）
 
 ```php
-namespace Async;
+namespace Tphp;
 
 function spawn(callable $fn, mixed ...$args): Coroutine;   // 创建协程，立即返回
 function await(Coroutine|Channel $c): mixed;               // 等待结果/透传异常
@@ -41,6 +41,7 @@ class Coroutine {
     public function isDone(): bool;
     public function getResult(): mixed;                     // 未完成抛错
     public function getException(): ?Throwable;
+    public function wait(): mixed;                          // await() 的对象式别名
 }
 
 class Channel {
@@ -50,13 +51,25 @@ class Channel {
     public function close(): void;
     public function len(): int;
 }
+
+class TaskGroup {                                          // 别名 Tphp\Thread
+    public function spawn(callable $fn, ...$args): Coroutine;  // 启动并登记
+    public function wait(): array;                          // 全部完成，按登记序返回结果
+    public function count(): int;
+}
+
+class Task {                                               // async($callable) 的返回物
+    public function __invoke(...$args): Coroutine;          // 调用即启动
+}
 ```
 
 **语义要点**：
+- **`async(EXPR)` 语法结构**：唯一实参是**调用表达式**时，parser 改写为 `Tphp\spawn(fn() => EXPR)`——表达式整体在协程内执行，不会先求值；自由变量按 spawn 那一刻**按值捕获**。单实参非调用形态（`async($callable)`）退化为包装成 `Task`。`$obj->spawn(EXPR)` 同规则（`spawn` 是并发保留方法名，与 `async` 一致）
 - **取消**：`cancel()` 后协程在下一个挂起点抛 `AsyncCancelled`（直接继承 Throwable，`catch(Exception)` 不会误吞）；finally 保证资源清理
 - **死锁检测**：所有协程挂起且事件循环无任务 → `DeadlockError`（标注各协程挂起位置）
 - **无需 Mutex**：协程只在挂起点切换、无抢占，单线程内没有数据竞争——这是无色模型的核心卖点，不提供 Mutex/Synchronized
-- 后置（M7+）：`Async\scope()` 结构化并发、`Async\select()`、`withTimeout($c, $ms)`
+- **多等待者**：`recv` 空 / `send` 满时的等待者按 **FIFO** 排队唤醒，多消费者与多生产者都支持；`send` 优先直接交接给队首 `recv`（值走协程私有槽），否则入缓冲。因此 Channel 可直接当**信号量**做并发限流（预置 N 个令牌，任务 `recv` 取、`finally` 归还）
+- 后置（M7+）：`Tphp\scope()` 结构化并发、`Tphp\select()`、`withTimeout($c, $ms)`
 
 ## 3. Worker 线程 API（M5，真 OS 线程）
 
@@ -82,7 +95,7 @@ class Worker {
 
 **模型**（txiki Worker 同款）：
 - 子线程 = **独立 VM 实例**：独立堆/VM 栈/intern 表/事件循环/协程调度器，**绝不共享 PHP 对象**——没有 Mutex、没有共享内存陷阱，并发安全靠隔离 + 消息，不靠纪律
-- 子线程内可继续 `Async\spawn`（协程）和再开 Worker（线程树）
+- 子线程内可继续 `Tphp\spawn`（协程）和再开 Worker（线程树）
 - 启动：`uv_thread_create` + `uv_sem` 握手（构造返回时子 runtime 已就绪）；停止：父线程独占生命周期 Stop→uv_async 唤醒→uv_thread_join→Free
 
 **跨线程值克隆规则**：
@@ -108,7 +121,7 @@ class Worker {
 - JSON：`json_encode json_decode`（C 原生手写，M6）
 - 杂项：`str_contains str_starts_with str_ends_with`、`array_map/filter/reduce/usort`（接受 callable）
 
-**PHP 层**（lib\，打包进二进制）：`sprintf` 全量、`date()/mktime()/checkdate()`、`array_column array_combine array_flip array_walk array_chunk array_splice`、`strtr ucwords nl2br strip_tags`、`Async 高层组合器`、后续 `Str/Arr` 工具类
+**PHP 层**（lib\，打包进二进制）：`sprintf` 全量、`date()/mktime()/checkdate()`、`array_column array_combine array_flip array_walk array_chunk array_splice`、`strtr ucwords nl2br strip_tags`、`Tphp 高层组合器`、后续 `Str/Arr` 工具类
 
 **后置**（M7+）：pcre2 vendor 后 `preg_*` 全套、内置 SQLite（libsqlite3 vendor，`Sqlite\Db` 对象 + 协程化）、HTTP server（`Http\Server`）、REPL
 
@@ -161,7 +174,7 @@ tphp test <dir>                   测试运行器（M6，EXPECT 断言协议）
 **异步示例（M4 验收）**：
 ```php
 <?php
-use function Async\{spawn, await, all};
+use function Tphp\{spawn, await, all};
 
 // 1) 无感：sleep 不占 CPU，不阻塞其他协程
 spawn(function () {
@@ -178,7 +191,7 @@ $t0 = microtime(true);
 echo "elapsed = " . round(microtime(true) - $t0, 2) . "s\n";
 
 // 3) Channel：生产者/消费者
-$ch = new Async\Channel(4);
+$ch = new Tphp\Channel(4);
 spawn(function () use ($ch) {
     foreach (range(1, 5) as $i) $ch->send($i * $i);
     $ch->close();

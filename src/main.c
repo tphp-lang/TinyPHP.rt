@@ -60,7 +60,7 @@ int tphp_vm_run(Program *prog);
 void tphp_dump_program(Program *prog);
 /* M5: 编译后冻结 prog（预 flatten 全类 + INIT_FCALL ic 急解析） */
 void tphp_prog_freeze(Program *prog);
-/* sched.c：Async\Coroutine 等内部类注册（编译前；幂等） */
+/* sched.c：Tphp\Coroutine 等内部类注册（编译前；幂等） */
 void tphp_async_init(void);
 /* io.c：TStream 内部类注册（编译前；幂等） */
 void tphp_io_init(void);

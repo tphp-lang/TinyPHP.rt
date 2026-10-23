@@ -1,8 +1,8 @@
 <?php
 // M4-e: http_get —— Content-Length、chunked、302 重定向（相对 Location）、
 // 自定义头（opts['headers']）；自建 HTTP server 驱动
-use function Async\spawn;
-use function Async\await;
+use function Tphp\spawn;
+use function Tphp\await;
 
 $srv = stream_socket_server("tcp://127.0.0.1:18301");
 
