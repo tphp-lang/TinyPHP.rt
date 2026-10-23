@@ -9,7 +9,7 @@
 |---|---|---|
 | **纯 PHP（lib\*.php）** | 能用现有 builtin/内部类表达的；纯算法/组合逻辑 | date/array_column（M6 打包进 exe） |
 | **builtin 函数（C）** | 单个无状态操作，参数→返回值，不需要对象 | strlen/sort/serialize |
-| **内部类（C）** | 有状态（句柄/上下文）、需要方法调用/生命周期管理 | Tphp\Channel、tphp\Worker、TStream |
+| **内部类（C）** | 有状态（句柄/上下文）、需要方法调用/生命周期管理 | Tphp\Channel、Tphp\Worker、TStream |
 
 判断标准：需要持有 OS 资源（fd/socket/timer/线程）或跨调用状态 → 内部类；一次调用完成 → builtin；C 标准库没有现成实现且纯 PHP 性能可接受 → lib。**禁止**为了"快"把纯逻辑下沉到 C（先测性能，bench 有证据再说）。
 
@@ -41,7 +41,7 @@ static TVal bi_myfunc(VM *vm, TVal *args, int n) {
 ```c
 /* 1. 建类：属性 + 方法（方法名必须 tstr_intern，防 GC） */
 static void myext_make_class(void) {
-    TClass *c = worker_make_class("tphp\\MyThing");     /* 类名也 intern */
+    TClass *c = worker_make_class("Tphp\\MyThing");      /* 类名也 intern */
     myext_add_native(c, "open",  (void *)nm_open,  false);
     myext_add_native(c, "read",  (void *)nm_read,  false);
     myext_add_native(c, "count", (void *)nm_count, true);   /* 静态 native */

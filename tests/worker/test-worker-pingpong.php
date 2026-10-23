@@ -1,7 +1,7 @@
 <?php
 // M5-d: ping-pong 1000 —— 单 Worker 1000 次 post/recv round-trip，
 // 验证消息序与 mailbox 稳定性（PLAN/04 M5 验收标准）
-use tphp\Worker;
+use Tphp\Worker;
 
 $w = new Worker(function () {
     $me = Worker::self();

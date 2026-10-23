@@ -14,7 +14,7 @@
 | DNS | `gethostbyname` `gethostbynamel`（uv_getaddrinfo） |
 | HTTP 客户端 | `http_get(string $url, array $opts = []): string`（新内置；重定向/超时/自定义头，M4 简版；**https 走 mbedtls**） |
 | 进程 | `exec` `shell_exec` `proc_open`（M6，uv_spawn） |
-| 信号 | `tphp\on_signal(SIGINT, fn)`（M6+） |
+| 信号 | `Tphp\on_signal(SIGINT, fn)`（M6+） |
 
 **HTTPS（M4）**：libuv 不提供 TLS → vendor mbedtls + `cacert.pem` 根证书内嵌进 exe（txiki `src/cacert.c` 同款，`scripts/update-ca-bundle.sh` 可直接抄来维护证书）；`http://` 与裸 TCP/UDP 不受影响。**注意**：HTTP/1.1 客户端必须支持 **chunked transfer 解码**（主流响应均为 chunked），否则 https 验收基本必挂；重定向、Content-Length、keep-alive=close 简版即可。
 
@@ -89,7 +89,7 @@ class Worker {
     public function isRunning(): bool;
     public function id(): int;
 
-    public static function self(): WorkerContext;           // 子线程内取自身上下文
+    public static function self(): Tphp\Worker\Context;     // 子线程内取自身上下文
 }
 ```
 
@@ -213,7 +213,7 @@ try {
 **线程示例（M5 验收）**：
 ```php
 <?php
-use tphp\Worker;
+use Tphp\Worker;
 
 // 父线程：开 4 个 worker 跑 CPU 密集任务，主线程事件循环不受影响
 $workers = [];

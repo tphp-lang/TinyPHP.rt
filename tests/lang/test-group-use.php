@@ -1,7 +1,7 @@
 <?php
 // 组 use：use function A\{f, g}; / use A\{B, C as D};
 use function Tphp\{spawn, await, all};
-use tphp\{Worker, Worker as W2};
+use Tphp\{Worker, Worker as W2};
 
 function inc2(int $x): int { return $x + 2; }
 
@@ -17,4 +17,4 @@ echo "alias=", $cls, "\n";
 
 // EXPECT: all=3,4,5
 // EXPECT: await=12
-// EXPECT: alias=tphp\Worker
+// EXPECT: alias=Tphp\Worker

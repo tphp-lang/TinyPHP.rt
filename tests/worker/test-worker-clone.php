@@ -1,7 +1,7 @@
 <?php
 // M5-c: Worker 克隆协议 —— 捕获值深拷 / 对象消息 __cloneState 跨线程
 // round-trip / 子线程返回对象 / enum 消息
-use tphp\Worker;
+use Tphp\Worker;
 
 // 1) 闭包捕获值跨线程深拷（标量 + 数组）
 $prefix = "cap:";

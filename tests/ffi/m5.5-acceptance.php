@@ -13,7 +13,7 @@
 // EXPECT: bitfield_rejected=ok
 // EXPECT: m5.5-acceptance-ok
 
-use tphp\Worker;
+use Tphp\Worker;
 
 // 1) 系统库零配置绑定（user32/msvcrt）
 $u = FFI::cdef("unsigned int GetTickCount(void);", "user32.dll");

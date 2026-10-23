@@ -105,8 +105,8 @@ $libc->qsort($a, 3, 4, function ($x, $y) {
 - 短调用（如 `abs`、`GetTickCount`）主线程可接受
 
 ```php
-$w = new tphp\Worker(function () {
-    $me = tphp\Worker\Worker::self();
+$w = new Tphp\Worker(function () {
+    $me = Tphp\Worker::self();
     $ffi = FFI::cdef("int abs(int j);", "msvcrt.dll");
     $me->post($ffi->abs(-8));
 });

@@ -3,7 +3,7 @@
 // EXPECT: ok
 
 // Worker 线程内 FFI 可用（阻塞调用放 Worker 的文档路径）
-use tphp\Worker;
+use Tphp\Worker;
 
 $w = new Worker(function () {
     $me = Worker::self();

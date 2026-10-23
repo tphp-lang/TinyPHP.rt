@@ -1,6 +1,6 @@
 <?php
-// M5-c: tphp\Worker 基础 —— 真 OS 线程 + mailbox round-trip + stop 退出协议
-use tphp\Worker;
+// M5-c: Tphp\Worker 基础 —— 真 OS 线程 + mailbox round-trip + stop 退出协议
+use Tphp\Worker;
 
 $w = new Worker(function () {
     $me = Worker::self();

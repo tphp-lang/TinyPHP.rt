@@ -5,7 +5,7 @@
 // FFI 回调 × Worker（PLAN/02 §4.5.1 线程约定）：
 //   同线程同步调用；C 跨线程调回调 = 未定义（文档禁止）；Worker 隔离
 //   是官方答案——每线程独立 TLS 回调表，Worker 内自建 cdef+trampoline。
-use tphp\Worker;
+use Tphp\Worker;
 
 $lib = PHP_OS_FAMILY === "Windows" ? "msvcrt.dll"
      : (PHP_OS_FAMILY === "Darwin" ? "libSystem.B.dylib" : "libc.so.6");

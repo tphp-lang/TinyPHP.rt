@@ -1,7 +1,7 @@
 <?php
 // M5-c: 多 Worker 并发 —— 3 个线程并行回声；主线程 sleep/IO 不被阻塞
 // （worker 满载时主线程事件循环照常推进，PLAN/04 验收语义）
-use tphp\Worker;
+use Tphp\Worker;
 use function Tphp\spawn;
 use function Tphp\await;
 

@@ -2,7 +2,7 @@
 // M5-d 验收（PLAN/02 §6 线程示例适配 + PLAN/04 M5 标准）：
 // 4 个 Worker 跑 CPU 密集任务，主线程 sleep 事件循环不受影响；
 // 总耗时 ≈ max（并行）而非串行总和
-use tphp\Worker;
+use Tphp\Worker;
 
 function fib($n) { return $n < 2 ? $n : fib($n - 1) + fib($n - 2); }
 

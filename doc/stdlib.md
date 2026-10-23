@@ -141,7 +141,7 @@ $p1(3, 4)->wait();           // 启动并等待
 **内置类**（均在 `Tphp\` 下）：
 - `Tphp\Coroutine`（`isdone`/`getresult`/`cancel`/**`wait`**…）——`wait()` 是 `await()` 的对象式别名
 - `Tphp\Channel`（`send`/`recv`/`close`/`len`，`new Tphp\Channel(cap)`）——支持多消费者/多生产者（等待者 FIFO 唤醒），可直接当信号量做并发限流
-- `Tphp\TaskGroup` / `Tphp\Thread`（`spawn`/`wait`/`count`）——协程任务组，`wait()` 按登记序返回结果数组；`Thread` 是同义短名（注意语义是单线程内并发，真 OS 线程用 `tphp\Worker`）
+- `Tphp\TaskGroup` / `Tphp\Thread`（`spawn`/`wait`/`count`）——协程任务组，`wait()` 按登记序返回结果数组；`Thread` 是同义短名（注意语义是单线程内并发，真 OS 线程用 `Tphp\Worker`）
 - `Tphp\Task`——`async()` 的返回物，`__invoke` 每次调用新建一个协程
 
 ```php
@@ -164,11 +164,11 @@ $threads->wait();
 
 `gethostbyname` `gethostbynamel` `fsockopen` `stream_socket_server` `stream_socket_accept` `http_get`（含 HTTPS，mbedtls）
 
-## Worker（`tphp\`）
+## Worker（`Tphp\`，真 OS 线程）
 
 ```php
-$w = new tphp\Worker(function () {
-    $me = tphp\Worker\Worker::self();
+$w = new Tphp\Worker(function () {
+    $me = Tphp\Worker::self();     // 子线程内的上下文（Tphp\Worker\Context）
     $me->post($msg);
     while (($m = $me->recv()) !== false) { ... }
 });

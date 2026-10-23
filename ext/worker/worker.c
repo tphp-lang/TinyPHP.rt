@@ -511,7 +511,7 @@ void tphp_worker_init(void) {
     if (g_worker_inited) return;
     g_worker_inited = true;
 
-    TClass *w = worker_make_class("tphp\\Worker");
+    TClass *w = worker_make_class("Tphp\\Worker");
     w->m_ctor = (int16_t)w->n_methods;
     worker_add_native(w, "__construct", (void *)nm_worker_construct, false);
     worker_add_native(w, "post", (void *)nm_worker_post, false);
@@ -524,7 +524,7 @@ void tphp_worker_init(void) {
     tphp_class_register(w);
     g_worker_cls = w;
 
-    TClass *c = worker_make_class("tphp\\WorkerContext");
+    TClass *c = worker_make_class("Tphp\\Worker\\Context");
     worker_add_native(c, "post", (void *)nm_worker_post, false);
     worker_add_native(c, "recv", (void *)nm_worker_recv, false);
     worker_add_native(c, "isrunning", (void *)nm_worker_is_running, false);

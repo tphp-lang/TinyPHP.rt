@@ -14,7 +14,7 @@
 
 use function Tphp\{spawn, await, all, async};
 use Tphp\Thread;
-use tphp\Worker;
+use Tphp\Worker;
 
 // ─────────────────────────────────────────────────────────────
 // 1. 业务函数：无色。不写 async，不写 await。
