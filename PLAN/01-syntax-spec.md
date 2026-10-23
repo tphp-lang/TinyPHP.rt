@@ -29,7 +29,7 @@
 | object / closure / enum | ✅ | |
 | 资源 resource | ❌ | 新运行时无此概念；I/O 句柄封装为对象（如 `File`、`Socket`） |
 | 类型声明 | ✅ | 参数/返回值/属性：`int` `?int`（可空）`int\|string`（union）`array` `mixed` `iterable` `static` `self\|parent`、类名、enum 名 |
-| 交叉类型 / DNF | ❌ 后置 | M7+ |
+| 交叉类型 / DNF | ❌ 后置 | M7+ → 近期批次 C1，见 §12.1 |
 | 联合类型运行期校验 | ✅ | 运行期强制；加载期能静态推断的直接报错 |
 | int/float 自动宽化 | ✅ | int→float 传参允许（对齐 PHP）；float→int 非法 |
 
@@ -102,8 +102,8 @@ Throwable
 | `each()` | PHP 8 已删除，对齐不支持；用 foreach（`list()` 语法本身已支持，见 §4） |
 | `${var}` 插值 | 对齐 PHP 8.2 deprecation；用 `{$var}` |
 | `set_error_handler` / `error_reporting` / `trigger_error` | 错误统一为异常 |
-| 生成器 `yield / yield from` | 规划后置 M7+（协程已覆盖主要场景，届时可用协程实现） |
-| 注解 `#[Attr]` | 语义后置 M7+；**词法器必须特判 `#[`**（否则被静默吞掉、无任何报错），判据照抄 php-src `zend_language_scanner.l:1390`：`#` 后第一个字符**不是** `[` 才是行注释；`#[` 识别为属性记号后在加载期明确报错 |
+| 生成器 `yield / yield from` | 规划后置 M7+（协程已覆盖主要场景，届时可用协程实现）——路线见 §12.2-A |
+| 注解 `#[Attr]` | 语义后置 M7+（路线见 §12.2-B）；**词法器必须特判 `#[`**（否则被静默吞掉、无任何报错），判据照抄 php-src `zend_language_scanner.l:1390`：`#` 后第一个字符**不是** `[` 才是行注释；`#[` 识别为属性记号后在加载期明确报错 |
 | `declare(ticks/encoding)`、`set_time_limit` | 无意义 |
 | `goto` 进出 try/catch 块 | 其余 goto 允许 |
 
@@ -251,3 +251,31 @@ echo $d->hello(), "\n";                     // Hello, woof
 echo Status::fromLabel('on')->speak(), "\n";// status=A
 echo Status::Active::class, "\n";           // App\Model\Status
 ```
+
+## 12. 语法补全路线（2026-10-23 对照 php-src 8.5.7 分析定稿）
+
+> 现状：§9"明确不支持清单"中大部分是**有意决策**（`&$ref`/`extract`/`eval`/`@`/错误处理器——与协程/单二进制/静态分析模型冲突，不翻案）。
+> 真正的语法缺口收敛为下述三档；近期批次 = C 小语法包，A/B 为 M7 立项候选。
+
+### 12.1 近期批次：C 小语法包（编译器/类型层增量，风险低）
+
+| 项 | PHP | 落点 |
+|---|---|---|
+| **C1 交叉类型 `A&B` + DNF `(A&B)\|C`** | 8.2 | `parse_type`（§2 标"后置"处）+ `tphp_type_accepts` 运行期合取/析取 + 加载期错误消息；DNF 为括号化联合成员 |
+| **C2 typed class constants** `const int X = 1;` | 8.3 | parse.c 类 const 解析（现无类型位置，~1976）加类型前缀存 TClass 常量；惰性求值 thunk 返回处按声明类型校验（对齐属性 typed 检查点模式） |
+| **C3 new in initializers 验证补缺** | 8.1 | `function f($x = new Foo)` / 属性默认值 / 类常量 `new`——parse_expr 已含 A_NEW，需实测三处语义（**每次调用/每次读取新建** vs 单次求值；PHP 语义 = 每次求值点新建）；缺则在 default thunk 路径补 |
+
+批次验收：各配 EXPECT 测试（交叉类型合取/拒绝、typed const 类型违约抛 TypeError、默认值 new 每次新实例）；PLAN/01 §2 类型表与 §9 同步勾销。
+
+### 12.2 M7 立项候选（单独立项，先立规格再动手）
+
+| 项 | PHP | 说明 |
+|---|---|---|
+| **A 生成器 `yield` / `yield from`** | 5.5 | 唯一影响写法习惯的大特性（框架生态普及）。实现 = 编译器函数内状态机（yield 点暂停/恢复，**不依赖调度器**——与协程是两套机器）+ `Generator` 内部类（current/key/next/send/throw/getReturn/valid）+ `yield from` 委托转发。预估数天；立项时先出 PLAN 规格（opcode 集、状态保存、与异常/finally 交互） |
+| **B 注解 `#[Attr]` + 反射读取** | 8.0 | lexer 现特判拒绝（`Attributes not supported`）。正经做 = 属性记号 → AST → 存储（类/方法/属性/参数/常量）→ `ReflectionClass::getAttributes` 最小集 + `Attribute` 类标记 + 实例化校验。tphp 生态早期、无框架消费反射元数据——**等需求出现再立项**，避免做了空转 |
+
+### 12.3 不做（记录防翻案）
+
+- 属性钩子 `&get` 引用返回——与 `&$ref` 模型冲突（§6 已注）
+- `${var}` 插值、`each()`——对齐 PHP 自身废弃
+- `declare(ticks/encoding)`——无意义

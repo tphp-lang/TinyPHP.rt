@@ -47,6 +47,7 @@
 | [PLAN/04-milestones-testing.md](PLAN/04-milestones-testing.md) | 里程碑 M0~M6（每阶段绑定语法+功能范围与验收标准）、测试策略、风险与规避 |
 | [PLAN/05-extension-guide.md](PLAN/05-extension-guide.md) | **贡献者规范**：内置扩展（builtin/内部类）开发模式、核心约定红线、错误处理与安全标准、工作流与上线检查清单 |
 | [PLAN/pkg-manager.md](PLAN/pkg-manager.md) | **内置包管理器（无外部工具/无 git）**：mod.json/mod.lock、vendor 布局、PSR-4 autoload、new/add/remove/install/upload 命令规格、实施阶段（已全部实现） |
+| [PLAN/perf-roadmap.md](PLAN/perf-roadmap.md) | **性能路线**：参照系三层（Zend/Bun/IR JIT）、优化时机四判据、解释器优化清单、IR 框架 JIT 路线（PHP 8.4 官方底座）、Bun 借鉴清单、防翻案结论 |
 
 ## 技术栈与环境
 
