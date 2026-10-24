@@ -3187,6 +3187,16 @@ static int32_t op_fetch_cconst(VM *vm, TOp *op) {
         } else {
             tval_addref(out);
         }
+        /* PHP 8.3 typed class constants：按声明类型校验（含 thunk 求值结果） */
+        if (cown && cown->ctypes && cidx >= 0 && cown->ctypes[cidx]) {
+            const char *given = NULL;
+            if (!tphp_type_accepts(tstr_val(cown->ctypes[cidx]), out,
+                                   (TClass *)cown, &given))
+                vm_raise(vm, ex_class("TypeError"), op,
+                         "Typed constant %s::%s must be of type %s, %s given",
+                         tstr_val(cown->name), tstr_val(cname),
+                         tstr_val(cown->ctypes[cidx]), given ? given : "?");
+        }
         wtake(vm, op, out);
         return 1;
     }
@@ -3967,16 +3977,21 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     /* caller pc is NOT advanced here: thunks are always invoked from
      * inside a handler (op_recv / op_new_user->tphp_obj_alloc), and the
-     * dispatch loop advances pc by that handler's return value. */
+     * dispatch loop advances pc by that handler's return value.
+     * deep 语义（跑到本帧弹出）：默认值/常量 thunk 允许 `new` 与函数调用
+     * （PHP 8.1 new-in-initializers）——子帧（ctor 等）必须在本循环内继续
+     * 执行；旧"帧切换即退出"会让 ctor 帧成孤儿（$this 为 null）。 */
     vm->x.frame = f;
     static int thunk_trace = -1;
     if (thunk_trace < 0) thunk_trace = getenv("TPHP_TRACE") ? 1 : 0;
-    while (vm->x.frame == f) {
-        TOp *op = &f->fn->ops[f->pc];
-        if (thunk_trace) fprintf(stderr, "[trace %s pc=%u %s]\n", tstr_val(f->fn->name),
-                                 f->pc, tphp_op_name(op->op));
+    VMFrame *stop = f->prev;   /* f 弹出即 free，勿在条件里读 f->prev（UAF） */
+    while (vm->x.frame && vm->x.frame != stop) {
+        VMFrame *cf = vm->x.frame;
+        TOp *op = &cf->fn->ops[cf->pc];
+        if (thunk_trace) fprintf(stderr, "[trace %s pc=%u %s]\n", tstr_val(cf->fn->name),
+                                 cf->pc, tphp_op_name(op->op));
         int32_t d = ((OpHandler)op->handler)(vm, op);
-        if (d) f->pc += (uint32_t)d;
+        if (d) cf->pc += (uint32_t)d;
     }
     return vm->x.thunk_ret;
 }

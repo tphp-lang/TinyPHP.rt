@@ -29,7 +29,7 @@
 | object / closure / enum | ✅ | |
 | 资源 resource | ❌ | 新运行时无此概念；I/O 句柄封装为对象（如 `File`、`Socket`） |
 | 类型声明 | ✅ | 参数/返回值/属性：`int` `?int`（可空）`int\|string`（union）`array` `mixed` `iterable` `static` `self\|parent`、类名、enum 名 |
-| 交叉类型 / DNF | ❌ 后置 | M7+ → 近期批次 C1，见 §12.1 |
+| 交叉类型 / DNF | ✅ | C 批已实现（2026-10-23）：`A&B`、`(A&B)\|null`（DNF，括号 parse 期消费不入库）；交叉成员仅 class-like + object/self/parent/static；union 内交叉必须括号、`?` 不能修饰交叉（对齐 PHP 8.2）；见 §12.1 |
 | 联合类型运行期校验 | ✅ | 运行期强制；加载期能静态推断的直接报错 |
 | int/float 自动宽化 | ✅ | int→float 传参允许（对齐 PHP）；float→int 非法 |
 
@@ -257,15 +257,15 @@ echo Status::Active::class, "\n";           // App\Model\Status
 > 现状：§9"明确不支持清单"中大部分是**有意决策**（`&$ref`/`extract`/`eval`/`@`/错误处理器——与协程/单二进制/静态分析模型冲突，不翻案）。
 > 真正的语法缺口收敛为下述三档；近期批次 = C 小语法包，A/B 为 M7 立项候选。
 
-### 12.1 近期批次：C 小语法包（编译器/类型层增量，风险低）
+### 12.1 近期批次：C 小语法包（编译器/类型层增量，风险低）✅ 已完成（2026-10-23）
 
-| 项 | PHP | 落点 |
-|---|---|---|
-| **C1 交叉类型 `A&B` + DNF `(A&B)\|C`** | 8.2 | `parse_type`（§2 标"后置"处）+ `tphp_type_accepts` 运行期合取/析取 + 加载期错误消息；DNF 为括号化联合成员 |
-| **C2 typed class constants** `const int X = 1;` | 8.3 | parse.c 类 const 解析（现无类型位置，~1976）加类型前缀存 TClass 常量；惰性求值 thunk 返回处按声明类型校验（对齐属性 typed 检查点模式） |
-| **C3 new in initializers 验证补缺** | 8.1 | `function f($x = new Foo)` / 属性默认值 / 类常量 `new`——parse_expr 已含 A_NEW，需实测三处语义（**每次调用/每次读取新建** vs 单次求值；PHP 语义 = 每次求值点新建）；缺则在 default thunk 路径补 |
+| 项 | PHP | 落点 | 状态 |
+|---|---|---|---|
+| **C1 交叉类型 `A&B` + DNF `(A&B)\|C`** | 8.2 | parse_type_decl 重写（段抽 parse_type_one_seg；括号组消费不入库；union 内裸交叉/`?`修饰交叉拒绝；class-like 白名单）+ tphp_type_accepts 段内 `&` 合取（type_seg_chain_ok；type_seg_ok 类名分支改按 len 拷贝——曾 NUL 扫描吞整串） | ✅ |
+| **C2 typed class constants** `const int X = 1;` | 8.3 | parse.c 类 const 加类型前缀（L_IDENT+前瞻=` 判别类型/名字）；TClass.ctypes 并行数组（trait/接口合并 + worker clone 同步）；FETCH_CCONST 求值后校验（thunk 结果同样过检），违约 TypeError | ✅ |
+| **C3 new in initializers** | 8.1 | 参数默认值/属性默认值/类常量/promoted 四处均通——修 VM bug：**thunk 嵌套循环改 deep 语义**（旧"帧切换即退出"让 ctor 帧成孤儿 $this=null；run_frame_until_pop_deep 同 autoload 修复，stop=f->prev 先缓存防 UAF） | ✅ |
 
-批次验收：各配 EXPECT 测试（交叉类型合取/拒绝、typed const 类型违约抛 TypeError、默认值 new 每次新实例）；PLAN/01 §2 类型表与 §9 同步勾销。
+批次验收：`tests/lang/test-{types-intersection,typed-const,new-in-initializers}.php`；lang 目录 68 全绿。
 
 ### 12.2 M7 立项候选（单独立项，先立规格再动手）
 

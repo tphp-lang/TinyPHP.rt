@@ -1631,63 +1631,123 @@ static ADestructList *parse_destruct_list(Parser *p, bool bracket_form) {
  * Builtin spellings are lowercased (PHP types are case-insensitive); class
  * names keep their declared spelling (matched case-insensitively later).
  * Returns NULL when no type is present. */
+/* 交叉类型成员白名单（PHP 8.2：intersection 仅 class-like + object/self/parent/static；
+ * 标量/数组/null 等 builtin 拼写拒绝）。seg 已经过小写化处理。 */
+static bool type_seg_is_classlike(const char *seg) {
+    static const char *bad[] = { "int", "float", "string", "bool", "array",
+                                 "iterable", "mixed", "null", "true", "false",
+                                 "callable", "closure", NULL };
+    for (int i = 0; bad[i]; i++)
+        if (strcmp(seg, bad[i]) == 0) return false;
+    return true;   /* object/self/parent/static 与类名（含 \）都放行 */
+}
+
+/* 解析一个裸类型段（限定名或 builtin/伪类型关键字）到 buf（小写化 builtin）。
+ * 无段可解析返回 false（不消费 token）。 */
+static bool parse_type_one_seg(Parser *p, char *buf, size_t cap) {
+    if (p->tok.kind == L_IDENT) {
+        size_t k = 0;
+        const char *s = tstr_val(p->tok.ident);
+        for (; s[k] && k + 1 < cap; k++) buf[k] = s[k];
+        buf[k] = 0;
+        advance(p);
+        while (p->tok.kind == P_BACKSLASH) {
+            advance(p);
+            if (p->tok.kind != L_IDENT) p_error(p, "Expected name after '\\'");
+            size_t l = strlen(buf);
+            if (l + 2 < cap) { buf[l] = '\\'; buf[l + 1] = 0; }
+            const char *s2 = tstr_val(p->tok.ident);
+            size_t m = strlen(buf), j = 0;
+            for (; s2[j] && m + j + 1 < cap; j++) buf[m + j] = s2[j];
+            buf[m + j] = 0;
+            advance(p);
+        }
+        bool all_alpha = true;
+        for (size_t j = 0; buf[j]; j++) {
+            char ch = buf[j];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
+                { all_alpha = false; break; }
+        }
+        if (all_alpha) {
+            for (size_t j = 0; buf[j]; j++)
+                if (buf[j] >= 'A' && buf[j] <= 'Z')
+                    buf[j] = (char)(buf[j] + 32);
+        }
+        return true;
+    }
+    const char *kw = NULL;
+    if (p->tok.kind == KW_ARRAY) kw = "array";
+    else if (p->tok.kind == KW_SELF) kw = "self";
+    else if (p->tok.kind == KW_PARENT) kw = "parent";
+    else if (p->tok.kind == KW_STATIC) kw = "static";
+    else if (p->tok.kind == KW_NULL) kw = "null";
+    else if (p->tok.kind == KW_TRUE) kw = "true";
+    else if (p->tok.kind == KW_FALSE) kw = "false";
+    if (!kw) return false;
+    snprintf(buf, cap, "%s", kw);
+    advance(p);
+    return true;
+}
+
+/* 类型声明：?T / T|U / T&U（交叉，PHP 8.2）/ (T&U)|V（DNF）。
+ * 存储为字符串：交叉成员内 '&' 连接、union 用 '|'、括号不入库
+ * （运行期 tphp_type_accepts 按 '|' split 后段内 '&' 即合取，语义自动正确）。 */
 static TStr *parse_type_decl(Parser *p) {
     bool nullable = accept(p, P_QUESTION);
     char buf[512];
     size_t n = 0;
-    int segs = 0;
+    int usegs = 0;          /* union 成员数 */
+    bool has_amp = false;   /* 出现过交叉成员 */
+    bool bare_amp = false;  /* 出现过未加括号的交叉成员 */
     for (;;) {
-        const char *seg = NULL;
-        char segbuf[256];
-        if (p->tok.kind == L_IDENT) {
-            /* qualified: A\B\C */
-            size_t k = 0;
-            const char *s = tstr_val(p->tok.ident);
-            for (; s[k] && k < sizeof segbuf - 1; k++) segbuf[k] = s[k];
-            segbuf[k] = 0;
-            advance(p);
-            while (p->tok.kind == P_BACKSLASH) {
-                advance(p);
-                if (p->tok.kind != L_IDENT) p_error(p, "Expected name after '\\'");
-                size_t l = strlen(segbuf);
-                if (l + 1 < sizeof segbuf) { segbuf[l] = '\\'; segbuf[l + 1] = 0; }
-                const char *s2 = tstr_val(p->tok.ident);
-                size_t m = strlen(segbuf), j = 0;
-                for (; s2[j] && m + j < sizeof segbuf - 1; j++) segbuf[m + j] = s2[j];
-                segbuf[m + j] = 0;
-                advance(p);
+        bool paren = false;
+        if (p->tok.kind == P_LPAREN) { paren = true; advance(p); }
+        /* --- 一个 union 成员：裸段[&段]* 或 (裸段&段+) --- */
+        int amps = 0;
+        bool first_seg = true;
+        for (;;) {
+            char segbuf[256];
+            if (!parse_type_one_seg(p, segbuf, sizeof segbuf)) {
+                if (first_seg && usegs == 0 && !paren && !nullable) return NULL;
+                if (first_seg && (usegs > 0 || paren || nullable))
+                    p_error(p, "Expected type name");
+                break;   /* & 后缺段 */
             }
-            /* lowercase builtin spellings (letters only; qualified names
-             * containing '\' keep their declared spelling) */
-            bool all_alpha = true;
-            for (size_t j = 0; segbuf[j]; j++) {
-                char ch = segbuf[j];
-                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')))
-                    { all_alpha = false; break; }
+            if (amps > 0 || (paren && !first_seg)) {
+                if (!type_seg_is_classlike(segbuf))
+                    p_error(p, "Intersection types support only class names, "
+                               "object, self/static/parent");
             }
-            if (all_alpha) {
-                for (size_t j = 0; segbuf[j]; j++)
-                    if (segbuf[j] >= 'A' && segbuf[j] <= 'Z') segbuf[j] = (char)(segbuf[j] + 32);
-            }
-            seg = segbuf;
-        } else if (p->tok.kind == KW_ARRAY) { seg = "array"; advance(p); }
-        else if (p->tok.kind == KW_SELF) { seg = "self"; advance(p); }
-        else if (p->tok.kind == KW_PARENT) { seg = "parent"; advance(p); }
-        else if (p->tok.kind == KW_STATIC) { seg = "static"; advance(p); }
-        else if (p->tok.kind == KW_NULL) { seg = "null"; advance(p); }
-        else if (p->tok.kind == KW_TRUE) { seg = "true"; advance(p); }
-        else if (p->tok.kind == KW_FALSE) { seg = "false"; advance(p); }
-        else break;
-        size_t sl = strlen(seg);
-        if (n + (segs ? 1 : 0) + sl >= sizeof buf - 2)
-            p_error(p, "Type declaration too long");
-        if (segs) buf[n++] = '|';
-        memcpy(buf + n, seg, sl);
-        n += sl;
-        segs++;
+            size_t sl = strlen(segbuf);
+            if (n + sl + 2 >= sizeof buf - 1)
+                p_error(p, "Type declaration too long");
+            if (first_seg && usegs > 0) buf[n++] = '|';
+            if (!first_seg) buf[n++] = '&';
+            memcpy(buf + n, segbuf, sl);
+            n += sl;
+            first_seg = false;
+            if (!accept(p, P_AMP)) break;
+            amps++;
+        }
+        if (paren) {
+            if (amps == 0)
+                p_error(p, "Parenthesized types must contain an intersection "
+                           "(use (A&B), not (A))");
+            expect(p, P_RPAREN, "Expected ')' after intersection type");
+        }
+        if (amps > 0) {
+            has_amp = true;
+            if (!paren) bare_amp = true;
+        }
+        usegs++;
         if (!accept(p, P_PIPE)) break;
     }
-    if (!segs) {
+    if (bare_amp && usegs > 1)
+        p_error(p, "Intersection types inside a union must be parenthesized "
+                   "(write (A&B)|C)");
+    if (nullable && has_amp)
+        p_error(p, "'?' cannot modify an intersection type");
+    if (!usegs) {
         if (nullable) p_error(p, "Expected type name after '?'");
         return NULL;
     }
@@ -1975,8 +2035,89 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
 
     if (p->tok.kind == KW_CONST) {
         advance(p);
-        if (p->tok.kind != L_IDENT) p_error(p, "Expected constant name");
+        /* PHP 8.3 typed class constants：`const int X = 1;` / `const A|B X`。
+         * 边界判定：类型段序列后跟"名字 ="；名字本身是 L_IDENT，靠
+         * "L_IDENT + 前瞻 ="识别（恢复状态后由外层消费名字）。 */
         m->tag = CM_CONST;
+        m->prop.type = NULL;
+        bool maybe_type = (p->tok.kind == L_IDENT || p->tok.kind == KW_ARRAY ||
+                           p->tok.kind == KW_STATIC || p->tok.kind == KW_SELF ||
+                           p->tok.kind == KW_PARENT || p->tok.kind == P_QUESTION);
+        if (maybe_type && p->tok.kind == L_IDENT) {
+            /* L_IDENT：advance 后是 '=' → 它就是名字（无类型）；否则是类型段 */
+            Lex save_lx = p->lx;
+            Token save_tok = p->tok;
+            advance(p);
+            bool is_name = (p->tok.kind == P_ASSIGN);
+            p->lx = save_lx;
+            p->tok = save_tok;
+            maybe_type = !is_name;
+        }
+        if (maybe_type) {
+            char tbuf[512];
+            size_t tn = 0;
+            int tsegs = 0, tamps_total = 0;
+            for (;;) {
+                /* 前瞻：当前 L_IDENT 后是 '=' → 到名字了，结束类型 */
+                if (p->tok.kind == L_IDENT) {
+                    Lex sp = p->lx;
+                    Token st = p->tok;
+                    advance(p);
+                    bool at_name = (p->tok.kind == P_ASSIGN);
+                    p->lx = sp; p->tok = st;
+                    if (at_name) break;
+                }
+                char seg[256];
+                if (!parse_type_one_seg(p, seg, sizeof seg))
+                    p_error(p, "Expected type or constant name after 'const'");
+                size_t sl2 = strlen(seg);
+                if (tn + sl2 + 2 >= sizeof tbuf)
+                    p_error(p, "Type declaration too long");
+                if (tsegs) tbuf[tn++] = '|';
+                memcpy(tbuf + tn, seg, sl2);
+                tn += sl2;
+                tsegs++;
+                if (accept(p, P_AMP)) {
+                    /* 交叉段（class-like 白名单） */
+                    if (!type_seg_is_classlike(seg))
+                        p_error(p, "Intersection types support only class names, "
+                                   "object, self/static/parent");
+                    tamps_total++;
+                    /* 第二段起：& 拼进当前成员（不加 |） */
+                    for (;;) {
+                        if (p->tok.kind == L_IDENT) {
+                            Lex sp = p->lx;
+                            Token st = p->tok;
+                            advance(p);
+                            bool at_name = (p->tok.kind == P_ASSIGN);
+                            p->lx = sp; p->tok = st;
+                            if (at_name)
+                                p_error(p, "Expected type after '&'");
+                        }
+                        char seg2[256];
+                        if (!parse_type_one_seg(p, seg2, sizeof seg2))
+                            p_error(p, "Expected type after '&'");
+                        if (!type_seg_is_classlike(seg2))
+                            p_error(p, "Intersection types support only class "
+                                       "names, object, self/static/parent");
+                        size_t l2 = strlen(seg2);
+                        if (tn + l2 + 2 >= sizeof tbuf)
+                            p_error(p, "Type declaration too long");
+                        tbuf[tn++] = '&';
+                        memcpy(tbuf + tn, seg2, l2);
+                        tn += l2;
+                        tamps_total++;
+                        if (!accept(p, P_AMP)) break;
+                    }
+                    break;   /* 交叉成员后 v1 不支持再接 union（如需 DNF 用括号完整形态后置） */
+                }
+                if (!accept(p, P_PIPE)) break;
+            }
+            (void)tamps_total;
+            tbuf[tn] = 0;
+            m->prop.type = tstr_intern(tbuf, tn);
+        }
+        if (p->tok.kind != L_IDENT) p_error(p, "Expected constant name");
         m->prop.name = p->tok.ident;
         advance(p);
         expect(p, P_ASSIGN, "Expected '=' in class constant");

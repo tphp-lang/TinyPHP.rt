@@ -3582,7 +3582,9 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             cls->cnames = tm_realloc(cls->cnames, sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cvals = tm_realloc(cls->cvals, sizeof(TVal) * (size_t)(cls->n_consts + 1));
             cls->cthunks = tm_realloc(cls->cthunks, sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
+            cls->ctypes = tm_realloc(cls->ctypes, sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cnames[cls->n_consts] = mem->prop.name;
+            cls->ctypes[cls->n_consts] = mem->prop.type;   /* 8.3 typed const（interned，NULL=无） */
             if (ok) {
                 cls->cvals[cls->n_consts] = d;
                 tval_addref(d);

@@ -194,8 +194,9 @@ typedef struct TClass {
     TStr **iface_names; int n_iface_names; /* unresolved (own + flat) */
     /* class constants: parallel arrays, declaration order.
      * cthunks[i] != 0：惰性常量表达式（compile_thunk 索引），cvals[i] 为
-     * T_UNDEF 占位，首次取用时求值并缓存（P2-B 类常量表达式）。 */
-    TStr **cnames; TVal *cvals; uint16_t *cthunks; int n_consts;
+     * T_UNDEF 占位，首次取用时求值并缓存（P2-B 类常量表达式）。
+     * ctypes[i]：PHP 8.3 typed constants 声明类型字符串（NULL=无类型）。 */
+    TStr **cnames; TVal *cvals; uint16_t *cthunks; TStr **ctypes; int n_consts;
     /* enum */
     TEnumCase *cases; int n_cases;        /* CK_ENUM */
     bool backed;          /* enum has a backing type */

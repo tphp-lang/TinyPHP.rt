@@ -76,18 +76,32 @@ static bool type_seg_ok(const char *seg, size_t len, TVal v, TClass *scope) {
     if (len == 6 && memcmp(seg, "parent", 6) == 0)
         return scope && scope->parent && v.t == T_OBJ &&
                tphp_class_isa(((TObj *)v.u.p)->cls, scope->parent);
-    /* class/interface name (case-insensitive, leading '\' allowed) */
+    /* class/interface name (case-insensitive, leading '\' allowed)；
+     * 按 len 拷贝——交叉段 "a&b" 的子段非 NUL 结尾（C1） */
     {
         char lc[256];
         size_t k = 0;
         const char *s = seg;
         if (*s == '\\') s++;
-        for (; s[k] && k + 1 < sizeof lc; k++) lc[k] = lc_ascii(s[k]);
+        size_t rest = (size_t)(seg + len - s);
+        for (; k < rest && k + 1 < sizeof lc; k++) lc[k] = lc_ascii(s[k]);
         lc[k] = 0;
         TClass *want = tphp_class_lookup(lc);
         if (!want) return false;
         return v.t == T_OBJ && tphp_class_isa(((TObj *)v.u.p)->cls, want);
     }
+}
+
+/* 交叉成员判定：段内 '&' 连接的每一段都必须通过（PHP 8.2 intersection）。 */
+static bool type_seg_chain_ok(const char *seg, size_t len, TVal v, TClass *scope) {
+    const char *s = seg, *e = seg + len;
+    while (s < e) {
+        const char *a = s;
+        while (s < e && *s != '&') s++;
+        if (s == a || !type_seg_ok(a, (size_t)(s - a), v, scope)) return false;
+        if (s < e) s++;   /* skip '&' */
+    }
+    return true;
 }
 
 bool tphp_type_accepts(const char *type, TVal v, TClass *scope,
@@ -100,7 +114,15 @@ bool tphp_type_accepts(const char *type, TVal v, TClass *scope,
         const char *seg = p;
         while (*p && *p != '|') p++;
         size_t len = (size_t)(p - seg);
-        if (len && type_seg_ok(seg, len, v, scope)) return true;
+        if (len) {
+            /* 段内含 '&' → 交叉（合取）；否则普通段 */
+            bool is_cross = false;
+            for (size_t i = 0; i < len; i++)
+                if (seg[i] == '&') { is_cross = true; break; }
+            if (is_cross ? type_seg_chain_ok(seg, len, v, scope)
+                         : type_seg_ok(seg, len, v, scope))
+                return true;
+        }
         if (!*p) break;
         p++;   /* skip '|' */
     }
@@ -720,11 +742,14 @@ static void bind_traits(TClass *cls) {
                 sizeof(TVal) * (size_t)(cls->n_consts + 1));
             cls->cthunks = tm_realloc(cls->cthunks,
                 sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
+            cls->ctypes = tm_realloc(cls->ctypes,
+                sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cnames[cls->n_consts] = t->cnames[ci];
             tval_addref(t->cvals[ci]);
             cls->cvals[cls->n_consts] = t->cvals[ci];
             /* P2-B: 惰性常量表达式的 thunk 索引随导入共享（prog 级只读） */
             cls->cthunks[cls->n_consts] = t->cthunks ? t->cthunks[ci] : 0;
+            cls->ctypes[cls->n_consts] = t->ctypes ? t->ctypes[ci] : NULL;
             cls->n_consts++;
         }
     }
@@ -838,12 +863,15 @@ void tphp_class_ensure_flat(TClass *cls) {
                     sizeof(TVal) * (size_t)(cls->n_consts + 1));
                 cls->cthunks = tm_realloc(cls->cthunks,
                     sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
+                cls->ctypes = tm_realloc(cls->ctypes,
+                    sizeof(TStr *) * (size_t)(cls->n_consts + 1));
                 cls->cnames[cls->n_consts] = ifc->cnames[k];
                 TVal v = ifc->cvals[k];
                 tval_addref(v);
                 cls->cvals[cls->n_consts] = v;
                 /* P2-B: 惰性常量 thunk 索引随接口继承共享 */
                 cls->cthunks[cls->n_consts] = ifc->cthunks ? ifc->cthunks[k] : 0;
+                cls->ctypes[cls->n_consts] = ifc->ctypes ? ifc->ctypes[k] : NULL;
                 cls->n_consts++;
             }
         }
@@ -1097,6 +1125,11 @@ void tphp_class_tab_clone_thread(void) {
                 nc->cthunks = tm_malloc(sizeof(uint16_t) * (size_t)nc->n_consts);
                 memcpy(nc->cthunks, c->cthunks,
                        sizeof(uint16_t) * (size_t)nc->n_consts);
+            }
+            if (c->ctypes) {
+                nc->ctypes = tm_malloc(sizeof(TStr *) * (size_t)nc->n_consts);
+                memcpy(nc->ctypes, c->ctypes,
+                       sizeof(TStr *) * (size_t)nc->n_consts);
             }
         }
         if (nc->n_cases) {
