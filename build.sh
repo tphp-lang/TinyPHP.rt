@@ -68,7 +68,7 @@ fi
 # ext\* include dirs MUST come after any libffi include: libffi's public
 # header is <ffi.h>; an -Iext/ffi earlier in the list with an ffi.h inside
 # would shadow it (same trap as the historic src/ffi.h naming ban).
-INC="$INC -Iext/ffi -Iext/net -Iext/io -Iext/worker -Iext/json -Iext/serialize -Iext/pkg -Iext/builtin -Iext/standard"
+INC="$INC -Iext/ffi -Iext/net -Iext/io -Iext/worker -Iext/json -Iext/serialize -Iext/pkg -Iext/builtin -Iext/standard -Iext/pcre"
 
 # normalize arch: arm64 -> aarch64 for target string (Linux); keep arm64 on Darwin
 case "$TARCH" in
