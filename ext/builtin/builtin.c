@@ -14,6 +14,7 @@
 #include "pkg.h"
 #include "builtin.h"     /* need_str/need_int/str_find 导出（ext/standard 复用） */
 #include "standard.h"    /* 迁至 ext/standard 的函数表引用 */
+#include "pcre.h"        /* preg_*（ext/pcre） */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2440,6 +2441,15 @@ const Builtin tphp_builtins[] = {
     { "pkg_add", bi_pkg_add },
     { "pkg_remove", bi_pkg_remove },
     { "pkg_install", bi_pkg_install },
+    /* 正则（ext/pcre；PLAN/preg.md） */
+    { "preg_match", bi_preg_match },
+    { "preg_match_all", bi_preg_match_all },
+    { "preg_replace", bi_preg_replace },
+    { "preg_split", bi_preg_split },
+    { "preg_grep", bi_preg_grep },
+    { "preg_last_error", bi_preg_last_error },
+    { "preg_last_error_msg", bi_preg_last_error_msg },
+    { "preg_quote", bi_preg_quote },
 };
 
 const int tphp_builtin_count = (int)(sizeof tphp_builtins / sizeof tphp_builtins[0]);

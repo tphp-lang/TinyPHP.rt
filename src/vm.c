@@ -4553,6 +4553,21 @@ static void vm_seed_consts(VM *vm) {
         /* 打包应用资源根（io 层 tphp://asset/ 前缀直读内存 zip）；
          * 未打包时读取会得到 "not a packed executable" 警告 */
         { "ASSET_ROOT",  "tphp://asset", 0 },
+        /* preg_* 常量（PHP 值；PLAN/preg.md） */
+        { "PREG_NO_ERROR", NULL, 0 },
+        { "PREG_INTERNAL_ERROR", NULL, 1 },
+        { "PREG_BACKTRACK_LIMIT_ERROR", NULL, 2 },
+        { "PREG_RECURSION_LIMIT_ERROR", NULL, 3 },
+        { "PREG_JIT_STACKLIMIT_ERROR", NULL, 4 },
+        { "PREG_LIMIT_UTF8_ERROR", NULL, 5 },
+        { "PREG_PATTERN_ORDER", NULL, 0 },
+        { "PREG_SET_ORDER", NULL, 1 },
+        { "PREG_OFFSET_CAPTURE", NULL, 256 },
+        { "PREG_UNMATCHED_AS_NULL", NULL, 512 },
+        { "PREG_SPLIT_NO_EMPTY", NULL, 1 },
+        { "PREG_SPLIT_DELIM_CAPTURE", NULL, 2 },
+        { "PREG_SPLIT_OFFSET_CAPTURE", NULL, 4 },
+        { "PREG_GREP_INVERT", NULL, 1 },
     };
     for (size_t i = 0; i < sizeof seeds / sizeof seeds[0]; i++) {
         if (vm->n_consts >= 256) return;

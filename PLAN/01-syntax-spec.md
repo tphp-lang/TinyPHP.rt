@@ -134,6 +134,7 @@ Throwable
 | 未初始化 typed 属性读取 | Error "must not be accessed before initialization" | 抛 `UndefinedError`（同为致命，措辞不同） |
 | 动态静态方法名 + 命名参数 `C::$v(a: 1)` | 运行期按真实签名重排 | 加载期拒绝（命名参数重排需编译期签名） |
 | `eval()` | 支持 | **不实现**（决策：注入面不安全、实际使用率低）；调用报 `Call to undefined function eval()` |
+| `preg_match` 的 `$matches` 引用输出 | `&$matches` 自动创建 | **无引用**：要求已初始化数组（`$m = []; preg_match($p, $s, $m);`）原地清空填充（`sort` 同哲学）；未定义/非数组 → TypeError（引导消息） |
 | 属性钩子 `&get` 引用返回 | 支持 | v1 按普通 `get` 执行（引用返回后置） |
 | 属性钩子 `parent::$p::get()` | 支持 | ✅ 已实现（`A_PROPHOOK` + `OP_PROPHOOK`） |
 | 属性钩子 `final` override 校验 | 编译期拒绝子类覆盖 final 钩子 | ✅ 已实现（flatten 时校验） |

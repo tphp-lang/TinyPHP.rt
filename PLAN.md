@@ -49,6 +49,7 @@
 | [PLAN/pkg-manager.md](PLAN/pkg-manager.md) | **内置包管理器（无外部工具/无 git）**：mod.json/mod.lock、vendor 布局、PSR-4 autoload、new/add/remove/install/upload 命令规格、实施阶段（已全部实现） |
 | [PLAN/perf-roadmap.md](PLAN/perf-roadmap.md) | **性能路线**：参照系三层（Zend/Bun/IR JIT）、优化时机四判据、解释器优化清单、IR 框架 JIT 路线（PHP 8.4 官方底座）、Bun 借鉴清单、防翻案结论 |
 | [PLAN/generators.md](PLAN/generators.md) | **生成器（yield）**：帧保存模型（VMFrame 直存 Generator）、opcode 集、v1 范围（G1 基础/G2 send/G3 边界）、v2 后置（throw/from/dtor-finally）、已知差异 |
+| [PLAN/preg.md](PLAN/preg.md) | **正则（preg_*）**：vendor pcre2（php-src 8.5.7 pcre2lib）、模式语法/修饰符映射、v1 函数集语义、错误模型决策（编译=异常/运行=返回值协议）、P1–P4 分批 |
 
 ## 技术栈与环境
 

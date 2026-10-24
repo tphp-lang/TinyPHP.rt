@@ -43,7 +43,7 @@ if [ "$TARCH" != "$HOST_ARCH" ]; then
   esac
   echo "tphp build: cross-compile $HOST_ARCH -> $TARCH"
 fi
-INC="-Isrc -Ideps/libuv/include -Ideps/libuv/src -Ideps/mimalloc/include -Ideps/mimalloc/src -Ideps/mbedtls/include -Ideps/mbedtls/library -Ideps/miniz"
+INC="-Isrc -Ideps/libuv/include -Ideps/libuv/src -Ideps/mimalloc/include -Ideps/mimalloc/src -Ideps/mbedtls/include -Ideps/mbedtls/library -Ideps/miniz -Ideps/pcre2"
 
 # libffi: vendored headers OK (arch-independent); libs must be host-arch
 # (never deps/libffi/lib/libffi.a: mingw COFF, see link step)
@@ -171,6 +171,14 @@ done
 # _DEFAULT_SOURCE: glibc exposes ftello/fseeko (MZ_FTELL64/MZ_FSEEK64) only
 # under POSIX feature macros; macOS libc declares them by default
 $CC -w $CFLAGS -D_DEFAULT_SOURCE $INC -c deps/miniz/miniz.c -o "$OBJ/miniz.o"
+
+# ---- pcre2 (vendored php-src pcre2lib; no JIT; PHP source whitelist) ----
+echo "[4b/6] compiling pcre2 (no JIT)..."
+PCRE2_DEFS="-DHAVE_CONFIG_H -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1"
+PCRE2_SRCS="pcre2_auto_possess pcre2_chartables pcre2_compile pcre2_config pcre2_context pcre2_chkdint pcre2_dfa_match pcre2_error pcre2_jit_compile pcre2_maketables pcre2_match pcre2_match_data pcre2_newline pcre2_ord2utf pcre2_pattern_info pcre2_serialize pcre2_string_utils pcre2_study pcre2_substitute pcre2_substring pcre2_tables pcre2_ucd pcre2_valid_utf pcre2_xclass pcre2_find_bracket pcre2_convert pcre2_extuni pcre2_script_run"
+for f in $PCRE2_SRCS; do
+  $CC -w $CFLAGS $PCRE2_DEFS -Ideps/pcre2 -c "deps/pcre2/$f.c" -o "$OBJ/pcre2_$f.o"
+done
 
 # ---- [5/6] tphp sources (src + ext) ----
 echo "[5/6] compiling tphp sources..."

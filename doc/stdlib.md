@@ -102,6 +102,13 @@
 
 名字/条件非法抛 `ValueError`，IO 失败抛 `RuntimeException`；成功返回 `true`。
 
+### 正则（vendor pcre2；见 PLAN/preg.md）
+`preg_match` `preg_match_all` `preg_replace` `preg_split` `preg_grep` `preg_quote` `preg_last_error` `preg_last_error_msg`
+
+- 模式语法对齐 PHP（分隔符/修饰符 `imsxADUuJn`）；编译失败/坏修饰符/坏分隔符 → 异常（PHP 的 Warning 按"诊断即异常"升级）
+- `$matches` 需已初始化数组（无引用，见 PLAN/01 §10）；常量 `PREG_OFFSET_CAPTURE` / `PREG_UNMATCHED_AS_NULL` / `PREG_SET_ORDER` / `PREG_SPLIT_*` / `PREG_GREP_INVERT` / `PREG_*_ERROR` 已内置
+- 后置：`preg_replace_callback`、数组形态 replace、PCRE2 JIT
+
 ### 其他
 `exit`/`die` `spl_autoload_register`
 
