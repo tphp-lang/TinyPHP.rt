@@ -57,6 +57,16 @@ typedef void (*TphpRaiseHook)(const char *ex_class_name,
 extern _Thread_local void *tphp_vm_current;
 extern _Thread_local TphpRaiseHook tphp_raise_hook;
 
+/* ---- frame/slots TLS 池（vm.c；perf-roadmap L1 帧池化）----
+ * 所有 VMFrame 分配/回收必须走这组 API（含 sched 协程根帧、generator），
+ * 保证池内复用与 memset 初始化一致。 */
+struct VMFrame;
+struct VMFrame *tphp_frame_alloc(void);
+void tphp_frame_recycle(struct VMFrame *f);          /* 槽位 TVal 须已释放 */
+struct TVal;
+struct TVal *tphp_slots_alloc(unsigned n);
+void tphp_slots_release(struct TVal *p, unsigned n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -164,11 +164,9 @@ static void build_root_frame(VM *vm, TCont *c) {
             tphp_vm_raise(vm, "Error", "Call to undefined function %s()",
                           tstr_val(nm));
     }
-    VMFrame *f = tm_malloc(sizeof *f);
-    memset(f, 0, sizeof *f);   /* zero gen/… — 协程根帧同样必须初始化 */
+    VMFrame *f = tphp_frame_alloc();   /* 帧池（perf-roadmap L1） */
     f->fn = fn;
-    f->file = fn->file;           /* 根帧源文件：异常归属/raise_file 依赖，
-                                   * tm_malloc 不初始化，漏设会读到已释放填充值 */
+    f->file = fn->file;           /* 根帧源文件：异常归属/raise_file 依赖 */
     /* 可见性作用域：闭包 bindTo/bind 重绑优先，否则声明类（闭包体里访问
      * 声明类的 private 成员依赖它）；按名调用的普通函数无类作用域 */
     TClass *scope = NULL;
@@ -180,7 +178,7 @@ static void build_root_frame(VM *vm, TCont *c) {
     f->called_cls = scope;        /* static:: 后绑定与声明类一致 */
     f->n_calls_at_entry = 0;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = tphp_slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (clo)

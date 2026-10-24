@@ -135,6 +135,18 @@ bool tval_norm_key(TVal *key); /* value.c */
 
 bool tarr_set(TArr *a, TVal key, TVal val) {
     if (!tval_norm_key(&key)) return false;
+    /* L3 键 intern（PHP zend hash 同款）：查找键比较 memcmp → 指针相等；
+     * interned 串不 refcount、addref/release 为 no-op。永久驻留（CLI 单
+     * 进程 ≈ PHP request 级 intern 生命周期）。 */
+    if (key.t == T_STR) {
+        TStr *ks = (TStr *)key.u.p;
+        if (!(ks->h.flags & GC_FLAG_INTERNED))
+            key = TV_STR(tstr_intern(ks->c, ks->len));
+    }
+    /* packed 维护（L2）：仅"连续 append int 键"保持；其余写入打破。
+     * 不变量：packed=true ⇒ data[i] 恒为键 i（i=0..n-1）无洞。 */
+    if (!a->packed || key.t != T_INT || key.u.i != a->next_idx)
+        a->packed = false;
     ABucket *b = arr_find(a, key, NULL);
     if (b) {
         tval_release(&a->data[b->val_off]);
@@ -184,6 +196,13 @@ bool tarr_append(TArr *a, TVal val) {
 
 TVal *tarr_get(TArr *a, TVal key) {
     if (!tval_norm_key(&key)) return NULL;
+    /* packed 快路径（L2）：int 键直取 data[i]，跳过哈希探测 */
+    if (a->packed && key.t == T_INT) {
+        int64_t i = key.u.i;
+        if (i >= 0 && (uint32_t)i < a->n)
+            return &a->data[i];
+        return NULL;
+    }
     ABucket *b = arr_find(a, key, NULL);
     return b ? &a->data[b->val_off] : NULL;
 }
@@ -195,6 +214,7 @@ bool tarr_has(TArr *a, TVal key) {
 
 bool tarr_unset(TArr *a, TVal key) {
     if (!tval_norm_key(&key)) return false;
+    a->packed = false;   /* 洞出现，data 不再连续 */
     ABucket *b = arr_find(a, key, NULL);
     if (!b) return false;
     uint32_t di = b->val_off;
@@ -213,6 +233,7 @@ TArr *tarr_cow(TArr *a) {
     b->free_head = a->free_head;
     b->dcap = a->dcap;
     b->dused = a->dused;
+    b->packed = a->packed;   /* L2：布局不变时快路径同样成立 */
     if (a->dcap) {
         b->data = tm_malloc(sizeof(TVal) * a->dcap);
         /* only copy the initialized prefix; zero the tail (memcpy of

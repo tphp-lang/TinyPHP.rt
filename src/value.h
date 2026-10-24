@@ -118,6 +118,9 @@ typedef struct TArr {
     TVal    *data;
     uint32_t dcap, dused;
     uint32_t free_head;  /* freelist head of free data slots (-1 = none) */
+    /* packed（perf-roadmap L2）：仅追加连续 int 键且无 unset 洞时 true；
+     * 此时 data[i] 恒为键 i 的值（i=0..n-1），tarr_get int 键直取。 */
+    bool packed;
 } TArr;
 
 /* ---- classes & objects (M3; declared here, implemented in class.c) ----

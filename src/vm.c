@@ -249,6 +249,13 @@ void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* frame/slots 池（定义在 generator 桥接前；perf-roadmap L1） */
+static VMFrame *frame_alloc(void);
+static void frame_recycle(VMFrame *f);
+static TVal *slots_alloc(uint32_t n);
+static void slots_release(TVal *p, uint32_t n);
+static void frame_destroy(VMFrame *f);
+
 /* value.c hook: convert engine value errors into exceptions */
 static void vm_value_raise(const char *cls_name, const char *fmt, va_list ap)
     __attribute__((noreturn));
@@ -1577,7 +1584,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
         for (uint16_t i = fn->n_params; i < rec->n_args; i++)
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
     vm->x.n_args = (int)rec->args_base;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     /* 可见性 scope（PHP EG(scope)）优先级：
      *   1. rec->scope_decl = TMethod.decl——普通方法=声明类（B::f() 执行 A
@@ -1596,7 +1603,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     f->n_args_sent = rec->n_args;
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (rec->clo)
@@ -1701,13 +1708,9 @@ static int32_t op_return(VM *vm, TOp *op) {
     }
     VMFrame *f = vm->x.frame;
     struct VMFrame *prev = f->prev;
-    TFunc *fn = f->fn;
-    uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    for (uint32_t i = 0; i < nslots; i++)
-        tval_release(&f->slots[i]);
-    tm_free(f->slots);
-    tm_free(f);
-    if (f == vm->main_frame) vm->main_frame = NULL;   /* 防 global_slot UAF */
+    bool was_main = (f == vm->main_frame);
+    frame_destroy(f);            /* 释放槽位 + 回收进池 */
+    if (was_main) vm->main_frame = NULL;   /* 防 global_slot UAF */
     vm->x.frame = prev;
     if (!vm->x.frame) vm->x.done = true;
     return 0;
@@ -2225,6 +2228,70 @@ static void run_frame_until_pop_deep(VM *vm, VMFrame *f) {
 
 static void frame_destroy(VMFrame *f);
 
+/* ---- frame/slots TLS 池（perf-roadmap L1）----
+ * bench：调用 ~300ns/次，帧分配（head+slots 两次 malloc）为头号嫌疑。
+ * head 定长 freelist；slots 按档 4..256 TVal freelist（>256 直接 malloc）。
+ * 池上限防长寿命泄漏；复用时 memset/初始化循环覆盖脏数据。 */
+#define FP_POOL_MAX 256
+#define SP_CLASS 7   /* 4,8,16,32,64,128,256 */
+static _Thread_local VMFrame *g_fpool;
+static _Thread_local int g_fpool_n;
+static _Thread_local void *g_spool[SP_CLASS];
+static _Thread_local int g_spn[SP_CLASS];
+
+static TVal *slots_alloc(uint32_t n) {
+    if (n == 0) n = 1;
+    int c = 0;
+    uint32_t s = 4;
+    while (s < n && c < SP_CLASS - 1) { s <<= 1; c++; }
+    if (s < n) return tm_malloc(sizeof(TVal) * n);   /* >256：不入池 */
+    if (g_spool[c]) {
+        TVal *p = (TVal *)g_spool[c];
+        g_spool[c] = *(void **)p;   /* 首槽暂存 next */
+        g_spn[c]--;
+        return p;
+    }
+    return tm_malloc(sizeof(TVal) * s);
+}
+
+static void slots_release(TVal *p, uint32_t n) {
+    if (!p) return;
+    if (n == 0) n = 1;
+    int c = 0;
+    uint32_t s = 4;
+    while (s < n && c < SP_CLASS - 1) { s <<= 1; c++; }
+    if (s < n || g_spn[c] >= FP_POOL_MAX) { tm_free(p); return; }
+    *(void **)p = g_spool[c];
+    g_spool[c] = p;
+    g_spn[c]++;
+}
+
+static VMFrame *frame_alloc(void) {
+    VMFrame *f;
+    if (g_fpool) {
+        f = g_fpool;
+        g_fpool = *(VMFrame **)f;
+        g_fpool_n--;
+    } else {
+        f = tm_malloc(sizeof *f);
+    }
+    memset(f, 0, sizeof *f);
+    return f;
+}
+
+static void frame_recycle(VMFrame *f) {
+    if (g_fpool_n >= FP_POOL_MAX) { tm_free(f); return; }
+    *(VMFrame **)f = g_fpool;
+    g_fpool = f;
+    g_fpool_n++;
+}
+
+/* 公共 API（sched.c 协程根帧等使用） */
+VMFrame *tphp_frame_alloc(void) { return frame_alloc(); }
+void tphp_frame_recycle(VMFrame *f) { frame_recycle(f); }
+TVal *tphp_slots_alloc(unsigned n) { return slots_alloc(n); }
+void tphp_slots_release(TVal *p, unsigned n) { slots_release(p, n); }
+
 /* generator.c 桥接（同 tffi 模式） */
 void tphp_vm_frame_destroy(VMFrame *f) { frame_destroy(f); }
 void tphp_vm_run_nested_deep(VM *vm, VMFrame *f) { run_frame_until_pop_deep(vm, f); }
@@ -2253,7 +2320,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     rec->uf = m->fn;
     rec->scope_decl = m->decl;
     TFunc *fn = m->fn;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
                  : ((fn->is_method && fn->decl_cls)
@@ -2267,7 +2334,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     f->called_cls = owner;
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (o) {
@@ -2317,7 +2384,7 @@ static bool call_hook(VM *vm, TOp *op, TObj *o, TStr *pname, TFunc *fn,
     rec->is_thunk = true;
     rec->uf = fn;
     rec->called_cls = o->cls;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->fn = fn;
     f->file = fn->file;
@@ -2329,7 +2396,7 @@ static bool call_hook(VM *vm, TOp *op, TObj *o, TStr *pname, TFunc *fn,
     f->vis_scope = fn->decl_cls ? (TClass *)fn->decl_cls : o->cls;
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     f->slots[0] = TV_OBJ(o);     /* $this（方法形态 slot 0；无捕获） */
@@ -2611,7 +2678,7 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         rec->dst_kind = op->tr;
         rec->dst_slot = op->ar;
         TFunc *fn = rec->uf;
-        VMFrame *f = tm_malloc(sizeof *f);
+        VMFrame *f = frame_alloc();
         memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
         f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
                      : ((fn->is_method && fn->decl_cls)
@@ -2625,7 +2692,7 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         f->n_calls_at_entry = vm->x.n_calls;
         f->gen = NULL;
         uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-        f->slots = tm_malloc(sizeof(TVal) * nslots);
+        f->slots = slots_alloc(nslots);
         for (uint32_t i = 0; i < nslots; i++)
             f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
         f->slots[0] = TV_OBJ(o);   /* $this; transfers the +1 reference */
@@ -3928,8 +3995,8 @@ static void frame_destroy(VMFrame *f) {
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
     for (uint32_t i = 0; i < nslots; i++)
         tval_release(&f->slots[i]);
-    tm_free(f->slots);
-    tm_free(f);
+    slots_release(f->slots, nslots);
+    frame_recycle(f);
 }
 
 /* unwind after a throw: find a handler or pop frames; ends Uncaught at the
@@ -4050,7 +4117,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     rec->uf = fn;
     rec->args_base = (uint32_t)vm->x.n_args;
     rec->is_thunk = true;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = (fn->is_method && fn->decl_cls)
         ? (TClass *)fn->decl_cls : NULL;
@@ -4063,7 +4130,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     f->n_args_sent = 0;
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     /* caller pc is NOT advanced here: thunks are always invoked from
@@ -4280,7 +4347,7 @@ static int32_t op_require(VM *vm, TOp *op) {
     rec->dst_slot = op->ar;
     rec->is_include = true;
 
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… */
     f->fn = inc->main;
     f->file = name_copy;
@@ -4290,7 +4357,7 @@ static int32_t op_require(VM *vm, TOp *op) {
     f->n_args_sent = 0;
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)inc->main->n_locals + inc->main->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     vm->x.frame->pc++;
@@ -4409,7 +4476,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
         if (vm->x.exception) vm_unwind_jump(vm);
         return;
     }
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fnc;
@@ -4420,7 +4487,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
     f->called_cls = NULL;         /* no class scope for autoloaders */
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fnc->n_locals + fnc->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (clo)
@@ -4967,7 +5034,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         rec->is_thunk = true;
         rec->uf = fn;
         rec->args_base = base;
-        VMFrame *f = tm_malloc(sizeof *f);
+        VMFrame *f = frame_alloc();
         memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
         f->fn = fn;
@@ -4979,7 +5046,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         f->n_calls_at_entry = vm->x.n_calls;
         f->gen = NULL;
         uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-        f->slots = tm_malloc(sizeof(TVal) * nslots);
+        f->slots = slots_alloc(nslots);
         for (uint32_t i = 0; i < nslots; i++)
             f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
         f->slots[0] = TV_OBJ(recv);
@@ -5014,7 +5081,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     rec->is_thunk = true;            /* RETURN stores into thunk_ret */
     rec->uf = fn;
     rec->args_base = base;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fn;
@@ -5030,7 +5097,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
                   : (clo ? (TClass *)clo->fn->decl_cls : NULL);
     f->n_calls_at_entry = vm->x.n_calls;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     if (clo)
@@ -5062,7 +5129,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     tphp_raise_hook = vm_value_raise;
     tphp_tostr_hook = vm_tostring_hook;
     TFunc *fn = clo->fn;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fn;
@@ -5074,7 +5141,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     f->called_cls = NULL;
     f->n_calls_at_entry = 0;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     for (uint16_t i = 0; i < clo->n_cap; i++) {
@@ -5098,7 +5165,7 @@ int tphp_vm_run(Program *prog) {
     tphp_vm_current = vm;
     tphp_raise_hook = vm_value_raise;
     tphp_tostr_hook = vm_tostring_hook;
-    VMFrame *f = tm_malloc(sizeof *f);
+    VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = prog->main;
@@ -5110,7 +5177,7 @@ int tphp_vm_run(Program *prog) {
     f->called_cls = NULL;         /* main frame: global scope */
     f->n_calls_at_entry = 0;
     uint32_t nslots = (uint32_t)prog->main->n_locals + prog->main->n_tmps;
-    f->slots = tm_malloc(sizeof(TVal) * nslots);
+    f->slots = slots_alloc(nslots);
     for (uint32_t i = 0; i < nslots; i++)
         f->slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     vm->x.frame = vm->main_frame = f;

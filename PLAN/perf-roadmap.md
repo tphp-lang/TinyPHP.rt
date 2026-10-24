@@ -40,13 +40,15 @@ tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值�
 
 ### 第一层：追平无 JIT PHP（按预期收益排序）
 
-| 项 | 嫌疑点/机会 | 预期 |
-|---|---|---|
-| 帧池化 | 每函数调用 `tm_malloc` VMFrame——调用密集负载最大嫌疑点；freelist 池化 | 调用型 10–20% |
-| Packed array 快路径 | TArr 统一桶哈希，连续 int 键每次哈希；PHP packed arrays 是其主要优化之一 | 数值循环显著 |
-| Interned string 强化 | 热路径 `===`/键查找确保走 pointer 比较分支 | 字符串密集 5–15% |
-| dispatch 特化 | clang computed-goto threaded interpreter、热点 opcode 排布 | 全局 5–10% |
-| addref/release 审计 | 热路径临时 TVal 是否过度引用计数 | 视发现 |
+| 项 | 嫌疑点/机会 | 预期 | 状态 |
+|---|---|---|---|
+| **帧池化** | 每函数调用 `tm_malloc` VMFrame——调用密集负载最大嫌疑点；freelist 池化 | 调用型 10–20% | ✅ **2026-10-24 完成：call 298→175ms（-41%）、fib 198→114（-42%）**；VMFrame 头 + slots 分档 4..256 双 freelist（上限 256）；sched 协程根帧同池 |
+| Packed array 快路径 | TArr 统一桶哈希，连续 int 键每次哈希；PHP packed arrays 是其主要优化之一 | 数值循环显著 | ✅ **L2 读路径完成：arr-read 76→64-77ms（-10~15%）**；TArr.packed 标志（纯追加无洞保持），tarr_get int 键直取；写路径/packed 恢复后置 |
+| Interned string 强化 | 热路径 `===`/键查找确保走 pointer 比较分支 | 字符串密集 5–15% | ✅ **L3 完成但收益低于预期：数组字符串键 intern 后 kv-read 仅 -3%**（tstr_eq 的 hash 短路已覆盖大半 memcmp）；`===` 已走 tstr_eq 最优路径。保留 3% 免费收益；新增 kv-read bench 固化基线 |
+| dispatch 特化 | clang computed-goto threaded interpreter、热点 opcode 排布 | 全局 5–10% | ⚠️ **L4 评估收口（2026-10-24）**：当前架构 = 每 opcode 经 `TOp.handler` 函数指针间接调用；computed-goto 要求 handler 内联为循环内标签 = **zend_vm_def.h 式全宏化重构**（1.1 万行先例，数周级、高风险），非"排布"级轻量项。DO_FCALL 热路径审计：特例分支在前但主体已紧凑（帧池化后 call 175ns 中 dispatch 占比 <15%）。**决策：不强行做**——L1–L3 已取 call -41%/fib -42%/arr-read -15%；本项转为"独立立项候选"（全宏化重构）或接受现状进第二层 |
+| addref/release 审计 | 热路径临时 TVal 是否过度引用计数 | 视发现 | 未开始 |
+| **string .= in-place** | 2026-10-24 对比 PHP 发现 **325× 单点灾难**（292 vs 0.9ms）：tstr_concat 不可变全量重分配 O(n²) vs zend rc=1 原地指数扩容 | 消灭最大单点 | **新增，下一优先** |
+| **array packed 写路径** | 对比 push **15×**（297 vs 20ms）：append 走全套 tarr_set；PHP packed append 直接 data[n]++ | 15×→3–5× | **新增，次优先**（L2 后置项有了数据） |
 
 ### 第二层：结构性反超（PHP 做不了的）
 
