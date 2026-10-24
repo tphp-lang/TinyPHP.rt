@@ -51,15 +51,31 @@ echo "hello\n";
 3. 跑 `run.ps1` 或 `tphp test tests/<dir>`
 4. **纯 ASCII，UTF-8 无 BOM**（中文注释曾导致换行被吞的坑）
 
-## 基准（bench）
+## 基准（bench，11 项）
 
 ```bash
-./build/tphp run tests/bench/test-bench-fib.php
+./build/tphp.exe run tests/bench/test-bench-fib.php
 # stdout: fib28=317811（恒定）
 # stderr: BENCH fib(28) = 123.4 ms（回归基线）
 ```
 
-结果断言恒定；耗时打 stderr 不进 EXPECT。
+结果断言恒定；耗时打 stderr 不进 EXPECT。分类覆盖（perf-roadmap §3 判据 3；方法论对齐 Bun：分类微基准，真实负载样本另行）：
+
+| 文件 | 覆盖 |
+|---|---|
+| `test-bench-fib.php` | 递归调用密集 fib(28) |
+| `test-bench-call.php` | 空函数+方法调用 1e6（调用开销基线） |
+| `test-bench-array-push.php` | 数组追加 1e6 |
+| `test-bench-array-read.php` | packed 顺序读 1e6 |
+| `test-bench-array-rmw.php` | 读改写 1e5 |
+| `test-bench-string.php` | 拼接+查找+substr（字符串密集） |
+| `test-bench-exception.php` | throw/catch 1e5（异常路径） |
+| `test-bench-coroutine.php` | spawn/await 1e4（协程切换） |
+| `test-bench-serialize.php` | serialize/unserialize 2e3 |
+| `test-bench-json.php` | json enc+dec 2e3 |
+| `test-bench-object.php` | new+method+dtor 1e5（对象生命周期） |
+
+2026-10-23 基线（Windows x86_64，仅供相对回归，跨机不可比）：call 298 / string 298 / json 294 / push 291 / fib 198 / throw 154 / serialize 113 / spawn 82 / arr-read 76 / new-dtor 65 / rmw 43（ms）。初步读数：调用 ~300ns/次（帧分配为头号嫌疑）、协程切换 ~8μs/次、packed 读 ~76ns/次。
 
 ## php-compat 对拍
 
