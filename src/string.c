@@ -69,6 +69,19 @@ TStr *tstr_concat(TStr *a, TStr *b) {
     return s;
 }
 
+/* `.=` in-place（perf-roadmap）：dst 唯一引用且有预留容量时原地追加。
+ * 仅限 T_STR 源（$s .= $x 主循环场景）；成功后 dst 原地生效、无需写回。 */
+bool tstr_append_inplace(TStr *dst, const char *s, size_t n) {
+    if (dst->h.flags & (GC_FLAG_INTERNED | GC_FLAG_MFCC)) return false;
+    if (dst->h.rc != 1) return false;
+    if ((uint64_t)dst->len + n > (uint64_t)dst->cap) return false;
+    memcpy(dst->c + dst->len, s, n);
+    dst->len += (uint32_t)n;
+    dst->c[dst->len] = 0;
+    dst->hash = 0;   /* 内容变了，失效缓存哈希 */
+    return true;
+}
+
 /* ---- number -> string, PHP 8 semantics (echo/print/var_dump) ---- */
 TStr *tphp_int_to_str(int64_t i) {
     char buf[32];

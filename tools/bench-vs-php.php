@@ -43,13 +43,15 @@ bench("array-read 1e6", function () {
 });
 
 bench("kv-read 1.6e6", function () {
+    // 变量键：常量键会被 Zend optimizer 间歇性整段折叠（进程间双态 ~22ms/~1.7ms，已实测）
     $m = ["alpha" => 1, "beta" => 2, "gamma" => 3, "delta" => 4,
           "epsilon" => 5, "zeta" => 6, "eta" => 7, "theta" => 8];
+    $keys = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
     $sum = 0;
     for ($r = 0; $r < 200000; $r++) {
-        $sum += $m["alpha"] + $m["beta"] + $m["gamma"] + $m["delta"]
-              + $m["epsilon"] + $m["zeta"] + $m["eta"] + $m["theta"];
+        for ($k = 0; $k < 8; $k++) $sum += $m[$keys[$k]];
     }
+    if ($sum !== 7200000) echo "kv-FAIL\n";
 });
 
 bench("string 4e4", function () {

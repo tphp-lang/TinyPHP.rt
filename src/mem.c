@@ -65,13 +65,17 @@ static void gc_unregister(GCHead *h) {
 
 /* ---- string allocation (used by string.c) ---- */
 TStr *tstr_alloc_raw(uint32_t len, bool interned) {
-    TStr *s = tm_malloc(sizeof(TStr) + (size_t)len + 1);
+    /* 非 interned 预留尾部余量（.=` in-place 扩容，perf-roadmap；zend
+     * zend_string rc=1 原地增长同思路）。interned 只读 cap=len。 */
+    uint32_t cap = interned ? len : (len < 64 ? 96 : len + len / 2 + 32);
+    TStr *s = tm_malloc(sizeof(TStr) + (size_t)cap + 1);
     s->h.rc = 1;
     s->h.color = GC_COLOR_UNMARKED;
     s->h.kind = GC_KIND_STR;
     s->h.flags = interned ? GC_FLAG_INTERNED : 0;
     s->len = len;
     s->hash = 0;
+    s->cap = cap;
     s->c[len] = 0;
     if (!interned) gc_register(&s->h);
     return s;

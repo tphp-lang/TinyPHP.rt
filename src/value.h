@@ -98,8 +98,9 @@ typedef struct TClosure {
 void tclo_free(TClosure *c);   /* mem.c */
 void tex_free(TExObj *x);
 
-/* ---- string: immutable, NUL-terminated for C interop ---- */
-typedef struct TStr { GCHead h; uint32_t len; uint32_t hash; char c[]; } TStr;
+/* ---- string: immutable, NUL-terminated for C interop ----
+ * cap：分配容量（>.=` in-place 用；0=len 精确分配）。interned 只读 cap=len。 */
+typedef struct TStr { GCHead h; uint32_t len; uint32_t hash; uint32_t cap; char c[]; } TStr;
 
 /* ---- array: insertion-ordered hash map (PHP array semantics) ----
  * data[] holds values in insertion order; free slots hold T_NULL with the
@@ -279,6 +280,8 @@ int64_t gc_collect(void);
 TStr  *tstr_new(const char *s, size_t len);        /* heap string */
 TStr  *tstr_intern(const char *s, size_t len);     /* program-lifetime string */
 TStr  *tstr_concat(TStr *a, TStr *b);              /* new heap string */
+/* `.=` in-place：dst 唯一引用且 cap 够时原地追加（perf-roadmap）；成功 true */
+bool   tstr_append_inplace(TStr *dst, const char *s, size_t n);
 uint32_t tstr_hash(TStr *s);
 static inline size_t tstr_len(const TStr *s) { return s->len; }
 static inline const char *tstr_val(const TStr *s) { return s->c; }

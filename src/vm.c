@@ -458,7 +458,23 @@ BIN_HANDLER(op_mul, tval_mul)
 BIN_HANDLER(op_div, tval_div)
 BIN_HANDLER(op_mod, tval_mod)
 BIN_HANDLER(op_pow, tval_pow)
-BIN_HANDLER(op_concat, tval_concat)
+/* op_concat 专用（非宏）：`.=` 同槽快路——dst TStr 唯一引用且有 cap 余量
+ * 时原地追加（zend rc=1 同思路；perf-roadmap 325× string 灾难修复）。
+ * 原地成功 = 槽内值已更新，直接 return 1（勿 wtake——会 release 正在用的串）。 */
+static int32_t op_concat(VM *vm, TOp *op) {
+    TVal a = rdv(vm, op, 1);
+    TVal b = rdv(vm, op, 2);
+    if (a.t == T_STR && b.t == T_STR &&
+        op->t1 == op->tr && op->a1 == op->ar) {   /* dst 与 o1 同槽（.=/s=s.x） */
+        TStr *dst = (TStr *)a.u.p;
+        TStr *bs = (TStr *)b.u.p;
+        if (tstr_append_inplace(dst, bs->c, bs->len))
+            return 1;
+    }
+    TVal r = tval_concat(a, b);
+    wtake(vm, op, r);
+    return 1;
+}
 BIN_HANDLER(op_bw_and, tval_band)
 BIN_HANDLER(op_bw_or, tval_bor)
 BIN_HANDLER(op_bw_xor, tval_bxor)

@@ -85,23 +85,27 @@ echo "hello\n";
 
 ## 对比 PHP 8.5.1（2026-10-24，同脚本 tools/bench-vs-php.php）
 
-环境：Windows x86_64；PHP 8.5.1 NTS（opcache 开/JIT=disable 为公平参照）；tphp = L1–L3 后。JIT tracing 列仅参考（微基准下预热都不够，无感）。
+环境：Windows x86_64；PHP 8.5.1 NTS；**三方口径**：tphp / PHP（`opcache.enable_cli=1`，JIT 关）/ PHP+JIT（`opcache.jit=tracing`、`jit_buffer_size=128M`，已验证 status.jit.enabled）。tphp = L1–L3 + string .= in-place 后。
 
-| 基准 | tphp | PHP(无JIT) | 差距 |
-|---|---|---|---|
-| fib(28) | 109.3 | 29.3 | 3.7× |
-| call 1e6（闭包） | 82.8 | 30.5 | 2.7× |
-| array-push 1e6 | 296.8 | 20.1 | **14.8×** |
-| array-rmw 1e5 | 15.3 | 1.9 | **8.1×** |
-| array-read 1e6 | 66.1 | 17.5 | 3.8× |
-| kv-read 1.6e6 | 78.0 | 22.6 | 3.5× |
-| **string .= 4e4** | **292.4** | **0.9** | **325×** ⚠️ |
-| throw/catch 1e5 | 109.9 | 30.4 | 3.6× |
-| serialize 2e3 | 114.1 | 50.2 | 2.3× |
-| json 2e3 | 301.0 | 198.0 | 1.5× |
-| object 1e5 | 46.1 | 9.9 | 4.7× |
+| 基准 | tphp | PHP | PHP+JIT | vs 无JIT | vs JIT |
+|---|---|---|---|---|---|
+| fib(28) | 114.7 | 26.5 | 10.9 | 4.3× | 10.5× |
+| call 1e6（闭包） | 82.7 | 30.6 | 5.6 | 2.7× | 14.8× |
+| array-push 1e6 | 295.4 | 21.5 | 11.5 | 13.7× | **25.7×** |
+| array-rmw 1e5 | 10.3 | 2.1 | 1.8 | 4.9× | 5.7× |
+| array-read 1e6 | 64.9 | 13.0 | 2.6 | 5.0× | **25.0×** |
+| kv-read 1.6e6（变量键） | 160.2 | 34.4 | 7.2 | 4.7× | 22.3× |
+| string .= 4e4 | 2.1 | 1.4 | 1.2 | 1.5× | 1.8× |
+| throw/catch 1e5 | 112.8 | 31.8 | 30.2 | 3.5× | 3.7× |
+| serialize 2e3 | 121.7 | 51.8 | 55.4 | 2.3× | 2.2× |
+| json 2e3 | 310.3 | 198.7 | 199.7 | 1.6× | 1.6× |
+| object 1e5 | 51.9 | 9.5 | 7.3 | 5.5× | 7.1× |
 
-**发现**：① `string .=` 是 325× 单点灾难——tstr_concat 不可变全量重分配（O(n²)）vs zend_string rc=1 原地扩容；② array-push 15× = packed 写路径（L2 后置项，现有数据支撑）；③ 解释器正常差距带 2.7–4.7×；json/serialize 已 1.5–2.3×。**下一步**：`.=` in-place 优化 → packed 写路径。
+**结论**（详表与路线见 [../PLAN/perf-roadmap.md](../PLAN/perf-roadmap.md) §1.1）：JIT 不敏感簇（string/throw/serialize/json）1.6–3.7× 靠解释器关闭；JIT 敏感簇（fib/call/push/read/kv/rmw/object）vs JIT 5.7–25.7×，唯一通路 = 自研 IR JIT。
+
+**历史修正**：①早期"JIT 微基准无感"是 CLI 未开 `opcache.enable_cli` 导致 JIT 从未点火——实测 fib/call/arr-read 提升 2.4–5.5×；②kv-read 常量键形态会被 Zend optimizer 间歇性整段折叠（进程间双态 ~22ms/~1.7ms，结果仍正确，`optimization_level=0` 后恒慢态；JIT 全程 false）——**跨运行时 bench 禁用"常量键+无副作用求和"形态**，已改变量键+校验。
+
+2026-10-24 `.=` in-place 修复：**string 292.4→2.1ms**——TStr 加 cap 预留（非 interned：len<64→96 否则 +50%），op_concat 同槽快路 `tstr_append_inplace`（rc==1 且非 interned 原地追加；成功不走 wtake 防自释放）。
 
 ## php-compat 对拍
 

@@ -12,13 +12,45 @@
 
 tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值语义 TVal，无 IS_REFERENCE 别名棱角）、无 symbol_table 历史、帧结构简单、单二进制无 SAPI/opcache 固定开销、无色协程（PHP 无等价物）。
 
+### 1.1 三方差距基线（2026-10-24 实测，tools/bench-vs-php.php）
+
+PHP 侧：8.5.1 NTS + `opcache.enable_cli=1`；JIT 列 = `opcache.jit=tracing` + `jit_buffer_size=128M`（已验证 status.jit.enabled=1）。kv-read 已改**变量键**（常量键会被 Zend optimizer 间歇性整段折叠，见 §1.2）。
+
+| 基准 | tphp | PHP | PHP+JIT | vs 无JIT | vs JIT |
+|---|---|---|---|---|---|
+| fib(28) | 114.7 | 26.5 | 10.9 | 4.3× | **10.5×** |
+| call 1e6（闭包） | 82.7 | 30.6 | 5.6 | 2.7× | **14.8×** |
+| array-push 1e6 | 295.4 | 21.5 | 11.5 | 13.7× | **25.7×** |
+| array-rmw 1e5 | 10.3 | 2.1 | 1.8 | 4.9× | **5.7×** |
+| array-read 1e6 | 64.9 | 13.0 | 2.6 | 5.0× | **25.0×** |
+| kv-read 1.6e6（变量键） | 160.2 | 34.4 | 7.2 | 4.7× | **22.3×** |
+| string .= 4e4 | 2.1 | 1.4 | 1.2 | 1.5× | 1.8× |
+| throw/catch 1e5 | 112.8 | 31.8 | 30.2 | 3.5× | 3.7× |
+| serialize 2e3 | 121.7 | 51.8 | 55.4 | 2.3× | 2.2× |
+| json 2e3 | 310.3 | 198.7 | 199.7 | 1.6× | 1.6× |
+| object 1e5 | 51.9 | 9.5 | 7.3 | 5.5× | **7.1×** |
+
+**差距两簇（决定路线分工）**：
+
+- **JIT 不敏感簇**（string 1.8× / throw 3.7× / serialize 2.2× / json 1.6×）：Zend JIT 帮不上（C 实现/异常路径为主）→ 解释器与 C 引擎工程即可关闭，天然"≥JIT PHP"地板
+- **JIT 敏感簇**（fib 10.5× / call 14.8× / push 25.7× / read 25× / kv 22× / rmw 5.7× / object 7.1×）：无 JIT PHP 自己就快 tphp 2.7–14× → **解释器优化物理到不了，唯一通路 = §5 自研 JIT**
+
+**更正旧结论**："JIT tracing 微基准无感"是**测错了**——CLI 未开 `opcache.enable_cli`，JIT 从未点火。实测 JIT 对 fib（26.5→10.9）、call（30.6→5.6）、arr-read（13.0→2.6）提升 2.4–5.5×。
+
+### 1.2 bench 方法论教训（Zend optimizer 双态）
+
+kv-read 常量键形态在 opcache 开/JIT 关下**进程间双态**：约一半进程 ~22ms（真查表），另一半 ~1.7ms（optimizer 整段折叠成常量加法，结果仍正确；`opcache.optimization_level=0` 后恒为慢态）。JIT status 全程 false，file_cache 未启用——是 Zend optimizer 自身的非确定行为（疑似 ASLR 相关 pass 次序）。**约束：跨运行时对比 bench 禁止依赖常量键+无副作用的求和形态**；kv-read 已改变量键+校验（tphp 变量键路径 160ms ≈ 常量键 68.6 的 2.3×——tphp 无"opcode 内缓存字面量键 hash"优化，记为解释器候选项）。
+
 ## 2. 参照系（三层，防混淆）
+
+> **2026-10-24 目标升级（用户拍板）**：性能目标 = **持平或超越 JIT PHP**。
+> 解释器优化（本节第一/二层）物理到不了 JIT 级别——唯一路径是 §5 的自研字节码 JIT（IR 框架）。第一二层价值重定位：①热身（JIT 未覆盖路径/deopt 回退的下限）②启动与短脚本（无预热）③JIT 前的基建（帧池/字符串 cap 都被 JIT 代码路径复用）。
 
 | 层 | 参照物 | 目标 |
 |---|---|---|
-| 纯 VM 吞吐 | **Zend（opcache 开、JIT 关）** | 追平 0.8–1.2x（第一层优化）→ 结构性反超 1.2–2x（第二层） |
+| 纯 VM 吞吐 | **Zend（opcache 开、JIT 关）** | 追平 0.8–1.2x（第一层优化）→ 结构性反超 1.2–2x（第二层）——**降级为 JIT 未命中路径的下限保障** |
 | 运行时工程层 | **Bun**（安装/IO/bench 方法论，非引擎） | 见 §6 |
-| 超越"开 JIT 的 PHP" | **IR 自研字节码 JIT**（§5）+ 姊妹 AOT 分工 | 远期主路径，时机见 §3 |
+| 超越"开 JIT 的 PHP" | **IR 自研字节码 JIT**（§5）+ 姊妹 AOT 分工 | **主目标**（2026-10-24 起）；现实里程碑：baseline JIT 先达"无追踪 JIT PHP 的 ±20%"，再冲击持平/超越 |
 
 **排除性结论（防翻案）**：
 - ❌ 借壳 JSC/JSC JIT——JIT 不可剥离语言引擎（JSC 编译 JS 字节码，与 JSValue/JSCell 对象模型耦合）；"PHP→JS 转译"是 HipHop for PHP 用十年验证过的死路（语义保真灾难 + Facebook 官方放弃 PHP 兼容）
@@ -47,8 +79,9 @@ tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值�
 | Interned string 强化 | 热路径 `===`/键查找确保走 pointer 比较分支 | 字符串密集 5–15% | ✅ **L3 完成但收益低于预期：数组字符串键 intern 后 kv-read 仅 -3%**（tstr_eq 的 hash 短路已覆盖大半 memcmp）；`===` 已走 tstr_eq 最优路径。保留 3% 免费收益；新增 kv-read bench 固化基线 |
 | dispatch 特化 | clang computed-goto threaded interpreter、热点 opcode 排布 | 全局 5–10% | ⚠️ **L4 评估收口（2026-10-24）**：当前架构 = 每 opcode 经 `TOp.handler` 函数指针间接调用；computed-goto 要求 handler 内联为循环内标签 = **zend_vm_def.h 式全宏化重构**（1.1 万行先例，数周级、高风险），非"排布"级轻量项。DO_FCALL 热路径审计：特例分支在前但主体已紧凑（帧池化后 call 175ns 中 dispatch 占比 <15%）。**决策：不强行做**——L1–L3 已取 call -41%/fib -42%/arr-read -15%；本项转为"独立立项候选"（全宏化重构）或接受现状进第二层 |
 | addref/release 审计 | 热路径临时 TVal 是否过度引用计数 | 视发现 | 未开始 |
-| **string .= in-place** | 2026-10-24 对比 PHP 发现 **325× 单点灾难**（292 vs 0.9ms）：tstr_concat 不可变全量重分配 O(n²) vs zend rc=1 原地指数扩容 | 消灭最大单点 | **新增，下一优先** |
-| **array packed 写路径** | 对比 push **15×**（297 vs 20ms）：append 走全套 tarr_set；PHP packed append 直接 data[n]++ | 15×→3–5× | **新增，次优先**（L2 后置项有了数据） |
+| **string .= in-place** | 2026-10-24 对比 PHP 发现 **325× 单点灾难**（292 vs 0.9ms）：tstr_concat 不可变全量重分配 O(n²) vs zend rc=1 原地指数扩容 | 消灭最大单点 | ✅ **完成：292→2.2ms（-99%，vs PHP 2.4×）**；TStr.cap 预留 + op_concat 同槽 tstr_append_inplace（rc==1 原地，成功不 wtake） |
+| **array packed 写路径** | 三方对比坐实：push vs 无JIT **13.7×**、vs JIT **25.7×**（297 vs 21.5/11.5ms）：append 走全套 tarr_set；PHP packed append 直接 data[n]++ | 13.7×→3–5× | **最高优先解释器项**（vs-JIT 目标下与 §5 并列必做——JIT 不敏感簇之外的最大单点） |
+| **字面量键 hash 缓存** | kv-read 变量键 160ms vs 常量键 68.6ms（2.3×）；PHP 在 opcode 里预存字面量键 hash，tphp 每次重哈希 | kv 类 30–50% | 新增候选项（L3 键 intern 的读侧补完） |
 
 ### 第二层：结构性反超（PHP 做不了的）
 
@@ -88,9 +121,13 @@ tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值�
 - DynASM 构建步骤进 build 脚本（fiber 汇编同款先例）
 - deopt 是 JIT 最难两块之一（v1 靠"入口 guard + 失败弃用 JIT 回解释器"简化）
 
-### 5.4 时机
+### 5.4 时机与 spike 结果
 
-§3 判据满足后立 JIT 专项（先出 opcode→IR lowering 规格）；可选前置 spike（半天）：vendor `deps/ir/` + 跑通自带 bench + 手写 fib 打样，消除构建风险。
+§3 判据满足后立 JIT 专项（先出 opcode→IR lowering 规格）。**spike 已完成（2026-10-24，tools/ir_spike_fib.c）**：
+
+- vendor `deps/ir/`（dstogov/ir）；IR 对象隔离放 `build/obj_ir/`（**勿进 build/obj/**——全量 build.cmd 链 `*.o`，ir_spike.o 的 main 与 src_main 冲突）；无 libgcc 环境需 `tools/chkstk_stub.S`（__chkstk 探测桩，clang 动态 alloca 会引用）
+- fib(28)=317811 正确；**IR baseline JIT 1.2ms / 65 字节机器码**，同机对比：tphp 解释 114.7 / PHP 解释 26.5 / **PHP tracing JIT 10.9**——**手写 int64 IR 比 Zend tracing JIT 快 9×**（tracing 对递归 fib 有追踪/回退开销；平坦原生递归直接赢）
+- 结论：后端质量疑问消除——胜负全在 tphp 的 opcode→IR lowering + TVal guard 质量；§2 主目标路线可行性从"纸面"升级为"已验证后端"
 
 ## 6. Bun 可借鉴清单（引擎外工程层）
 
@@ -105,13 +142,18 @@ tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值�
 | Benchmark 方法论 | 真实负载（oha/真实应用）+ 微基准并列；多运行时同脚本；反 ab/autocannon | bench 扩充（§3 判据 3）按此约定 | **现在** |
 | 分级 trace | BUN_TRACE 编译期常量埋点，禁用零开销 + tracy | tphp 的 TPHP_TRACE 是逐指令级（太重）；做 profiler 时学埋点式 | profiler 时 |
 
-## 7. 行动顺序（汇总）
+## 7. 行动顺序（2026-10-24 对齐"持平/超越 JIT PHP"目标）
 
-1. **现在**：bench 套件扩充 + CI（§3 判据 3；方法论按 §6 Bun 约定）——可与功能批次并行
-2. **功能阈值**：C 小语法包 → 生成器 → `preg_*`（[01 §12](01-syntax-spec.md)）
-3. **解释器优化窗口**：§4 第一层（帧池化/packed array 起步）
-4. **JIT 立项**：spike（vendor IR）→ opcode→IR lowering 规格 → baseline JIT 实现
-5. **随 M7**：HTTP server 按 §6 零拷贝设计立项；pkg 缓存按 Bun 模式立项
+> 已完成不再列：bench 套件（§3 判据 3）、C 语法包/生成器/preg（功能阈值）、L1 帧池化 + L2 packed 读 + L3 键 intern + string .= in-place。
+
+1. **解释器地板（进行中）**：目标 = 关闭 JIT 不敏感簇剩余单点 + 为 JIT 未命中路径立下限
+   - array packed 写路径（push vs JIT 25.7×，§4 最高优先）
+   - 字面量键 hash 缓存（kv 2.3× 形态差，§4 新项）
+   - object（7.1×）/throw（3.7×）路径审计
+   - 收口：当前未提交批次（string .= in-place + 本节文档）
+2. **JIT 立项（地板项完成后立即，两线可部分并行）**：半天 spike（vendor `deps/ir/` + fib 打样，§5.4）→ opcode→IR lowering 规格 → baseline JIT v1（函数级、int/call 热路径、入口 guard + deopt 回解释器）
+3. **里程碑门**：M1 = JIT 敏感簇 vs 追踪 JIT ≤2×（先杀 fib/call/read）；M2 = 全套件几何均值 ≥1.0×（持平）；M3 = 敏感簇反超（tphp 纯值 TVal guard 更干净的结构性红利兑现）
+4. **随 M7**：HTTP server 按 §6 零拷贝设计立项；pkg 缓存按 Bun 模式立项（与 1–3 并行不阻塞）
 
 ## 8. 不做清单（防翻案）
 
@@ -119,6 +161,6 @@ tphp 的**结构性优势**（PHP 因包袱做不到）：无 `&$ref`（纯值�
 |---|---|
 | 借壳 JSC/V8 等现成 JS 引擎 JIT | JIT 与语言引擎对象模型深度耦合，不可剥离 |
 | PHP→JS/WASM 转译 | HipHop 十年验证的死路（语义保真灾难） |
-| 追平"开 JIT 的 Zend"作为近期目标 | 远期走 IR 自研 JIT（§5），近期目标是无 JIT Zend |
+| 用纯解释器优化去追平"开 JIT 的 Zend" | 解释器物理到不了 JIT 级（§1.1 两簇数据）；唯一通路 = IR 自研 JIT（§5），解释器优化只做地板与 JIT 未命中下限 |
 | io_uring 抢先接入 | 业界（含 Bun）未解决通用异步文件 IO，线程卸载够用 |
 | 为性能提前牺牲语义兼容 | 对拍层是护城河；优化在语义冻结后 |
