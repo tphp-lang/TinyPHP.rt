@@ -1,0 +1,40 @@
+--TEST--
+003: vector BITCAST uint8 round trip
+--ARGS--
+--run
+--CODE--
+extern func printf(uintptr_t, ...): int32_t;
+func vec8_to_int(<int8_t*1>): uint8_t
+{
+	l_1 = START(l_3);
+	<int8_t*1> v = PARAM(l_1, "v", 1);
+	uint8_t ret = BITCAST(v);
+	l_3 = RETURN(l_1, ret);
+}
+func int_to_vec8(uint8_t): <int8_t*1>
+{
+	l_1 = START(l_4);
+	uint8_t x = PARAM(l_1, "x", 1);
+	<int8_t*1> ret = BITCAST(x);
+	l_4 = RETURN(l_1, ret);
+}
+func main(void): int32_t
+{
+	int32_t c_0 = 0;
+	int32_t c_1 = 1;
+	uint64_t c_0x12 = 0x12;
+	uintptr_t c_printf = func printf(uintptr_t, ...): int32_t;
+	uintptr_t c_fmt = "0x%x 0x%x\n";
+	uintptr_t c_vec8_to_int = func vec8_to_int(<int8_t*1>): uint8_t;
+	uintptr_t c_int_to_vec8 = func int_to_vec8(uint8_t): <int8_t*1>;
+	l_1 = START(l_5);
+	<int8_t*1> vx, l_2 = CALL/1(l_1, c_int_to_vec8, c_0x12);
+	uint8_t r_1, l_3 = CALL/1(l_2, c_vec8_to_int, vx);
+	int8_t r_2 = EXTRACT(vx, c_0);
+	uint32_t t_1 = ZEXT(r_1);
+	uint32_t t_2 = SEXT(r_2);
+	l_4 = CALL/3(l_3, c_printf, c_fmt, t_1, t_2);
+	l_5 = RETURN(l_4, c_0);
+}
+--EXPECT--
+0x12 0x12

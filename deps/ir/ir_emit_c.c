@@ -1,0 +1,1511 @@
+/*
+ * IR - Lightweight JIT Compilation Framework
+ * (C code generator)
+ * This file is part of the IR Project distributed under the MIT-style LICENSE.
+ * Authors: Dmitry Stogov <dmitry@php.net>
+ */
+
+#include "ir.h"
+#include "ir_private.h"
+
+#define IR_TYPE_TNAME(name, type, field, flags) #field,
+
+static const char *ir_type_tname[IR_LAST_TYPE] = {
+	NULL,
+	IR_TYPES(IR_TYPE_TNAME)
+};
+
+typedef struct _ir_c_backend_data {
+	const char        *func_name;
+	bool               resolved_label_syms;
+} ir_c_backend_data;
+
+static int ir_add_tmp_type(ir_ctx *ctx, uint8_t type, ir_ref from, ir_ref to, void *data)
+{
+	if (from == 0) {
+		ir_bitset tmp_types = data;
+
+		ir_bitset_incl(tmp_types, type);
+	}
+	return 1;
+}
+
+static void ir_resolve_label_syms(ir_ctx *ctx)
+{
+	uint32_t b;
+	ir_block *bb;
+
+	for (b = 1, bb = &ctx->cfg_blocks[b]; b <= ctx->cfg_blocks_count; bb++, b++) {
+		ir_insn *insn = &ctx->ir_base[bb->start];
+
+		if (insn->op == IR_BEGIN && insn->op2) {
+			IR_ASSERT(ctx->ir_base[insn->op2].op == IR_LABEL);
+			ctx->ir_base[insn->op2].val.u32_hi = b;
+		}
+	}
+}
+
+static void ir_emit_c_type_name(ir_type type, FILE *f)
+{
+	if (IR_IS_TYPE_VECTOR(type)) {
+		fprintf(f, "%s __attribute__((__vector_size__(%d)))",
+			ir_type_cname[IR_VECTOR_BASE_TYPE(type)], IR_VECTOR_SIZE(type));
+	} else {
+		fprintf(f, "%s", ir_type_cname[type]);
+	}
+}
+
+static bool ir_emit_c_call_conv(FILE *f, uint32_t flags)
+{
+	switch (flags & IR_CALL_CONV_MASK) {
+		case IR_CC_FASTCALL:
+			fprintf(f, "__fastcall");
+			return 1;
+		case IR_CC_PRESERVE_NONE:
+			fprintf(f, "__attribute__((preserve_none))");
+			return 1;
+#if defined(IR_TARGET_X64)
+		case IR_CC_X86_64_SYSV:
+			fprintf(f, "__attribute__((sysv_abi))");
+			return 1;
+		case IR_CC_X86_64_MS:
+			fprintf(f, "__attribute__((ms_abi))");
+			return 1;
+#elif defined(IR_TARGET_AARCH64)
+		case IR_CC_AARCH64_SYSV:
+			return 0;
+		case IR_CC_AARCH64_DARWIN:
+			return 0;
+#endif
+		default:
+			IR_ASSERT((flags & IR_CALL_CONV_MASK) == IR_CC_DEFAULT || (flags & IR_CALL_CONV_MASK) == IR_CC_BUILTIN);
+			return 0;
+	}
+}
+
+static void ir_emit_c_func_proto(const char *name, uint32_t flags, ir_type ret_type, uint32_t params_count, const uint8_t *param_types, bool is_ptr, FILE *f)
+{
+	ir_emit_c_type_name(ret_type, f);
+
+	if (is_ptr) {
+		fprintf(f, " (");
+		if (ir_emit_c_call_conv(f, flags)) {
+			fprintf(f, " ");
+		}
+		fprintf(f, "*");
+		if (name) {
+			fprintf(f, "%s", name);
+		}
+		fprintf(f, ")");
+	} else {
+		fprintf(f, " ");
+		if (ir_emit_c_call_conv(f, flags)) {
+			fprintf(f, " ");
+		}
+		if (name) {
+			fprintf(f, "%s", name);
+		}
+	}
+
+	fprintf(f, "(");
+	if (params_count) {
+		uint32_t i;
+
+		for (i = 0; i < params_count; i++) {
+			if (i) {
+				fprintf(f, ", ");
+			}
+			ir_emit_c_type_name(param_types[i], f);
+		}
+		if (flags & IR_VARARG_FUNC) {
+			fprintf(f, ", ...");
+		}
+	} else if (flags & IR_VARARG_FUNC) {
+		fprintf(f, "...");
+	} else {
+		fprintf(f, "void");
+	}
+	fprintf(f, ")");
+}
+
+static void ir_emit_c_const(ir_ctx *ctx, ir_insn *insn, FILE *f)
+{
+	if (insn->op == IR_LABEL) {
+		ir_c_backend_data *data = ctx->data;
+
+		if (!data->resolved_label_syms) {
+			data->resolved_label_syms = 1;
+			ir_resolve_label_syms(ctx);
+		}
+		fprintf(f, "&&bb%d", insn->val.u32_hi);
+	} else {
+		if (insn->op == IR_SYM) {
+			fprintf(f, "&");
+		} else if (IR_IS_TYPE_VECTOR(insn->type)) {
+			fprintf(f, "(");
+			ir_emit_c_type_name(insn->type, f);
+			fprintf(f, ")");
+		}
+		ir_print_const(ctx, insn, f, true);
+	}
+}
+
+static int ir_emit_dessa_move(ir_ctx *ctx, uint8_t type, ir_ref from, ir_ref to, void *data)
+{
+	FILE *f = data;
+
+	if (to) {
+		fprintf(f, "\td_%d = ", ctx->vregs[to]);
+	} else {
+		fprintf(f, "\ttmp_%s = ", ir_type_tname[type]);
+	}
+	if (IR_IS_CONST_REF(from)) {
+		ir_emit_c_const(ctx, &ctx->ir_base[from], f);
+		fprintf(f, ";\n");
+	} else if (from) {
+		fprintf(f, "d_%d;\n", ctx->vregs[from]);
+	} else {
+		fprintf(f, "tmp_%s;\n", ir_type_tname[type]);
+	}
+	return 1;
+}
+
+static void ir_emit_ref(ir_ctx *ctx, FILE *f, ir_ref ref)
+{
+	if (IR_IS_CONST_REF(ref)) {
+		ir_emit_c_const(ctx, &ctx->ir_base[ref], f);
+	} else {
+		ir_insn *insn = &ctx->ir_base[ref];
+		if (insn->op == IR_VLOAD || insn->op == IR_VLOAD_v) {
+			ir_insn *var = &ctx->ir_base[insn->op2];
+
+			IR_ASSERT(var->op == IR_VAR/* || var->op == IR_PARAM*/);
+			fprintf(f, "%s", ir_get_str(ctx, var->op2));
+			return;
+		}
+		fprintf(f, "d_%d", ctx->vregs[ref]);
+	}
+}
+
+static void ir_emit_def_ref(ir_ctx *ctx, FILE *f, ir_ref def)
+{
+	IR_ASSERT(ctx->vregs[def] > 0);
+	fprintf(f, "\td_%d = ", ctx->vregs[def]);
+}
+
+static void ir_emit_copy(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_unary_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op)
+{
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "%s", op);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_binary_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " %s ", op);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_signed_cast(FILE *f, ir_type type)
+{
+	if (!IR_IS_TYPE_SIGNED(type) && !IR_IS_TYPE_VECTOR(type)) {
+		switch (ir_type_size[type]) {
+			default:
+				IR_ASSERT(0);
+			case 1:
+				fprintf(f, "(int8_t)");
+				break;
+			case 2:
+				fprintf(f, "(int16_t)");
+				break;
+			case 4:
+				fprintf(f, "(int32_t)");
+				break;
+			case 8:
+				fprintf(f, "(int64_t)");
+				break;
+		}
+	}
+}
+
+static void ir_emit_unsigned_cast(FILE *f, ir_type type)
+{
+	if (!IR_IS_TYPE_UNSIGNED(type) && !IR_IS_TYPE_VECTOR(type)) {
+		switch (ir_type_size[type]) {
+			default:
+				IR_ASSERT(0);
+			case 1:
+				fprintf(f, "(uint8_t)");
+				break;
+			case 2:
+				fprintf(f, "(uint16_t)");
+				break;
+			case 4:
+				fprintf(f, "(uint32_t)");
+				break;
+			case 8:
+				fprintf(f, "(uint64_t)");
+				break;
+		}
+	}
+}
+
+static void ir_emit_signed_binary_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op)
+{
+	uint8_t t1 = ctx->ir_base[insn->op1].type;
+
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_signed_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " %s ", op);
+	ir_emit_signed_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_unsigned_binary_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op)
+{
+	uint8_t t1 = ctx->ir_base[insn->op1].type;
+
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " %s ", op);
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_unsigned_comparison_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op, const char *fop)
+{
+	uint8_t t1 = ctx->ir_base[insn->op1].type;
+
+	IR_ASSERT(t1 == ctx->ir_base[insn->op1].type);
+	ir_emit_def_ref(ctx, f, def);
+	if (t1 == IR_FLOAT || t1 == IR_DOUBLE) {
+		fprintf(f, "!(");
+	} else {
+		ir_emit_unsigned_cast(f, t1);
+	}
+	ir_emit_ref(ctx, f, insn->op1);
+	if (t1 == IR_FLOAT || t1 == IR_DOUBLE) {
+		fprintf(f, " %s ", fop);
+	} else {
+		fprintf(f, " %s ", op);
+		ir_emit_unsigned_cast(f, t1);
+	}
+	ir_emit_ref(ctx, f, insn->op2);
+	if (t1 == IR_FLOAT || t1 == IR_DOUBLE) {
+		fprintf(f, ")");
+	}
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_unordered(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	if (insn->op == IR_ORDERED) {
+		fprintf(f, "!");
+	}
+	fprintf(f, "__builtin_isunordered(");
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ", ");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_rol_ror(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *op1, const char *op2)
+{
+	uint8_t t1 = ctx->ir_base[insn->op1].type;
+
+	IR_ASSERT(!IR_IS_TYPE_VECTOR(insn->type) && !IR_IS_TYPE_VECTOR(t1));
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "(");
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " %s ", op1);
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ") | (");
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " %s (%d", op2, ir_type_size[t1] * 8);
+	fprintf(f, " - ");
+	ir_emit_unsigned_cast(f, t1);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, "));\n");
+}
+
+static void ir_emit_bswap(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+
+	IR_ASSERT(!IR_IS_TYPE_VECTOR(insn->type));
+	switch (ir_type_size[insn->type]) {
+		default:
+			IR_ASSERT(0);
+		case 4:
+			fprintf(f, "__builtin_bswap32(");
+			break;
+		case 8:
+			fprintf(f, "__builtin_bswap64(");
+			break;
+	}
+
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_count(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *name)
+{
+	IR_ASSERT(!IR_IS_TYPE_VECTOR(insn->type));
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "__builtin_%s%s(", name, ir_type_size[insn->type] == 8 ? "ll" : "");
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_sext(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	IR_ASSERT(IR_IS_TYPE_INT(insn->type));
+	IR_ASSERT(IR_IS_TYPE_INT(ctx->ir_base[insn->op1].type));
+	IR_ASSERT(ir_type_size[insn->type] > ir_type_size[ctx->ir_base[insn->op1].type]);
+	ir_emit_def_ref(ctx, f, def);
+	switch (ir_type_size[insn->type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(int8_t)");
+			break;
+		case 2:
+			fprintf(f, "(int16_t)");
+			break;
+		case 4:
+			fprintf(f, "(int32_t)");
+			break;
+		case 8:
+			fprintf(f, "(int64_t)");
+			break;
+	}
+	switch (ir_type_size[ctx->ir_base[insn->op1].type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(int8_t)");
+			break;
+		case 2:
+			fprintf(f, "(int16_t)");
+			break;
+		case 4:
+			fprintf(f, "(int32_t)");
+			break;
+		case 8:
+			fprintf(f, "(int64_t)");
+			break;
+	}
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_zext(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	IR_ASSERT(IR_IS_TYPE_INT(insn->type));
+	IR_ASSERT(IR_IS_TYPE_INT(ctx->ir_base[insn->op1].type));
+	IR_ASSERT(ir_type_size[insn->type] > ir_type_size[ctx->ir_base[insn->op1].type]);
+	ir_emit_def_ref(ctx, f, def);
+	switch (ir_type_size[insn->type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(uint8_t)");
+			break;
+		case 2:
+			fprintf(f, "(uint16_t)");
+			break;
+		case 4:
+			fprintf(f, "(uint32_t)");
+			break;
+		case 8:
+			fprintf(f, "(uint64_t)");
+			break;
+	}
+	switch (ir_type_size[ctx->ir_base[insn->op1].type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(uint8_t)");
+			break;
+		case 2:
+			fprintf(f, "(uint16_t)");
+			break;
+		case 4:
+			fprintf(f, "(uint32_t)");
+			break;
+		case 8:
+			fprintf(f, "(uint64_t)");
+			break;
+	}
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_trunc(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	IR_ASSERT(IR_IS_TYPE_INT(insn->type));
+	IR_ASSERT(IR_IS_TYPE_INT(ctx->ir_base[insn->op1].type));
+	IR_ASSERT(ir_type_size[insn->type] < ir_type_size[ctx->ir_base[insn->op1].type]);
+	ir_emit_def_ref(ctx, f, def);
+	switch (ir_type_size[insn->type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(uint8_t)");
+			break;
+		case 2:
+			fprintf(f, "(uint16_t)");
+			break;
+		case 4:
+			fprintf(f, "(uint32_t)");
+			break;
+		case 8:
+			fprintf(f, "(uint64_t)");
+			break;
+	}
+	switch (ir_type_size[ctx->ir_base[insn->op1].type]) {
+		default:
+			IR_ASSERT(0);
+		case 1:
+			fprintf(f, "(uint8_t)");
+			break;
+		case 2:
+			fprintf(f, "(uint16_t)");
+			break;
+		case 4:
+			fprintf(f, "(uint32_t)");
+			break;
+		case 8:
+			fprintf(f, "(uint64_t)");
+			break;
+	}
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_bitcast(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	IR_ASSERT(ir_get_type_size(insn->type) == ir_get_type_size(ctx->ir_base[insn->op1].type));
+	if (IR_IS_TYPE_VECTOR(insn->type) || IR_IS_TYPE_VECTOR(ctx->ir_base[insn->op1].type)) {
+		ir_emit_def_ref(ctx, f, def);
+		fprintf(f, "(");
+		ir_emit_c_type_name(insn->type, f);
+		fprintf(f, ")");
+		ir_emit_ref(ctx, f, insn->op1);
+		fprintf(f, ";\n");
+	} else if (IR_IS_TYPE_INT(insn->type)) {
+		if (IR_IS_TYPE_INT(ctx->ir_base[insn->op1].type)) {
+			ir_emit_def_ref(ctx, f, def);
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, ";\n");
+		} else if (ctx->ir_base[insn->op1].type == IR_DOUBLE) {
+			fprintf(f, "\t{union {double d; uint64_t bits;} _u; _u.d = ");
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, "; ");
+			ir_emit_ref(ctx, f, def);
+			fprintf(f, " = _u.bits;}\n");
+		} else {
+			IR_ASSERT(ctx->ir_base[insn->op1].type == IR_FLOAT);
+			fprintf(f, "\t{union {float f; uint32_t bits;} _u; _u.f = ");
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, "; ");
+			ir_emit_ref(ctx, f, def);
+			fprintf(f, " = _u.bits;}\n");
+		}
+	} else {
+		IR_ASSERT(IR_IS_TYPE_FP(insn->type));
+		IR_ASSERT(IR_IS_TYPE_INT(ctx->ir_base[insn->op1].type));
+		if (insn->type == IR_DOUBLE) {
+			fprintf(f, "\t{union {double d; uint64_t bits;} _u; _u.bits = ");
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, "; ");
+			ir_emit_ref(ctx, f, def);
+			fprintf(f, " = _u.d;}\n");
+		} else {
+			IR_ASSERT(insn->type == IR_FLOAT);
+			fprintf(f, "\t{union {float f; uint32_t bits;} _u; _u.bits = ");
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, "; ");
+			ir_emit_ref(ctx, f, def);
+			fprintf(f, " = _u.f;}\n");
+		}
+	}
+}
+
+static void ir_emit_conv(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_minmax_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+//	fprintf(f, "\td_%d = ", ctx->vregs[def]);
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	if (insn->op == IR_MIN) {
+		fprintf(f, " < ");
+	} else {
+		IR_ASSERT(insn->op == IR_MAX);
+		fprintf(f, " > ");
+	}
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, " ? ");
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " : ");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_conditional_op(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, " ? ");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, " : ");
+	ir_emit_ref(ctx, f, insn->op3);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_abs(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_type type = ctx->ir_base[insn->op1].type;
+
+	ir_emit_def_ref(ctx, f, def);
+	if (IR_IS_TYPE_FP(type)) {
+		if (type == IR_DOUBLE) {
+			fprintf(f, "fabs(");
+		} else {
+			fprintf(f, "fabsf(");
+		}
+		ir_emit_ref(ctx, f, insn->op1);
+		fprintf(f, ")\n");
+	} else {
+		if (IR_IS_TYPE_SIGNED(type)) {
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, " < 0 ? -");
+			ir_emit_ref(ctx, f, insn->op1);
+			fprintf(f, " : ");
+			ir_emit_ref(ctx, f, insn->op1);
+		} else {
+			ir_emit_ref(ctx, f, insn->op1);
+		}
+		fprintf(f, ";\n");
+	}
+}
+
+static void ir_emit_overflow_math(ir_ctx *ctx, FILE *f, int def, ir_insn *insn, const char *func, const char *op)
+{
+	ir_type type = insn->type;
+	ir_use_list *use_list = &ctx->use_lists[def];
+	ir_ref n, *p, overflow = IR_UNUSED;
+
+	n = use_list->count;
+	for (p = &ctx->use_edges[use_list->refs]; n > 0; p++, n--) {
+		ir_insn *use_insn = &ctx->ir_base[*p];
+		if (use_insn->op == IR_OVERFLOW) {
+			overflow = *p;
+			break;
+		}
+	}
+
+	IR_ASSERT(IR_IS_TYPE_INT(type));
+	if (overflow) {
+		ir_emit_def_ref(ctx, f, overflow);
+	} else {
+		fprintf(f, "\t");
+	}
+	fprintf(f, "__builtin_%s%s%s_overflow(",
+		ir_type_size[type] < 4 ? "" : (IR_IS_TYPE_SIGNED(type) ? "s" : "u"),
+		func,
+		ir_type_size[type] == 8 ? "ll" : "");
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ", ");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ", &");
+	ir_emit_ref(ctx, f, def);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_if(ir_ctx *ctx, FILE *f, uint32_t b, ir_ref def, ir_insn *insn, uint32_t next_block)
+{
+	uint32_t true_block = 0, false_block = 0;
+	bool short_true = 0, short_false = 0;
+
+	ir_get_true_false_blocks(ctx, b, &true_block, &false_block);
+	if (true_block == next_block) {
+		short_false = 1;
+	} else if (false_block == next_block) {
+		short_true = 1;
+	}
+
+	fprintf(f, "\tif (");
+	if (short_false) {
+		fprintf(f, "!");
+	}
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ")");
+
+	if (short_true) {
+		fprintf(f, " goto bb%d;\n", true_block);
+	} else if (short_false) {
+		fprintf(f, " goto bb%d;\n", false_block);
+	} else {
+		fprintf(f, " goto bb%d; else goto bb%d;\n", true_block, false_block);
+	}
+}
+
+static void ir_emit_guard(ir_ctx *ctx, FILE *f, ir_insn *insn)
+{
+	fprintf(f, "\tif (");
+	if (insn->op == IR_GUARD) {
+		fprintf(f, "!");
+	}
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ") return ");
+	// Treat guard as a function with the same return type and no arguments
+	fprintf(f, "((");
+	ir_emit_c_type_name(ctx->ret_type, f);
+	fprintf(f, " (*)(void))(");
+	ir_emit_ref(ctx, f, insn->op3);
+	fprintf(f, "))();\n");
+}
+
+static void ir_emit_extract(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, "[");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, "];\n");
+}
+
+static void ir_emit_replace(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ";\n");
+	fprintf(f, "\td_%d[", ctx->vregs[def]);
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, "] = ");
+	ir_emit_ref(ctx, f, insn->op3);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_splat(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	uint32_t n;
+
+	IR_ASSERT(IR_IS_TYPE_VECTOR(insn->type));
+	n = IR_VECTOR_LENGTH(insn->type);
+	IR_ASSERT(n > 0);
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "(");
+	ir_emit_c_type_name(insn->type, f);
+	fprintf(f, "){");
+	ir_emit_ref(ctx, f, insn->op1);
+	while (--n) {
+		fprintf(f, ", ");
+		ir_emit_ref(ctx, f, insn->op1);
+	}
+	fprintf(f, "};\n");
+}
+
+static void ir_emit_shuffle(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	if (IR_IS_CONST_REF(insn->op3)) {
+		ir_type t;
+		uint32_t n;
+
+		t = ctx->ir_base[insn->op3].type;
+		IR_ASSERT(IR_IS_TYPE_VECTOR(t));
+		n = IR_VECTOR_LENGTH(t);
+		t = IR_VECTOR_BASE_TYPE(t);
+		IR_ASSERT(IR_IS_TYPE_INT(t));
+
+		fprintf(f, "__builtin_shufflevector(");
+		ir_emit_ref(ctx, f, insn->op1);
+		fprintf(f, ", ");
+		ir_emit_ref(ctx, f, insn->op2);
+
+		if (ir_type_size[t] == 1) {
+			int8_t *p = ir_long_const_ptr(ctx, insn->op3);
+
+			for (; n > 0; p++, n--) {
+				fprintf(f, ", %d", (int)*p);
+			}
+		} else if (ir_type_size[t] == 2) {
+			int16_t *p = ir_long_const_ptr(ctx, insn->op3);
+
+			for (; n > 0; p++, n--) {
+				fprintf(f, ", %d", (int)*p);
+			}
+		} else if (ir_type_size[t] == 4) {
+			int32_t *p = ir_long_const_ptr(ctx, insn->op3);
+
+			for (; n > 0; p++, n--) {
+				fprintf(f, ", %d", (int)*p);
+			}
+		} else if (ir_type_size[t] == 8) {
+			int64_t *p = ir_long_const_ptr(ctx, insn->op3);
+
+			for (; n > 0; p++, n--) {
+				fprintf(f, ", %d", (int)*p);
+			}
+		} else {
+			IR_ASSERT(0);
+		}
+	} else {
+		fprintf(f, "__builtin_shuffle(");
+		ir_emit_ref(ctx, f, insn->op1);
+		fprintf(f, ", ");
+		ir_emit_ref(ctx, f, insn->op2);
+		fprintf(f, ", ");
+		ir_emit_ref(ctx, f, insn->op3);
+	}
+
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_convert_vector(ir_ctx *ctx, FILE *f, int def, ir_insn *insn)
+{
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "__builtin_convertvector(");
+	ir_emit_ref(ctx, f, insn->op1);
+	fprintf(f, ", ");
+	ir_emit_c_type_name(insn->type, f);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_switch(ir_ctx *ctx, FILE *f, uint32_t b, ir_ref def, ir_insn *insn)
+{
+	ir_block *bb;
+	uint32_t n, *p, use_block;
+	ir_insn *use_insn;
+
+	fprintf(f, "\tswitch (");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ") {\n");
+
+	bb = &ctx->cfg_blocks[b];
+	p = &ctx->cfg_edges[bb->successors];
+	for (n = bb->successors_count; n != 0; p++, n--) {
+		use_block = *p;
+		use_insn = &ctx->ir_base[ctx->cfg_blocks[use_block].start];
+		if (use_insn->op == IR_CASE_VAL) {
+			fprintf(f, "\t\tcase ");
+			ir_emit_ref(ctx, f, use_insn->op2);
+			fprintf(f, ": goto bb%d;\n", ir_skip_empty_target_blocks(ctx, use_block));
+		} else if (use_insn->op == IR_CASE_RANGE) {
+			fprintf(f, "\t\tcase ");
+			ir_emit_ref(ctx, f, use_insn->op2);
+			fprintf(f, " ... ");
+			ir_emit_ref(ctx, f, use_insn->op3);
+			fprintf(f, ": goto bb%d;\n", ir_skip_empty_target_blocks(ctx, use_block));
+		} else {
+			IR_ASSERT(use_insn->op == IR_CASE_DEFAULT);
+			fprintf(f, "\t\tdefault: goto bb%d;\n", ir_skip_empty_target_blocks(ctx, use_block));
+		}
+	}
+	fprintf(f, "\t}\n");
+}
+
+static void ir_emit_func_cast(ir_ctx *ctx, FILE *f, ir_ref ref, const ir_proto_t *proto, ir_type ret_type)
+{
+	fprintf(f, "((");
+	ir_emit_c_func_proto(NULL,
+		proto ? proto->flags : IR_CC_DEFAULT,
+		proto ? proto->ret_type : ret_type,
+		proto ? proto->params_count : 0,
+		proto ? proto->param_types : NULL,
+		1, f);
+	fprintf(f, ")");
+	ir_emit_ref(ctx, f, ref);
+	fprintf(f, ")");
+}
+
+static void ir_emit_call(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	int j, n;
+	const ir_proto_t *proto = ir_call_proto(ctx, insn);
+
+	if (insn->type != IR_VOID && ctx->vregs[def] > 0) {
+		ir_emit_def_ref(ctx, f, def);
+	} else {
+		fprintf(f, "\t");
+	}
+	if (IR_IS_CONST_REF(insn->op2)) {
+		if (ctx->ir_base[insn->op2].op == IR_FUNC) {
+			fprintf(f, "%s", ir_get_str(ctx, ctx->ir_base[insn->op2].val.name));
+		} else {
+			IR_ASSERT(ctx->ir_base[insn->op2].op == IR_FUNC_ADDR);
+			ir_emit_func_cast(ctx, f, insn->op2, proto, insn->type);
+		}
+	} else if (ctx->ir_base[insn->op2].op == IR_PROTO) {
+		ir_emit_func_cast(ctx, f, insn->op2, proto, insn->type);
+	} else {
+		ir_emit_ref(ctx, f, insn->op2);
+	}
+	fprintf(f, "(");
+	n = insn->inputs_count;
+	for (j = 3; j <= n; j++) {
+		if (j != 3) {
+			fprintf(f, ", ");
+		}
+		ir_ref arg = ir_insn_op(insn, j);
+		if (ctx->ir_base[arg].op == IR_ARGVAL) {
+			arg = ctx->ir_base[arg].op1;
+		}
+		ir_emit_ref(ctx, f, arg);
+	}
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_tailcall(ir_ctx *ctx, FILE *f, ir_insn *insn)
+{
+	int j, n;
+	const ir_proto_t *proto = ir_call_proto(ctx, insn);
+
+	if (insn->type != IR_VOID) {
+		fprintf(f, "\treturn ");
+	} else {
+		fprintf(f, "\t");
+	}
+	if (IR_IS_CONST_REF(insn->op2)) {
+		if (ctx->ir_base[insn->op2].op == IR_FUNC) {
+			fprintf(f, "%s", ir_get_str(ctx, ctx->ir_base[insn->op2].val.name));
+		} else {
+			IR_ASSERT(ctx->ir_base[insn->op2].op == IR_FUNC_ADDR);
+			ir_emit_func_cast(ctx, f, insn->op2, proto, insn->type);
+		}
+	} else if (ctx->ir_base[insn->op2].op == IR_PROTO) {
+		ir_emit_func_cast(ctx, f, insn->op2, proto, insn->type);
+	} else {
+		ir_emit_ref(ctx, f, insn->op2);
+	}
+	fprintf(f, "(");
+	n = insn->inputs_count;
+	for (j = 3; j <= n; j++) {
+		if (j != 3) {
+			fprintf(f, ", ");
+		}
+		ir_emit_ref(ctx, f, ir_insn_op(insn, j));
+	}
+	fprintf(f, ");\n");
+	if (insn->type == IR_VOID) {
+		fprintf(f, "\treturn;\n");
+	}
+}
+
+static void ir_emit_ijmp(ir_ctx *ctx, FILE *f, ir_insn *insn)
+{
+	fprintf(f, "\tgoto *(void**)(");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_alloca(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	if (ctx->vregs[def] > 0) {
+		ir_emit_def_ref(ctx, f, def);
+	} else {
+		fprintf(f, "\t");
+	}
+	fprintf(f, "(uintptr_t)alloca(");
+	ir_emit_ref(ctx, f, insn->op2);
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_vaddr(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	ir_insn *var = &ctx->ir_base[insn->op1];
+
+	ir_emit_def_ref(ctx, f, def);
+	fprintf(f, "&");
+	IR_ASSERT(var->op == IR_VAR/* || var->op == IR_PARAM*/);
+	fprintf(f, "%s", ir_get_str(ctx, var->op2));
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_vstore(ir_ctx *ctx, FILE *f, ir_insn *insn)
+{
+	ir_insn *var;
+
+	IR_ASSERT(insn->op2 > 0);
+	var = &ctx->ir_base[insn->op2];
+	IR_ASSERT(var->op == IR_VAR/* || var->op == IR_PARAM*/);
+	fprintf(f, "\t%s = ", ir_get_str(ctx, var->op2));
+	ir_emit_ref(ctx, f, insn->op3);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_load(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	if (ctx->vregs[def] > 0) {
+		ir_emit_def_ref(ctx, f, def);
+	} else {
+		fprintf(f, "\t");
+	}
+	fprintf(f, "*((");
+	ir_emit_c_type_name(insn->type, f);
+	fprintf(f, "*)");
+	if (IR_IS_CONST_REF(insn->op2)) {
+		ir_emit_c_const(ctx, &ctx->ir_base[insn->op2], f);
+	} else {
+		fprintf(f, "d_%d", ctx->vregs[insn->op2]);
+	}
+	fprintf(f, ");\n");
+}
+
+static void ir_emit_store(ir_ctx *ctx, FILE *f, ir_insn *insn)
+{
+	ir_type type = ctx->ir_base[insn->op3].type;
+
+	fprintf(f, "\t*((");
+	ir_emit_c_type_name(type, f);
+	fprintf(f, "*)");
+	if (IR_IS_CONST_REF(insn->op2)) {
+		ir_emit_c_const(ctx, &ctx->ir_base[insn->op2], f);
+	} else {
+		fprintf(f, "d_%d", ctx->vregs[insn->op2]);
+	}
+	fprintf(f, ") = ");
+	ir_emit_ref(ctx, f, insn->op3);
+	fprintf(f, ";\n");
+}
+
+static void ir_emit_tls_addr(ir_ctx *ctx, FILE *f, ir_ref def, ir_insn *insn)
+{
+	if (insn->op2 < 0 && insn->op3 == 0) {
+		ir_emit_def_ref(ctx, f, def);
+		fprintf(f, "__builtin_thread_pointer();\n");
+	} else {
+		fprintf(stderr, "ERROR: IR_%s is not implemented yet\n", ir_op_name[insn->op]);
+		exit(1);
+	}
+}
+
+static int ir_emit_c_func(ir_ctx *ctx, const char *name, FILE *f)
+{
+	ir_ref i, n, *p;
+	ir_insn *insn;
+	ir_use_list *use_list;
+	bool first;
+	ir_bitset vars, tmp_types;
+	uint32_t _b, b, target, prev = 0;
+	ir_block *bb;
+	ir_c_backend_data data;
+
+	data.func_name = name;
+	data.resolved_label_syms = 0;
+	ctx->data = &data;
+
+	/* Emit function prototype */
+	if (ctx->flags & IR_STATIC) {
+		fprintf(f, "static ");
+	}
+	ir_emit_c_type_name(ctx->ret_type != (ir_type)-1 ? ctx->ret_type : IR_VOID, f);
+	fprintf(f, " ");
+	if (ir_emit_c_call_conv(f, ctx->flags)) {
+		fprintf(f, " ");
+	}
+	fprintf(f, "%s(", name);
+	use_list = &ctx->use_lists[1];
+	n = use_list->count;
+	first = 1;
+	for (p = &ctx->use_edges[use_list->refs]; n > 0; p++, n--) {
+		insn = &ctx->ir_base[*p];
+		if (insn->op == IR_PARAM) {
+			if (first) {
+				first = 0;
+			} else {
+				fprintf(f, ", ");
+			}
+			ir_emit_c_type_name(insn->type, f);
+			if (insn->op2) {
+				fprintf(f, " %s", ir_get_str(ctx, insn->op2));
+			}
+		}
+	}
+	if (ctx->flags & IR_VARARG_FUNC) {
+		if (first) {
+			first = 0;
+		} else {
+			fprintf(f, ", ");
+		}
+		fprintf(f, "...");
+	}
+	if (first) {
+		fprintf(f, "void");
+	}
+	fprintf(f, ")\n{\n");
+
+	if (!ctx->prev_ref) {
+		ir_build_prev_refs(ctx);
+	}
+
+	/* Emit declarations for local variables */
+	tmp_types = ir_bitset_malloc(IR_LAST_TYPE);
+	vars = ir_bitset_malloc(ctx->vregs_count + 1);
+	for (b = 1, bb = ctx->cfg_blocks + b; b <= ctx->cfg_blocks_count; b++, bb++) {
+		IR_ASSERT(!(bb->flags & IR_BB_UNREACHABLE));
+		if (ctx->prev_ref[bb->end] == bb->start
+		 && bb->successors_count == 1
+		 && ctx->cfg_edges[bb->successors] != b
+		 && (ctx->ir_base[bb->end].op == IR_END || ctx->ir_base[bb->end].op == IR_LOOP_END)
+		 && !(bb->flags & (IR_BB_START|IR_BB_ENTRY|IR_BB_DESSA_MOVES))) {
+			bb->flags |= IR_BB_EMPTY;
+		}
+		if (bb->flags & IR_BB_DESSA_MOVES) {
+			ir_gen_dessa_moves(ctx, b, ir_add_tmp_type, tmp_types);
+		}
+		for (i = bb->start, insn = ctx->ir_base + i; i <= bb->end;) {
+			if (insn->op == IR_VAR) {
+				/* IR_VAR never gets a vreg (see ir_assign_virtual_registers_slow()),
+				 * so it must be declared here, independently of ctx->vregs[i]. */
+				if (ctx->use_lists[i].count > 0) {
+					fprintf(f, "\t");
+					ir_emit_c_type_name(insn->type, f);
+					fprintf(f, " %s;\n", ir_get_str(ctx, insn->op2));
+				}
+			} else if (ctx->vregs[i] > 0) {
+				if (!ir_bitset_in(vars, ctx->vregs[i])) {
+					ir_bitset_incl(vars, ctx->vregs[i]);
+					if (insn->op == IR_PARAM) {
+						fprintf(f, "\t");
+						ir_emit_c_type_name(insn->type, f);
+						fprintf(f, " d_%d = %s;\n", ctx->vregs[i], ir_get_str(ctx, insn->op2));
+					} else if (insn->op == IR_VLOAD || insn->op == IR_VLOAD_v) {
+						/* skip, we use variable name instead */
+					} else {
+						fprintf(f, "\t");
+						ir_emit_c_type_name(insn->type, f);
+						fprintf(f, " d_%d;\n", ctx->vregs[i]);
+					}
+				} else if (insn->op == IR_PARAM) {
+					IR_ASSERT(0 && "unexpected PARAM");
+					ctx->data = NULL;
+					return 0;
+				}
+			}
+			n = ir_insn_len(insn);
+			i += n;
+			insn += n;
+		}
+	}
+	ir_mem_free(vars);
+
+	IR_BITSET_FOREACH(tmp_types, ir_bitset_len(IR_LAST_TYPE), i) {
+		fprintf(f, "\t");
+		ir_emit_c_type_name(i, f);
+		fprintf(f, " tmp_%s;\n", ir_type_tname[i]);
+	} IR_BITSET_FOREACH_END();
+	ir_mem_free(tmp_types);
+
+	for (_b = 1; _b <= ctx->cfg_blocks_count; _b++) {
+		if (ctx->cfg_schedule) {
+			b = ctx->cfg_schedule[_b];
+		} else {
+			b = _b;
+		}
+		bb = &ctx->cfg_blocks[b];
+		IR_ASSERT(!(bb->flags & IR_BB_UNREACHABLE));
+		if ((bb->flags & (IR_BB_START|IR_BB_ENTRY|IR_BB_EMPTY)) == IR_BB_EMPTY) {
+			continue;
+		}
+		if (bb->predecessors_count > 1
+		 || (bb->predecessors_count == 1 && ctx->cfg_edges[bb->predecessors] != prev)
+		 || ctx->ir_base[bb->start].op == IR_CASE_VAL
+		 || ctx->ir_base[bb->start].op == IR_CASE_RANGE
+		 || ctx->ir_base[bb->start].op == IR_CASE_DEFAULT
+		 || (ctx->ir_base[bb->start].op == IR_BEGIN && ctx->ir_base[bb->start].op2)) {
+			fprintf(f, "bb%d:\n", b);
+		}
+		prev = b;
+		for (i = bb->start, insn = ctx->ir_base + i; i <= bb->end;) {
+			switch (insn->op) {
+				case IR_NOP:
+				case IR_START:
+				case IR_BEGIN:
+				case IR_IF_TRUE:
+				case IR_IF_FALSE:
+				case IR_CASE_VAL:
+				case IR_CASE_RANGE:
+				case IR_CASE_DEFAULT:
+				case IR_MERGE:
+				case IR_LOOP_BEGIN:
+				case IR_UNREACHABLE:
+				case IR_PARAM:
+				case IR_VAR:
+				case IR_PHI:
+				case IR_PI:
+				case IR_VLOAD:
+				case IR_VLOAD_v:
+				case IR_ARGVAL:
+					/* skip */
+					break;
+				case IR_EQ:
+					ir_emit_binary_op(ctx, f, i, insn, "==");
+					break;
+				case IR_NE:
+					ir_emit_binary_op(ctx, f, i, insn, "!=");
+					break;
+				case IR_LT:
+					ir_emit_binary_op(ctx, f, i, insn, "<");
+					break;
+				case IR_GE:
+					ir_emit_binary_op(ctx, f, i, insn, ">=");
+					break;
+				case IR_LE:
+					ir_emit_binary_op(ctx, f, i, insn, "<=");
+					break;
+				case IR_GT:
+					ir_emit_binary_op(ctx, f, i, insn, ">");
+					break;
+				case IR_ULT:
+					ir_emit_unsigned_comparison_op(ctx, f, i, insn, "<", ">=");
+					break;
+				case IR_UGE:
+					ir_emit_unsigned_comparison_op(ctx, f, i, insn, ">=", "<");
+					break;
+				case IR_ULE:
+					ir_emit_unsigned_comparison_op(ctx, f, i, insn, "<=", ">");
+					break;
+				case IR_UGT:
+					ir_emit_unsigned_comparison_op(ctx, f, i, insn, ">", "<=");
+					break;
+				case IR_ORDERED:
+				case IR_UNORDERED:
+					ir_emit_unordered(ctx, f, i, insn);
+					break;
+				case IR_ADD:
+					ir_emit_binary_op(ctx, f, i, insn, "+");
+					break;
+				case IR_SUB:
+					ir_emit_binary_op(ctx, f, i, insn, "-");
+					break;
+				case IR_MUL:
+					ir_emit_binary_op(ctx, f, i, insn, "*");
+					break;
+				case IR_DIV:
+					ir_emit_binary_op(ctx, f, i, insn, "/");
+					break;
+				case IR_MOD:
+					ir_emit_binary_op(ctx, f, i, insn, "%");
+					break;
+				case IR_NEG:
+					ir_emit_unary_op(ctx, f, i, insn, "-");
+					break;
+				case IR_NOT:
+					ir_emit_unary_op(ctx, f, i, insn, insn->type == IR_BOOL ? "!" : "~");
+					break;
+				case IR_OR:
+					ir_emit_binary_op(ctx, f, i, insn, insn->type == IR_BOOL ? "||" : "|");
+					break;
+				case IR_AND:
+					ir_emit_binary_op(ctx, f, i, insn, insn->type == IR_BOOL ? "&&" : "&");
+					break;
+				case IR_XOR:
+					ir_emit_binary_op(ctx, f, i, insn, "^");
+					break;
+				case IR_MIN:
+				case IR_MAX:
+					ir_emit_minmax_op(ctx, f, i, insn);
+					break;
+				case IR_COND:
+					ir_emit_conditional_op(ctx, f, i, insn);
+					break;
+				case IR_ABS:
+					ir_emit_abs(ctx, f, i, insn);
+					break;
+				case IR_SHL:
+					ir_emit_binary_op(ctx, f, i, insn, "<<");
+					break;
+				case IR_SHR:
+					ir_emit_unsigned_binary_op(ctx, f, i, insn, ">>");
+					break;
+				case IR_SAR:
+					ir_emit_signed_binary_op(ctx, f, i, insn, ">>");
+					break;
+				case IR_ROL:
+					ir_emit_rol_ror(ctx, f, i, insn, "<<", ">>");
+					break;
+				case IR_ROR:
+					ir_emit_rol_ror(ctx, f, i, insn, ">>", "<<");
+					break;
+				case IR_BSWAP:
+					ir_emit_bswap(ctx, f, i, insn);
+					break;
+				case IR_CTPOP:
+					ir_emit_count(ctx, f, i, insn, "popcount");
+					break;
+				case IR_CTLZ:
+					ir_emit_count(ctx, f, i, insn, "clz");
+					break;
+				case IR_CTTZ:
+					ir_emit_count(ctx, f, i, insn, "ctz");
+					break;
+				case IR_SEXT:
+					if (IR_IS_TYPE_VECTOR(insn->type)) {
+						ir_emit_convert_vector(ctx, f, i, insn);
+					} else {
+						ir_emit_sext(ctx, f, i, insn);
+					}
+					break;
+				case IR_ZEXT:
+					if (IR_IS_TYPE_VECTOR(insn->type)) {
+						ir_emit_convert_vector(ctx, f, i, insn);
+					} else {
+						ir_emit_zext(ctx, f, i, insn);
+					}
+					break;
+				case IR_TRUNC:
+					if (IR_IS_TYPE_VECTOR(insn->type)) {
+						ir_emit_convert_vector(ctx, f, i, insn);
+					} else {
+						ir_emit_trunc(ctx, f, i, insn);
+					}
+					break;
+				case IR_BITCAST:
+					ir_emit_bitcast(ctx, f, i, insn);
+					break;
+				case IR_PROTO:
+					ir_emit_def_ref(ctx, f, i);
+					fprintf(f, "(");
+					ir_emit_c_type_name(insn->type, f);
+					fprintf(f, ")");
+					ir_emit_func_cast(ctx, f, insn->op1, (const ir_proto_t *)ir_get_str(ctx, insn->op2), insn->type);
+					fprintf(f, ";\n");
+					break;
+				case IR_INT2FP:
+				case IR_FP2INT:
+				case IR_FP2FP:
+					if (IR_IS_TYPE_VECTOR(insn->type)) {
+						ir_emit_convert_vector(ctx, f, i, insn);
+					} else {
+						ir_emit_conv(ctx, f, i, insn);
+					}
+					break;
+				case IR_ADD_OV:
+					ir_emit_overflow_math(ctx, f, i, insn, "add", "+");
+					break;
+				case IR_SUB_OV:
+					ir_emit_overflow_math(ctx, f, i, insn, "sub", "-");
+					break;
+				case IR_MUL_OV:
+					ir_emit_overflow_math(ctx, f, i, insn, "mul", "*");
+					break;
+				case IR_OVERFLOW:
+					break;
+				case IR_COPY:
+					ir_emit_copy(ctx, f, i, insn);
+					break;
+				case IR_RETURN:
+					IR_ASSERT(bb->successors_count == 0);
+					fprintf(f, "\treturn");
+					if (!insn->op2) {
+						fprintf(f, ";\n");
+					} else {
+						fprintf(f, " ");
+						ir_emit_ref(ctx, f, insn->op2);
+						fprintf(f, ";\n");
+					}
+					break;
+				case IR_END:
+				case IR_LOOP_END:
+					IR_ASSERT(bb->successors_count == 1);
+					if (bb->flags & IR_BB_DESSA_MOVES) {
+						ir_gen_dessa_moves(ctx, b, ir_emit_dessa_move, f);
+					}
+					target = ir_skip_empty_target_blocks(ctx, ctx->cfg_edges[bb->successors]);
+					if (target != ir_next_block(ctx, _b)) {
+						fprintf(f, "\tgoto bb%d;\n", target);
+					}
+					break;
+				case IR_IF:
+					ir_emit_if(ctx, f, b, i, insn, ir_next_block(ctx, _b));
+					break;
+				case IR_SWITCH:
+					ir_emit_switch(ctx, f, b, i, insn);
+					break;
+				case IR_CALL:
+					ir_emit_call(ctx, f, i, insn);
+					break;
+				case IR_TAILCALL:
+					ir_emit_tailcall(ctx, f, insn);
+					break;
+				case IR_IGOTO:
+				case IR_IJMP:
+					ir_emit_ijmp(ctx, f, insn);
+					break;
+				case IR_ALLOCA:
+					ir_emit_alloca(ctx, f, i, insn);
+					break;
+				case IR_VADDR:
+					ir_emit_vaddr(ctx, f, i, insn);
+					break;
+				case IR_VSTORE:
+				case IR_VSTORE_v:
+					ir_emit_vstore(ctx, f, insn);
+					break;
+				case IR_LOAD:
+				case IR_LOAD_v:
+					ir_emit_load(ctx, f, i, insn);
+					break;
+				case IR_STORE:
+				case IR_STORE_v:
+					ir_emit_store(ctx, f, insn);
+					break;
+				case IR_BLOCK_BEGIN:
+					fprintf(f, "{\n");
+					break;
+				case IR_BLOCK_END:
+					fprintf(f, "}\n");
+					break;
+				case IR_FRAME_ADDR:
+					ir_emit_def_ref(ctx, f, i);
+					fprintf(f, "__builtin_frame_address(0);");
+					break;
+				case IR_VA_START:
+					fprintf(f, "\tva_start(");
+					ir_emit_ref(ctx, f, insn->op2);
+					fprintf(f, ");\n");
+					break;
+				case IR_VA_END:
+					fprintf(f, "\tva_end(");
+					ir_emit_ref(ctx, f, insn->op2);
+					fprintf(f, ");\n");
+					break;
+				case IR_VA_COPY:
+					fprintf(f, "\tva_copy(");
+					ir_emit_ref(ctx, f, insn->op2);
+					fprintf(f, ", ");
+					ir_emit_ref(ctx, f, insn->op3);
+					fprintf(f, ");\n");
+					break;
+				case IR_VA_ARG:
+					if (ctx->vregs[i] > 0) {
+						ir_emit_def_ref(ctx, f, i);
+					} else {
+						fprintf(f, "\t");
+					}
+					fprintf(f, "va_arg(");
+					ir_emit_ref(ctx, f, insn->op2);
+					fprintf(f, ", ");
+					ir_emit_c_type_name(insn->type, f);
+					fprintf(f, ");\n");
+					break;
+				case IR_TRAP:
+					fprintf(f, "\t__builtin_debugtrap();\n");
+					break;
+				case IR_GUARD:
+				case IR_GUARD_NOT:
+					ir_emit_guard(ctx, f, insn);
+					break;
+				case IR_EXTRACT:
+					ir_emit_extract(ctx, f, i, insn);
+					break;
+				case IR_REPLACE:
+					ir_emit_replace(ctx, f, i, insn);
+					break;
+				case IR_SPLAT:
+					ir_emit_splat(ctx, f, i, insn);
+					break;
+				case IR_SHUFFLE:
+					ir_emit_shuffle(ctx, f, i, insn);
+					break;
+				case IR_TLS_ADDR:
+					ir_emit_tls_addr(ctx, f, i, insn);
+					break;
+				case IR_RLOAD:
+				case IR_RSTORE:
+				case IR_ASM:
+				case IR_ASM_OUT:
+				case IR_ASM_GOTO:
+					fprintf(stderr, "ERROR: IR_%s is not implemented yet\n", ir_op_name[insn->op]);
+					exit(1);
+					return 0;
+				default:
+					IR_ASSERT(0 && "NIY instruction");
+					ctx->status = IR_ERROR_UNSUPPORTED_CODE_RULE;
+					ctx->data = NULL;
+					return 0;
+			}
+			n = ir_insn_len(insn);
+			i += n;
+			insn += n;
+		}
+	}
+
+	fprintf(f, "}\n");
+
+	if (data.resolved_label_syms) {
+		for (b = 1, bb = &ctx->cfg_blocks[b]; b <= ctx->cfg_blocks_count; bb++, b++) {
+			ir_insn *insn = &ctx->ir_base[bb->start];
+
+			if (insn->op == IR_BEGIN && insn->op2) {
+				IR_ASSERT(ctx->ir_base[insn->op2].op == IR_LABEL);
+				ctx->ir_base[insn->op2].val.u32_hi = 0;
+			}
+		}
+	}
+	ctx->data = NULL;
+	return 1;
+}
+
+int ir_emit_c(ir_ctx *ctx, const char *name, FILE *f)
+{
+	return ir_emit_c_func(ctx, name, f);
+}
+
+void ir_emit_c_func_decl(const char *name, uint32_t flags, ir_type ret_type, uint32_t params_count, const uint8_t *param_types, FILE *f)
+{
+	if (flags & IR_EXTERN) {
+		fprintf(f, "extern ");
+	} else if (flags & IR_STATIC) {
+		fprintf(f, "static ");
+	}
+	ir_emit_c_func_proto(name, flags, ret_type, params_count, param_types, 0, f);
+	fprintf(f, ";\n");
+}
+
+void ir_emit_c_sym_decl(const char *name, uint32_t flags, FILE *f)
+{
+	if (flags & IR_EXTERN) {
+		fprintf(f, "extern ");
+	} else if (flags & IR_STATIC) {
+		fprintf(f, "static ");
+	}
+	if (flags & IR_CONST) {
+		fprintf(f, "static ");
+	}
+	// TODO: type
+	fprintf(f, "uintptr_t %s", name);
+	if (flags & IR_INITIALIZED) {
+		fprintf(f, " =\n");
+	} else {
+		fprintf(f, ";\n");
+	}
+}

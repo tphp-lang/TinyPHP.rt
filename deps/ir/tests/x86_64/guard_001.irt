@@ -1,0 +1,49 @@
+--TEST--
+001: GUARD must not reuse flags set in another basic block
+--TARGET--
+x86_64-*-sysv
+--ARGS--
+-S
+--CODE--
+func guard(): void
+{
+	l_1 = START(l_99);
+	l_99 = RETURN(l_1);
+}
+func test(int64_t, int64_t, int64_t): int64_t
+{
+	uintptr_t addr = func guard(): void;
+	int64_t zero = 0;
+	int64_t one = 1;
+	l_1 = START(l_99);
+	int64_t a = PARAM(l_1, "a", 1);
+	int64_t b = PARAM(l_1, "b", 2);
+	int64_t n = PARAM(l_1, "n", 3);
+	int64_t v = ADD(a, b);
+	bool cond = LT(v, zero);
+	l_2 = END(l_1);
+	l_3 = LOOP_BEGIN(l_2, l_10);
+	int64_t i = PHI/2(l_3, zero, i2);
+	l_4 = GUARD_NOT(l_3, cond, addr);
+	int64_t i2 = ADD(i, one);
+	bool more = LT(i2, n);
+	l_5 = IF(l_4, more);
+	l_6 = IF_TRUE(l_5);
+	l_10 = LOOP_END(l_6);
+	l_7 = IF_FALSE(l_5);
+	l_99 = RETURN(l_7, v);
+}
+--EXPECT--
+guard:
+	retq
+
+test:
+	leaq (%rsi, %rdi), %rax
+	xorl %ecx, %ecx
+.L1:
+	testq %rax, %rax
+	jl guard
+	leaq 1(%rcx), %rcx
+	cmpq %rdx, %rcx
+	jl .L1
+	retq

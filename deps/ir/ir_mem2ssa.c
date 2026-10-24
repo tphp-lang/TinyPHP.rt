@@ -1,0 +1,997 @@
+/*
+ * IR - Lightweight JIT Compilation Framework
+ * (MEM2SSA - Static Single Assignment Form Construction for VAR/ALLOCA)
+ * This file is part of the IR Project distributed under the MIT-style LICENSE.
+ * Authors: Dmitry Stogov <dmitry@php.net>
+ */
+
+#include "ir.h"
+#include "ir_private.h"
+
+/* We perform SSA renaming in a sparse way, iterating though VAR use lists,
+ * therefore use lists should be sorted acording to dominance order
+ * (dominance tree pre-order and control order inside the blocks).
+ *
+ * ir_mem2ssa_order() labels conrtol nodes in the desired order
+ *
+ * ir_mem2ssa_sort() - sorts use list of given VAR
+ */
+static uint32_t *ir_mem2ssa_order(ir_ctx *ctx)
+{
+	uint32_t num = 1;
+	uint32_t *order = ir_mem_malloc(sizeof(int) * ctx->insns_count);
+	uint32_t *block_order = ir_mem_malloc(sizeof(uint32_t) * (ctx->cfg_blocks_count + 1));
+	ir_list work;
+	uint32_t i, b;
+	ir_block *bb;
+
+	/* DFS over dominance tree compute pre-order */
+	ir_list_init(&work, ctx->cfg_blocks_count + 1);
+	ir_list_push(&work, 1);
+	IR_ASSERT(ctx->cfg_blocks[1].next_succ == 0);
+	while (ir_list_len(&work)) {
+		b = ir_list_pop(&work);
+		block_order[num++] = b;
+		bb = &ctx->cfg_blocks[b];
+		if (bb->dom_child) {
+			uint32_t child = bb->dom_child;
+			uint32_t i = ir_list_len(&work);
+			do {
+				ir_list_push(&work, child);
+				bb = &ctx->cfg_blocks[child];
+				child = bb->dom_next_child;
+			} while (child);
+			uint32_t j = ir_list_len(&work) - 1;
+			/* revert children */
+			while (i < j) {
+				SWAP_REFS(work.a.refs[i], work.a.refs[j]);
+				i++;
+				j--;
+			}
+		}
+	}
+	ir_list_free(&work);
+	IR_ASSERT(num == ctx->cfg_blocks_count + 1);
+
+	/* For each block in reverse pre-order */
+	num = 1;
+	for (i = ctx->cfg_blocks_count; i; i--) {
+		b = block_order[i];
+		bb = &ctx->cfg_blocks[b];
+
+		/* Number control nodes of the block in reverse order */
+		ir_ref ref = bb->end;
+		IR_ASSERT(ctx->cfg_map[ref] == b);
+//		order[ref] = num++;
+		ref = ctx->ir_base[ref].op1;
+		while (ref != bb->start) {
+			ctx->cfg_map[ref] = b;
+			order[ref] = num++;
+			ref = ctx->ir_base[ref].op1;
+		}
+		IR_ASSERT(ctx->cfg_map[ref] == b);
+//		order[ref] = num++;
+	}
+	ir_mem_free(block_order);
+	return order;
+}
+
+static void ir_mem2ssa_sort(ir_ref *a, int n, uint32_t *order)
+{
+	int i, j;
+
+	/* quick sort */
+	while (n > 15) {
+		int p;
+		uint32_t pivot;
+		int mid = (n - 1) / 2;
+
+		if (order[a[mid]] > order[a[0]]) SWAP_REFS(a[mid], a[0]);
+		if (order[a[n-1]] > order[a[0]]) SWAP_REFS(a[n-1], a[0]);
+		if (order[a[n-1]] > order[a[mid]]) SWAP_REFS(a[n-1], a[mid]);
+		pivot = order[a[mid]];
+		i = -1;
+		j = n;
+		while (1) {
+			while (order[a[++i]] > pivot);
+			while (order[a[--j]] < pivot);
+			if (i >= j) break;
+			SWAP_REFS(a[i], a[j]);
+		}
+		p = j + 1;
+		if (j < n - p) {
+			ir_mem2ssa_sort(a, p, order);
+			a += p;
+			n = n - p;
+		} else {
+			ir_mem2ssa_sort(a + p, n - p, order);
+			n = p;
+		}
+	}
+
+	if (n > 1) {
+		/* insert sort */
+		int i, j;
+
+		for (i = 1; i < n; i++) {
+			ir_ref tmp = a[i];
+			j = i;
+			do {
+				ir_ref prev = a[j - 1];
+				if (order[prev] > order[tmp]) break;
+				a[j] = prev;
+				j--;
+			} while (j > 0);
+			a[j] = tmp;
+		}
+	}
+}
+
+static ir_ref ir_uninitialized(ir_ctx *ctx, ir_type type)
+{
+	/* read of uninitialized variable (use 0) */
+	if (IR_IS_TYPE_SCALAR(type)) {
+		ir_val c;
+
+		c.i64 = 0;
+		return ir_const(ctx, c, type);
+	} else {
+		ir_ref ref;
+
+		IR_ASSERT(IR_IS_TYPE_VECTOR(type));
+		ref = ir_const_vector(ctx, type);
+		memset(ir_long_const_ptr(ctx, ref), 0, IR_VECTOR_SIZE(type));
+		return ir_long_const_commit(ctx, ref);
+	}
+}
+
+static void ir_mem2ssa_convert(ir_ctx      *ctx,
+                               uint32_t    *order,
+                               ir_ref      *ssa_vars,
+                               ir_list     *queue,
+                               ir_bitset    defs,
+                               ir_bitset    merges,
+                               ir_bitqueue *iter_worklist,
+                               ir_ref       var,
+                               ir_ref       next,
+                               ir_type      type)
+{
+	ir_ref *p, i, n, use, next_ctrl;
+	ir_insn *use_insn;
+	uint32_t b, *q;
+	uint32_t last_order;
+
+	/* For each usage of VAR (use list should be sorted) */
+	last_order = 0xffffffff;
+	next_ctrl = next;
+	n = ctx->use_lists[var].count;
+	for (p = ctx->use_edges + ctx->use_lists[var].refs; n > 0; p++, n--) {
+		use = *p;
+		IR_ASSERT(use);
+		if (use == next_ctrl) {
+			next_ctrl = IR_UNUSED;
+			continue;
+		}
+		use_insn = &ctx->ir_base[use];
+		if (use_insn->op == IR_VSTORE || use_insn->op == IR_STORE) {
+			IR_ASSERT(use_insn->op2 == var && use_insn->op3 != var);
+			b = ctx->cfg_map[use];
+			if (b) {
+				if (UNEXPECTED(order[use] > last_order)) {
+					goto sort_use_list;
+				}
+				last_order = order[use];
+				/* Mark VAR as defined and alive at the end of BB */
+				ir_bitset_incl(defs, b);
+				ssa_vars[b] = var;
+			}
+		} else {
+			IR_ASSERT(use_insn->op == IR_VLOAD || use_insn->op == IR_LOAD);
+			IR_ASSERT(use_insn->op2 == var);
+			b = ctx->cfg_map[use];
+			if (b) {
+				if (UNEXPECTED(order[use] > last_order)) {
+					goto sort_use_list;
+				}
+				last_order = order[use];
+				if (ssa_vars[b] != var) {
+					ssa_vars[b] = var;  /* mark VAR as alive at start of BB */
+					ir_list_push(queue, b); /* schedule BB for backward path exploration on the next step */
+				}
+			}
+		}
+	}
+
+	if (0) {
+sort_use_list:
+		/* Move dead LOAD/STOREs to the end of use_list to exclude them from sorting
+		 * and revert all actions done on unsorted use_list */
+		queue->len = 0;
+		n = ctx->use_lists[var].count;
+		p = ctx->use_edges + ctx->use_lists[var].refs;
+		i = 0;
+		while (i < n) {
+			b = ctx->cfg_map[p[i]];
+			if (b) {
+				i++;
+				ir_bitset_excl(defs, b);
+				ssa_vars[b] = 0;
+			} else {
+				SWAP_REFS(p[i], p[n-1]);
+				n--;
+			}
+		}
+		ir_mem2ssa_sort(p, n, order);
+
+		next_ctrl = next;
+		for (; n > 0; p++, n--) {
+			use = *p;
+			IR_ASSERT(use);
+			if (use == next_ctrl) {
+				next_ctrl = IR_UNUSED;
+				continue;
+			}
+			b = ctx->cfg_map[use];
+			IR_ASSERT(b);
+			use_insn = &ctx->ir_base[use];
+			if (use_insn->op == IR_VSTORE || use_insn->op == IR_STORE) {
+				IR_ASSERT(use_insn->op2 == var && use_insn->op3 != var);
+				/* Mark VAR as defined and alive at the end of BB */
+				ir_bitset_incl(defs, b);
+				ssa_vars[b] = var;
+			} else {
+				IR_ASSERT(use_insn->op == IR_VLOAD || use_insn->op == IR_LOAD);
+				IR_ASSERT(use_insn->op2 == var);
+				if (ssa_vars[b] != var) {
+					ssa_vars[b] = var;  /* mark VAR as alive at start of BB */
+					ir_list_push(queue, b); /* schedule BB for backward path exploration on the next step */
+				}
+			}
+		}
+	}
+
+	/* Find all MERGEs where VAR is alive, exploring paths backward from "uses" to "definitions".
+	 *
+	 * See algorithms 6 and 7 from "Computing Liveness Sets for SSA-Form Programs"
+	 * by Florian Brandner, Benoit Boissinot, Alain Darte, Benoit Dupont de Dinechin,
+	 * Fabrice Rastello. TR Inria RR-7503, 2011
+	 */
+	while (ir_list_len(queue)) {
+		ir_block *bb;
+
+		b = ir_list_pop(queue);
+next:
+		bb = &ctx->cfg_blocks[b];
+		if (bb->predecessors_count > 1) {
+			IR_ASSERT(ctx->ir_base[bb->start].op == IR_MERGE || ctx->ir_base[bb->start].op == IR_LOOP_BEGIN);
+			ir_bitset_incl(merges, b); /* collect all MERGEs for the next step */
+			n = bb->predecessors_count;
+
+			for (q = ctx->cfg_edges + bb->predecessors; n > 0; q++, n--) {
+				b = *q;
+				if (ssa_vars[b] != var) {
+					ssa_vars[b] = var;
+					if (n == 1) goto next;
+					ir_list_push(queue, b);
+				}
+			}
+		} else if (bb->predecessors_count == 1) {
+			IR_ASSERT(ctx->ir_base[bb->start].op != IR_START && ctx->ir_base[bb->start].op1);
+			b = ctx->cfg_edges[bb->predecessors];
+			if (ssa_vars[b] != var) {
+				ssa_vars[b] = var;
+				goto next;
+			}
+		}
+	}
+
+	/* Insert PHI nodes into Domintar Frontiers where VAR is alive.
+	 * Find the DFs on-the-fly using the algoritm (Figure 5) from
+	 * "A Simple, Fast Dominance Algorithm" by Cooper, Harvey and Kennedy. */
+	bool changed;
+	do {
+		changed = 0;
+		IR_BITSET_FOREACH(merges, ir_bitset_len(ctx->cfg_blocks_count + 1), b) {
+			uint32_t dom;
+
+			ir_block *bb = &ctx->cfg_blocks[b];
+			ir_ref start = bb->start;
+			dom = bb->idom;
+			IR_ASSERT(ctx->ir_base[start].op == IR_MERGE || ctx->ir_base[start].op == IR_LOOP_BEGIN);
+			n = bb->predecessors_count;
+			for (q = ctx->cfg_edges + bb->predecessors; n > 0; q++, n--) {
+				uint32_t runner = *q;
+				while (runner != dom) {
+					if (ir_bitset_in(defs, runner)) {
+						goto create_phi;
+					}
+					runner = ctx->cfg_blocks[runner].idom;
+					IR_ASSERT(runner);
+				}
+			}
+			if (0) {
+				ir_ref phi;
+
+create_phi:
+				phi = ir_emit_N(ctx, IR_OPT(IR_PHI, type), bb->predecessors_count + 1);
+				ir_set_op(ctx, phi, 1, start);
+				ir_use_list_add(ctx, start, phi);
+				ir_bitset_excl(merges, b);
+				ir_list_push(queue, phi);
+				ssa_vars[b] = phi;
+				if (!ir_bitset_in(defs, b)) {
+					/* Mark VAR as defined and alive at the end of BB */
+					ir_bitset_incl(defs, b);
+					changed = 1;
+				}
+			}
+		} IR_BITSET_FOREACH_END();
+	} while (changed);
+
+	ir_bitqueue_grow(iter_worklist, ctx->insns_count);
+
+	/* Renaming: remove STROREs and replace LOADs by last STOREed values or by PHIs */
+	next_ctrl = next;
+	n = ctx->use_lists[var].count;
+	for (i = 0; i < n; i++) {
+		use = ctx->use_edges[ctx->use_lists[var].refs + i];
+		if (use == next_ctrl) {
+			next_ctrl = IR_UNUSED;
+			continue;
+		}
+		use_insn = &ctx->ir_base[use];
+		if (use_insn->op == IR_VSTORE || use_insn->op == IR_STORE) {
+			/*
+			 *  prev VAR val      prev VAR val
+			 *      \ |  /         |
+			 *      VSTORE    =>   |
+			 *      /              |
+			 *  next              next
+			 *
+			 */
+
+
+			ir_ref prev = use_insn->op1;
+			ir_ref next = ir_next_control(ctx, use);
+			ctx->ir_base[next].op1 = prev;
+			ir_use_list_replace_one(ctx, prev, use, next);
+
+			if (ctx->ir_base[use_insn->op3].type == type
+				/* We can't store a reference to ALLOCA in ssa_vars[], because this may break
+				 * the following call to ir_mem2saa_convert() for this ALLOCA.
+				 * TODO: find a better solution ??? */
+			 && ctx->ir_base[use_insn->op3].op != IR_ALLOCA) {
+				if (!IR_IS_CONST_REF(use_insn->op3)) {
+					ir_use_list_remove_one(ctx, use_insn->op3, use);
+					/* op3 may became dead */
+					if (ctx->use_lists[use_insn->op3].count == 0
+					 || (ctx->use_lists[use_insn->op3].count == 1
+					  && (ir_op_flags[ctx->ir_base[use_insn->op3].op] & IR_OP_FLAG_NO_SIDE_EFFECT))) {
+						ir_bitqueue_add(iter_worklist, use_insn->op3);
+					}
+				}
+
+				b = ctx->cfg_map[use];
+				if (EXPECTED(b)) {
+					ssa_vars[b] = use_insn->op3;
+				}
+
+				MAKE_NOP(use_insn);
+				CLEAR_USES(use);
+			} else {
+				ir_use_list_remove_one(ctx, use, next);
+
+				use_insn->opt = IR_OPT(IR_BITCAST, type);
+				use_insn->inputs_count = 1;
+				use_insn->op1 = use_insn->op3;
+				use_insn->op2 = IR_UNUSED;
+				use_insn->op3 = IR_UNUSED;
+
+				ir_bitqueue_add(iter_worklist, use);
+
+				b = ctx->cfg_map[use];
+				if (EXPECTED(b)) {
+					ssa_vars[b] = use;
+				}
+			}
+			ctx->cfg_map[use] = 0;
+		} else if (use_insn->op == IR_VLOAD || use_insn->op == IR_LOAD) {
+			uint32_t b0;
+
+			/*
+			 *  prev    VAR      prev   ssa_val
+			 *      \  /          |     |
+			 *      VLOAD    =>   |     |
+			 *      /  \          |     |
+			 *  next    use      next   use
+			 *
+			 */
+
+			ir_ref val;
+			ir_ref prev = use_insn->op1;
+			ir_ref next = ir_next_control(ctx, use);
+
+			ctx->ir_base[next].op1 = prev;
+			ir_use_list_remove_one(ctx, use, next);
+			ir_use_list_replace_one(ctx, prev, use, next);
+
+			b0 = b = ctx->cfg_map[use];
+			while (1) {
+				if (!b) {
+					val = ir_uninitialized(ctx, type);
+					break;
+				}
+				val = ssa_vars[b];
+				if (val != var) {
+					/* compress the descovered dominance path */
+					while (b0 != b) {
+						ssa_vars[b0] = val;
+						b0 = ctx->cfg_blocks[b0].idom;
+					}
+					break;
+				}
+				b = ctx->cfg_blocks[b].idom;
+			}
+			IR_ASSERT(ctx->ir_base[val].type == type);
+			if (use_insn->type == type) {
+				ir_iter_replace(ctx, use, val, iter_worklist);
+
+				use_insn = &ctx->ir_base[use];
+				MAKE_NOP(use_insn);
+				CLEAR_USES(use);
+			} else {
+				use_insn->op = IR_BITCAST;
+				use_insn->inputs_count = 1;
+				use_insn->op1 = val;
+				use_insn->op2 = IR_UNUSED;
+				ir_bitqueue_add(iter_worklist, use);
+				ir_iter_add_uses(ctx, use, iter_worklist);
+				if (val > 0) {
+					ir_use_list_add(ctx, val, use);
+				}
+			}
+			ctx->cfg_map[use] = 0;
+		}
+	}
+
+	/* Renaming: set PHI operands */
+	while (ir_list_len(queue)) {
+		ir_ref phi = ir_list_pop(queue);
+		ir_insn *phi_insn = &ctx->ir_base[phi];
+
+		IR_ASSERT(phi_insn->op == IR_PHI);
+		ir_ref start = phi_insn->op1;
+		ir_insn *start_insn = &ctx->ir_base[start];
+		IR_ASSERT(start_insn->op == IR_MERGE || start_insn->op == IR_LOOP_BEGIN);
+		n = start_insn->inputs_count;
+		for (i = 0, p = start_insn->ops + 1; i < n; p++, i++) {
+			ir_ref val, end = *p;
+			b = ctx->cfg_map[end];
+			val = ssa_vars[b];
+			while (val == var) {
+				b = ctx->cfg_blocks[b].idom;
+				if (!b) {
+					val = ir_uninitialized(ctx, type);
+					break;
+			    }
+				val = ssa_vars[b];
+			}
+			ir_set_op(ctx, phi, i + 2, val);
+			if (!IR_IS_CONST_REF(val)) {
+				ir_use_list_add(ctx, val, phi);
+			}
+		}
+	}
+}
+
+#define IR_CANNOT_CONVERT 0
+#define IR_MAY_PROMOTE    1
+#define IR_MAY_SPLIT      2
+
+#define IR_MAX_SPLIT_SIZE 256
+
+
+typedef struct {
+	uint32_t size;
+	uint32_t count;
+	uint8_t  sizes[IR_MAX_SPLIT_SIZE + 1];
+} ir_mem2ssa_split_layout;
+
+
+static int ir_mem2ssa_may_split_alloca(ir_ctx *ctx, ir_mem2ssa_split_layout *layout, ir_ref var, ir_ref next);
+
+static int ir_mem2ssa_may_convert_alloca(ir_ctx *ctx, ir_ref var, ir_ref next, ir_insn *insn,
+                                         ir_type *type_ptr, ir_mem2ssa_split_layout *split_layout)
+{
+	ir_ref n, *p, use, skip;
+	ir_insn *use_insn;
+	ir_use_list *use_list;
+	ir_type type = IR_VOID;
+	size_t size;
+
+	if (!IR_IS_CONST_REF(insn->op2)) {
+		/* dynamic alloca() of variable size */
+		return IR_CANNOT_CONVERT;
+	}
+	if (!(ctx->ir_base[insn->op2].type >= IR_U8
+	   && ctx->ir_base[insn->op2].type <= IR_U64
+	   && ctx->ir_base[insn->op2].val.u64 > 0)
+	 && !(ctx->ir_base[insn->op2].type >= IR_I8
+	   && ctx->ir_base[insn->op2].type <= IR_I64
+	   && ctx->ir_base[insn->op2].val.i64 > 0)) {
+		/* size passed to alloca() is not a positive integer number */
+		return IR_CANNOT_CONVERT;
+	}
+
+	size = (size_t)ctx->ir_base[insn->op2].val.u64;
+	use_list = &ctx->use_lists[var];
+	n = use_list->count;
+	skip = next;
+
+	p = &ctx->use_edges[use_list->refs];
+	do {
+		use = *p;
+		IR_ASSERT(use);
+		use_insn = &ctx->ir_base[use];
+		if (use == skip) {
+			skip = IR_UNUSED;
+			p++;
+			continue; /* skip control link */
+		}
+		if (use_insn->op == IR_LOAD) {
+			if (use_insn->op2 != var) {
+				return IR_CANNOT_CONVERT;
+			} else if (ir_get_type_size(use_insn->type) != size) {
+				goto try_split;
+			}
+			if (!type) {
+				type = use_insn->type;
+			}
+		} else if (use_insn->op == IR_STORE) {
+			if (use_insn->op2 != var || use_insn->op3 == var) {
+				return IR_CANNOT_CONVERT;
+			} else if (ir_get_type_size(ctx->ir_base[use_insn->op3].type) != size) {
+				goto try_split;
+			}
+			if (!type) {
+				type = ctx->ir_base[use_insn->op3].type;
+			}
+		} else {
+try_split:
+			if (size > IR_MAX_SPLIT_SIZE) return IR_CANNOT_CONVERT;
+			split_layout->size = (uint32_t)size;
+			split_layout->count = 0;
+			return ir_mem2ssa_may_split_alloca(ctx, split_layout, var, next);
+		}
+		p++;
+	} while (--n > 0);
+
+	*type_ptr = type;
+
+	return IR_MAY_PROMOTE;
+}
+
+static bool ir_mem2ssa_add_split_var(ir_ctx *ctx, ir_mem2ssa_split_layout *layout, size_t offset, size_t size)
+{
+	IR_ASSERT(size > 0);
+	if (size > 128) return 0; // TODO: support for bigger vectors ???
+
+	if (offset + size > layout->size) {
+		return 0;
+	} else if (!layout->count) {
+		memset(layout->sizes, 0, layout->size);
+	} else if (layout->sizes[offset]) {
+		/* check for the same size */
+		return (layout->sizes[offset] == size);
+	} else {
+		size_t i;
+
+		/* check for overlapping */
+		for (i = offset + 1; i < offset + size; i++) {
+			if (layout->sizes[i]) return 0;
+		}
+		if (offset > 0) {
+			size_t n = IR_MIN(offset, 7);
+
+			for (i = 1; i <= n; i++) {
+				if (layout->sizes[offset - i] > i) return 0;
+			}
+		}
+	}
+
+	layout->count++;
+	layout->sizes[offset] = (uint8_t)size;
+
+	return 1;
+}
+
+static bool ir_mem2ssa_may_promote(ir_ctx *ctx, ir_mem2ssa_split_layout *layout, ir_ref var, size_t offset)
+{
+	ir_ref n, *p, use;
+	ir_insn *use_insn;
+	ir_use_list *use_list;
+	uint32_t use_size;
+
+	use_list = &ctx->use_lists[var];
+	n = use_list->count;
+
+	p = &ctx->use_edges[use_list->refs];
+	while (n > 0) {
+		use = *p;
+		IR_ASSERT(use);
+		use_insn = &ctx->ir_base[use];
+		if (use_insn->op == IR_LOAD) {
+			if (use_insn->op2 != var) {
+				return 0;
+			}
+			use_size = ir_get_type_size(use_insn->type);
+			if (use_size == layout->size
+			 || !ir_mem2ssa_add_split_var(ctx, layout, offset, use_size)) {
+				return 0;
+			}
+		} else if (use_insn->op == IR_STORE) {
+			if (use_insn->op2 != var || use_insn->op3 == var) {
+				return 0;
+			}
+			use_size = ir_get_type_size(ctx->ir_base[use_insn->op3].type);
+			if (use_size == layout->size
+			 || !ir_mem2ssa_add_split_var(ctx, layout, offset, use_size)) {
+				return 0;
+			}
+		} else {
+			return 0;
+		}
+		p++;
+		n--;
+	}
+
+	return 1;
+}
+
+static int ir_mem2ssa_may_split_alloca(ir_ctx *ctx, ir_mem2ssa_split_layout *layout, ir_ref var, ir_ref next)
+{
+	ir_ref n, *p, use;
+	ir_insn *use_insn;
+	ir_use_list *use_list;
+	uint32_t use_size;
+
+	use_list = &ctx->use_lists[var];
+	n = use_list->count;
+
+	p = &ctx->use_edges[use_list->refs];
+	do {
+		use = *p;
+		IR_ASSERT(use);
+		use_insn = &ctx->ir_base[use];
+		if (use == next) {
+			next = IR_UNUSED;
+			p++;
+			continue; /* skip control link */
+		}
+		if (use_insn->op == IR_LOAD) {
+			if (use_insn->op2 != var) {
+				return IR_CANNOT_CONVERT;
+			}
+			use_size = ir_get_type_size(use_insn->type);
+			if (use_size == layout->size
+			 || !ir_mem2ssa_add_split_var(ctx, layout, 0, use_size)) {
+				return IR_CANNOT_CONVERT;
+			}
+		} else if (use_insn->op == IR_STORE) {
+			if (use_insn->op2 != var || use_insn->op3 == var) {
+				return IR_CANNOT_CONVERT;
+			}
+			use_size = ir_get_type_size(ctx->ir_base[use_insn->op3].type);
+			if (use_size == layout->size
+			 || !ir_mem2ssa_add_split_var(ctx, layout, 0, use_size)) {
+				return IR_CANNOT_CONVERT;
+			}
+		} else if (use_insn->op == IR_ADD
+				&& use_insn->op1 == var
+				&& IR_IS_CONST_REF(use_insn->op2)
+				&& IR_IS_TYPE_INT(ctx->ir_base[use_insn->op2].type)
+				&& ctx->ir_base[use_insn->op2].val.u64 < layout->size
+				&& ir_mem2ssa_may_promote(ctx, layout, use, (size_t)ctx->ir_base[use_insn->op2].val.u64)) {
+			/* pass */
+		} else {
+			return IR_CANNOT_CONVERT;
+		}
+		p++;
+	} while (--n > 0);
+
+	return layout->count > 0 ? IR_MAY_SPLIT : IR_CANNOT_CONVERT;
+}
+
+/* SRA - Scalar Replacement Of Aggregates */
+static void ir_mem2ssa_split_alloca(ir_ctx *ctx, ir_mem2ssa_split_layout *layout, ir_ref var, ir_ref next)
+{
+	ir_ref ref;
+	ir_ref i, j, use;
+	ir_insn *use_insn;
+	ir_use_list *use_list;
+	ir_ref first_new_alloca = IR_UNUSED;
+	uint32_t b = ctx->cfg_map[var];
+
+	IR_ASSERT(layout->count > 0);
+
+	/* update size in the original ALLOCA node */
+	i = 0;
+	while (!layout->sizes[i]) i++;
+	ctx->ir_base[var].op2 = ir_const_size_t(ctx, layout->sizes[i]);
+	layout->sizes[i] = 0; /* reuse original ALLOCA node */
+
+	if (layout->count > 1) {
+		/* create new ALLOCA nodes and link them into the control chain */
+		ir_ref prev = ctx->ir_base[var].op1;
+		uint32_t n = layout->count;
+		uint32_t j = 1;
+
+		ir_use_list_remove_one(ctx, prev, var);
+		first_new_alloca = ctx->insns_count;
+		do {
+			i++;
+			while (!layout->sizes[i]) i++;
+			ref = ir_emit2(ctx, IR_OPTX(IR_ALLOCA, IR_ADDR, 2), prev, ir_const_size_t(ctx, layout->sizes[i]));
+			ir_use_list_add(ctx, prev, ref);
+			prev = ref;
+			ctx->cfg_map[ref] = b;
+			layout->sizes[i] = j; /* use new ALLOCA node */
+			j++;
+			n--;
+		} while (n > 1);
+		ir_use_list_add(ctx, prev, var);
+		ctx->ir_base[var].op1 = prev;
+	}
+
+	use_list = &ctx->use_lists[var];
+	for (i = 0, j = 0; i < use_list->count; i++) {
+		use = ctx->use_edges[use_list->refs + i];
+		IR_ASSERT(use);
+		if (use == next) {
+			next = IR_UNUSED;
+			/* compact use_list */
+			if (i != j) {
+				ctx->use_edges[use_list->refs + j] = use;
+			}
+			j++;
+			continue; /* skip control link */
+		}
+		use_insn = &ctx->ir_base[use];
+		if (use_insn->op == IR_LOAD || use_insn->op == IR_STORE) {
+			/* compact use_list */
+			if (i != j) {
+				ctx->use_edges[use_list->refs + j] = use;
+			}
+			j++;
+		} else {
+			IR_ASSERT(use_insn->op == IR_ADD
+				&& use_insn->op1 == var
+				&& IR_IS_CONST_REF(use_insn->op2)
+				&& IR_IS_TYPE_INT(ctx->ir_base[use_insn->op2].type)
+				&& ctx->ir_base[use_insn->op2].val.u64 < layout->size);
+
+			size_t offset = (size_t)ctx->ir_base[use_insn->op2].val.u64;
+
+			ref = layout->sizes[offset] == 0 ? var : first_new_alloca + layout->sizes[offset] - 1;
+			ir_replace(ctx, use, ref);
+			MAKE_NOP(use_insn);
+			CLEAR_USES(use);
+		}
+	}
+
+	/* clean the tail of use list */
+	i = use_list->count;
+	use_list->count = j;
+	for (; j < i; j++) {
+		ctx->use_edges[use_list->refs + j] = IR_UNUSED;
+	}
+}
+
+static bool ir_mem2ssa_may_convert_var(ir_ctx *ctx, ir_ref var, ir_insn *insn)
+{
+	ir_ref n, *p, use;
+	ir_insn *use_insn;
+	ir_use_list *use_list;
+	ir_type type;
+	uint32_t size;
+
+	use_list = &ctx->use_lists[var];
+	n = use_list->count;
+	if (!n) {
+		return 0;
+	}
+
+	p = &ctx->use_edges[use_list->refs];
+	type = insn->type;
+	size = ir_get_type_size(type);
+	do {
+		use = *p;
+		IR_ASSERT(use);
+		use_insn = &ctx->ir_base[use];
+		if (use_insn->op == IR_VLOAD) {
+			if (use_insn->op2 != var
+			 || (use_insn->type != type
+			  && ir_get_type_size(use_insn->type) != size)) {
+				return 0;
+			}
+		} else if (use_insn->op == IR_VSTORE) {
+			if (use_insn->op2 != var
+			 || use_insn->op3 == var
+			 || (ctx->ir_base[use_insn->op3].type != type
+			  && ir_get_type_size(ctx->ir_base[use_insn->op3].type) != size)) {
+				return 0;
+			}
+		} else {
+			return 0;
+		}
+		p++;
+	} while (--n > 0);
+
+	return 1;
+}
+
+int ir_mem2ssa(ir_ctx *ctx)
+{
+	uint32_t b;
+	ir_block *bb;
+	ir_ref *ssa_vars = NULL;
+	ir_list queue;
+	ir_bitset defs;
+	ir_bitqueue iter_worklist;
+	uint32_t *order;
+	ir_mem2ssa_split_layout split_layout;
+
+	ctx->flags2 &= ~IR_MEM2SSA_VARS;
+	IR_ASSERT(ctx->use_lists && ctx->cfg_blocks);
+
+	for (b = 1, bb = ctx->cfg_blocks + 1; b <= ctx->cfg_blocks_count; bb++, b++) {
+		ir_ref ref, next, start = bb->start;
+		ir_ref i, j, n = ctx->use_lists[start].count;
+		ir_insn *insn;
+
+		if (ssa_vars
+		 && (ctx->ir_base[start].op == IR_MERGE
+		  || (ctx->ir_base[start].op == IR_BEGIN
+		   && ctx->ir_base[ctx->ir_base[start].op1].op == IR_END))) {
+			/* CFG reduction may open oportunities for more redundand LOADs and STOREs elimination */
+			ir_bitqueue_add(&iter_worklist, start);
+		}
+
+		if (n > 1) { /* BB start node is used at least by next control or by BB end node */
+			ir_use_list *use_list = &ctx->use_lists[start];
+
+			for (i = 0, j = 0; i < use_list->count; i++) {
+				ir_ref use = ctx->use_edges[use_list->refs + i];
+
+				insn = &ctx->ir_base[use];
+				if (insn->op == IR_VAR) {
+					if (ctx->use_lists[use].count == 0) {
+						MAKE_NOP(insn);
+						continue;
+					} else if (ir_mem2ssa_may_convert_var(ctx, use, insn)) {
+						uint32_t len = ir_bitset_len(ctx->cfg_blocks_count + 1);
+
+						if (!ssa_vars) {
+							ir_bitqueue_init(&iter_worklist, ctx->insns_count);
+							ssa_vars = ir_mem_calloc(ctx->cfg_blocks_count + 1, sizeof(ir_ref));
+							ir_list_init(&queue, ctx->cfg_blocks_count);
+							defs = ir_mem_calloc(len * 2, IR_BITSET_BITS / 8);
+							order = ir_mem2ssa_order(ctx);
+						} else {
+							memset(defs, 0, len * 2 * IR_BITSET_BITS / 8);
+						}
+
+						ir_mem2ssa_convert(ctx, order, ssa_vars, &queue, defs, defs + len, &iter_worklist, use, IR_UNUSED, insn->type);
+
+						insn = &ctx->ir_base[use];
+						MAKE_NOP(insn);
+						CLEAR_USES(use);
+						ctx->flags2 |= IR_MEM2SSA_VARS;
+
+						use_list = &ctx->use_lists[start]; /* reload */
+						continue;
+					}
+				}
+
+				/* compact use list */
+				if (i != j) {
+					ctx->use_edges[use_list->refs + j] = use;
+				}
+				j++;
+			}
+			if (i != j) {
+				use_list->count = j;
+				do {
+					ctx->use_edges[use_list->refs + j] = IR_UNUSED; /* clenu-op the removed tail */
+					j++;
+				} while (j != i);
+			}
+		}
+
+		ref = bb->end;
+		insn = &ctx->ir_base[ref];
+		next = ref;
+		ref = insn->op1;
+		while (ref != start) {
+			insn = &ctx->ir_base[ref];
+			if (insn->op == IR_ALLOCA) {
+				ir_type type;
+				int convert;
+
+				if (ctx->use_lists[ref].count == 1) {
+					ir_ref prev = insn->op1;
+					ctx->ir_base[next].op1 = prev;
+					if (!IR_IS_CONST_REF(insn->op2)) {
+						ir_use_list_remove_one(ctx, insn->op2, ref);
+					}
+					ir_use_list_replace_one(ctx, prev, ref, next);
+					MAKE_NOP(insn);
+					CLEAR_USES(ref);
+					ctx->cfg_map[ref] = 0;
+					ref = prev;
+					continue;
+				}
+				convert = ir_mem2ssa_may_convert_alloca(ctx, ref, next, insn, &type, &split_layout);
+				if (convert == IR_MAY_PROMOTE) {
+					uint32_t len = ir_bitset_len(ctx->cfg_blocks_count + 1);
+					ir_ref prev;
+
+					if (!ssa_vars) {
+						ir_bitqueue_init(&iter_worklist, ctx->insns_count);
+						ssa_vars = ir_mem_calloc(ctx->cfg_blocks_count + 1, sizeof(ir_ref));
+						ir_list_init(&queue, ctx->cfg_blocks_count);
+						defs = ir_mem_calloc(len * 2, IR_BITSET_BITS / 8);
+						order = ir_mem2ssa_order(ctx);
+					} else {
+						memset(defs, 0, len * 2 * IR_BITSET_BITS / 8);
+					}
+
+					ir_mem2ssa_convert(ctx, order, ssa_vars, &queue, defs, defs + len, &iter_worklist, ref, next, type);
+
+					insn = &ctx->ir_base[ref];
+					prev = insn->op1;
+					next = ir_next_control(ctx, ref);
+					ctx->ir_base[next].op1 = prev;
+					if (!IR_IS_CONST_REF(insn->op2)) {
+						ir_use_list_remove_one(ctx, insn->op2, ref);
+					}
+					ir_use_list_replace_one(ctx, prev, ref, next);
+					MAKE_NOP(insn);
+					CLEAR_USES(ref);
+					ctx->cfg_map[ref] = 0;
+					ref = prev;
+					next = ir_next_control(ctx, ref);
+					ctx->flags2 |= IR_MEM2SSA_VARS;
+					continue;
+				} else if (convert == IR_MAY_SPLIT) {
+					ir_mem2ssa_split_alloca(ctx, &split_layout, ref, next);
+					continue;
+				}
+			} else if (ssa_vars
+					&& (insn->op == IR_LOAD
+					 || insn->op == IR_STORE
+					 || insn->op == IR_VLOAD
+					 || insn->op == IR_VSTORE)) {
+				/* After removing SSA related LOADs and STOREs unrelated LOADs and STOREs may become redundand */
+				ir_bitqueue_add(&iter_worklist, ref);
+			}
+			next = ref;
+			ref = insn->op1;
+		}
+	}
+
+	if (ssa_vars) {
+		ir_mem_free(order);
+		ir_mem_free(defs);
+		ir_list_free(&queue);
+		ir_mem_free(ssa_vars);
+
+		// TODO: remove BOLCK_BEGIN and BLOCK_END without ALLOCAs between them
+		ir_bitqueue_grow(&iter_worklist, ctx->insns_count);
+		ir_iter_opt(ctx, &iter_worklist);
+
+		ir_bitqueue_free(&iter_worklist);
+	}
+
+	return 1;
+}

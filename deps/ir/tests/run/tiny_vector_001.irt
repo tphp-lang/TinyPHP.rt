@@ -1,0 +1,39 @@
+--TEST--
+LOAD and STORE of 2-bytes vectors
+--ARGS--
+--run
+--CODE--
+extern func @printf(uintptr_t, ...): int32_t;
+static const @str.1[13] = "%d %d %d %d\n\000";
+func @main(): int32_t
+{
+	uintptr_t c_13 = sym(@str.1);
+	int32_t c_12 = 1;
+	int32_t c_11 = 0;
+	uintptr_t c_10 = func @printf(uintptr_t, ...): int32_t;
+	<uint8_t*2> c_9 = {2, 2};
+	uint64_t c_7 = 2;
+	uint64_t c_6 = 4;
+	<uint8_t*2> c_5 = {1, 2};
+	l_1 = START(l_20);
+	uintptr_t d_2, l_2 = ALLOCA(l_1, c_6, 2);
+	l_3 = STORE_v(l_2, d_2, c_5);
+	uintptr_t d_4 = ADD(d_2, c_7);
+	<uint8_t*2> d_5, l_5 = LOAD_v(l_3, d_2);
+	<uint8_t*2> d_6 = ADD(d_5, c_9);
+	l_7 = STORE_v(l_5, d_4, d_6);
+	<uint8_t*2> d_8, l_8 = LOAD(l_7, d_2);
+	uint8_t d_9 = EXTRACT(d_8, c_11);
+	uint32_t d_10 = ZEXT(d_9);
+	uint8_t d_11 = EXTRACT(d_8, c_12);
+	uint32_t d_12 = ZEXT(d_11);
+	<uint8_t*2> d_13, l_13 = LOAD(l_8, d_4);
+	uint8_t d_14 = EXTRACT(d_13, c_11);
+	uint32_t d_15 = ZEXT(d_14);
+	uint8_t d_16 = EXTRACT(d_13, c_12);
+	uint32_t d_17 = ZEXT(d_16);
+	int32_t d_18, l_18 = CALL/5(l_13, c_10, c_13, d_10, d_12, d_15, d_17);
+	l_20 = RETURN(l_18, c_11);
+}
+--EXPECT--
+1 2 3 4

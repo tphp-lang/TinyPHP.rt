@@ -1,0 +1,34 @@
+?  Passing and returning stuctures by value
+	+ in memory
+	- in several registers
+	- full ABI conformance
+-  MEMCPY, MEMSET
+-  Consider IR cleanup (VAR -> ALLOCA, VLOAD -> LOAD, VSTORE -> STORE, LOOP_END -> END, LOOP_BEGIN -> MERGE, PI)
+-  long double
+
+-  revisit ir_bind()
+
+?  reassociation folding rules
+-  folding engine improvement (one rule for few patterns)
+
+-  Extend SCCP to support range inference and PI node
+	- See "Eliminating Range Checks using SSA Form" John Gough, Herbert Klaeren
+	- PI nodes may be defined as %dst = BOUND_LOW/HIGH(%ctrl, %src, %low/high_bound)
+	- PI nodes may be inserted after IF and GUARD
+	- PI should not be lifted to BB with PHIs
+
+?  instruction selection
+    - BURS ???
+
+?  register allocation
+	-  optimisation of spill code placement (BB local or through resolution)
+	-  separate INT and FP allocation phases (for performance)
+	-  Try to avoid live-interval construction, see "Efficient Global Register Allocation" Ian Rogers
+
+?  code generation
+	-  TAILCALL with stack arguments (tests/x86/tailcall_001.itr)
+	-  binary code emission without DynAsm ???
+
+?  modules (functions, data objecs, import, export, prototypes, forward declarations, memory segments, ref data, expr data) 
+-  interpreter
+-  alias analyzes
