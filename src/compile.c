@@ -2058,6 +2058,16 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
              dst, e->line);
         return dst;
     }
+    case A_YIELD: {
+        /* yield val | yield key => val：t1=值 t2=键（无键=UNUSED→自动键）
+         * tr=send 目标。函数已由 parse 标 is_generator。 */
+        Loc dst = tmp_dst(c, want);
+        Loc v = compile_expr(c, e->u.yld.val, LOC_NONE);
+        Loc k = e->u.yld.key ? compile_expr(c, e->u.yld.key, LOC_NONE)
+                             : (Loc){ .kind = OPD_UNUSED };
+        emit(c, OP_YIELD, v, k, dst, e->line);
+        return dst;
+    }
     case A_CLONE: {
         Loc src = compile_expr(c, e->u.clone.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
@@ -2943,6 +2953,11 @@ static void collect_expr_vars(AExpr *e, AExprList *out, AParam **params, int n_p
         if (e->u.clone.overrides)
             collect_expr_vars(e->u.clone.overrides, out, params, n_params);
         return;
+    case A_YIELD:
+        collect_expr_vars(e->u.yld.val, out, params, n_params);
+        if (e->u.yld.key)
+            collect_expr_vars(e->u.yld.key, out, params, n_params);
+        return;
     }
 }
 
@@ -3117,6 +3132,9 @@ static bool expr_uses_self_prop(AExpr *e, TStr *pname) {
     case A_CLONE:
         return expr_uses_self_prop(e->u.clone.e, pname) ||
                expr_uses_self_prop(e->u.clone.overrides, pname);
+    case A_YIELD:
+        return expr_uses_self_prop(e->u.yld.val, pname) ||
+               (e->u.yld.key && expr_uses_self_prop(e->u.yld.key, pname));
     case A_ARRAY: {
         for (int i = 0; i < e->u.alist->n; i++) {
             if (expr_uses_self_prop(e->u.alist->items[i].key, pname)) return true;
@@ -3305,6 +3323,37 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
         int vslot = get_var(&c, af->params[af->n_params - 1]->name);
         emit(&c, OP_RECV_VARIADIC, (Loc){ .kind = OPD_UNUSED, .slot = af->n_params - 1 },
              LOC_NONE, LOC_CV(vslot), af->line);
+    }
+    /* PHP 8 generators：is_generator（parse 期置位）→ 标记 + 首条 CREATE +
+     * 返回类型白名单校验（PHP：Generator/Traversable/Iterator/object/无） */
+    if (af->is_generator) {
+        f->is_generator = true;
+        if (af->ret_type) {
+            const char *rt = tstr_val(af->ret_type);
+            size_t rl = tstr_len(af->ret_type);
+            const char *base = rt;
+            if (rl && rt[0] == '\\') { base = rt + 1; rl--; }
+            char lcb[32];
+            size_t k = 0;
+            for (; k < rl && k + 1 < sizeof lcb; k++) {
+                char ch = base[k];
+                lcb[k] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+            }
+            lcb[k] = 0;
+            bool ok_rt = strcmp(lcb, "generator") == 0 ||
+                         strcmp(lcb, "traversable") == 0 ||
+                         strcmp(lcb, "iterator") == 0 ||
+                         strcmp(lcb, "object") == 0;
+            if (!ok_rt)
+                tphp_fatal_src(file, af->line,
+                               "A generator function must not declare a return "
+                               "type other than Generator, Traversable, Iterator "
+                               "or object (got \"%s\")", rt);
+        }
+        /* CREATE 在 RECV 之后：参数先经 RECV 落入帧槽（共享 args 区随后可被
+         * 覆盖），CREATE 再摘帧装 Generator（PHP 的 CREATE 在最前是因为其
+         * 参数直接在堆帧上；tphp RECV 模型下等价语义） */
+        emit(&c, OP_GENERATOR_CREATE, LOC_NONE, LOC_NONE, LOC_NONE, af->line);
     }
     compile_stmt_list(&c, af->body);
     emit(&c, OP_RETURN, LOC_NONE, LOC_NONE, LOC_NONE, af->line); /* implicit */
@@ -4023,6 +4072,11 @@ static void expand_expr_tree(AExpr *e, const char *cur_file,
         expand_expr_tree(e->u.clone.e, cur_file, pre, n_pre, cap_pre);
         if (e->u.clone.overrides)
             expand_expr_tree(e->u.clone.overrides, cur_file, pre, n_pre, cap_pre);
+        return;
+    case A_YIELD:
+        expand_expr_tree(e->u.yld.val, cur_file, pre, n_pre, cap_pre);
+        if (e->u.yld.key)
+            expand_expr_tree(e->u.yld.key, cur_file, pre, n_pre, cap_pre);
         return;
     case A_ASSIGN: case A_ASSIGN_OP: case A_INSTANCEOF:
         expand_expr_tree(e->u.bin.l, cur_file, pre, n_pre, cap_pre);

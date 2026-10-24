@@ -58,6 +58,7 @@ typedef enum {
                        * （OP_REQUIRE 运行期求值）。二者至少一个非 NULL。 */
     A_PROPHOOK,       /* u.phook {cls, prop, is_set, args}:
                        * PHP 8.4 parent::$p::get() / parent::$p::set($v) */
+    A_YIELD,          /* u.yld {val, key}: yield val / yield key => val */
 } ANTag;
 
 typedef struct { AExpr *key; AExpr *val; bool is_spread; } AArrayItem;
@@ -89,6 +90,7 @@ typedef struct AFunc {
     AParam **params; int n_params;
     AExprList *uses;      /* closure `use ($a, $b)` — A_VAR exprs; NULL */
     bool is_static;
+    bool is_generator;    /* 体内含 yield（parse 期置位，PHP ZEND_ACC_GENERATOR 同款） */
     AStmtList *body;
     TStr *ret_type;       /* declared return type, normalized; NULL = none */
     int line;
@@ -137,6 +139,7 @@ typedef struct AExpr {
         struct { AExpr *obj; TStr *name; AExpr *aname; } prop;
         struct { AExpr *obj; TStr *name; AExpr *aname; AArgList *args; } mcall;
         struct { TStr *cls; TStr *member; AExpr *aname; AArgList *args; } scall;
+        struct { AExpr *val; AExpr *key; } yld;   /* A_YIELD: yield val | yield key => val */
         struct { TStr *path; AExpr *path_expr; bool is_require; bool is_once; } inc;
         /* A_REQUIRE / S_INCLUDE：path 字面量 or path_expr 动态表达式 */
     } u;

@@ -72,6 +72,8 @@ void tphp_ffi_init(void);
 void tphp_exclass_init(void);
 /* vm.c：Closure 内部类注册（P1-3，编译前；幂等） */
 void tphp_closure_class_init(void);
+/* generator.c：PHP 8 generators 内部类 */
+void tphp_generator_init(void);
 /* pack.c：M6.1 原生资产打包（构建 + 启动释放，跨平台） */
 #include "pack.h"
 /* pkg.c：内置包管理（无外部 git 依赖） */
@@ -492,6 +494,7 @@ static int run_source(const char *src, const char *name, bool dump) {
         tphp_ffi_init();              /* M5.5 FFI 内部类 */
         tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
         tphp_closure_class_init();    /* P1-3: Closure 内部类 */
+        tphp_generator_init();        /* PHP 8 generators（PLAN/generators.md） */
         if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
     }
     AStmtList *ast = tphp_parse_script(src, name);

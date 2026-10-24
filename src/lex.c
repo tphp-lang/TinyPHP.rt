@@ -82,6 +82,7 @@ static const struct { const char *name; LKind k; } keywords[] = {
     { "extends", KW_EXTENDS }, { "implements", KW_IMPLEMENTS },
     { "readonly", KW_READONLY }, { "enum", KW_ENUM },
     { "self", KW_SELF }, { "parent", KW_PARENT }, { "insteadof", KW_INSTEADOF },
+    { "yield", KW_YIELD }, { "from", KW_FROM },
     { NULL, L_EOF },
 };
 

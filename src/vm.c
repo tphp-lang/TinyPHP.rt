@@ -35,6 +35,7 @@
 #include "class.h"
 #include "tsched.h"
 #include "tffi.h"
+#include "generator.h"
 #include "bundle.h"
 #include "pack.h"
 #include "ast.h"
@@ -834,6 +835,14 @@ static int32_t op_array_spread(VM *vm, TOp *op) {
 /* ---- iteration ---- */
 static int32_t op_fe_reset(VM *vm, TOp *op) {
     TVal v = rdv(vm, op, 1);
+    if (v.t == T_OBJ && ((GCHead *)v.u.p)->kind == GC_KIND_OBJ) {
+        /* Generator（v1 对象 foreach 仅 Generator；一般 Iterator 后置） */
+        if (tphp_generator_fe_reset(vm, v)) {
+            tval_addref(v);
+            wtake(vm, op, v);
+            return 1;
+        }
+    }
     if (v.t != T_ARR)
         vm_raise(vm, ex_class("TypeError"), op,
                  "foreach iterates over value of type %s",
@@ -846,6 +855,24 @@ static int32_t op_fe_reset(VM *vm, TOp *op) {
 
 static int32_t op_fe_fetch(VM *vm, TOp *op) {
     TVal it = rd(vm, op, 1);
+    if (it.t == T_OBJ && ((GCHead *)it.u.p)->kind == GC_KIND_OBJ) {
+        TVal key = TV_NULL, val = TV_NULL;
+        bool more = false;
+        if (tphp_generator_fe_fetch(vm, it, &key, &val, &more)) {
+            if (!more) {
+                wtake(vm, op, TV_FALSE);
+                return 1;
+            }
+            TVal *vp = &vm->x.frame->slots[op->a2 + 1];
+            tval_release(vp);
+            *vp = val;                    /* 移交 +1 */
+            TVal *kp = &vm->x.frame->slots[op->a2 + 2];
+            tval_release(kp);
+            *kp = key;
+            wtake(vm, op, TV_TRUE);
+            return 1;
+        }
+    }
     TArr *a = (TArr *)it.u.p;
     TVal *cur = opd(vm, op, 2);
     int64_t i = cur->u.i;
@@ -868,6 +895,46 @@ static int32_t op_fe_fetch(VM *vm, TOp *op) {
     cur->u.i = i + 1;
     wtake(vm, op, TV_TRUE);
     return 1;
+}
+
+/* ---- generators（PLAN/generators.md；handler → generator.c） ---- */
+
+/* 生成器函数首条：帧已由 DO_FCALL 建立挂链、RECV 已搬参数入槽。
+ * 打包 Generator 对象写回调用方 dst，摘帧返回控制（参数已安全落槽）。 */
+static int32_t op_generator_create(VM *vm, TOp *op) {
+    (void)op;
+    VMFrame *f = vm->x.frame;
+    TVal genobj = tphp_generator_pack(vm, f);
+    VMCallRec *rec = (vm->x.n_calls > 0) ? &vm->x.calls[vm->x.n_calls - 1] : NULL;
+    if (!rec || (rec->uf == NULL && rec->clo == NULL))
+        tphp_vm_raise(vm, "Error", "Internal: generator create without call rec");
+    VMFrame *caller = f->prev;
+    if (rec->dst_kind != OPD_UNUSED && caller) {
+        TVal *d = &caller->slots[rec->dst_slot];
+        tval_release(d);
+        *d = genobj;              /* 移交引用给调用方 dst */
+    } else {
+        tval_release(&genobj);
+    }
+    vm->x.n_calls--;
+    f->pc++;                      /* 首驱动起点 = CREATE 之后 */
+    f->prev = NULL;
+    vm->x.frame = caller;
+    return 0;                     /* caller->pc 已在 DO_FCALL 推进 */
+}
+
+/* 产出：暂停生成器帧、摘链交还驱动方 */
+static int32_t op_yield(VM *vm, TOp *op) {
+    VMFrame *f = vm->x.frame;
+    if (!f->gen)
+        tphp_vm_raise(vm, "Error", "Internal: yield outside a generator");
+    TVal v = op->t1 != OPD_UNUSED ? rdv(vm, op, 1) : TV_NULL;
+    TVal k = op->t2 != OPD_UNUSED ? rdv(vm, op, 2) : TV_NULL;
+    bool has_key = op->t2 != OPD_UNUSED;
+    uint32_t slot = (op->tr != OPD_UNUSED) ? op->ar : 0;
+    bool has_send = op->tr != OPD_UNUSED;
+    tphp_generator_pause(vm, f, v, k, has_key, slot, has_send);
+    return 0;                     /* 帧已切换，勿再推进 */
 }
 
 /* shared: called_cls resolution for a frame being created */
@@ -1511,6 +1578,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
     vm->x.n_args = (int)rec->args_base;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     /* 可见性 scope（PHP EG(scope)）优先级：
      *   1. rec->scope_decl = TMethod.decl——普通方法=声明类（B::f() 执行 A
      *      的方法体 scope=A，A 的 private 可见）；trait 拷贝=使用类（TU）
@@ -1553,6 +1621,17 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
 }
 
 static int32_t op_return(VM *vm, TOp *op) {
+    /* 生成器函数 RETURN：存 retval、关帧（不经 call rec——generator 帧的
+     * DO_FCALL rec 已在 CREATE 时消费） */
+    if (vm->x.frame->gen) {
+        TVal r = TV_NULL;
+        if (op->t1 != OPD_UNUSED) {
+            r = rdv(vm, op, 1);
+            tval_addref(r);
+        }
+        tphp_generator_finish(vm, r);   /* 移交 r 引用 */
+        return 0;
+    }
     TVal r = TV_NULL;
     if (op->t1 != OPD_UNUSED) {
         r = rdv(vm, op, 1);
@@ -2144,6 +2223,12 @@ static void run_frame_until_pop_deep(VM *vm, VMFrame *f) {
     }
 }
 
+static void frame_destroy(VMFrame *f);
+
+/* generator.c 桥接（同 tffi 模式） */
+void tphp_vm_frame_destroy(VMFrame *f) { frame_destroy(f); }
+void tphp_vm_run_nested_deep(VM *vm, VMFrame *f) { run_frame_until_pop_deep(vm, f); }
+
 /* ---- magic-method invocation helper (C-level method call) ----
  * Runs method `name` (looked up on `owner`) with `args` (n of them, MOVED:
  * the callee consumes the references — RECV takes them into the parameter
@@ -2169,6 +2254,7 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     rec->scope_decl = m->decl;
     TFunc *fn = m->fn;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
                  : ((fn->is_method && fn->decl_cls)
                         ? (TClass *)fn->decl_cls : NULL);
@@ -2232,7 +2318,7 @@ static bool call_hook(VM *vm, TOp *op, TObj *o, TStr *pname, TFunc *fn,
     rec->uf = fn;
     rec->called_cls = o->cls;
     VMFrame *f = tm_malloc(sizeof *f);
-    memset(f, 0, sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->fn = fn;
     f->file = fn->file;
     f->pc = 0;
@@ -2526,6 +2612,7 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         rec->dst_slot = op->ar;
         TFunc *fn = rec->uf;
         VMFrame *f = tm_malloc(sizeof *f);
+        memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
         f->vis_scope = rec->scope_decl ? (TClass *)rec->scope_decl
                      : ((fn->is_method && fn->decl_cls)
                             ? (TClass *)fn->decl_cls : NULL);
@@ -2536,6 +2623,7 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
         f->args_base = base;
         f->n_args_sent = nargs;
         f->n_calls_at_entry = vm->x.n_calls;
+        f->gen = NULL;
         uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
         f->slots = tm_malloc(sizeof(TVal) * nslots);
         for (uint32_t i = 0; i < nslots; i++)
@@ -3905,8 +3993,10 @@ static void vm_unwind(VM *vm) {
          * 先 push rec 再建帧），slot0 的 $this 是最后一个引用。 */
         VMCallRec *crec = (f->n_calls_at_entry > 0)
             ? &vm->x.calls[f->n_calls_at_entry - 1] : NULL;
-        /* B6: 下一轮（父帧）的归因修正量——thunk 不前推 caller pc */
-        pc_back = (crec && crec->is_thunk) ? 0u : 1u;
+        /* B6: 下一轮（父帧）的归因修正量——thunk 不前推 caller pc；
+         * 生成器帧同理（resume 无 call rec，误取邻 rec 会把 caller pc
+         * 推出 try 范围 → 本该接住的异常变 Uncaught） */
+        pc_back = (crec && crec->is_thunk) || f->gen ? 0u : 1u;
         TObj *half_obj = NULL;
         if (crec && crec->is_ctor && f->slots[0].t == T_OBJ &&
             ((GCHead *)f->slots[0].u.p)->kind == GC_KIND_OBJ)
@@ -3961,6 +4051,7 @@ TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
     rec->args_base = (uint32_t)vm->x.n_args;
     rec->is_thunk = true;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = (fn->is_method && fn->decl_cls)
         ? (TClass *)fn->decl_cls : NULL;
     f->called_cls = NULL;             /* thunk 帧无类作用域（补未初始化） */
@@ -4190,7 +4281,7 @@ static int32_t op_require(VM *vm, TOp *op) {
     rec->is_include = true;
 
     VMFrame *f = tm_malloc(sizeof *f);
-    memset(f, 0, sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… */
     f->fn = inc->main;
     f->file = name_copy;
     f->pc = 0;
@@ -4239,6 +4330,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_isset_cconst),
     H(op_require),
     H(op_prophook),
+    H(op_generator_create), H(op_yield),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -4269,6 +4361,8 @@ const char *tphp_op_name(uint8_t op) {
         "ISSET_CCONST",
         "REQUIRE",
         "PROPHOOK",
+        "GENERATOR_CREATE",
+        "YIELD",
     };
     return op < OP_MAX ? names[op] : "?";
 }
@@ -4316,6 +4410,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
         return;
     }
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fnc;
     f->pc = 0;
@@ -4858,6 +4953,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         rec->uf = fn;
         rec->args_base = base;
         VMFrame *f = tm_malloc(sizeof *f);
+        memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
         f->fn = fn;
         f->file = fn->file;
@@ -4866,6 +4962,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         f->args_base = base;
         f->n_args_sent = (uint16_t)nq;
         f->n_calls_at_entry = vm->x.n_calls;
+        f->gen = NULL;
         uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
         f->slots = tm_malloc(sizeof(TVal) * nslots);
         for (uint32_t i = 0; i < nslots; i++)
@@ -4903,6 +5000,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     rec->uf = fn;
     rec->args_base = base;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fn;
     f->file = fn->file;
@@ -4950,6 +5048,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     tphp_tostr_hook = vm_tostring_hook;
     TFunc *fn = clo->fn;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = fn;
     f->file = fn->file;
@@ -4985,6 +5084,7 @@ int tphp_vm_run(Program *prog) {
     tphp_raise_hook = vm_value_raise;
     tphp_tostr_hook = vm_tostring_hook;
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     f->vis_scope = NULL;
     f->fn = prog->main;
     f->file = prog->file;

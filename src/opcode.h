@@ -67,6 +67,10 @@ typedef enum {
     OP_PROPHOOK,       /* PHP 8.4 parent::$p::get()/set()：a1=prop 名字面量
                         * （含$前缀）；ext=0 get / 1 set；实参已 SEND 入栈
                         * （args_base 由本 op 的 call rec 记录） */
+    OP_GENERATOR_CREATE, /* 生成器函数首条：帧已由 DO_FCALL 建立挂链，本 op
+                          * 摘帧装入 Generator 对象写回调用方 dst，返回控制 */
+    OP_YIELD,          /* 产出：t1=值，t2=键（可空），tr/ar=send 目标槽；
+                        * 暂停帧（摘链不销毁），控制交回驱动方 */
     OP_MAX,
 } Opcode;
 
@@ -117,6 +121,8 @@ typedef struct TFunc {
     bool is_closure;
     bool is_method;        /* M3: slot 0 (after captures) holds $this */
     bool is_variadic;      /* last param is ...$x: extras go to RECV_VARIADIC */
+    bool is_generator;     /* 函数体含 yield（PHP 8.5 §generators）：调用返回
+                            * Generator 而非执行；RETURN 走关闭分支 */
     void *decl_cls;        /* TClass*: class this method was declared in */
     void *prog;            /* Program*: owning program（动态 require 的文件有
                             * 自己的 funcs 表——CLOSURE_INIT 等按索引取函数
@@ -161,6 +167,8 @@ typedef struct VMFrame {
     void *called_cls;    /* TClass*: actual class for static:: (late binding) */
     void *vis_scope;     /* P3: 可见性作用域覆盖（parent::__construct 帧 =
                             声明类）；NULL = 用 called_cls */
+    void *gen;           /* TGen*: generator frame marker (NULL = plain);
+                            * every frame alloc site must zero it */
     uint32_t n_calls_at_entry;   /* n_calls when this frame took over; unwind
                                     restores it (M5-b: leftover call recs of
                                     builtin/magic raises) */

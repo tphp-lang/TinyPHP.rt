@@ -165,6 +165,7 @@ static void build_root_frame(VM *vm, TCont *c) {
                           tstr_val(nm));
     }
     VMFrame *f = tm_malloc(sizeof *f);
+    memset(f, 0, sizeof *f);   /* zero gen/… — 协程根帧同样必须初始化 */
     f->fn = fn;
     f->file = fn->file;           /* 根帧源文件：异常归属/raise_file 依赖，
                                    * tm_malloc 不初始化，漏设会读到已释放填充值 */

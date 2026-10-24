@@ -30,6 +30,11 @@ typedef struct {
     Token tok;       /* 1-token lookahead */
     const char *file;
     TStr *ns;        /* current namespace (S_NS_END carries the outer) */
+    int in_const_expr; /* 默认值/类常量/属性默认上下文（yield 禁止） */
+    /* 函数上下文栈：yield 标记栈顶 AFunc（parse 期，PHP 同款）；
+     * 空栈 = 函数体外（加载期拒绝） */
+    struct AFunc *fn_stack[64];
+    int n_fn_stack;
 } Parser;
 /* PHP 8.4 __PROPERTY__：钩子体内折叠为属性名字符串（parse 期设置） */
 static TStr *g_hook_prop_name;
@@ -144,9 +149,10 @@ static TStr *expect_ident(Parser *p, const char *what) {
 
 /* 成员名位置（`->` / `?->` 之后）：标识符或任意关键字。
  * PHP 允许 $o->fn / $o->match / $o->class —— 关键字在成员位置退化为
- * 标识符。lex.c 对所有标识符（含关键字 token）都填了 ident，可直接取用。 */
+ * 标识符（半保留字含 yield/from：enum E::from、方法名 from 均合法）。
+ * lex.c 对所有标识符（含关键字 token）都填了 ident，可直接取用。 */
 static bool tok_is_member_name(LKind k) {
-    return k == L_IDENT || (k >= KW_IF && k <= KW_INSTEADOF);
+    return k == L_IDENT || (k >= KW_IF && k <= KW_FROM);
 }
 
 static AExpr *ae_new(int tag, int line) {
@@ -886,10 +892,9 @@ static AExpr *parse_static_access(Parser *p, TStr *name, int line) {
     } else if (p->tok.kind == L_IDENT) {
         member = p->tok.ident;
         advance(p);
-    } else if (p->tok.kind == KW_SELF || p->tok.kind == KW_PARENT ||
-               p->tok.kind == KW_STATIC || p->tok.kind == KW_NEW) {
-        /* keywords as member names: `Worker::self()`, `FFI::new()` are
-         * valid static method calls in PHP */
+    } else if (tok_is_member_name(p->tok.kind)) {
+        /* keywords as member names: `Worker::self()`, `FFI::new()`,
+         * `Status::from()` — PHP semi-reserved list */
         member = p->tok.ident;
         advance(p);
     } else {
@@ -1164,8 +1169,7 @@ static AExpr *parse_postfix_from(Parser *p, AExpr *e) {
             if (p->tok.kind == KW_CLASS) {
                 member = tstr_intern("class", 5);
                 advance(p);
-            } else if (p->tok.kind == L_IDENT || p->tok.kind == KW_SELF ||
-                       p->tok.kind == KW_PARENT || p->tok.kind == KW_STATIC) {
+            } else if (tok_is_member_name(p->tok.kind)) {
                 member = p->tok.ident;   /* keywords usable as member names */
                 advance(p);
             } else {
@@ -1503,6 +1507,29 @@ static bool is_lvalue(AExpr *e) {
 }
 
 static AExpr *parse_assign_level(Parser *p) {
+    /* PHP 8 generators：yield 优先级低于赋值（`$x = yield $v`）；
+     * `yield k => v` 键值形态；yield from v2 后置。 */
+    if (p->tok.kind == KW_YIELD) {
+        int yline = p->tok.line;
+        if (p->in_const_expr)
+            p_error(p, "yield cannot be used in constant or default expressions");
+        if (p->n_fn_stack == 0)
+            p_error(p, "yield expression can only be used inside a function");
+        p->fn_stack[p->n_fn_stack - 1]->is_generator = true;
+        advance(p);
+        if (p->tok.kind == KW_FROM)
+            p_error(p, "'yield from' is not supported yet (planned v2; see PLAN/generators.md)");
+        AExpr *first = parse_assign_level(p);
+        AExpr *key = NULL, *val = first;
+        if (accept(p, P_FATARROW)) {
+            key = first;
+            val = parse_assign_level(p);
+        }
+        AExpr *e = ae_new(A_YIELD, yline);
+        e->u.yld.val = val;
+        e->u.yld.key = key;
+        return e;
+    }
     AExpr *lhs = parse_pipe_level(p);
     int line = p->tok.line;
     int op = -1;
@@ -1577,6 +1604,22 @@ static AExpr *parse_kw_or_level(Parser *p) {
 }
 
 static AExpr *parse_expr(Parser *p) { return parse_kw_or_level(p); }
+
+/* 函数上下文栈（yield 标记目标） */
+static void fn_push(Parser *p, struct AFunc *f) {
+    if (p->n_fn_stack >= 64) p_error(p, "Function nesting too deep");
+    p->fn_stack[p->n_fn_stack++] = f;
+}
+static void fn_pop(Parser *p) { p->n_fn_stack--; }
+
+/* 常量/默认值表达式上下文：yield 禁止（PHP：constexpr 含 yield 报错） */
+static AExpr *parse_expr_cctx(Parser *p) {
+    int save = p->in_const_expr;
+    p->in_const_expr = 1;
+    AExpr *e = parse_expr(p);
+    p->in_const_expr = save;
+    return e;
+}
 
 /* ============ destructuring ============ */
 static ADestructList *parse_destruct_list(Parser *p, bool bracket_form) {
@@ -1820,7 +1863,7 @@ static void parse_params(Parser *p, AFunc *f) {
         if ((pvis >= 0 || pro_readonly) && variadic)
             p_error(p, "Cannot promote a variadic parameter");
         advance(p);
-        if (accept(p, P_ASSIGN)) par->default_val = parse_expr(p);
+        if (accept(p, P_ASSIGN)) par->default_val = parse_expr_cctx(p);
         f->params = tm_realloc(f->params, sizeof(AParam *) * (size_t)(f->n_params + 1));
         f->params[f->n_params++] = par;
         if (!accept(p, P_COMMA)) break;
@@ -2019,12 +2062,14 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
             if (kind == CK_INTERFACE)    /* P3: 接口方法不允许有方法体 */
                 p_error(p, "Interface method must not have a body");
             advance(p);
+            fn_push(p, f);
             AStmtList *l = asl_new();
             while (p->tok.kind != P_RBRACE) {
                 if (p->tok.kind == L_EOF) p_error(p, "Unterminated method body");
                 asl_push(l, parse_statement(p));
             }
             expect(p, P_RBRACE, "Expected '}'");
+            fn_pop(p);
             f->body = l;
         } else {
             expect(p, P_SEMI, "Expected ';' or '{' after method signature");
@@ -2121,7 +2166,7 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         m->prop.name = p->tok.ident;
         advance(p);
         expect(p, P_ASSIGN, "Expected '=' in class constant");
-        m->prop.def = parse_expr(p);
+        m->prop.def = parse_expr_cctx(p);
         expect(p, P_SEMI, "Expected ';'");
         return m;
     }
@@ -2197,7 +2242,7 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
         m->prop.def = NULL;
         m->next = NULL;
         advance(p);
-        if (accept(p, P_ASSIGN)) m->prop.def = parse_expr(p);
+        if (accept(p, P_ASSIGN)) m->prop.def = parse_expr_cctx(p);
 
         /* 钩子块：`{ get ...; set ...; }` —— 替代 ';'（php-src hooked_property
          * 文法：T_VARIABLE '{' hook_list '}' 后无分号），且禁止逗号链 */
@@ -2233,7 +2278,7 @@ static AClassMember *parse_class_member(Parser *p, int kind, TStr *cls_name) {
             nx->prop.type = ptype;
             nx->prop.def = NULL;
             advance(p);
-            if (accept(p, P_ASSIGN)) nx->prop.def = parse_expr(p);
+            if (accept(p, P_ASSIGN)) nx->prop.def = parse_expr_cctx(p);
             tail->next = nx;
             tail = nx;
         }
@@ -2263,7 +2308,7 @@ static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name) {
             m->vis = CVIS_PUBLIC;
             m->prop.name = p->tok.ident;
             advance(p);
-            if (accept(p, P_ASSIGN)) m->prop.def = parse_expr(p);
+            if (accept(p, P_ASSIGN)) m->prop.def = parse_expr_cctx(p);
             expect(p, P_SEMI, "Expected ';'");
             b->items = tm_realloc(b->items, sizeof(AClassMember *) * (size_t)(b->n + 1));
             b->items[b->n++] = m;
@@ -2352,12 +2397,14 @@ static AExpr *parse_closure(Parser *p, bool is_static) {
     }
     if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
     expect(p, P_LBRACE, "Expected '{' for closure body");
+    fn_push(p, f);
     AStmtList *l = asl_new();
     while (p->tok.kind != P_RBRACE) {
         if (p->tok.kind == L_EOF) p_error(p, "Unterminated closure body");
         asl_push(l, parse_statement(p));
     }
     expect(p, P_RBRACE, "Expected '}'");
+    fn_pop(p);
     f->body = l;
     AExpr *e = ae_new(A_CLOSURE, line);
     e->u.clo.func = f;
@@ -2376,10 +2423,12 @@ static AExpr *parse_arrow_fn(Parser *p) {
     expect(p, P_RPAREN, "Expected ')'");
     if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p);
     expect(p, P_FATARROW, "Expected '=>' after arrow function parameters");
+    fn_push(p, f);
     AStmtList *l = asl_new();
     AStmt *ret = as_new(S_RETURN, line);
     ret->u.e = parse_expr(p);
     asl_push(l, ret);
+    fn_pop(p);
     f->body = l;
     AExpr *e = ae_new(A_ARROW, line);
     e->u.clo.func = f;
@@ -2398,12 +2447,14 @@ static AStmt *parse_function_decl(Parser *p) {
     expect(p, P_RPAREN, "Expected ')'");
     if (accept(p, P_COLON)) f->ret_type = parse_type_decl(p); /* P1-1: 运行期校验 */
     expect(p, P_LBRACE, "Expected '{' for function body");
+    fn_push(p, f);
     AStmtList *l = asl_new();
     while (p->tok.kind != P_RBRACE) {
         if (p->tok.kind == L_EOF) p_error(p, "Unterminated function body");
         asl_push(l, parse_statement(p));
     }
     expect(p, P_RBRACE, "Expected '}'");
+    fn_pop(p);
     f->body = l;
     AStmt *s = as_new(S_FUNCDECL, line);
     s->u.func = f;
