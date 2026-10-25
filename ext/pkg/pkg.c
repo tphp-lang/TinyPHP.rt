@@ -310,6 +310,7 @@ static void strlist_push(char ***arr, int *n, const char *s) {
 
 /* psr-4 值可为 string 或 string[]（Composer 兼容） */
 static void parse_psr4(TMod *m, TArr *psr4) {
+    tarr_sync_buckets(psr4);
     for (uint32_t i = 0; i < psr4->dused; i++) {
         if (psr4->data[i].t == T_UNDEF) continue;
         /* key：按偏移反查（与 json.c arr_key_by_off 同式） */
@@ -393,6 +394,7 @@ static bool tmod_from_json(TVal v, TMod *m, char *err, size_t errcap) {
     }
     TArr *dp = mget_obj(o, "deps");
     if (dp) {
+        tarr_sync_buckets(dp);
         for (uint32_t i = 0; i < dp->dused; i++) {
             if (dp->data[i].t == T_UNDEF || dp->data[i].t != T_ARR) continue;
             TVal key = TV_NULL;
@@ -1429,6 +1431,7 @@ static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
 
 /* 把 lock 条目里的 integrity 对象展开成 IntList（拷贝，脱离 TArr 生命周期） */
 static void integrity_from_snap(TArr *snap, IntList *l) {
+    tarr_sync_buckets(snap);
     for (uint32_t i = 0; i < snap->dused; i++) {
         if (snap->data[i].t != T_STR) continue;
         TVal key = TV_NULL;
@@ -2069,6 +2072,7 @@ int tphp_pkg_install(const char *proj_dir, bool force,
             return 2;
         }
         TArr *lock = (TArr *)lv.u.p;
+        tarr_sync_buckets(lock);
         for (uint32_t i = 0; i < lock->dused; i++) {
             if (lock->data[i].t != T_ARR) continue;
             TVal key = TV_NULL;
@@ -2184,6 +2188,7 @@ int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap) {
     if (!ok || lv.t != T_ARR) return 0;              /* lock 坏：放行交给 install 流程 */
     TArr *lock = (TArr *)lv.u.p;
     int rc = 0;
+    tarr_sync_buckets(lock);
     for (uint32_t i = 0; i < lock->dused; i++) {
         if (lock->data[i].t != T_ARR) continue;
         TVal key = TV_NULL;

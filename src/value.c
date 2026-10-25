@@ -113,6 +113,7 @@ static int cmp_strings(TStr *a, TStr *b) {
 
 static int cmp_array(TArr *a, TArr *b) {
     if (a->n != b->n) return a->n < b->n ? -1 : 1;
+    tarr_sync_buckets(a);   /* 反查键前补齐惰性桶（L5） */
     for (uint32_t i = 0; i < a->dused; i++) {
         TVal v = a->data[i];
         if (v.t == T_NULL) continue; /* free slot */

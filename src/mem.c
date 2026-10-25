@@ -93,6 +93,7 @@ TArr *tarr_alloc_raw(void) {
     a->dcap = a->dused = 0;
     a->free_head = UINT32_MAX;
     a->packed = true;   /* 空数组视为 packed（纯追加时保持） */
+    a->bpending = 0;
     gc_register(&a->h);
     return a;
 }

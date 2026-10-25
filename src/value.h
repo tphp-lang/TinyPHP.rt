@@ -122,6 +122,10 @@ typedef struct TArr {
     /* packed（perf-roadmap L2）：仅追加连续 int 键且无 unset 洞时 true；
      * 此时 data[i] 恒为键 i 的值（i=0..n-1），tarr_get int 键直取。 */
     bool packed;
+    /* 惰性桶同步（L5 写路径）：bpending = 尚未写入 buckets 的 append 数。
+     * 不变量：bpending>0 ⇒ packed（全部键为 int 0..n-1，dused==n 无洞），
+     * 桶落后但可从 data 全量重建；任何摸 buckets 的路径先 tarr_sync_buckets。 */
+    uint32_t bpending;
 } TArr;
 
 /* ---- classes & objects (M3; declared here, implemented in class.c) ----
@@ -308,6 +312,9 @@ void  tarr_free(TArr *a);
 bool  tarr_set(TArr *a, TVal key, TVal val);       /* inserts or replaces */
 bool  tarr_append(TArr *a, TVal val);              /* $a[] = v */
 TVal *tarr_get(TArr *a, TVal key);                 /* NULL when absent */
+/* 惰性桶同步：bpending>0 时从 data[0..n) 全量重建 buckets（键全 int）；
+ * 否则 no-op。所有直接遍历/写入 a->buckets 的代码入口必须先调用。 */
+void  tarr_sync_buckets(TArr *a);
 bool  tarr_has(TArr *a, TVal key);
 bool  tarr_unset(TArr *a, TVal key);
 static inline uint32_t tarr_count(TArr *a) { return a->n; }

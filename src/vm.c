@@ -38,6 +38,7 @@
 #include "generator.h"
 #include "bundle.h"
 #include "pack.h"
+#include "jit.h"
 #include "ast.h"
 #include <uv.h>        /* uv_os_uname → PHP_UNAME */
 #include <stdarg.h>
@@ -387,6 +388,9 @@ static TArr *dim_cow(VM *vm, TVal *bp) {
 
 /* key of data slot di (for iteration / spread) */
 static TVal arr_key_at(TArr *a, uint32_t di) {
+    /* packed 快路：键即 data 下标（顺带把 O(bcap) 反查降为 O(1)；
+     * bpending>0 时桶落后也正确） */
+    if (a->packed) return di < a->n ? TV_INT((int64_t)di) : TV_NULL;
     for (uint32_t b = 0; b < a->bcap; b++) {
         ABucket *bk = &a->buckets[b];
         if (bk->key.t != T_NULL && bk->val_off == di)
@@ -1640,6 +1644,40 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
         f->slots[0] = TV_OBJ((TObj *)rec->this_obj);
         rec->this_obj = NULL;
     }
+#ifdef TPHP_JIT
+    /* IR baseline JIT (PLAN/ir-jit.md): frame ready, RECV deferred to
+     * prologue. Guard-fail leaves slots UNDEF / args intact → interpreter. */
+    if (tphp_jit_available()) {
+        if (!fn->jit_entry && fn->hot != UINT16_MAX &&
+            ++fn->hot >= TPHP_JIT_HOT_THRESHOLD)
+            tphp_jit_compile(fn);
+        if (fn->jit_entry && f->n_args_sent >= fn->n_params) {
+            TVal jret = { .u.i = 0, .t = T_NULL };
+            int jok = ((JitEntry)fn->jit_entry)(vm, f->slots,
+                                                &vm->x.args[rec->args_base],
+                                                &jret);
+            if (jok) {
+                VMCallRec *jr = &vm->x.calls[vm->x.n_calls - 1];
+                vm->x.n_calls--;
+                if (jr->dst_kind != OPD_UNUSED) {
+                    TVal *d = &vm->x.frame->prev->slots[jr->dst_slot];
+                    tval_release(d);
+                    *d = jret;
+                } else {
+                    tval_release(&jret);
+                }
+                VMFrame *jprev = f->prev;
+                frame_destroy(f);
+                vm->x.frame = jprev;
+                if (!vm->x.frame) vm->x.done = true;
+                /* caller pc was already advanced past DO_FCALL (frame-push
+                 * path line ~1633) — must NOT advance again (d=0) */
+                return 0;
+            }
+            /* deopt: guards precede writes; interpreter runs RECV normally */
+        }
+    }
+#endif
     return 0;                     /* pc managed (new frame starts at 0) */
 }
 
@@ -4734,6 +4772,7 @@ void tphp_vm_restore_clone_state(VM *vm, TObj *o, TVal state) {
     /* 默认恢复：状态数组 string 键 → 同名属性槽直填 */
     if (state.t != T_ARR) return;
     TArr *a = (TArr *)state.u.p;
+    tarr_sync_buckets(a);   /* 桶可能落后（L5 惰性同步） */
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
         /* 反查键（data 序 ↔ bucket） */
@@ -5176,6 +5215,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
 int tphp_vm_run(Program *prog) {
     VM *vm = &g_vm;
     memset(vm, 0, sizeof *vm);
+    tphp_jit_init();   /* idempotent; reads TPHP_JIT once */
     vm->prog = prog;
     vm_seed_consts(vm);
     tphp_vm_current = vm;

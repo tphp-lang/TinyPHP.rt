@@ -438,7 +438,6 @@ static TVal eval_const2(Ctx *c, AExpr *e, bool *ok) {
          * static-prop defaults): fold them eagerly, no spread */
         AArrayList *al = e->u.alist;
         TArr *a = tarr_new();
-        int64_t next = 0;
         for (int i = 0; i < al->n; i++) {
             AArrayItem *it = &al->items[i];
             if (it->is_spread) { *ok = false; tarr_free(a); return TV_NULL; }
@@ -452,11 +451,9 @@ static TVal eval_const2(Ctx *c, AExpr *e, bool *ok) {
                     tval_release(&v); tarr_free(a);
                     return TV_NULL;
                 }
-                if (k.t == T_INT) next = k.u.i + 1;
                 tarr_set(a, k, v);          /* value ownership moves in */
             } else {
-                tarr_set(a, TV_INT(next), v);
-                next++;
+                tarr_append(a, v);           /* packed 快路（L5） */
             }
         }
         return TV_ARR(a);

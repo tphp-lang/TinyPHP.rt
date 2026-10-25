@@ -48,6 +48,7 @@ static void dump_pad(int n) {
 }
 
 static TVal arr_key_at(TArr *a, uint32_t di) {
+    if (a->packed) return di < a->n ? TV_INT((int64_t)di) : TV_NULL;
     for (uint32_t b = 0; b < a->bcap; b++) {
         ABucket *bk = &a->buckets[b];
         if (bk->key.t != T_NULL && bk->val_off == di)
@@ -766,6 +767,7 @@ static TVal bi_array_shift(VM *vm, TVal *args, int n) {
 static TVal bi_array_unshift(VM *vm, TVal *args, int n) {
     if (n < 2) RAISE(vm, "ArgumentCountError", "array_unshift() expects at least 2 arguments");
     TArr *a = need_arr(vm, &args[0], "array_unshift", "#1 ($array)");
+    tarr_sync_buckets(a);
     /* 原地前插：新值 + 原元素（字符串键保留、数字键重排，对齐 PHP）。
      * 旧实现重建数组写回 args[0]——实参副本，调用方收不到（2026-10-15 修） */
     TVal *vals = tm_malloc(sizeof(TVal) * (size_t)(n - 1 + a->n));
@@ -946,6 +948,7 @@ static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 static TVal bi_sort(VM *vm, TVal *args, int n) {
     (void)n;
     TArr *a = need_arr(vm, &args[0], "sort", "#1 ($array)");
+    tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
     /* 原地排序：收集（+1）→ 插入排序 → 清空原数组 → 按序写回。
@@ -989,6 +992,7 @@ static TVal bi_sort(VM *vm, TVal *args, int n) {
 static TVal bi_rsort(VM *vm, TVal *args, int n) {
     (void)n;
     TArr *a = need_arr(vm, &args[0], "rsort", "#1 ($array)");
+    tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
     /* 原地排序（同 bi_sort；旧实现写回 args[0] 无效） */
@@ -1538,6 +1542,7 @@ static TVal bi_array_filter(VM *vm, TVal *args, int n) {
     need_arr(vm, &args[0], "array_filter", "#1 ($array)");
     if (n >= 2) need_callable(vm, &args[1], "array_filter", "#2 ($callback)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
@@ -1597,6 +1602,7 @@ static TVal bi_usort(VM *vm, TVal *args, int n) {
     need_arr(vm, &args[0], "usort", "#1 ( &$array )");
     need_callable(vm, &args[1], "usort", "#2 ($callback)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
     /* 收集元素 */
@@ -1650,6 +1656,7 @@ static TVal bi_array_flip(VM *vm, TVal *args, int n) {
     if (n != 1) RAISE(vm, "ArgumentCountError", "array_flip() expects exactly 1 argument");
     need_arr(vm, &args[0], "array_flip", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
@@ -1677,6 +1684,7 @@ static TVal bi_array_unique(VM *vm, TVal *args, int n) {
     if (n != 1) RAISE(vm, "ArgumentCountError", "array_unique() expects exactly 1 argument");
     need_arr(vm, &args[0], "array_unique", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
@@ -1712,6 +1720,7 @@ static TVal bi_array_search(VM *vm, TVal *args, int n) {
     need_arr(vm, &args[1], "array_search", "#2 ($haystack)");
     bool strict = n >= 3 ? tval_to_bool(args[2]) : false;
     TArr *a = (TArr *)args[1].u.p;
+    tarr_sync_buckets(a);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
         bool hit = strict ? tval_strict_eq(args[0], a->data[i])
@@ -1781,6 +1790,7 @@ static TVal bi_array_key_first(VM *vm, TVal *args, int n) {
     if (n != 1) RAISE(vm, "ArgumentCountError", "array_key_first() expects exactly 1 argument");
     need_arr(vm, &args[0], "array_key_first", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
         for (uint32_t b = 0; b < a->bcap; b++)
@@ -1796,6 +1806,7 @@ static TVal bi_array_key_last(VM *vm, TVal *args, int n) {
     if (n != 1) RAISE(vm, "ArgumentCountError", "array_key_last() expects exactly 1 argument");
     need_arr(vm, &args[0], "array_key_last", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     for (uint32_t i = a->dused; i > 0; i--) {
         uint32_t j = i - 1;
         if (a->data[j].t == T_UNDEF) continue;
@@ -2071,6 +2082,7 @@ static TVal bi_array_chunk(VM *vm, TVal *args, int n) {
         RAISE(vm, "ValueError", "array_chunk(): Argument #2 ($length) must be greater than 0");
     bool preserve = n >= 3 ? tval_to_bool(args[2]) : false;
     TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
     TArr *out = tarr_new();
     TArr *cur = NULL;
     int64_t cnt = 0;
@@ -2111,6 +2123,7 @@ static TVal bi_strtr(VM *vm, TVal *args, int n) {
         need_arr(vm, &args[1], "strtr", "#2 ($replace_pairs)");
         /* 简化：从长到短替换 */
         TArr *pairs = (TArr *)args[1].u.p;
+        tarr_sync_buckets(pairs);
         /* 构造可变缓冲 */
         size_t cap = s->len + 1;
         char *buf = tm_malloc(cap);

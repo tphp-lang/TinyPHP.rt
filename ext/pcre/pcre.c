@@ -216,6 +216,7 @@ static TArr *matches_arr(VM *vm, TVal *slot, const char *fname) {
     a->next_idx = 0;
     a->free_head = UINT32_MAX;
     a->dused = 0;
+    a->bpending = 0;   /* 清空后无待同步项（L5） */
     return a;
 }
 
@@ -701,6 +702,7 @@ TVal bi_preg_grep(VM *vm, TVal *args, int n) {
     pcre2_match_data *md = pcre2_match_data_create_from_pattern(code, NULL);
 
     TArr *out = tarr_new();
+    tarr_sync_buckets(arr);   /* 反查原键前补齐惰性桶（L5） */
     for (uint32_t i = 0; i < arr->dused; i++) {
         if (arr->data[i].t == T_UNDEF) continue;
         if (arr->data[i].t != T_STR) continue;   /* PHP：仅字符串元素 */

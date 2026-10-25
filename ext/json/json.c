@@ -95,6 +95,8 @@ static bool enc_val(VM *vm, JBuf *b, TVal v, int depth, int options);
 
 /* 数组是否连续 int 键 0..n-1 */
 static bool arr_is_list(TArr *a) {
+    if (a->packed) return true;   /* 不变量：packed ⇒ 键即 0..n-1 无洞 */
+    tarr_sync_buckets(a);
     uint32_t idx = 0;
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
@@ -114,6 +116,8 @@ static bool arr_is_list(TArr *a) {
 }
 
 static TVal arr_key_by_off(TArr *a, uint32_t off) {
+    if (a->packed) return off < a->n ? TV_INT((int64_t)off) : TV_NULL;
+    tarr_sync_buckets(a);
     for (uint32_t bk = 0; bk < a->bcap; bk++)
         if (a->buckets[bk].val_off == off && a->buckets[bk].key.t != T_NULL)
             return a->buckets[bk].key;

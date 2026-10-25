@@ -123,6 +123,7 @@ static void sw_seen_done(SW *w, GCHead *h) {
 static void sw_val(SW *w, TVal v);
 
 static void sw_array(SW *w, TArr *a) {
+    tarr_sync_buckets(a);
     int ref = sw_seen_enter(w, &a->h);
     if (ref >= 0) {
         put_u8(&w->buf, &w->len, &w->cap, 'R');
@@ -385,6 +386,7 @@ TVal tval_clone_deep(TVal v) {
     }
     if (v.t == T_ARR) {
         TArr *a = (TArr *)v.u.p;
+        tarr_sync_buckets(a);
         TArr *n = tarr_new();
         /* data[] 物理序 = 插入序；off→key 逆映射一次扫描（O(n)） */
         TVal *keys = tm_malloc(sizeof(TVal) * (size_t)(a->dused ? a->dused : 1));

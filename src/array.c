@@ -54,6 +54,7 @@ static void arr_grow_buckets(TArr *a, uint32_t new_bcap) {
  * *free_slot_out (optional) receives the first reusable slot (tombstone or
  * the empty slot that stopped the probe). */
 static ABucket *arr_find(TArr *a, TVal key, uint32_t *free_slot_out) {
+    tarr_sync_buckets(a);   /* packed append 惰性桶：查桶前先补齐 */
     if (!a->buckets) return NULL;
     uint32_t slot = key_hash(key) & a->hmask;
     uint32_t free_slot = UINT32_MAX;
@@ -131,6 +132,34 @@ static void arr_maybe_grow(TArr *a) {
         arr_grow_buckets(a, a->bcap ? a->bcap * 2 : 16);
 }
 
+/* 惰性桶同步（L5）：把 data[0..n) 全量重建进 buckets。bpending>0 时全部
+ * 键都是 int 0..n-1（不变量），旧桶里的 int 键无需 release；重建后 packed
+ * 布局不变（packed 保持，tarr_get 快路仍有效）。O(n)，只在有人查桶时付。 */
+void tarr_sync_buckets(TArr *a) {
+    if (a->bpending == 0) return;
+    a->bpending = 0;
+    uint32_t bcap = a->bcap ? a->bcap : 16;
+    while (a->n * 4 >= bcap * 3) bcap *= 2;   /* 载荷 < 0.75，防建完即-grow */
+    if (bcap != a->bcap || !a->buckets) {
+        if (a->buckets) tm_free(a->buckets);
+        a->buckets = tm_malloc(sizeof(ABucket) * (size_t)bcap);
+        a->bcap = bcap;
+        a->hmask = bcap - 1;
+    }
+    for (uint32_t i = 0; i < a->bcap; i++) {
+        a->buckets[i].key.t = T_NULL;
+        a->buckets[i].val_off = UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < a->n; i++) {     /* packed：data[i] 即键 i */
+        TVal key = TV_INT((int64_t)i);
+        uint32_t slot = key_hash(key) & a->hmask;
+        while (a->buckets[slot].val_off != UINT32_MAX)
+            slot = (slot + 1) & a->hmask;
+        a->buckets[slot].key = key;
+        a->buckets[slot].val_off = i;
+    }
+}
+
 bool tval_norm_key(TVal *key); /* value.c */
 
 bool tarr_set(TArr *a, TVal key, TVal val) {
@@ -191,6 +220,19 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
 }
 
 bool tarr_append(TArr *a, TVal val) {
+    /* packed 快路（L5）：直接 data[n]=val，桶惰性补齐（bpending）——
+     * 跳过 norm/find/grow/双查/桶写。非 packed 走全套 tarr_set。 */
+    if (a->packed) {
+        if (a->dused == a->dcap) {
+            a->dcap = a->dcap ? a->dcap * 2 : 8;
+            a->data = tm_realloc(a->data, sizeof(TVal) * a->dcap);
+        }
+        a->data[a->dused++] = val;
+        a->n++;
+        a->next_idx++;
+        a->bpending++;
+        return true;
+    }
     return tarr_set(a, TV_INT(a->next_idx), val);
 }
 
@@ -209,6 +251,10 @@ TVal *tarr_get(TArr *a, TVal key) {
 
 bool tarr_has(TArr *a, TVal key) {
     if (!tval_norm_key(&key)) return false;
+    if (a->packed && key.t == T_INT) {   /* 快路同 tarr_get，免无谓 sync */
+        int64_t i = key.u.i;
+        return i >= 0 && (uint32_t)i < a->n;
+    }
     return arr_find(a, key, NULL) != NULL;
 }
 
@@ -234,6 +280,7 @@ TArr *tarr_cow(TArr *a) {
     b->dcap = a->dcap;
     b->dused = a->dused;
     b->packed = a->packed;   /* L2：布局不变时快路径同样成立 */
+    b->bpending = a->bpending;   /* 桶同样落后，复制方自行 sync */
     if (a->dcap) {
         b->data = tm_malloc(sizeof(TVal) * a->dcap);
         /* only copy the initialized prefix; zero the tail (memcpy of
