@@ -127,6 +127,10 @@ typedef struct TFunc {
     void *prog;            /* Program*: owning program（动态 require 的文件有
                             * 自己的 funcs 表——CLOSURE_INIT 等按索引取函数
                             * 必须经此反查，不能用 vm->prog） */
+    /* IR JIT（PLAN/ir-jit.md）：入口热度计数；jit_entry 一次写全局只读。
+     * hot == UINT16_MAX = 编译已尝试且失败（熔断，不再重试）。 */
+    uint16_t hot;
+    void *jit_entry;       /* JitEntry 或 NULL */
 } TFunc;
 
 typedef struct Program {

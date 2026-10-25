@@ -3,16 +3,16 @@
 > 状态：已确认设计，按里程碑串行执行。计划确认时间：2026-10-09。
 > 详细规格拆分在 `PLAN\` 文件夹中，本文档为索引与定位声明。
 
-## ⚠️ 定位声明：这是解释型运行时，不是 AOT
+## ⚠️ 定位声明：解释型运行时 + 热函数 baseline JIT
 
-**TinyPHP.rt = 解释器**：源码 → 编译为自有 opcode → **自有 VM 解释执行**。
-- **不做 AOT、不做 JIT、不生成机器码/C 源码**——"小型"指运行时内核小（约 1.3 万行 C），不是编译器
-- 因为是解释器，**动态特性全部保留**：`$fn()`、`new $cls`、`$obj->$method()`、`$cls::$method()`、`$obj->{'prop'}` 等运行期动态分发是基本能力（opcode 层天然支持，无加载期约束）
+**TinyPHP.rt = 解释器为本体**：源码 → 编译为自有 opcode → **自有 VM 解释执行**。
+- **不做 AOT**；执行模型默认是解释器。**2026-10-24 性能目标升级（用户拍板）= 持平或超越开 tracing JIT 的 PHP**，唯一通路是自研 **IR baseline JIT**（PLAN/ir-jit.md，vendor dstogov/ir = PHP 8.4+ 官方 JIT 同后端）——JIT 只覆盖热函数，语义兜底永远是解释器
+- 因为本体是解释器，**动态特性全部保留**：`$fn()`、`new $cls`、`$obj->$method()`、`$cls::$method()`、`$obj->{'prop'}` 等运行期动态分发是基本能力（opcode 层天然支持，无加载期约束）
 - 类型声明（int/string/union/readonly）只是**运行期校验 + 加载期辅助报错**，与 AOT 的"强类型子集"完全是两回事；strict 声明全局隐含开启，但语义校验发生在运行时
 - 与 TinyPHP（姊妹项目）的关系：TinyPHP 编译 PHP 严格子集到 C（AOT），TinyPHP.rt 解释执行接近完整 PHP 8 语义。两者代码零共享、定位互补
 - 抛掉 `&$ref` 引用的唯一原因：**引用模型与协程挂起、跨线程克隆、简单 GC 三者冲突**，与 AOT 无关
 
-**术语澄清**：计划中的"编译"一律指 **源码 → opcode 的加载阶段**（lex → parse → AST → 字节码，与 php-src 内部 `zend_compile.c` 的"编译器"同义）——任何脚本执行前都要先过这一步，产物是自有 opcode 交给 VM 解释，**永不生成机器码**。因此"编译期报错"更准确的叫法是 **加载期报错**：脚本还没执行第一行就被拒绝的静态错误（语法错误、不支持的特性等），对应 PHP 7+ 的 `ParseError/CompileError`；而 `TypeError/DivisionByZeroError` 等是 opcode 执行时抛出的**运行期报错**。下文文档统一使用"加载期"。
+**术语澄清**：计划中的"编译"一律指 **源码 → opcode 的加载阶段**（lex → parse → AST → 字节码，与 php-src 内部 `zend_compile.c` 的"编译器"同义）——任何脚本执行前都要先过这一步，产物是自有 opcode 交给 VM 解释；热函数另可经 ir-jit 编译为机器码（§PLAN/ir-jit.md，2026-10-25 起）。因此"编译期报错"更准确的叫法是 **加载期报错**：脚本还没执行第一行就被拒绝的静态错误（语法错误、不支持的特性等），对应 PHP 7+ 的 `ParseError/CompileError`；而 `TypeError/DivisionByZeroError` 等是 opcode 执行时抛出的**运行期报错**。下文文档统一使用"加载期"。
 
 ## 硬性目标
 
@@ -26,7 +26,7 @@
 | 决策点 | 结论 |
 |---|---|
 | 实现语言 | C11（可直接搬 zend_fibers.c / Zend/asm 现成实现） |
-| 项目性质 | **解释型运行时**（opcode + VM），非 AOT、非 JIT |
+| 项目性质 | **解释型运行时**（opcode + VM）为本体，非 AOT；热函数 IR baseline JIT（2026-10-24 拍板，PLAN/ir-jit.md） |
 | 语法范围 | 过程式 + 完整 OOP（M1 先过程式，M3 补 OOP） |
 | I/O 层 | 直接 vendor libuv 源码（不用 submodule） |
 | 数组数字字符串键 | **对齐 PHP**："8"→int 8；"08"/"8.5"/超 int64 保留字符串（M1 定死冻结） |
@@ -50,6 +50,7 @@
 | [PLAN/perf-roadmap.md](PLAN/perf-roadmap.md) | **性能路线**：参照系三层（Zend/Bun/IR JIT）、优化时机四判据、解释器优化清单、IR 框架 JIT 路线（PHP 8.4 官方底座）、Bun 借鉴清单、防翻案结论 |
 | [PLAN/generators.md](PLAN/generators.md) | **生成器（yield）**：帧保存模型（VMFrame 直存 Generator）、opcode 集、v1 范围（G1 基础/G2 send/G3 边界）、v2 后置（throw/from/dtor-finally）、已知差异 |
 | [PLAN/preg.md](PLAN/preg.md) | **正则（preg_*）**：vendor pcre2（php-src 8.5.7 pcre2lib）、模式语法/修饰符映射、v1 函数集语义、错误模型决策（编译=异常/运行=返回值协议）、P1–P4 分批 |
+| [PLAN/ir-jit.md](PLAN/ir-jit.md) | **IR baseline JIT v1**：函数级 lowering 规格——封闭类型世界（int/float/bool/null）、opcode 白名单、JitEntry ABI 与 prologue guard、JIT→JIT 调用折叠、slow helper 复用 tval_*、构建/线程约束、M1 验收（fib vs 追踪 JIT ≤2.5×） |
 
 ## 技术栈与环境
 

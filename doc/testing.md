@@ -103,6 +103,10 @@ echo "hello\n";
 
 **结论**（详表与路线见 [../PLAN/perf-roadmap.md](../PLAN/perf-roadmap.md) §1.1）：JIT 不敏感簇（string/throw/serialize/json）1.6–3.7× 靠解释器关闭；JIT 敏感簇（fib/call/push/read/kv/rmw/object）vs JIT 5.7–25.7×，唯一通路 = 自研 IR JIT。
 
+2026-10-25 L5 惰性桶同步后（bench-vs-php 同脚本）：**array-push 295.4→78.2ms（-74%）**，vs 无JIT PHP 3.6×（原 13.7×）、vs JIT 6.7×（原 25.7×）——packed append 只写 data[n]，桶在有人查时才从 data 全量重建（tarr_sync_buckets）；其余 bench 持平或小幅改善（json -6%、object -7%）。
+
+2026-10-25 IR baseline JIT v1 上线（PLAN/ir-jit.md；TPHP_JIT=0 可关）：**fib(28) 13.2ms vs PHP tracing JIT 10.9ms = 1.2×（M1 达成）**，比 tphp 解释器（114.7ms）快 8.7×。仅 fib 等封闭 int 函数进 JIT 白名单，其余 bench 不变；全量 218/218。
+
 **历史修正**：①早期"JIT 微基准无感"是 CLI 未开 `opcache.enable_cli` 导致 JIT 从未点火——实测 fib/call/arr-read 提升 2.4–5.5×；②kv-read 常量键形态会被 Zend optimizer 间歇性整段折叠（进程间双态 ~22ms/~1.7ms，结果仍正确，`optimization_level=0` 后恒慢态；JIT 全程 false）——**跨运行时 bench 禁用"常量键+无副作用求和"形态**，已改变量键+校验。
 
 2026-10-24 `.=` in-place 修复：**string 292.4→2.1ms**——TStr 加 cap 预留（非 interned：len<64→96 否则 +50%），op_concat 同槽快路 `tstr_append_inplace`（rc==1 且非 interned 原地追加；成功不走 wtake 防自释放）。

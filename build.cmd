@@ -13,8 +13,8 @@ set CFLAGS_US=-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURC
 rem ext\* include dirs MUST come after deps\libffi\include: libffi's public
 rem header is <ffi.h>; an -Iext\ffi earlier in the list with an ffi.h inside
 rem would shadow it (same trap as the historic src\ffi.h naming ban).
-set INC=-Isrc -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz -Ideps\pcre2 -Iext\ffi -Iext\net -Iext\io -Iext\worker -Iext\json -Iext\serialize -Iext\pkg -Iext\builtin -Iext\standard -Iext\pcre
-set DEFS=-DTPHP_TARGET="\"x86_64-w64-windows-gnu\""
+set INC=-Isrc -Ideps\ir -Ideps\libuv\include -Ideps\libuv\src -Ideps\mimalloc\include -Ideps\mimalloc\src -Ideps\mbedtls\include -Ideps\mbedtls\library -Ideps\libffi\include -Ideps\miniz -Ideps\pcre2 -Iext\ffi -Iext\net -Iext\io -Iext\worker -Iext\json -Iext\serialize -Iext\pkg -Iext\builtin -Iext\standard -Iext\pcre
+set DEFS=-DTPHP_TARGET="\"x86_64-w64-windows-gnu\"" -DTPHP_JIT
 
 if not exist build mkdir build
 if not exist %OBJ% mkdir %OBJ%
@@ -44,6 +44,14 @@ rem PHP pcre2lib source whitelist (php-src config.w32); -w: vendored code
 set PCRE2_DEFS=-DHAVE_CONFIG_H -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1
 set PCRE2_SRCS=pcre2_auto_possess pcre2_chartables pcre2_compile pcre2_config pcre2_context pcre2_chkdint pcre2_dfa_match pcre2_error pcre2_jit_compile pcre2_maketables pcre2_match pcre2_match_data pcre2_newline pcre2_ord2utf pcre2_pattern_info pcre2_serialize pcre2_string_utils pcre2_study pcre2_substitute pcre2_substring pcre2_tables pcre2_ucd pcre2_valid_utf pcre2_xclass pcre2_find_bracket pcre2_convert pcre2_extuni pcre2_script_run
 for %%f in (%PCRE2_SRCS%) do %CC% -w %CFLAGS% %PCRE2_DEFS% -Ideps\pcre2 -c "deps\pcre2\%%f.c" -o "%OBJ%\pcre2_%%f.o" || goto :fail
+
+echo [3d/5] compiling IR (JIT backend, x86_64 only)...
+rem objects go to %OBJ%\ir_*.o (no main - safe in the link glob); generated
+rem fold/x86 headers are vendored in-repo (force-added, see PLAN/ir-jit.md)
+set IR_SRCS=ir ir_cfg ir_check ir_dump ir_emit ir_emit_c ir_gcm ir_gdb ir_load ir_mem2ssa ir_patch ir_ra ir_ra_simple ir_save ir_sccp ir_strtab
+for %%f in (%IR_SRCS%) do %CC% -w %CFLAGS% -DIR_TARGET_X64 -Ideps\ir -c "deps\ir\%%f.c" -o "%OBJ%\ir_%%f.o" || goto :fail
+rem clang dynamic alloca refs __chkstk; no libgcc on this toolchain
+%CC% -w -c tools\chkstk_stub.S -o "%OBJ%\chkstk_stub.o" || goto :fail
 
 echo [4/5] compiling tphp sources (src + ext)...
 for %%f in (src\*.c) do %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~nf.o" || goto :fail

@@ -80,7 +80,7 @@ kv-read 常量键形态在 opcache 开/JIT 关下**进程间双态**：约一半
 | dispatch 特化 | clang computed-goto threaded interpreter、热点 opcode 排布 | 全局 5–10% | ⚠️ **L4 评估收口（2026-10-24）**：当前架构 = 每 opcode 经 `TOp.handler` 函数指针间接调用；computed-goto 要求 handler 内联为循环内标签 = **zend_vm_def.h 式全宏化重构**（1.1 万行先例，数周级、高风险），非"排布"级轻量项。DO_FCALL 热路径审计：特例分支在前但主体已紧凑（帧池化后 call 175ns 中 dispatch 占比 <15%）。**决策：不强行做**——L1–L3 已取 call -41%/fib -42%/arr-read -15%；本项转为"独立立项候选"（全宏化重构）或接受现状进第二层 |
 | addref/release 审计 | 热路径临时 TVal 是否过度引用计数 | 视发现 | 未开始 |
 | **string .= in-place** | 2026-10-24 对比 PHP 发现 **325× 单点灾难**（292 vs 0.9ms）：tstr_concat 不可变全量重分配 O(n²) vs zend rc=1 原地指数扩容 | 消灭最大单点 | ✅ **完成：292→2.2ms（-99%，vs PHP 2.4×）**；TStr.cap 预留 + op_concat 同槽 tstr_append_inplace（rc==1 原地，成功不 wtake） |
-| **array packed 写路径** | 三方对比坐实：push vs 无JIT **13.7×**、vs JIT **25.7×**（297 vs 21.5/11.5ms）：append 走全套 tarr_set；PHP packed append 直接 data[n]++ | 13.7×→3–5× | **最高优先解释器项**（vs-JIT 目标下与 §5 并列必做——JIT 不敏感簇之外的最大单点） |
+| **array packed 写路径** | 三方对比坐实：push vs 无JIT **13.7×**、vs JIT **25.7×**（297 vs 21.5/11.5ms）：append 走全套 tarr_set；PHP packed append 直接 data[n]++ | 13.7×→3–5× | ✅ **L5 完成：push 295.4→78.2ms（-74%），vs 无JIT 3.6×（进目标带）、vs JIT 25.7×→6.7×**。惰性桶同步：TArr.bpending（未同步 append 数；不变量 bpending>0⇒packed⇒全 int 键），tarr_append packed 快路只写 data[n]，tarr_sync_buckets 摸桶前全量重建；~25 个直接遍历 buckets 的入口加一行守卫，arr_key_at/arr_is_list/tarr_has 加 packed 快路（foreach 反查键 O(bcap)→O(1) 附赠）；GC/值枚举走 data[] 免改。压测 31 项（混合键/COW/serialize/json/sort/unshift/preg_grep/<=>）与 PHP 8.5.1 双端对拍一致 |
 | **字面量键 hash 缓存** | kv-read 变量键 160ms vs 常量键 68.6ms（2.3×）；PHP 在 opcode 里预存字面量键 hash，tphp 每次重哈希 | kv 类 30–50% | 新增候选项（L3 键 intern 的读侧补完） |
 
 ### 第二层：结构性反超（PHP 做不了的）
@@ -151,7 +151,7 @@ kv-read 常量键形态在 opcache 开/JIT 关下**进程间双态**：约一半
    - 字面量键 hash 缓存（kv 2.3× 形态差，§4 新项）
    - object（7.1×）/throw（3.7×）路径审计
    - 收口：当前未提交批次（string .= in-place + 本节文档）
-2. **JIT 立项（地板项完成后立即，两线可部分并行）**：半天 spike（vendor `deps/ir/` + fib 打样，§5.4）→ opcode→IR lowering 规格 → baseline JIT v1（函数级、int/call 热路径、入口 guard + deopt 回解释器）
+2. **JIT 立项（v1.0 完成 2026-10-25）**：spike ✅ → lowering 规格 ✅（[ir-jit.md](ir-jit.md)）→ **baseline JIT v1 实现 ✅**（src/jit.c；M1 达成：fib vs 追踪 JIT **1.2×**，13.2 vs 10.9ms；218/218）。v1.1 候选：trampoline 零装箱、int 循环寄存器化、闭包/数组 op 进白名单
 3. **里程碑门**：M1 = JIT 敏感簇 vs 追踪 JIT ≤2×（先杀 fib/call/read）；M2 = 全套件几何均值 ≥1.0×（持平）；M3 = 敏感簇反超（tphp 纯值 TVal guard 更干净的结构性红利兑现）
 4. **随 M7**：HTTP server 按 §6 零拷贝设计立项；pkg 缓存按 Bun 模式立项（与 1–3 并行不阻塞）
 
