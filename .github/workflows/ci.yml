@@ -35,6 +35,17 @@ jobs:
         shell: pwsh
         run: ./tests/run.ps1
 
+      - name: Setup PHP (opcache + tracing JIT)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
+
+      - name: Perf vs PHP strongest (opcache + JIT)
+        shell: pwsh
+        run: ./tools/perf-compare.ps1 -Php php -MaxFibRatio 6.0 -Report perf-vs-php.md
+
       - name: Pack smoke (PE resources)
         shell: pwsh
         run: |
@@ -83,6 +94,17 @@ jobs:
         shell: pwsh
         run: ./tests/run.ps1
 
+      - name: Setup PHP (opcache + tracing JIT)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
+
+      - name: Perf vs PHP strongest (opcache + JIT)
+        shell: pwsh
+        run: ./tools/perf-compare.ps1 -Php php -MaxFibRatio 6.0 -Report perf-vs-php.md
+
       - name: Pack smoke (ELF section / footer)
         run: |
           mkdir -p data
@@ -127,6 +149,18 @@ jobs:
         shell: pwsh
         run: ./tests/run.ps1
 
+      - name: Setup PHP (opcache + tracing JIT)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
+
+      # aarch64 v1: tphp IR JIT disabled (x86_64 only) - report-only vs PHP JIT
+      - name: Perf vs PHP strongest (opcache + JIT)
+        shell: pwsh
+        run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
+
       - name: Pack smoke (ELF section / footer)
         run: |
           mkdir -p data
@@ -170,6 +204,18 @@ jobs:
       - name: Test
         shell: pwsh
         run: ./tests/run.ps1
+
+      - name: Setup PHP (opcache + tracing JIT)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
+
+      # aarch64 v1: tphp IR JIT disabled (x86_64 only) - report-only vs PHP JIT
+      - name: Perf vs PHP strongest (opcache + JIT)
+        shell: pwsh
+        run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
 
       - name: Pack smoke (footer container)
         run: |
@@ -219,6 +265,18 @@ jobs:
       - name: Test (Rosetta 2)
         shell: pwsh
         run: ./tests/run.ps1
+
+      - name: Setup PHP (opcache + tracing JIT)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+          ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
+
+      # cross-arch (arm64 PHP native vs x86_64 tphp under Rosetta) - report-only
+      - name: Perf vs PHP strongest (opcache + JIT)
+        shell: pwsh
+        run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
 
       - name: Smoke
         run: |

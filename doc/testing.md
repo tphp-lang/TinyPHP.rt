@@ -107,6 +107,18 @@ echo "hello\n";
 
 2026-10-25 IR baseline JIT v1 上线（PLAN/ir-jit.md；TPHP_JIT=0 可关）：**fib(28) 13.2ms vs PHP tracing JIT 10.9ms = 1.2×（M1 达成）**，比 tphp 解释器（114.7ms）快 8.7×。仅 fib 等封闭 int 函数进 JIT 白名单，其余 bench 不变；全量 218/218。
 
+## CI 性能对比（全平台，对 PHP 最强态）
+
+`tools/perf-compare.ps1`：tphp 最强态（x86_64 开 IR JIT；aarch64 v1 为解释器）对 **PHP 最强态**（`opcache.enable_cli=1` + `opcache.jit=tracing` + 128M buffer，脚本内置 JIT 活性探针，未点火即报错）。bench 只含纯计算项（无异步/线程——PHP 原生没有）。五个 CI job 的 Test 步骤后各挂一步：
+
+| 平台 | fib 门槛 | 说明 |
+|---|---|---|
+| Windows x86_64 / Linux x86_64 | ≤6.0×（硬门） | tphp IR JIT 开启；本地实测 ~1.1–1.3× |
+| Linux aarch64 / macOS aarch64 | 仅报告 | tphp JIT v1 未启用（x86_64 only），解释器对 PHP JIT 如实呈现 |
+| macOS x86_64（cross） | 仅报告 | arm PHP 原生 vs x86_64 tphp（Rosetta），跨架构不设门 |
+
+报告同时打进 step summary（`$GITHUB_STEP_SUMMARY`）。Zend optimizer 双态坑（§上文）已由 bench 变量键修复规避。
+
 **历史修正**：①早期"JIT 微基准无感"是 CLI 未开 `opcache.enable_cli` 导致 JIT 从未点火——实测 fib/call/arr-read 提升 2.4–5.5×；②kv-read 常量键形态会被 Zend optimizer 间歇性整段折叠（进程间双态 ~22ms/~1.7ms，结果仍正确，`optimization_level=0` 后恒慢态；JIT 全程 false）——**跨运行时 bench 禁用"常量键+无副作用求和"形态**，已改变量键+校验。
 
 2026-10-24 `.=` in-place 修复：**string 292.4→2.1ms**——TStr 加 cap 预留（非 interned：len<64→96 否则 +50%），op_concat 同槽快路 `tstr_append_inplace`（rc==1 且非 interned 原地追加；成功不走 wtake 防自释放）。
