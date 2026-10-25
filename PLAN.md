@@ -51,6 +51,7 @@
 | [PLAN/generators.md](PLAN/generators.md) | **生成器（yield）**：帧保存模型（VMFrame 直存 Generator）、opcode 集、v1 范围（G1 基础/G2 send/G3 边界）、v2 后置（throw/from/dtor-finally）、已知差异 |
 | [PLAN/preg.md](PLAN/preg.md) | **正则（preg_*）**：vendor pcre2（php-src 8.5.7 pcre2lib）、模式语法/修饰符映射、v1 函数集语义、错误模型决策（编译=异常/运行=返回值协议）、P1–P4 分批 |
 | [PLAN/ir-jit.md](PLAN/ir-jit.md) | **IR baseline JIT v1**：函数级 lowering 规格——封闭类型世界（int/float/bool/null）、opcode 白名单、JitEntry ABI 与 prologue guard、JIT→JIT 调用折叠、slow helper 复用 tval_*、构建/线程约束、M1 验收（fib vs 追踪 JIT ≤2.5×） |
+| [PLAN/backlog.md](PLAN/backlog.md) | **全量任务与未来规划（交接文档）**：现状快照、给新 AI 的工作协议红线、P0 性能主线（JIT v1.1 等 9 项→M2/M3）、P1 功能线 8 项、P2 工程线 16 项、远期里程碑判据、已决策不做指针、工具速查 |
 
 ## 技术栈与环境
 

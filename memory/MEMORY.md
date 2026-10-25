@@ -10,6 +10,8 @@
 - 用户边界：严格前后端/文档一致性；不为修而修；测试必须真实跑（禁改测试假通过）。
 - OOP 审计（2026-10-15，~70 探针 vs PHP 8.6-dev 对拍）：主体与 PHP 逐字节一致；**P0：①跨帧 catch 断裂（调用是 try 体最后一条 op 时接不住，compile.c ex 表 end_pc 差一 + vm.c:1162 压帧前推 pc；修法 end_pc=end+1）②__destruct 永不触发**；P1：typed 属性全线 Parse error（与文档矛盾）、用户异常类不可 extends/catch（TExClass 与 TClass 两套系统）、Closure 类缺失；P2：nullsafe/new 命名参数/方法命名参数/方法 first-class callable 均为 "lands in M3" 占位桩（PLAN/01 §11 示例自相矛盾）、类常量表达式全拒、trait 常量不导入、子类静态属性重声明失效、数组/字符串 callable ❌；P3：override 签名/私有 ctor 不校验、接口方法体被接受、ValueError 缺失。测试盲区：现有套件只测同帧 catch、无 typed 属性/析构测试。
 
+## 交接入口（2026-10-25）PLAN/backlog.md = 下一步任务清单（零上下文 AI 可直接接手）：现状快照 + 工作协议红线 + P0 性能（JIT v1.1 白名单扩容打 7× 几何均值→M2）+ P1 功能 + P2 工程 + 工具速查。perf 手动对比 = Actions→Perf workflow。
+
 ## 2026-10-15 OOP 审计修复（P0+P1 全闭环，116/116）
 - P0-1 跨帧异常：S_TRY 三处 end_pc=end+1（缩进不一，replace_all 曾漏一处）
 - P0-2 __destruct：**op_new_user rc++ 未抵消是总根因**（每对象恒漏一引用）；析构=引擎引用+DTORED+复活判断(rc>1)+GC defer 两段式+收尾快照遍历；GC 补 OBJ 属性边与全 kind 释放；sort/rsort/array_unshift 曾是空操作（写回 args 副本）
