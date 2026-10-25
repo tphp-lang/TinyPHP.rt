@@ -15,10 +15,10 @@ extern "C" {
 #endif
 
 /* ---- version ---- */
-#define TPHP_VERSION "0.0.1"
+#define TPHP_VERSION "0.0.2"
 #define TPHP_VERSION_MAJOR 0
 #define TPHP_VERSION_MINOR 0
-#define TPHP_VERSION_PATCH 1
+#define TPHP_VERSION_PATCH 2
 
 /* target triple, injected by build script (-DTPHP_TARGET=...) */
 #ifndef TPHP_TARGET
