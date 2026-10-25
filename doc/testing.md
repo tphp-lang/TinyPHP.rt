@@ -109,11 +109,11 @@ echo "hello\n";
 
 ## CI 性能对比（全平台，对 PHP 最强态）
 
-`tools/perf-compare.ps1`：tphp 最强态（x86_64 开 IR JIT；aarch64 v1 为解释器）对 **PHP 最强态**（`opcache.enable_cli=1` + `opcache.jit=tracing` + 128M buffer，脚本内置 JIT 活性探针，未点火即报错）。bench 只含纯计算项（无异步/线程——PHP 原生没有）。五个 CI job 的 Test 步骤后各挂一步：
+`tools/perf-compare.ps1`：tphp 最强态（x86_64 开 IR JIT；aarch64 v1 为解释器）对 **PHP 最强态**（`opcache.enable_cli=1` + `opcache.jit=tracing` + 128M buffer，脚本内置 JIT 活性探针，未点火即报错）。bench 只含纯计算项（无异步/线程——PHP 原生没有）。**独立 workflow `.github/workflows/perf.yml`，仅 `workflow_dispatch` 手动触发**（不在 PR/push 的 ci.yml 里——共享 runner 上 bench 噪声大且费时，按需跑）。五个平台 job 一次全跑：
 
 | 平台 | fib 门槛 | 说明 |
 |---|---|---|
-| Windows x86_64 / Linux x86_64 | ≤6.0×（硬门） | tphp IR JIT 开启；本地实测 ~1.1–1.3× |
+| Windows x86_64 / Linux x86_64 | 输入参数 `fib_gate`（默认 6.0×，硬门；0=仅报告） | tphp IR JIT 开启；本地实测 ~1.1–1.3× |
 | Linux aarch64 / macOS aarch64 | 仅报告 | tphp JIT v1 未启用（x86_64 only），解释器对 PHP JIT 如实呈现 |
 | macOS x86_64（cross） | 仅报告 | arm PHP 原生 vs x86_64 tphp（Rosetta），跨架构不设门 |
 
