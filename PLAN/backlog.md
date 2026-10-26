@@ -33,7 +33,7 @@
 
 | # | 任务 | 验收 | 规格/落点 |
 |---|---|---|---|
-| P0-1 | **JIT v1.1 白名单扩容**：闭包调用域化（CLOSURE_INIT/SEND_CAP，call bench）、`FETCH_DIM_R` packed 快路（array-read/kv）、POW/变量移位 slow helper、float 参数 prologue、for/while 循环全形态验证 | array-read/kv/call 进 2–5× 带；几何均值先 ≤3× | ir-jit §12.2；`src/jit.c` |
+| P0-1 | **JIT v1.1 白名单扩容**（进行中，半成品在工作区）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；**阻塞 = IR codegen 三形态崩溃**（链式 TMP-ADD 图、循环内 if/else MERGE、嵌套循环——ir_check 拦不住；前者独立最小集已可编译见 tools/ir_chainadd.c，差在 tphp 实图与最小集的节点 diff；后两者由 jit_cfg_ok 守卫静态拒绝，修好删守卫）。急切编译已撤（暴露链式 ADD 崩溃），修好后恢复 | array-read/kv/call 进 2–5× 带；几何均值先 ≤3× | ir-jit §12.2；src/jit.c；memory/2026-10-26.md |
 | P0-2 | **trampoline 免装箱 + 槽位寄存器化**（arg 直传寄存器；评估 `IR_OPT_MEM2SSA`） | fib 2.7× → ~1× | ir-jit §12.2；`src/jit.c` |
 | P0-3 | **字面量键 hash 缓存**（opcode 预存字面量键 hash，kv 类 2.3× 形态差；JIT 外路径同受益） | kv 显著下降 | perf-roadmap §4 表 |
 | P0-4 | **object / throw 路径审计**（vs JIT 7–12× / 4×）→ 解释器优化或进白名单 | 出审计结论并落地至少一半差距 | perf-roadmap §1.1；对象属性单态 guard 见 ir-jit §12.3 |

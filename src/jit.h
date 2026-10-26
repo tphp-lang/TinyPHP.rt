@@ -23,6 +23,9 @@ typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *args_in, TVal *ret);
 
 /* Hotness threshold for the first compile attempt (zend jit_hot_func default) */
 #define TPHP_JIT_HOT_THRESHOLD 127
+/* 急切编译（v1.1）：体小的合格函数首调即编译——函数粒度热度对
+ * "只调一次的大循环"（bench 闭包形态）永不触发；小体编译成本 ≪ 循环收益 */
+#define TPHP_JIT_EAGER_MAX_OPS 96
 
 /* Process-wide availability (TPHP_JIT=0 disables; aarch64 v1: off) */
 bool tphp_jit_available(void);

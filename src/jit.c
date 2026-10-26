@@ -20,6 +20,8 @@
 #include <stdio.h>
 
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
+TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
+TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
 
 #ifdef TPHP_JIT
 
@@ -152,6 +154,83 @@ int tphp_jit_call(VM *vm, TFunc *fn, TVal *args_in, TVal *ret) {
     g_jsp -= nslots;
     return ok;
 }
+
+/* ---- v1.1 helpers：镜像解释器语义（可 raise；raise 由调用点的
+ * vm->x.unwind 接住——解释器钩子/FFI bounded pad 均在 C 栈上方） ---- */
+
+void tphp_jit_array_init(VM *vm, TVal *dst) {
+    (void)vm;
+    tval_release(dst);
+    *dst = TV_ARR(tarr_new());
+}
+
+/* ASSIGN_DIM 无键形态（$a[] = $v）：镜像 do_dim_write append 路径 */
+void tphp_jit_assign_append(VM *vm, TVal *base, TVal *val) {
+    if (base->t == T_UNDEF) {
+        tval_release(base);
+        *base = TV_ARR(tarr_new());
+    }
+    if (base->t != T_ARR)
+        tphp_vm_raise(vm, "TypeError", NULL,
+                      "Cannot use scalar value as array");
+    TArr *a = tarr_cow((TArr *)base->u.p);
+    if (a != (TArr *)base->u.p) {
+        tval_release(base);
+        *base = TV_ARR(a);
+    }
+    tval_addref(*val);
+    tarr_append(a, *val);
+}
+
+/* FETCH_DIM_R：镜像 op_fetch_dim_r 的数组分支（string/FFI 形态不进白名单） */
+void tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
+    TVal base_v = *base;
+    TVal key = *key_in;
+    if (base_v.t != T_ARR)
+        tphp_vm_raise(vm, "TypeError", NULL,
+                      "Cannot access offset on %s",
+                      base_v.t == T_NULL ? "null" : base_v.t == T_INT ? "int" :
+                      base_v.t == T_FLOAT ? "float" :
+                      (base_v.t == T_TRUE || base_v.t == T_FALSE) ? "bool" : "value");
+    TArr *arr = (TArr *)base_v.u.p;
+    if (!tval_norm_key(&key))
+        tphp_vm_raise(vm, "TypeError", NULL, "Illegal offset type");
+    TVal *v = tarr_get(arr, key);
+    if (!v) {
+        if (key.t == T_INT)
+            tphp_vm_raise(vm, "UndefinedError", NULL, "Undefined array key %lld",
+                          (long long)key.u.i);
+        tphp_vm_raise(vm, "UndefinedError", NULL, "Undefined array key \"%s\"",
+                      tstr_val((TStr *)key.u.p));
+    }
+    tval_addref(*v);
+    tval_release(dst);
+    *dst = *v;
+}
+
+/* CLOSURE_INIT 无捕获形态：镜像 op_closure_init（n_cap=0 时不碰 caps 栈） */
+void tphp_jit_closure_init(VM *vm, TVal *dst, TFunc *self, uint32_t fn_idx) {
+    Program *prog = self->prog ? self->prog : vm->prog;
+    if (!prog || fn_idx >= (uint32_t)prog->n_funcs)
+        tphp_vm_raise(vm, "Error", NULL, "Internal: closure function missing");
+    TClosure *c = tphp_tclo_alloc0(prog->funcs[fn_idx]);
+    tval_release(dst);
+    *dst = TV_CLO(c);
+}
+
+/* INIT_DYN..DO_FCALL 动态调用（$f(...)）：JIT'd 无捕获闭包走 trampoline，
+ * 其余回落 tphp_vm_call_callable（语义统一入口） */
+void tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
+    TVal clo = *clo_slot;
+    if (clo.t == T_CLOSURE) {
+        TClosure *c = (TClosure *)clo.u.p;
+        if (c->fn && !c->bfn && c->n_cap == 0 && c->fn->jit_entry) {
+            if (tphp_jit_call(vm, c->fn, args_in, ret))
+                return;
+        }
+    }
+    *ret = tphp_vm_call_callable(vm, clo, args_in, n);
+}
 /* ================================================================
  * Eligibility (PLAN/ir-jit.md §5)
  * ================================================================ */
@@ -162,12 +241,44 @@ static bool lit_scalar(TVal v) {
            v.t == T_FALSE || v.t == T_NULL;
 }
 
+/* CFG 守卫（v1.1 临时）：IR codegen 对两类形态仍崩（ir_check 拦不住，
+ * 见 memory/2026-10-26）——资格期静态拒绝，修好后删除：
+ *   1) 嵌套循环（≥2 个不同的回跳目标）
+ *   2) 循环体内带 else 的 if/else（find_join 出现 else 分支） */
+static int find_join(TFunc *fn, uint32_t p, uint32_t T,
+                     uint32_t *join_out, uint32_t *else_out);
+static bool jit_cfg_ok(TFunc *fn) {
+    uint32_t hdr[16]; int nh = 0;
+    for (uint32_t i = 0; i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if (op->op != OP_JMP) continue;
+        uint32_t H = op->ar;
+        if (H > i) continue;            /* 只看回跳 */
+        int seen = 0;
+        for (int k = 0; k < nh; k++) if (hdr[k] == H) seen = 1;
+        if (!seen) {
+            if (nh >= 16) return false;
+            hdr[nh++] = H;
+        }
+        /* 回跳环内找带 else 的前向 if/else */
+        for (uint32_t q = H; q < i; q++) {
+            TOp *e = &fn->ops[q];
+            if (e->op != OP_JMPZ && e->op != OP_JMPNZ) continue;
+            if (e->ar <= q) continue;
+            uint32_t join, els;
+            if (find_join(fn, q, e->ar, &join, &els) && els)
+                return false;
+        }
+    }
+    return nh <= 1;                     /* 单层循环 */
+}
+
 static bool jit_eligible_inner(TFunc *fn, int depth) {
     if (depth > 16) return false;
-    if (!fn || fn->is_main || fn->is_closure || fn->is_method ||
+    if (!fn || fn->is_main || fn->is_method ||
         fn->is_variadic || fn->is_generator || fn->n_ex > 0 ||
         fn->n_cap > 0 || fn->n_params > 8)
-        return false;
+        return false;   /* is_closure 允许（v1.1）：n_cap>0 已在上一行拒绝 */
     if (fn->param_types) {
         for (uint16_t i = 0; i < fn->n_params; i++)
             if (fn->param_types[i]) return false;
@@ -205,6 +316,19 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             break;
         case OP_COPY: case OP_ASSIGN: case OP_INC: case OP_DEC:
         case OP_NEG: case OP_POS: case OP_BOOL_NOT: case OP_BOOL_VAL:
+        case OP_ARRAY_INIT:
+            break;
+        case OP_ASSIGN_DIM:
+            /* v1.1 仅 append 形态（$a[] = $v）；带键走解释器 */
+            if (op->t2 != OPD_UNUSED) return false;
+            break;
+        case OP_FETCH_DIM_R:
+            if (op->t2 == OPD_UNUSED) return false;
+            break;
+        case OP_CLOSURE_INIT:
+            if (op->a2 != 0) return false;   /* 带捕获不进 v1.1 */
+            break;
+        case OP_INIT_DYN:
             break;
         case OP_CAST: {
             if (op->t2 != OPD_CONST) return false;
@@ -246,6 +370,7 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         }
     }
     if (recv_seen != fn->n_params) return false;
+    if (!jit_cfg_ok(fn)) return false;   /* v1.1 codegen 临时守卫 */
     return true;
 }
 
@@ -265,14 +390,20 @@ typedef struct {
     ir_ctx *ctx;
     TFunc *fn;
     ir_ref r_vm, r_slots, r_args, r_ret;
-    int in_loop;
-    uint32_t loop_header;
-    ir_ref loop_ref;
-    int in_loop_cond;
+    /* loop stack（v1.1：支持嵌套 for/while，深度8） */
+    enum { JIT_MAX_LOOPS = 8 };
+    int loop_sp;
+    uint32_t loop_hdr[JIT_MAX_LOOPS];
+    ir_ref loop_ref[JIT_MAX_LOOPS];
+    int loop_cond[JIT_MAX_LOOPS];   /* 1 = 等待头部的第一个 JMPZ（循环条件） */
     int fail;
-    /* folded call in progress (INIT_FCALL … DO_FCALL, args evaluated in between) */
+    /* folded call in progress (INIT_FCALL/INIT_DYN … DO_FCALL) */
     TFunc *p_callee;
     uint32_t p_argc, p_arg_slot[9];
+    int fail_line;
+    uint32_t cur_pc;
+    int p_dyn;                  /* 1 = INIT_DYN 动态调用 */
+    uint32_t p_dyn_slot;        /* 闭包所在 CV 槽 */
 } JitC;
 
 /* ir_builder macros expand to `ctx` — every lowering fn binds it locally */
@@ -342,7 +473,6 @@ static ir_ref make_truthy(JitC *j, ir_ref tag, ir_ref pay, ir_ref addr) {
     ir_ref falsy2 = ir_OR(IR_BOOL, falsy, flt0);
     return ir_NOT_B(falsy2);
 }
-/* Diamond: both sides live → END both + MERGE (IR hard rule) */
 static void store_bool(JitC *j, ir_ref da, ir_ref cond) {
     JIT_CTX();
     ir_ref ifc = ir_IF(cond);
@@ -460,6 +590,10 @@ static void lower_cmp(JitC *j, TOp *op) {
     ir_MERGE_2(eFast, eSlow);
 }
 
+/* 无分支 bool 存储：tag = T_FALSE + SEXT(cond)（FALSE=1, TRUE=2）。
+ * 钻石 MERGE 嵌在 LOOP 区域会触发 IR codegen 崩溃（ir_check 都拦不住），
+ * 值选择一律走位运算；控制流 IF 只留给 JMPZ。 */
+/* 无分支 mask：cond BOOL → i64 0/-1；i32 版 0/1 */
 static void lower_un(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
@@ -580,8 +714,32 @@ static void lower_incdec(JitC *j, TOp *op) {
 /* finish a folded call at DO_FCALL (args already recorded in j->p_*) */
 static void lower_call_finish(JitC *j, TOp *doop) {
     JIT_CTX();
-    TFunc *callee = j->p_callee;
     uint32_t argc = j->p_argc;
+    if (j->p_dyn) {
+        /* INIT_DYN 动态调用（$f(...)）：闭包值在 p_dyn_slot */
+        ir_ref args_arr = ir_ALLOCA(ir_CONST_I64((uintptr_t)argc * TVAL_SZ));
+        for (uint32_t k = 0; k < argc; k++) {
+            ir_ref sa = slot_addr(j, j->p_arg_slot[k]);
+            ir_ref d = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+            store_pay(j, d, load_pay(j, sa));
+            store_tag(j, d, load_tag(j, sa));
+        }
+        ir_ref clo_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+        ir_ref ca = slot_addr(j, j->p_dyn_slot);
+        store_pay(j, clo_sc, load_pay(j, ca));
+        store_tag(j, clo_sc, load_tag(j, ca));
+        ir_ref ret_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+        ir_ref t[5] = { j->r_vm, clo_sc, args_arr, ir_CONST_I32((int32_t)argc), ret_sc };
+        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t);
+        if (doop->tr != OPD_UNUSED) {
+            ir_ref da = slot_addr(j, doop->ar);
+            store_pay(j, da, ir_LOAD_I64(ret_sc));
+            store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
+        }
+        j->p_dyn = 0;
+        return;
+    }
+    TFunc *callee = j->p_callee;
     if (!callee || argc != callee->n_params) { j->fail = 1; return; }
 
     ir_ref args_arr = ir_ALLOCA(ir_CONST_I64((uintptr_t)argc * TVAL_SZ));
@@ -698,17 +856,20 @@ static ir_ref cond_addr(JitC *j, uint8_t kind, uint32_t a, ir_ref *tag_out,
 
 static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
     JIT_CTX();
-    if (j->fail) return trap_fail();
+    if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
     for (;;) {
-        if (pc >= j->fn->n_ops) return trap_fail();
+        j->cur_pc = pc;
+        if (pc >= j->fn->n_ops) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
         if (stop_has(stops, nstops, pc)) return trap_end(ir_END(), pc);
 
-        if (!j->in_loop && is_backedge_target(j->fn, pc)) {
+        if (is_backedge_target(j->fn, pc) &&
+            !(j->loop_sp > 0 && j->loop_hdr[j->loop_sp - 1] == pc)) {
+            if (j->loop_sp >= JIT_MAX_LOOPS) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             ir_ref ein = ir_END();
-            j->loop_ref = ir_LOOP_BEGIN(ein);
-            j->in_loop = 1;
-            j->loop_header = pc;
-            j->in_loop_cond = 1;
+            j->loop_ref[j->loop_sp] = ir_LOOP_BEGIN(ein);
+            j->loop_hdr[j->loop_sp] = pc;
+            j->loop_cond[j->loop_sp] = 1;
+            j->loop_sp++;
         }
 
         TOp *op = &j->fn->ops[pc];
@@ -718,6 +879,54 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             TVal v = j->fn->lits[op->a1];
             store_imm(j, slot_addr(j, op->ar), (int32_t)v.t,
                       ir_CONST_I64(v.u.i));
+            pc++;
+            break;
+        }
+        case OP_ARRAY_INIT: {
+            JIT_CTX();
+            ir_ref t[2] = { j->r_vm, slot_addr(j, op->ar) };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_array_init), 2, t);
+            pc++;
+            break;
+        }
+        case OP_ASSIGN_DIM: {   /* append 形态（资格判定已限 t2==UNUSED） */
+            JIT_CTX();
+            ir_ref t[3] = { j->r_vm, slot_addr(j, op->a1), slot_addr(j, op->ar) };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_assign_append), 3, t);
+            pc++;
+            break;
+        }
+        case OP_FETCH_DIM_R: {
+            JIT_CTX();
+            ir_ref key_addr;
+            if (op->t2 == OPD_CONST) {
+                TVal kv = j->fn->lits[op->a2];
+                key_addr = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                store_imm(j, key_addr, (int32_t)kv.t, ir_CONST_I64(kv.u.i));
+            } else {
+                key_addr = slot_addr(j, op->a2);
+            }
+            ir_ref t[4] = { j->r_vm, slot_addr(j, op->ar),
+                            slot_addr(j, op->a1), key_addr };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 4, t);
+            pc++;
+            break;
+        }
+        case OP_CLOSURE_INIT: {  /* 无捕获（资格判定 a2==0） */
+            JIT_CTX();
+            ir_ref args[4] = { j->r_vm, slot_addr(j, op->ar),
+                               ir_CONST_ADDR((uintptr_t)j->fn),
+                               ir_CONST_U32(op->a1) };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_closure_init), 4, args);
+            pc++;
+            break;
+        }
+        case OP_INIT_DYN: {
+            /* 动态调用折叠：$f(...) —— 闭包槽 a1，SEND…DO_FCALL 同静态折叠 */
+            if (j->p_callee) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            j->p_dyn = 1;
+            j->p_dyn_slot = op->a1;
+            j->p_argc = 0;
             pc++;
             break;
         }
@@ -740,39 +949,40 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee) { j->fail = 1; return trap_fail(); }  /* nested */
+            if (j->p_callee) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_callee = (TFunc *)op->ic;
+            j->p_dyn = 0;
             j->p_argc = 0;
             pc++;
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
-            if (!j->p_callee) { j->fail = 1; return trap_fail(); }
-            if (j->p_argc >= 9) { j->fail = 1; return trap_fail(); }
+            if (!j->p_callee && !j->p_dyn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_argc >= 9) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_arg_slot[j->p_argc++] = op->a1;
             pc++;
             break;
         }
         case OP_DO_FCALL: {
-            if (!j->p_callee) { j->fail = 1; return trap_fail(); }
+            if (!j->p_callee && !j->p_dyn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_call_finish(j, op);
-            if (j->fail) return trap_fail();
+            if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             pc++;
             break;
         }
         case OP_JMP: {
             uint32_t T = op->ar;
-            if (j->in_loop && T == j->loop_header)
+            if (j->loop_sp > 0 && T == j->loop_hdr[j->loop_sp - 1])
                 return trap_lb();   /* patched by loop-condition handler */
             return trap_end(ir_END(), T);
         }
         case OP_JMPZ: case OP_JMPNZ: {
             uint32_t T = op->ar;
-            if (T <= pc) return trap_fail();
+            if (T <= pc) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
 
             /* loop condition: first JMPZ at loop top level */
-            if (j->in_loop && j->in_loop_cond) {
-                j->in_loop_cond = 0;
+            if (j->loop_sp > 0 && j->loop_cond[j->loop_sp - 1]) {
+                j->loop_cond[j->loop_sp - 1] = 0;
                 uint32_t E = T;
                 ir_ref ta, pa, ad;
                 ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
@@ -783,24 +993,26 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 else ifx = ir_IF(ir_NOT_B(truthy));
                 ir_IF_TRUE(ifx);
                 Trap tb = emit_seq(j, pc + 1, stops, nstops);
+                if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2')
+                    fprintf(stderr, "[jit] loopcond pc=%u T=%u sp=%d tail=%d\n",
+                            pc, T, j->loop_sp, (int)tb.kind);
                 if (tb.kind == TR_FAIL) return tb;
                 if (tb.kind == TR_LOOPBACK) {
                     ir_ref le = ir_LOOP_END();
-                    ir_MERGE_SET_OP(j->loop_ref, 2, le);
-                    j->in_loop = 0;
+                    ir_MERGE_SET_OP(j->loop_ref[j->loop_sp - 1], 2, le);
                 } else {
-                    return trap_fail();   /* body must back-edge or fail */
+                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
                 }
                 ir_IF_FALSE(ifx);
                 /* exit path continues at E inside the false region */
-                j->in_loop = 0;
+                j->loop_sp--;
                 pc = E;
                 break;
             }
 
             uint32_t join, else_start;
             if (!find_join(j->fn, pc, T, &join, &else_start))
-                return trap_fail();
+                do { j->fail_line = __LINE__; return trap_fail(); } while (0);
 
             ir_ref ta, pa, ad;
             ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
@@ -814,15 +1026,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 tA = trap_end(ir_END(), T);
             } else {
                 uint32_t st[11]; int ns = nstops + 1;
-                if (nstops > 10) return trap_fail();
+                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = T;
                 tA = emit_seq(j, pc + 1, st, ns);
                 if (tA.kind == TR_FAIL) return tA;
-                if (tA.kind == TR_LOOPBACK) return trap_fail();
+                if (tA.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (tA.kind == TR_END && tA.target != join &&
                     !(else_start && tA.target == else_start))
-                    return trap_fail();
+                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
             ir_IF_FALSE(ifx);
@@ -832,26 +1044,26 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     tB = trap_end(ir_END(), T);
                 } else {
                     uint32_t st[11]; int ns = nstops + 1;
-                    if (nstops > 10) return trap_fail();
+                    if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                     if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                     st[nstops] = join;
                     tB = emit_seq(j, else_start, st, ns);
                     if (tB.kind == TR_FAIL) return tB;
-                    if (tB.kind == TR_LOOPBACK) return trap_fail();
+                    if (tB.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                     if (tB.kind == TR_END && tB.target != join)
-                        return trap_fail();
+                        do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 }
             } else {
                 uint32_t st[11]; int ns = nstops + 1;
-                if (nstops > 10) return trap_fail();
+                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = T;
                 tB = emit_seq(j, pc + 1, st, ns);
                 if (tB.kind == TR_FAIL) return tB;
-                if (tB.kind == TR_LOOPBACK) return trap_fail();
+                if (tB.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (tB.kind == TR_END && tB.target != join &&
                     !(else_start && tB.target == else_start))
-                    return trap_fail();
+                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
             int a_end = (tA.kind == TR_END && tA.target == join);
@@ -873,10 +1085,10 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 pc = join;
                 break;
             }
-            return trap_fail();
+            do { j->fail_line = __LINE__; return trap_fail(); } while (0);
         }
         default:
-            return trap_fail();
+            do { j->fail_line = __LINE__; return trap_fail(); } while (0);
         }
     }
 }
@@ -938,14 +1150,22 @@ void tphp_jit_compile(TFunc *fn) {
     void *entry = NULL;
     if (ok) {
         size_t size = 0;
+        if (jit_dbg()) {
+            fprintf(stderr, "[jit] ir_check...\n"); fflush(stderr);
+            bool chk = ir_check(ctx);
+            fprintf(stderr, "[jit] ir_check=%d\n", chk); fflush(stderr);
+        }
         entry = ir_jit_compile(ctx, 2, &size);
         if (jit_dbg())
             fprintf(stderr, "[jit] compile(%s) entry=%p size=%zu\n",
                     fn->name ? tstr_val(fn->name) : "?", entry, size);
     } else {
-        if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0])
-            fprintf(stderr, "[jit] compile(%s) FAILED emit (fail=%d trap=%d)\n",
-                    fn->name ? tstr_val(fn->name) : "?", j.fail, (int)t.kind);
+        if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0]) {
+            uint32_t pc = j.cur_pc < fn->n_ops ? j.cur_pc : 0;
+            fprintf(stderr,
+                    "[jit] compile(%s) FAILED emit (trap=%d pc=%u op=%u %s L%d)\n",
+                    fn->name ? tstr_val(fn->name) : "?", (int)t.kind, j.cur_pc, (unsigned)fn->ops[pc].op, tphp_op_name(fn->ops[pc].op), j.fail_line);
+        }
     }
     ir_free(ctx);
     tm_free(ctx);
