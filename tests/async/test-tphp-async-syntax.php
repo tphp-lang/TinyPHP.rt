@@ -4,7 +4,7 @@
 //   $obj->spawn(EXPR) —— 同规则（spawn 是并发保留方法名）
 //   async($callable)  —— 单实参不是调用形态时，按"包装"处理
 use function Tphp\{async, await};
-use Tphp\Thread;
+use Tphp\TaskGroup;
 
 function add(int $a, int $b): int {
     usleep(10000);
@@ -27,8 +27,8 @@ $c2 = async(add($n, 1));
 $n = 100;
 echo "captured=", await($c2), "\n";
 
-// 4) Thread::spawn(EXPR) 自动包 thunk
-$g = new Thread();
+// 4) TaskGroup::spawn(EXPR) 自动包 thunk
+$g = new TaskGroup();
 $g->spawn(add(1, 2));
 $g->spawn(add(3, 4));
 $r = $g->wait();

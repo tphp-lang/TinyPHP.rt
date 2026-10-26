@@ -1,15 +1,15 @@
 <?php
-// Tphp\Thread（= Tphp\TaskGroup）：任务组 spawn/wait/count，
+// Tphp\TaskGroup：协程任务组 spawn/wait/count，
 // 以及"包装一次、调用即启动"的写法
-use Tphp\Thread;
+use Tphp\TaskGroup;
 
 function task(int $id, int $ms): int {
     usleep($ms * 100);
     return $id * 10;
 }
 
-// 1) Thread：spawn 登记，wait 收口并按登记序返回结果
-$g = new Thread();
+// 1) TaskGroup：spawn 登记，wait 收口并按登记序返回结果
+$g = new TaskGroup();
 $g->spawn('task', 1, 300);
 $g->spawn('task', 2, 100);
 $g->spawn('task', 3, 200);
@@ -23,7 +23,7 @@ $t = async(task(...));
 $c = $t(7, 50);
 echo "task=", $c->wait(), "\n";
 
-// 3) 任务组也接受 async() 包装出的 Task
+// 3) TaskGroup 也接受 async() 包装出的 Task
 $g2 = new Tphp\TaskGroup();
 $g2->spawn($t, 4, 20);
 $g2->spawn($t, 5, 10);
@@ -33,7 +33,7 @@ echo "wrapped=", implode(",", $r2), "\n";
 
 // 4) 并发性：3 个 100ms 任务总耗时接近 100ms 而非 300ms
 $t0 = microtime(true);
-$g3 = new Thread();
+$g3 = new TaskGroup();
 for ($i = 1; $i <= 3; $i++) {
     $g3->spawn('task', $i, 1000);        // 1000 * 100us = 100ms
 }

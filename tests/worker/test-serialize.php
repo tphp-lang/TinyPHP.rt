@@ -67,10 +67,11 @@ enum Suit: string { case Hearts = 'H'; case Spades = 'S'; }
 $e = unserialize(serialize(Suit::Hearts));
 var_dump($e === Suit::Hearts, $e->value);
 
-// 8) closure 不可序列化 → NotCloneableError
+// 8) closure 可序列化（跨线程闭包支持）：函数索引 + 递归捕获
 try {
-    serialize(function () {});
-    echo "no-error\n";
+    $s = serialize(function () { return 7; });
+    $f2 = unserialize($s);
+    var_dump($f2 instanceof Closure, $f2());
 } catch (NotCloneableError $ex) {
     echo "not-cloneable\n";
 }
@@ -116,7 +117,8 @@ echo "serialize-done\n";
 // EXPECT: }
 // EXPECT: bool(true)
 // EXPECT: string(1) "H"
-// EXPECT: not-cloneable
+// EXPECT: bool(true)
+// EXPECT: int(7)
 // EXPECT: plain-rejected
 // EXPECT: bool(false)
 // EXPECT: serialize-done
