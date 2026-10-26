@@ -4834,6 +4834,13 @@ void tphp_run_shutdown_dtors(void) {
     /* tphp_sched_run 把宿主 ctx memset 清零过（数组指针为 NULL）——收尾
      * 析构要跑 PHP，先确保 per-context 堆数组存在 */
     tphp_ctx_ensure(&vm->x);
+    /* 多个 Worker 线程几乎同时退出时会并发进入这里（实测：两个 50ms
+     * 任务同时结束 → mimalloc 报堆损坏）。收尾涉及共享 Program 的
+     * 类表/常量/异常类克隆，用全局锁串行化。析构器不会重入本函数。 */
+    static uv_mutex_t s_dtor_mu;
+    static bool s_dtor_mu_init = false;
+    if (!s_dtor_mu_init) { uv_mutex_init(&s_dtor_mu); s_dtor_mu_init = true; }
+    uv_mutex_lock(&s_dtor_mu);
     vm->x.exception = NULL;      /* 未消费异常已由 sched_report_uncaught 报过 */
     /* B4: 先按类声明序释放静态属性（级联触发 __destruct，对齐 PHP
      * shutdown 析构序）；随后快照循环兜底环中/其它持有者对象 */
@@ -4857,6 +4864,7 @@ void tphp_run_shutdown_dtors(void) {
         tval_release(&self);     /* 退快照引用；rc 归零则直连释放 */
     }
     dyn_global_release_all();    /* B2: 动态全局条目收尾（幂等） */
+    uv_mutex_unlock(&s_dtor_mu); /* 收尾锁：见函数头部（多 Worker 并发退出） */
 }
 
 /* ---- prog freeze (M5): after compilation, before any thread runs ----
@@ -4866,10 +4874,31 @@ void tphp_run_shutdown_dtors(void) {
  * 2) pre-resolve INIT_FCALL inline caches: op->ic becomes a process-level
  *    constant (TFunc* / builtin fn), so worker threads run the same prog
  *    without writing to shared bytecode */
-void tphp_prog_freeze(Program *p) {
-    tphp_class_flatten_all();
+/* 查找函数所属 Program（主 或 inc_progs）。Worker 入口闭包跨线程共享时
+ * 需要知道字节码在哪个 Program（worker.c 不透明访问 VM 内部）。 */
+Program *tphp_vm_find_func_owner(TFunc *fn) {
     VM *vm = &g_vm;
-    vm->prog = p;
+    for (int i = 0; i < vm->prog->n_funcs; i++)
+        if (vm->prog->funcs[i] == fn) return vm->prog;
+    for (int pi = 0; pi < vm->n_inc_progs; pi++) {
+        Program *ip = vm->inc_progs[pi];
+        for (int i = 0; i < ip->n_funcs; i++)
+            if (ip->funcs[i] == fn) return ip;
+    }
+    return NULL;
+}
+
+uint32_t tphp_prog_func_index(Program *p, TFunc *fn) {
+    for (int i = 0; i < p->n_funcs; i++)
+        if (p->funcs[i] == fn) return (uint32_t)i;
+    return UINT32_MAX;
+}
+
+void tphp_prog_freeze(Program *p) {
+    VM *vm = &g_vm;
+    Program *saved = vm->prog;
+    vm->prog = p;                 /* IC 预解析用临时视图（freeze 可能在活跃 VM 上调用） */
+    tphp_class_flatten_all();
     for (int fi = -1; fi < p->n_funcs; fi++) {
         TFunc *fn = fi < 0 ? p->main : p->funcs[fi];
         for (uint32_t k = 0; k < fn->n_ops; k++) {
@@ -4883,6 +4912,7 @@ void tphp_prog_freeze(Program *p) {
             /* unresolved stays NULL: the runtime slow path reports it */
         }
     }
+    vm->prog = saved;             /* 恢复：freeze 不改变活跃 VM 的字节码视图 */
 }
 
 /* 调用任意 PHP callable（M5-c：worker 消息回调）：
@@ -5109,11 +5139,10 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         f->called_cls = mcls ? mcls : recv->cls;
         vm->x.n_args = (int)base;
         vm->x.frame = f;
-        while (vm->x.frame == f) {
-            TOp *cop = &f->fn->ops[f->pc];
-            int32_t d = ((OpHandler)cop->handler)(vm, cop);
-            if (d) f->pc += (uint32_t)d;
-        }
+        /* 跑到底：闭包体内再调用户函数会建子帧，"帧切换即退出"的旧式
+         * 循环会提前收工（子帧挂在栈上未执行 → 帧链错乱 + dst 未写）。
+         * 与 autoload 回调同一处理（run_frame_until_pop_deep）。 */
+        run_frame_until_pop_deep(vm, f);
         if (vm->x.exception) vm_unwind_jump(vm);
         return vm->x.thunk_ret;
     }
@@ -5164,18 +5193,15 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
      * op_do_fcall 主路径一致），此处只恢复 args 区水位 */
     vm->x.n_args = (int)base;
     vm->x.frame = f;
-    while (vm->x.frame == f) {
-        TOp *cop = &f->fn->ops[f->pc];
-        int32_t d = ((OpHandler)cop->handler)(vm, cop);
-        if (d) f->pc += (uint32_t)d;
-    }
+    /* 同上：普通闭包体内的用户函数子帧必须在本循环内执行完 */
+    run_frame_until_pop_deep(vm, f);
     if (vm->x.exception) vm_unwind_jump(vm);
     return vm->x.thunk_ret;
 }
 
 /* 以闭包为 main 跑一个独立 runtime（M5-c：Worker 子线程入口）。
  * prog 为共享只读字节码；本线程的 thread-local runtime 必须已初始化。 */
-int tphp_vm_run_closure(Program *prog, TClosure *clo) {
+int tphp_vm_run_closure(Program *prog, TClosure *clo, TVal *main_ret) {
     VM *vm = &g_vm;
     memset(vm, 0, sizeof *vm);
     vm->prog = prog;
@@ -5205,7 +5231,7 @@ int tphp_vm_run_closure(Program *prog, TClosure *clo) {
     }
     vm->x.frame = vm->main_frame = f;
     tphp_ctx_ensure(&vm->x);
-    int rc = tphp_sched_run();
+    int rc = tphp_sched_run(main_ret);     /* Worker 入口的返回值经这里传出 */
     tphp_run_shutdown_dtors();     /* P0-2: worker/闭包入口同样收尾析构 */
     tphp_raise_hook = NULL;
     tphp_vm_current = NULL;
@@ -5240,7 +5266,7 @@ int tphp_vm_run(Program *prog) {
     tphp_ctx_ensure(&vm->x);
     /* M4: the scheduler takes over — the script becomes the main coroutine
      * and the event loop drives spawn'ed ones until all are done */
-    int rc = tphp_sched_run();
+    int rc = tphp_sched_run(NULL);
     tphp_run_shutdown_dtors();     /* P0-2: 收尾析构（在 raise 钩子拆除前） */
     tphp_raise_hook = NULL;
     tphp_vm_current = NULL;

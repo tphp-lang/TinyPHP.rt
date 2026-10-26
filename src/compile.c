@@ -3865,9 +3865,18 @@ static char *dir_of(const char *path) {
     return d;
 }
 
+/* 绝对路径判定：POSIX '/'、Windows '\\' 开头，或盘符 'C:' 形式。
+ * 之前只按"相对路径"拼接，导致 __DIR__ 折叠出的绝对路径被重复拼接。 */
+static bool path_is_abs(const char *p) {
+    if (!p || !*p) return false;
+    if (p[0] == '/' || p[0] == '\\') return true;
+    if (p[1] == ':') return true;
+    return false;
+}
+
 static char *join_path(const char *dir, const char *rel) {
     /* Windows 路径：用 '\\' 或 '/' 都可，统一 '/' */
-    if (!dir) {
+    if (!dir || path_is_abs(rel)) {
         char *r = tm_malloc(strlen(rel) + 1);
         strcpy(r, rel);
         return r;

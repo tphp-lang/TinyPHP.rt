@@ -163,6 +163,33 @@ static AExpr *ae_new(int tag, int line) {
     return e;
 }
 
+/* 常量折叠：`__DIR__ . '/x.php'` 这类纯字面量拼接 → 单个 A_STR。
+ * 目的：让 require/include 走编译期内联。否则运行期 OP_REQUIRE 会为被
+ * 包含文件生成独立 Program（inc_progs），其中的闭包/函数无法作为
+ * Worker 入口跨线程共享。__DIR__/__FILE__ 在 parse 阶段已折叠成 A_STR，
+ * 所以这里只需处理字符串的 `.` 拼接。 */
+static AExpr *fold_str_concat(AExpr *e) {
+    if (!e || e->tag != A_BINARY || e->u.bin.op != P_DOT) return e;
+    AExpr *l = fold_str_concat(e->u.bin.l);
+    AExpr *r = fold_str_concat(e->u.bin.r);
+    if (l->tag != A_STR || r->tag != A_STR) {
+        e->u.bin.l = l;
+        e->u.bin.r = r;
+        return e;
+    }
+    const char *ls = tstr_val(l->u.name);
+    const char *rs = tstr_val(r->u.name);
+    size_t ln = strlen(ls), rn = strlen(rs);
+    char *buf = tm_malloc(ln + rn + 1);
+    memcpy(buf, ls, ln);
+    memcpy(buf + ln, rs, rn);
+    buf[ln + rn] = 0;
+    AExpr *out = ae_new(A_STR, e->line);
+    out->u.name = tstr_intern(buf, ln + rn);
+    tm_free(buf);
+    return out;
+}
+
 /* async(EXPR) 语法结构：当唯一实参是"调用表达式"时，把整个调用搬进
  * 协程执行（改写为 Tphp\spawn(fn() => EXPR)）。箭头函数自动按值捕获
  * 自由变量，所以参数里的变量在 spawn 那一刻取值。
@@ -207,7 +234,7 @@ static AExpr *make_async_call(AExpr *expr, int line) {
     args->n = 1;
 
     AExpr *call = ae_new(A_CALL, line);
-    call->u.call.name = tstr_intern("Tphp\\spawn", 10);
+    call->u.call.name = tstr_intern("\\Tphp\\spawn", 11);
     call->u.call.args = args;
     return call;
 }
@@ -468,7 +495,7 @@ static AExpr *parse_primary(Parser *p) {
         bool is_req = p->tok.kind == KW_REQUIRE || p->tok.kind == KW_REQUIRE_ONCE;
         bool is_once = p->tok.kind == KW_REQUIRE_ONCE || p->tok.kind == KW_INCLUDE_ONCE;
         advance(p);
-        AExpr *path = parse_ternary(p);
+        AExpr *path = fold_str_concat(parse_ternary(p));
         AExpr *e = ae_new(A_REQUIRE, line);
         e->u.inc.is_require = is_req;
         e->u.inc.is_once = is_once;
@@ -597,7 +624,7 @@ static AExpr *parse_primary(Parser *p) {
                 if (e->u.call.args->n == 1
                     && ast_is_call_expr(e->u.call.args->items[0].e))
                     return make_async_call(e->u.call.args->items[0].e, line);
-                e->u.call.name = tstr_intern("Tphp\\async", 10);
+                e->u.call.name = tstr_intern("\\Tphp\\async", 11);
             }
             return e;
         }
@@ -691,7 +718,7 @@ static AExpr *parse_primary(Parser *p) {
                 if (e->u.call.args->n == 1
                     && ast_is_call_expr(e->u.call.args->items[0].e))
                     return make_async_call(e->u.call.args->items[0].e, line);
-                e->u.call.name = tstr_intern("Tphp\\async", 10);
+                e->u.call.name = tstr_intern("\\Tphp\\async", 11);
             }
             return e;
         }
@@ -2962,7 +2989,7 @@ static AStmt *parse_statement(Parser *p) {
         bool is_req = p->tok.kind == KW_REQUIRE || p->tok.kind == KW_REQUIRE_ONCE;
         bool is_once = p->tok.kind == KW_REQUIRE_ONCE || p->tok.kind == KW_INCLUDE_ONCE;
         advance(p);
-        AExpr *e = parse_expr(p);
+        AExpr *e = fold_str_concat(parse_expr(p));
         expect(p, P_SEMI, "Expected ';' after require/include");
         if (e->tag == A_STR) {
             AStmt *s = as_new(S_INCLUDE, line);
