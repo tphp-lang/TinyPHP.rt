@@ -52,7 +52,7 @@ class Channel {
     public function len(): int;
 }
 
-class TaskGroup {                                          // 别名 Tphp\Thread
+class TaskGroup {                                          // Tphp\TaskGroup（协程任务组）
     public function spawn(callable $fn, ...$args): Coroutine;  // 启动并登记
     public function wait(): array;                          // 全部完成，按登记序返回结果
     public function count(): int;
@@ -105,10 +105,43 @@ class Worker {
 | null/bool/int/float/string | 直接深拷贝 |
 | array | 递归深拷贝（循环引用检测到即报错） |
 | object | 需实现 `__cloneState(): array`（自定义克隆协议），否则抛 `NotCloneableError` |
-| closure / 资源句柄 | 作为消息不可传（抛错）；**唯一例外**：Worker 入口闭包（见上方构造器注释，字节码共享 + 捕获值克隆，不走 mailbox 协议） |
+| closure | **可序列化**（T_CLOSURE 格式 = Program 注册表 id + 函数索引 + 递归捕获，2026-10-26 实现）；资源句柄不可传（抛错） |
 | 类/函数定义、lib 字节码、interned 字符串字面量 | **只读共享，零拷贝** |
 
 **背压**：mailbox 有界（默认 1024），`post` 满时协程内挂起（同步顶层则阻塞并告警）。
+
+## 3.1 Thread 真线程池 API（`Tphp\Thread`，2026-10-26）
+
+```php
+namespace Tphp;
+
+class Thread {
+    public function __construct();
+    public function spawn(callable $fn): mixed;   // 起一次性 OS 线程；入口闭包字节码只读共享
+    public function wait(): array;                // 阻塞等全部结束，按 spawn 序返回结果数组
+    public function detach(): void;               // fire-and-forget：立即返回，线程自己跑完
+    public function count(): int;                 // 当前跟踪中的线程数
+    public function poll(): array;                // 非阻塞收割已完成线程的返回值（不挂起协程）
+}
+```
+
+**与 TaskGroup（协程组）的分工**：
+
+| | `Tphp\TaskGroup`（协程） | `Tphp\Thread`（真线程） |
+|---|---|---|
+| 并行度 | 单线程内交错 | 多核真并行 |
+| 阻塞调用 | 卡住整个调度器 | 只卡住该线程 |
+| 捕获变量 | 同一份内存 | 跨线程**深拷贝**（序列化协议） |
+| 适用 | I/O 密集、大量并发 | 阻塞/计算密集；**UI 线程回调里跑长任务** |
+
+**为什么 UI 回调里必须用真线程**：协程是单线程协作式调度，`webview_run` 这类 C 阻塞调用占着唯一的 UI 线程 → 协程永远得不到调度（"点了按钮没反应"）；让 main 主动挂起则 UI 消息泵冻结。真线程不依赖调度器让出，在 FFI/C 回调里 `spawn` 立即开跑。
+
+**实现要点**：
+- 每次 `spawn` = 一个一次性 Worker（复用 §3 的 mailbox + 序列化基础设施），入口即该 callable
+- `main` 返回值经 `tphp_sched_run(TVal *main_ret)` 传出 → 子线程 serialize 后经 mailbox 回传父线程
+- `poll()` 用非阻塞 `tryRecv`，供 UI 线程安全收割（不挂起协程）
+- `detach()` 把 Worker 引用移交进程级孤儿表（父侧不再跟踪、不 join）
+- **捕获对象需实现 `__cloneState()`/`__restoreCloneState()`**，否则抛 `NotCloneableError`；闭包可捕获（走 T_CLOSURE 序列化：Program id + 函数索引 + 递归捕获）
 
 ## 4. 标准库清单
 

@@ -1,12 +1,12 @@
 # backlog · 全量任务与未来规划（交接文档）
 
-> 状态：2026-10-25 建档。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
-> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。
+> 状态：2026-10-25 建档，2026-10-26 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
+> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。当日日志：[../memory/2026-10-26.md](../memory/2026-10-26.md)。
 
-## 0. 现状快照（截至 2026-10-25）
+## 0. 现状快照（截至 2026-10-26）
 
-- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1（M1 达成）**。
-- **测试基线**：`tests/run.ps1` = **218 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
+- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1（M1 达成）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；协程组保留为 `Tphp\TaskGroup`）。
+- **测试基线**：`tests/run.ps1` = **222 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
 - **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态，首次全平台 CI 基线见 `memory/2026-10-23.md`）：
   - fib(28)：x86_64 0.4×–2.7×（tphp JIT 已覆盖）；全套件几何均值 **≈7×（Linux CI）**；
   - 未持平主体 = JIT 白名单外形态：array-read 20–51×、kv-read 15–27×、call 16×、object 7–12×；
@@ -16,13 +16,15 @@
 
 ## 1. 工作协议（给新 AI 的红线）
 
-1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，218/218 才算完；禁改期望凑绿。
+1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，222/222 才算完；禁改期望凑绿。
 2. **文档同步**：动功能必须同步对应 PLAN 规格（语法→01、运行时→02、性能→perf-roadmap、JIT→ir-jit、任务账→本文）+ `memory/<date>.md` 当日日志；`memory/MEMORY.md` 完成态保持准确。
 3. **构建**：Windows `cmd /c build.cmd`（结构体变更必须全量）；Unix `./build.sh`。IR 对象隔离（Windows `build/obj_ir/`、Unix `build/obj/ir_*.o`），带 main 的对象绝不进 tphp 链接。
 4. **语义参考** = 本机 php 原生对拍；php-src 源码在 `C:\Users\kllxs\Desktop\php-src-php-8.5.7`。
 5. **提交**：仅用户明说时提交；英文信息、单域前缀（perf/jit/feat/fix/ci/docs）。
 6. **环境坑**（详见 MEMORY.md 环境坑行）：PS5.1 GBK 假乱码（用 Edit/`[IO.File]` API）；PS5.1 原生传参剥双引号（探针走临时文件）；IR builder 宏要求局部变量名 `ctx`。
 7. **perf 协议**：只比纯计算（无异步/线程——PHP 没有）；bench 禁用"常量键+无副作用求和"（Zend optimizer 双态折叠，perf-roadmap §1.2）。
+8. **引用计数约定（新增，2026-10-26 P1 教训）**：`tarr_append`/`tarr_set` **不做 addref**——数组接管调用方那份引用；调用方若要自己继续持有必须**先 `tval_addref`**（范例 `src/vm.c` `op_assign`）。同一对象被两处持有时两份都要独立计数，否则先释放方提前 free → UAF/二次释放。native 方法返回值默认转移所有权。
+9. **内存 bug 排查（新增）**：分配器报"堆损坏"时**先建 ASAN 版本**（不定义 `TPHP_USE_MIMALLOC` → CRT malloc，ASAN 才能接管）拿分配/释放/使用三栈，别急着改 GC/分配器——2026-10-26 的 P1 前两轮（GC 哨兵、gc_tid 跨线程标记）全是误诊。流程见 `doc/testing.md`「内存问题定位（ASAN）」。
 8. **JIT 调试五坑**（JIT 任务必读，详 `memory/2026-10-23.md`）：①`ir_init` 不传 `IR_OPT_CFG` ②`ir_START` 在 `PARAM` 前 ③IF 双活路必须 END+MERGE_2、沉点侧可不对称 ④**DO_FCALL 已推进 caller pc，JIT 成功路径必须 return 0** ⑤JIT→JIT 用 TLS 槽栈 trampoline，勿走帧池。
 
 ## 2. P0 · 性能主线（7× 几何均值 → M2/M3）
@@ -93,8 +95,9 @@
 
 ## 7. 验证与工具速查
 
-- 全量测试：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`（期望 218/0）。
+- 全量测试：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`（期望 222/0）。
 - 性能对比：本地 `pwsh tools/perf-compare.ps1 -MaxFibRatio 6.0 -Report perf.md`；CI 手动 Actions → **Perf** → Run workflow（`fib_gate` 输入可调，0=仅报告）。
 - 单 bench：`build/tphp.exe run tests/bench/test-bench-*.php`（计时走 stderr）。
 - JIT 开关 `TPHP_JIT=0`；调试 `TPHP_JIT_DEBUG=1`；执行 trace `TPHP_TRACE=1`；opcode 查看 `--dump-opcodes`。
+- **内存 bug**：ASAN 版本（`TPHP_USE_MIMALLOC` 关 + `-fsanitize=address`）——流程见 `doc/testing.md`「内存问题定位（ASAN）」。
 - 历史决策检索：`memory/MEMORY.md`（锚点）→ `memory/<date>.md`（当日细节）→ 各 PLAN（权威规格）。
