@@ -502,7 +502,13 @@ static TVal nm_worker_stop(VM *vm, void *self, TVal *args, int n) {
     (void)args; (void)n;
     WHandle *h = worker_obj_handle(self);
     if (!h) return TV_NULL;
-    if (atomic_exchange(&h->state, 1) == 2) return TV_NULL;  /* 已 done */
+    if (atomic_exchange(&h->state, 1) == 2) {
+        /* 子线程已自行结束（state=done）：仍要 join 回收 OS 线程资源
+         * （uv_thread_t + 线程栈），否则泄漏。早前这里直接 return，
+         * 把"已完成"和"未 join"混成了一件事。 */
+        uv_thread_join(&h->tid);
+        return TV_NULL;
+    }
     wbox_close(&h->to_child);
     uint32_t len;
     char *data;
@@ -572,7 +578,16 @@ static TVal nm_thread_spawn(VM *vm, void *self, TVal *args, int n) {
     TObj *w = tphp_obj_alloc(g_worker_cls);
     nm_worker_construct(vm, w, args, n);
     TArr *a = (TArr *)t->props[0].u.p;
-    tarr_append(a, TV_OBJ(w));     /* 数组持有 alloc 的那份 rc */
+    /* 引用计数：tarr_append 不做 addref（调用方自己加，见 vm.c op_assign），
+     * 所以数组要自己持有一份 w 的引用。返回给调用方的 spawn() 结果是
+     * 另一份引用——两份都必须独立计数：
+     *   tphp_obj_alloc → rc=1（本次转移给返回值）
+     *   tval_addref    → rc=2（数组持有的那一份）
+     * 早前只 addref 一次，把同一份引用同时给了数组和返回值：数组释放时
+     * 提前 free(w)，调用方 frame 随后再 release → 二次释放 → UAF
+     * （mimalloc 报 "corrupted free list entry"）。 */
+    tval_addref(TV_OBJ(w));
+    tarr_append(a, TV_OBJ(w));
     return TV_OBJ(w);
 }
 
@@ -631,7 +646,10 @@ static TVal nm_thread_poll(VM *vm, void *self, TVal *args, int n) {
         if (m.t == T_NULL || m.t == T_FALSE) continue;   /* 未完成/已关闭 */
         tarr_append(out, m);
         nm_worker_stop(vm, wv.u.p, NULL, 0);             /* 已完成：join */
-        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };   /* 移出跟踪 */
+        /* 移出跟踪：把数组持有的那一份引用释放掉（不能只置 UNDEF——
+         * 那是泄漏；也不能提前释放——worker 还在用它）。 */
+        tval_release(&wv);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
     }
     return TV_ARR(out);
 }
