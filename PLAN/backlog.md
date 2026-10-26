@@ -57,6 +57,7 @@
 | P1-6 | WeakMap / WeakReference | 01 §不支持清单 | 立项时改 01 |
 | P1-7 | **FFI Unix 补齐核实**：02 记载 dlopen（Linux/macOS）后置，但 unix CI ffi 测试已绿——确认实际状态并同步 02 文档；缺则补 | 02 §FFI 实现行 | 文档一致性任务 |
 | P1-8 | 动态静态方法名 + 命名参数 `C::$v(a:1)`（现为加载期拒绝，01 §10 标注的唯一未实现项） | 01 §10 | 小项 |
+| P1-9 | **属性类型 FQCN 解析缺口**（实测 2026-10-27）：public \A \; 报 Parse error；PHP 允许。pebview 已用 docblock 绕开。落点 parse.c 属性类型 | 01 §2 类型声明 |
 
 ## 4. P2 · 工程线
 
@@ -66,7 +67,7 @@
 | P2-2 | pkg `autoload.classmap`；pack.include/exclude 的 build 消费 | pkg-manager 边界表、memory 余项 |
 | P2-3 | **pkg 全局缓存**（版本寻址 + 原子 rename + 硬链接，Bun 模式）与 keepalive 连接池 | perf-roadmap §6 表 |
 | P2-4 | pkg 注册表（`upload` 指引后的远期项） | pkg-manager §upload |
-| P2-5 | FFI 回调残留：struct 字段/数组元素闭包赋值 v2 余项核对、trampoline 去重复核、延迟异常传播（**存疑候选**：与硬 Fatal 是语义取舍，默认不做） | 02 §4.5.1 |
+| P2-5 | FFI 回调残留：~~可捕获异常~~ **v2-3 已完成（2026-10-27）**；余 struct 字段/数组元素闭包赋值 v2 核对、trampoline 去重复核、延迟异常传播到调用点外（**存疑候选**：与 PHP 语义取舍，默认不做） | 02 §4.5.1 |
 | P2-6 | **FFI DLL 打包器**（可选后置） | 04 §M5.5 行、03 §6.1 |
 | P2-7 | php-compat 对拍层加厚（现仅 17 例，从 Zend/tests 扩到几十例） | memory 缺口清单 |
 | P2-8 | standard 扩展测试加厚（现仅 1 个聚合文件） | memory 缺口清单 |

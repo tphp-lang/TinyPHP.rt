@@ -180,7 +180,7 @@ class Thread {
 - **生命周期**：trampoline + 闭包（addref）进入**线程局部回调表**，脚本/线程结束释放——CLI 单脚本 ≈ PHP 单请求"整请求有效"；无显式 close（学 PHP 非 Bun）；Worker 每线程独立表
 - **编组（C→PHP 参数）**：标量直转；`const char*` → 拷贝 TStr；其他指针 → 非 owned CData 视图；struct 参数 → 非 owned CData 别名 libffi 栈（回调返回后失效，文档红字）；varargs 回调与 array 参数**不支持**（对齐 PHP）
 - **编组（PHP→C 返回）**：标量宽松转换 + 同尺寸 CData memcpy；**类型不匹配 → stderr 警告 + 返回类型零值**（修 PHP 的"吞异常返回垃圾"坑）
-- **异常**：回调内 throw = **硬禁止**（对齐 PHP 措辞 "Throwing from FFI callbacks is not allowed"）——tphp 的 raise 是 longjmp，unwind 穿 trampoline 会跳过 ffi_call 的 C 栈帧毁掉 libffi/C 库状态；实现 = raise 钩子查 `tphp_ffi_cb_depth` >0 → 打印 + exit（比 PHP bailout 干净）。回调内允许嵌套 ffi_call（重入）
+- **异常**：v1 曾"回调内 throw = 硬禁止"——**已被 v2③ 可捕获设计取代**（见下）；历史：v1 实现 = raise 钩子查 `tphp_ffi_cb_depth` >0 → 打印 + exit（比 PHP bailout 干净）。回调内允许嵌套 ffi_call（重入）
 - **线程**：同线程同步；C 跨线程调回调 = 未定义（文档禁止）；不做 Bun 式 threadsafe 投递——Worker 隔离是官方答案
 - **地址面**：trampoline 不暴露裸地址（传参只认 Closure 值），配合既有 `cast` 拒裸 int
 - **验收**：`tests/ffi/test-ffi-callback.php` —— msvcrt/libc `qsort` + 捕获闭包端到端
@@ -197,6 +197,7 @@ class Thread {
      - **边界**：重入天然嵌套（每层 trampoline 各有 local jmp_buf）；qsort 比较器未捕获 throw → 每次比较 warning+0（比较相等，顺序可能不对——与 PHP 一致，文档注明回调必须自己 catch）；逃逸不 re-raise 到 FFI 调用点外（PHP 也不传播；真要做是 TLS pending 槽 + 边界检查，语义模糊：qsort 调 5 次比较器传哪个——超出 PHP 的增强后置）
      - 实现量：cb_trampoline 重写 ~80 行 + vm_unwind_bounded ~40 行 + 测试 4 条（回调内 catch / 未捕获 warning+零值+进程活 / 嵌套重入 / qsort 抛异常不崩）
      - 动机案例：pebview bind 里 `Thread::spawn` 序列化失败（Window 缺 __cloneState）→ 硬 Fatal 杀进程；可捕获设计下变 JS Promise error payload
+     - **v2③ 已完成（2026-10-27，223/223）**：`tphp_vm_call_bounded`（vm.c：local setjmp + `vm_unwind_core(floor)` 有界弹帧；逃逸恢复外层 unwind 返回 false）+ trampoline 打 E_WARNING 风格警告并零值返回；`vm_unwind_jump` 的 cb_depth Fatal 已移除（local pad 接管）。坑：floor 逃逸分支不得重置 n_calls/n_args（会抹掉 C 栈仍压着的 FFI call rec → 0xC0000005）；回归 `tests/ffi/test-ffi-callback-throw.php`
 - 验收测试：`tests/ffi/test-ffi-callback.php`（v1 qsort）+ `tests/ffi/test-ffi-callback-struct.php`（v2 字段赋值/读回/去重同地址/静态 new 抛错/读回指针传 qsort/200 次循环平稳）
 
 ## 5. CLI

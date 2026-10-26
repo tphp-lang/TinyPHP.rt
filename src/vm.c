@@ -156,6 +156,9 @@ static TClosure *tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap) {
     return c;
 }
 
+/* jit.c（v1.1）：无捕获闭包分配 */
+TClosure *tphp_tclo_alloc0(TFunc *fn) { return tclo_alloc(fn, NULL, 0); }
+
 /* first-class wrapper around a builtin function */
 static TClosure *tclo_alloc_builtin(BuiltinFn bfn) {
     TClosure *c = tm_malloc(sizeof *c);
@@ -187,20 +190,11 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
 }
 
 /* ---- engine raise: store the exception and longjmp to the main loop ---- */
-/* FFI 回调上下文中禁止 longjmp：unwind 会跳过 ffi_call 的 C 栈帧毁掉
- * libffi/C 库状态（PLAN/02 §4.5.1；PHP bailout 同病所以同样硬禁）。
- * 所有 vm->x.unwind 跳转必须经此（op_throw 直接 longjmp 曾绕过检查）。 */
+/* v2-3（PLAN/02 §4.5.1）：FFI 回调 trampoline 会把 vm->x.unwind 换成自己的
+ * local setjmp——回调内 raise 落到该 pad，由 tphp_vm_call_bounded 做有界
+ * unwind（try/catch 可用；逃逸 = warning+零值）。此处不再检查 cb_depth。 */
 static void vm_unwind_jump(VM *vm) __attribute__((noreturn));
 static void vm_unwind_jump(VM *vm) {
-    extern _Thread_local int tphp_ffi_cb_depth;
-    if (tphp_ffi_cb_depth > 0) {
-        const char *m = (vm->x.exception && vm->x.exception->message)
-            ? tstr_val(vm->x.exception->message) : "exception";
-        fprintf(stderr,
-                "PHP Fatal error: Throwing from FFI callbacks is not allowed: %s\n",
-                m);
-        exit(255);
-    }
     longjmp(vm->x.unwind, 1);
 }
 
@@ -1648,6 +1642,8 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     /* IR baseline JIT (PLAN/ir-jit.md): frame ready, RECV deferred to
      * prologue. Guard-fail leaves slots UNDEF / args intact → interpreter. */
     if (tphp_jit_available()) {
+        /* v1.1 急切编译（n_ops<=96 首调即编）暂撤——暴露链式 TMP-ADD 的
+         * codegen 崩溃（sp=$a+$b+$c；memory/2026-10-27），修好后恢复 */
         if (!fn->jit_entry && fn->hot != UINT16_MAX &&
             ++fn->hot >= TPHP_JIT_HOT_THRESHOLD)
             tphp_jit_compile(fn);
@@ -4054,8 +4050,10 @@ static void frame_destroy(VMFrame *f) {
 }
 
 /* unwind after a throw: find a handler or pop frames; ends Uncaught at the
- * bottom with a PHP-style stack trace */
-static void vm_unwind(VM *vm) {
+ * bottom with a PHP-style stack trace.
+ * floor != NULL（v2-3 有界模式）：pop 到 floor 帧即停（不弹 floor），
+ * *escaped = true 返回——trampoline 据此发 warning；floor==NULL 保持原语义。 */
+static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped) {
     TExObj *ex = vm->x.exception;
     const_eval_reset();           /* P2-B: unwind 中断的常量求值允许重试 */
     vm->x.n_trace = 0;
@@ -4068,6 +4066,13 @@ static void vm_unwind(VM *vm) {
     uint32_t pc_back = 0;
     while (vm->x.frame) {
         VMFrame *f = vm->x.frame;
+        if (floor && f == floor) {
+            /* 有界模式：floor 之上的帧已弹完仍无 handler——逃逸。
+             * 水位已由各弹出帧逐帧恢复（含 FFI 调用自身的 call rec），
+             * floor 处不得再写 n_calls/n_args（会抹掉 C 栈仍压着的 rec）。 */
+            if (escaped) *escaped = true;
+            return;
+        }
         TFunc *fn = f->fn;
         uint32_t pc = f->pc;
         if (pc > pc_back) pc -= pc_back;
@@ -4157,6 +4162,49 @@ static void vm_unwind(VM *vm) {
         fflush(stdout);
         vm->exit_code = 255;
     }
+}
+
+/* 原语义入口：无 floor，到底走 Uncaught 报告 */
+static void vm_unwind(VM *vm) { vm_unwind_core(vm, NULL, NULL); }
+
+/* ---- bounded callback call (PLAN/02 §4.5.1 v2-3) ----
+ * FFI trampoline 专用：raise 落在本函数的 local setjmp（不穿 ffi_call 的
+ * C 栈）；回调内 try/catch 由 vm_unwind_core 正常恢复；逃逸到 floor =
+ * warning（调用方处理）+ 返回 false。正常完成返回 true，*out = 回调返回值。
+ * 重入：每次进入各自 save/restore vm->x.unwind，天然嵌套。 */
+bool tphp_vm_call_bounded(VM *vm, TVal callable, TVal *args, int n, TVal *out) {
+    jmp_buf outer;
+    memcpy(&outer, &vm->x.unwind, sizeof outer);
+    VMFrame *floor = vm->x.frame;   /* C 调用点所在帧：回调帧全在其上 */
+    if (setjmp(vm->x.unwind) == 0) {
+        TVal r = tphp_vm_call_callable(vm, callable, args, n);
+        memcpy(&vm->x.unwind, &outer, sizeof outer);
+        *out = r;
+        return true;
+    }
+    /* longjmp 落地：异常逃出了回调的某个 try */
+    for (;;) {
+        bool escaped = false;
+        vm_unwind_core(vm, floor, &escaped);
+        if (escaped) {
+            memcpy(&vm->x.unwind, &outer, sizeof outer);
+            return false;
+        }
+        /* catch 命中：跑到回调帧全部弹出（= floor 再次成为当前帧） */
+        if (setjmp(vm->x.unwind) != 0)
+            continue;                 /* 恢复执行中再次 raise */
+        while (vm->x.frame && vm->x.frame != floor) {
+            VMFrame *cf = vm->x.frame;
+            TOp *cop = &cf->fn->ops[cf->pc];
+            int32_t d = ((OpHandler)cop->handler)(vm, cop);
+            if (d) cf->pc += (uint32_t)d;
+        }
+        break;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof outer);
+    *out = vm->x.thunk_ret;
+    vm->x.thunk_ret = (TVal){ .u.i = 0, .t = T_NULL };
+    return true;
 }
 
 /* ---- thunk machinery (runtime default values) ----

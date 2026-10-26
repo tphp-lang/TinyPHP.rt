@@ -1200,11 +1200,12 @@ static void wbuf_free_all(void) {
 }
 
 /* ============================================================
- * 回调 trampoline（v1，PLAN/02 §4.5.1）：闭包 → C 函数指针。
+ * 回调 trampoline（PLAN/02 §4.5.1）：闭包 → C 函数指针。
  * 生命周期：trampoline + 闭包（addref）进线程局部表，脚本/线程结束释放
- * （CLI 单脚本 ≈ PHP 单请求"整请求有效"）。回调内 throw = 硬 Fatal
- * （raise 钩子查 tphp_ffi_cb_depth——longjmp 穿 trampoline 会跳过
- * ffi_call 的 C 栈帧毁掉 libffi/C 库状态）。
+ * （CLI 单脚本 ≈ PHP 单请求"整请求有效"）。
+ * 异常（v2-3）：tphp_vm_call_bounded 的 local setjmp 接管 raise——
+ * 回调内 try/catch 正常工作；未捕获 = E_WARNING 风格 warning + 零值返回，
+ * 进程不死（对齐 PHP；longjmp 不穿 ffi_call 的 C 栈）。
  * ============================================================ */
 
 typedef struct FFIClosure {
@@ -1219,7 +1220,8 @@ typedef struct FFIClosure {
 static _Thread_local FFIClosure **g_closures;
 static _Thread_local int g_n_closures, g_cap_closures;
 
-/* vm.c vm_raise_at 查询：>0 时禁止 longjmp（回调内 throw → Fatal exit） */
+/* vm.c vm_raise_at 曾查询：>0 时 Fatal（v1）；v2-3 起由 trampoline 的
+ * local setjmp 接管，本计数仅保留嵌套深度语义（调试/未来 trace 用） */
 _Thread_local int tphp_ffi_cb_depth = 0;
 
 /* 宽松标量转换（回调返回路径；不 raise——非数值当 0） */
@@ -1348,6 +1350,9 @@ static void cb_encode_ret(FFIType *t, void *ret, TVal r) {
 /* vm.c（非公共头）：以 callable 调用一帧——回调 trampoline 用 */
 extern TVal tphp_vm_call_callable(struct VM *vm, TVal callable,
                                   TVal *args, int n);
+/* v2-3：有界回调调用（setjmp + floor unwind；见 PLAN/02 §4.5.1） */
+extern bool tphp_vm_call_bounded(struct VM *vm, TVal callable,
+                                 TVal *args, int n, TVal *out);
 
 static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
                           void *user_data) {
@@ -1362,7 +1367,25 @@ static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
         argv[i] = cb_decode_arg(sig->fn_params[i], args[i]);
     TVal r = TV_NULL;
     if (vm) {
-        r = tphp_vm_call_callable(vm, fc->fn, argv, n);
+        if (!tphp_vm_call_bounded(vm, fc->fn, argv, n, &r)) {
+            /* 逃逸：对齐 PHP E_WARNING——未捕获异常 warning + 零值返回，
+             * 进程不死；回调内 try/catch 已在 bounded 内处理 */
+            TExObj *ex = vm->x.exception;
+            if (ex) {
+                const char *cls = (ex->wrap && ex->wrap->cls->name)
+                    ? tstr_val(ex->wrap->cls->name) : ex->cls->name;
+                const char *file = ex->file ? ex->file : "-";
+                fprintf(stderr,
+                        "PHP Warning: Uncaught %s: %s in %s:%d in FFI callback\n"
+                        "  thrown in %s on line %d\n",
+                        cls, tstr_val(ex->message), file, ex->line,
+                        file, ex->line);
+                TVal xv = TV_OBJ(ex);
+                vm->x.exception = NULL;
+                tval_release(&xv);
+            }
+            r = TV_NULL;              /* 零值返回（cb_encode_ret 宽松语义） */
+        }
     } else {
         fprintf(stderr, "PHP Warning: FFI callback invoked without a VM\n");
     }
