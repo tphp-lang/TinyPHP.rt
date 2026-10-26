@@ -55,7 +55,7 @@
 | `DIRECTORY_SEPARATOR` | 路径分隔符（Windows `"\"`，其余 `"/"`） |
 | `PATH_SEPARATOR` | PATH 分隔符（Windows `";"`，其余 `":"`） |
 | `PHP_OS_FAMILY` | 系统家族：`"Windows"` / `"Linux"` / `"Darwin"` / `"BSD"`（对齐 PHP，macOS 归 Darwin） |
-| `PHP_VERSION` | 运行时版本号（如 `"0.0.1"`，来自 `TPHP_VERSION`） |
+| `PHP_VERSION` | 运行时版本号（如 `"0.0.2"`，来自 `TPHP_VERSION`） |
 | `PHP_PACK` | **tphp 扩展**：是否运行在打包 exe 内（bool；`tphp run`/源码执行恒 false） |
 | `PHP_UNAME` | 关联数组，uname(2) 五字段：`sysname` `nodename` `release` `version` `machine`（libuv `uv_os_uname`，Windows 同样提供；替代不规范的 `php_uname()` 全局函数） |
 | `PHP_INT_MAX` / `PHP_INT_MIN` | int64 边界 |
