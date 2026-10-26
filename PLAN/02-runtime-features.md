@@ -188,7 +188,15 @@ class Thread {
 - **v2 已完成**（2026-10-22，185/185）：
   1. **struct 字段/数组元素的闭包赋值**——写路径走既有 encode_arg（FUNC_PTR→closure_create）；补 fetch_prop/assign_dim 读回为非 owned 函数指针视图；`FFI::new("struct S")` 静态调用（sc=NULL）由 AV 改为明确 ValueError（结构体类型需 `$ffi->new`）
   2. **同闭包复用去重**——closure_create 按「T_CLOSURE 对象指针 + 签名 FFIType*」查 TLS 表复用同一 trampoline；失败路径（prep_cif/alloc/prep_loc）raise 前释放 fc/ats/closure（不学 PHP 静默泄漏）
-  3. ~~延迟异常传播~~ 后置：与硬 Fatal 是语义取舍，复杂度高收益有限；做则切换默认并保留 Fatal 于无法安全传播的场景
+  3. **异常语义修正 + 可捕获设计（v2③，已定稿待实现）**——v1 的"回调内 throw = 硬 Fatal"参照错了对象：php-src trampoline 对普通 throw 的真实行为是 `zend_call_function` 返回后查 `EG(exception)` → `E_WARNING` + `zend_clear_exception()` + 返回零值，**进程不死、回调内 try/catch 正常工作**（PHP 异常是 EG(exception) 检查点模型非 longjmp；Fatal 只属 bailout）。tphp 的困境是 raise=longjmp、unwind 穿 trampoline C 栈帧是 UB，v1 图省事 exit。**设计（2026-10-27 定稿，源自 pebview bind 崩溃复盘）**：trampoline 级 setjmp + 有界 unwind——
+     - `cb_trampoline`：保存外层 `vm->x.unwind` → 换成 local setjmp → 跑 `tphp_vm_call_callable`；raise 落到 local（不跳 fiber root、不穿 C 栈）
+     - `vm_unwind_bounded(vm, floor=entry)`：现有 `vm_unwind` 加 floor 帧参数——catch 命中恢复执行（再跑到 entry 弹出）；剥到 floor 即停报 escaped（不弹 trampoline 调用方帧）
+     - escaped → stderr warning（含 class/msg/file:line，`ex->file` 已有）+ 返回类型零值（复用 cb_encode_ret 宽松语义）→ `vm->x.unwind` 恢复外层 → depth--
+     - `vm_unwind_jump` 的 `depth>0 → Fatal` 降级为兜底断言（raise 已被 local setjmp 接管，正常不可达；仅 trampoline C 初始化段异常才走）
+     - **三层保证**：①回调内 try/catch 完全正常（C 无感知）②未捕获 = warning + 零值、进程不死（对齐 PHP E_WARNING）③结构性损坏兜底 Fatal
+     - **边界**：重入天然嵌套（每层 trampoline 各有 local jmp_buf）；qsort 比较器未捕获 throw → 每次比较 warning+0（比较相等，顺序可能不对——与 PHP 一致，文档注明回调必须自己 catch）；逃逸不 re-raise 到 FFI 调用点外（PHP 也不传播；真要做是 TLS pending 槽 + 边界检查，语义模糊：qsort 调 5 次比较器传哪个——超出 PHP 的增强后置）
+     - 实现量：cb_trampoline 重写 ~80 行 + vm_unwind_bounded ~40 行 + 测试 4 条（回调内 catch / 未捕获 warning+零值+进程活 / 嵌套重入 / qsort 抛异常不崩）
+     - 动机案例：pebview bind 里 `Thread::spawn` 序列化失败（Window 缺 __cloneState）→ 硬 Fatal 杀进程；可捕获设计下变 JS Promise error payload
 - 验收测试：`tests/ffi/test-ffi-callback.php`（v1 qsort）+ `tests/ffi/test-ffi-callback-struct.php`（v2 字段赋值/读回/去重同地址/静态 new 抛错/读回指针传 qsort/200 次循环平稳）
 
 ## 5. CLI
