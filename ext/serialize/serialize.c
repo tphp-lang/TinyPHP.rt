@@ -28,6 +28,7 @@
 #include "opcode.h"
 #include "tphp.h"
 #include <string.h>
+#include <uv.h>            /* 闭包跨线程：Program 注册表的 mutex */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -179,6 +180,41 @@ static void sw_object(SW *w, TObj *o) {
     sw_seen_done(w, &o->h);
 }
 
+/* ---- 闭包值（'C'）：跨线程闭包支持 ----
+ * 闭包 = 函数字节码（fn 指针，所属 Program 的函数索引）+ 递归捕获。
+ * Program 经进程级注册表（id ↔ Program*）标识——post 消息时注册，
+ * Worker 线程按 id 取回（Program 指针只读共享）。inc_progs 未 freeze，
+ * 共享前对 owner 执行 tphp_prog_freeze（幂等，IC 预解析后只读）。 */
+extern Program *tphp_vm_find_func_owner(TFunc *fn);
+extern uint32_t tphp_prog_func_index(Program *p, TFunc *fn);
+extern void     tphp_prog_freeze(Program *p);
+
+static uv_mutex_t s_prog_mu;
+static bool s_prog_mu_init = false;
+typedef struct { int id; Program *p; } ProgEnt;
+static ProgEnt s_progs[64];
+static int s_n_progs;
+
+static int prog_id_of(Program *p) {
+    if (!s_prog_mu_init) { uv_mutex_init(&s_prog_mu); s_prog_mu_init = true; }
+    uv_mutex_lock(&s_prog_mu);
+    for (int i = 0; i < s_n_progs; i++)
+        if (s_progs[i].p == p) { uv_mutex_unlock(&s_prog_mu); return s_progs[i].id; }
+    int id = s_n_progs + 1;                      /* 0 = 无效 */
+    if (s_n_progs < 64) s_progs[s_n_progs++] = (ProgEnt){ id, p };
+    uv_mutex_unlock(&s_prog_mu);
+    return id;
+}
+
+static Program *prog_by_id(int id) {
+    if (!s_prog_mu_init) { uv_mutex_init(&s_prog_mu); s_prog_mu_init = true; }
+    uv_mutex_lock(&s_prog_mu);
+    for (int i = 0; i < s_n_progs; i++)
+        if (s_progs[i].id == id) { uv_mutex_unlock(&s_prog_mu); return s_progs[i].p; }
+    uv_mutex_unlock(&s_prog_mu);
+    return NULL;
+}
+
 static void sw_val(SW *w, TVal v) {
     switch (v.t) {
     case T_NULL:  put_u8(&w->buf, &w->len, &w->cap, 'N'); break;
@@ -197,6 +233,29 @@ static void sw_val(SW *w, TVal v) {
     }
     case T_ARR:   sw_array(w, (TArr *)v.u.p); break;
     case T_OBJ:   sw_object(w, (TObj *)v.u.p); break;
+    case T_CLOSURE: {
+        TClosure *clo = (TClosure *)v.u.p;
+        if (clo->bfn)
+            tphp_raise("NotCloneableError",
+                       "Serialization of this value type is not supported");
+        Program *owner = tphp_vm_find_func_owner(clo->fn);
+        if (!owner)
+            tphp_raise("NotCloneableError",
+                       "Serialization of this value type is not supported");
+        if (w->vm && owner != w->vm->prog) tphp_prog_freeze(owner);  /* 幂等 */
+        uint32_t fi = tphp_prog_func_index(owner, clo->fn);
+        if (fi == UINT32_MAX)
+            tphp_raise("NotCloneableError",
+                       "Serialization of this value type is not supported");
+        int pid = prog_id_of(owner);
+        put_u8(&w->buf, &w->len, &w->cap, 'C');
+        put_i64(&w->buf, &w->len, &w->cap, pid);
+        put_u32(&w->buf, &w->len, &w->cap, fi);
+        put_u32(&w->buf, &w->len, &w->cap, clo->n_cap);
+        for (uint16_t i = 0; i < clo->n_cap; i++)
+            sw_val(w, clo->captures[i]);       /* 递归捕获（可嵌套闭包） */
+        break;
+    }
     default:
         tphp_raise("NotCloneableError",
                    "Serialization of this value type is not supported");
@@ -298,6 +357,35 @@ static TVal sr_val(SR *r) {
                 tval_release(&key);      /* 堆键抵消 */
         }
         return av;
+    }
+    case 'C': {
+        /* 闭包：pid + 函数索引 + 递归捕获。Program 经注册表取回
+         * （post 侧已注册；freeze 已由写侧完成 → 字节码只读）。 */
+        int64_t pid = sr_i64(r);
+        uint32_t fi = sr_u32(r);
+        uint32_t nc = sr_u32(r);
+        Program *p = prog_by_id((int)pid);
+        if (!p || fi >= (uint32_t)p->n_funcs) { r->ok = false; return TV_NULL; }
+        TFunc *fn = p->funcs[fi];
+        TClosure *clo = tm_malloc(sizeof *clo);
+        clo->h.rc = 1;
+        clo->h.color = 0;
+        clo->h.kind = GC_KIND_CLO;
+        clo->h.flags = 0;
+        gc_register(&clo->h);
+        clo->fn = fn;
+        clo->bfn = NULL;
+        clo->scope = NULL;                 /* 继承 fn->decl_cls 语义 */
+        clo->n_cap = (uint16_t)nc;
+        clo->captures = nc ? tm_malloc(sizeof(TVal) * (size_t)nc) : NULL;
+        for (uint32_t i = 0; i < nc && r->ok; i++)
+            clo->captures[i] = sr_val(r);  /* 所有权转移 */
+        if (!r->ok) {
+            TVal cv = TV_CLO(clo);
+            tval_release(&cv);
+            return TV_NULL;
+        }
+        return TV_CLO(clo);
     }
     case 'O': {
         /* 类名以完整 'S' 记录编码（与 writer 对称） */

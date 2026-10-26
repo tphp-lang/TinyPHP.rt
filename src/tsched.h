@@ -17,7 +17,7 @@ typedef struct TCont TCont;
 
 /* 启动调度器并运行到所有协程完成（tphp_vm_run 调用）。返回退出码：
  * main 协程未捕获异常 → 255；子协程有未捕获异常 → 255。 */
-int tphp_sched_run(void);
+int tphp_sched_run(TVal *main_ret);
 
 /* 内部类注册（Tphp\Coroutine）：必须在 tphp_compile 之前调用
  * （A_NEW 做编译期类存在性检查）；幂等。 */

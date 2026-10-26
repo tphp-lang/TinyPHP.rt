@@ -200,7 +200,11 @@ static void cont_entry(TFiber *fb) {
     TCont *c = (TCont *)tphp_fiber_data(fb);
     VM *vm = tphp_vm_instance();
     tphp_ctx_ensure(&vm->x);          /* 本协程自己的堆数组 */
-    vm->x.coro_result = &c->result;   /* 根帧 RETURN 写这里 */
+    /* 根帧 RETURN 写这里。sched_run 可能已指定外部接收槽（Worker 入口的
+     * 返回值要回传父线程），此时不覆盖——否则外部指针拿不到值，且双重
+     * 持有会在退出时报堆损坏 */
+    if (!vm->x.coro_result)
+        vm->x.coro_result = &c->result;
     if (setjmp(vm->x.unwind) == 0) {
         build_root_frame(vm, c);
         tval_release(&c->callable);   /* 已捕获进帧/已解析 */
@@ -463,6 +467,7 @@ static TVal nm_tg_construct(VM *vm, void *self, TVal *args, int n);
 static TVal nm_tg_spawn(VM *vm, void *self, TVal *args, int n);
 static TVal nm_tg_wait(VM *vm, void *self, TVal *args, int n);
 static TVal nm_tg_count(VM *vm, void *self, TVal *args, int n);
+static TVal nm_tg_detach(VM *vm, void *self, TVal *args, int n);
 static TVal nm_task_invoke(VM *vm, void *self, TVal *args, int n);
 
 static void register_coro_class(void) {
@@ -546,13 +551,14 @@ static TClass *make_tg_class(const char *name, size_t len) {
     add_native_method(cls, "spawn", (void *)nm_tg_spawn);
     add_native_method(cls, "wait", (void *)nm_tg_wait);
     add_native_method(cls, "count", (void *)nm_tg_count);
+    add_native_method(cls, "detach", (void *)nm_tg_detach);
     tphp_class_register(cls);
     return cls;
 }
 
 static void register_tg_class(void) {
+    /* 协程任务组只保留 TaskGroup —— Thread 已改为真线程（ext/worker） */
     g_tg_cls = make_tg_class("Tphp\\TaskGroup", 14);
-    make_tg_class("Tphp\\Thread", 11);
 }
 
 /* Tphp\Task —— async($callable) 的返回物：调用即启动协程。
@@ -1107,6 +1113,19 @@ static TVal nm_tg_count(VM *vm, void *self, TVal *args, int n) {
     return TV_INT(((TArr *)o->props[0].u.p)->n);
 }
 
+/* detach()：不再跟踪组内任务，立即返回。
+ * 任务本身已经在调度器就绪/等待队列里，清空组内数组只是放弃对它们的
+ * 引用（TCont 自持一份 coro_obj），协程照常跑完、照常回收。
+ * 语义：fire-and-forget —— 之后 wait() 返回空数组。 */
+static TVal nm_tg_detach(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    TVal old = o->props[0];
+    o->props[0] = TV_ARR(tarr_new());
+    tval_release(&old);           /* 释放组持有的协程对象引用 */
+    return TV_NULL;
+}
+
 /* ---- Tphp\Task ---- */
 
 /* __invoke(...$args)：启动协程并返回 Coroutine（参数个数上限同 spawn） */
@@ -1208,7 +1227,7 @@ void tphp_sched_loop_init(void) {
     g_loop_inited = true;
 }
 
-int tphp_sched_run(void) {
+int tphp_sched_run(TVal *main_ret) {
     tphp_sched_loop_init();
     g_sched_active = true;
     tphp_async_init();
@@ -1218,7 +1237,7 @@ int tphp_sched_run(void) {
     m->x = vm->x;
     memset(&vm->x, 0, sizeof vm->x);
     vm->x.done = true;
-    m->x.coro_result = NULL;          /* main 返回值丢弃 */
+    m->x.coro_result = main_ret;      /* NULL = main 返回值丢弃 */
     /* main 的 Coroutine 对象惰性创建（tphp_async_current），避免抢占
      * var_dump 的对象编号序列 */
     m->fib = tphp_fiber_new(tphp_fiber_default_stack, main_entry, m);

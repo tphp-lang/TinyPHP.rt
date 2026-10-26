@@ -35,7 +35,9 @@ TStr *tstr_new(const char *s, size_t len);
 void  tphp_vm_raise(struct VM *vm, const char *cls, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
 TVal  tphp_vm_call_callable(struct VM *vm, TVal callable, TVal *args, int n);
-int   tphp_vm_run_closure(Program *prog, TClosure *clo);
+int   tphp_vm_run_closure(Program *prog, TClosure *clo, TVal *main_ret);
+Program *tphp_vm_find_func_owner(TFunc *fn);   /* vm.c：函数所属 Program */
+void  tphp_prog_freeze(Program *p);            /* vm.c：幂等（flatten+IC 预解析） */
 void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */
 void  tphp_async_init(void);             /* sched.c */
 void  tphp_io_init(void);                /* io.c */
@@ -222,10 +224,17 @@ static uint32_t prog_func_index(Program *p, TFunc *fn) {
     return UINT32_MAX;
 }
 
-static char *worker_serialize_closure(Program *p, TClosure *clo,
-                                      uint32_t *out_len) {
-    uint32_t fi = prog_func_index(p, clo->fn);
-    if (fi == UINT32_MAX || clo->bfn) return NULL;
+/* 入口闭包序列化：自动定位所属 Program（主 或 inc_progs）。
+ * inc_progs 未 freeze（IC 运行期写）→ 共享前对 owner 执行 freeze
+ * （幂等：flatten 跳过已完成，IC 只解析空位 → 此后字节码只读）。
+ * 这解锁了 vendor/库文件里的闭包也能作为 Worker 入口。 */
+static char *worker_serialize_closure(VM *vm, TClosure *clo,
+                                      uint32_t *out_len, Program **owner_out) {
+    Program *owner = tphp_vm_find_func_owner(clo->fn);
+    if (!owner || clo->bfn) return NULL;
+    if (owner != vm->prog) tphp_prog_freeze(owner);
+    uint32_t fi = prog_func_index(owner, clo->fn);
+    if (fi == UINT32_MAX) return NULL;
     WBuf b = { NULL, 0, 0 };
     wbuf_put(&b, "W", 1);
     wbuf_put(&b, &fi, 4);
@@ -239,11 +248,25 @@ static char *worker_serialize_closure(Program *p, TClosure *clo,
         tval_release(&(TVal){ .u.p = s, .t = T_STR });
     }
     *out_len = (uint32_t)b.len;
+    if (owner_out) *owner_out = owner;
     return b.buf;
 }
 
-/* 子线程侧：从 blob 重建入口闭包（本线程堆；fn 指针共享只读） */
-static TClosure *worker_unserialize_closure(Program *p, const char *d,
+/* 顶层函数入口：与闭包同格式但无捕获（nc = 0）。
+ * 用于 new Worker("fn_name")——函数必须是主 Program 的顶层函数。 */
+static char *worker_serialize_func(Program *p, TFunc *fn, uint32_t *out_len) {
+    uint32_t fi = prog_func_index(p, fn);
+    if (fi == UINT32_MAX) return NULL;
+    WBuf b = { NULL, 0, 0 };
+    wbuf_put(&b, "W", 1);
+    wbuf_put(&b, &fi, 4);
+    uint32_t nc = 0;
+    wbuf_put(&b, &nc, 4);
+    *out_len = (uint32_t)b.len;
+    return b.buf;
+}
+
+/* 子线程侧：从 blob 重建入口闭包（本线程堆；fn 指针共享只读） */static TClosure *worker_unserialize_closure(Program *p, const char *d,
                                             size_t n, size_t *pos) {
     if (*pos + 1 > n || d[*pos] != 'W') return NULL;
     (*pos)++;
@@ -304,7 +327,7 @@ static void worker_thread(void *arg) {
     wbox_bind_rx(&h->to_child, tphp_sched_loop());
     uv_sem_post(&h->ready);
 
-    /* 入口闭包重建 + 以它为 main 跑独立调度器 */
+    /* 入口闭包重建 + 以它为 main 跑独立调度器；main 的返回值回传父线程 */
     size_t pos = 0;
     TClosure *clo = worker_unserialize_closure(h->prog, h->entry_blob,
                                                h->entry_len, &pos);
@@ -317,7 +340,14 @@ static void worker_thread(void *arg) {
     tm_free(h->entry_blob);
     h->entry_blob = NULL;
 
-    tphp_vm_run_closure(h->prog, clo);
+    TVal ret = TV_NULL;
+    tphp_vm_run_closure(h->prog, clo, &ret);
+    TStr *rs = tphp_serialize_val(NULL, ret);
+    tval_release(&ret);              /* main 返回值的引用归本线程持有 */
+    char *rdata = tm_malloc(rs->len);
+    memcpy(rdata, tstr_val(rs), rs->len);
+    wbox_put(&h->to_parent, rdata, (uint32_t)rs->len);
+    tval_release(&(TVal){ .u.p = rs, .t = T_STR });
 
     atomic_store(&h->state, 2);
     wbox_close(&h->to_parent);   /* 通知父线程：已退出 */
@@ -339,19 +369,40 @@ static TVal nm_worker_construct(VM *vm, void *self, TVal *args, int n) {
     if (n < 1 || (args[0].t != T_CLOSURE && args[0].t != T_STR))
         tphp_vm_raise(vm, "TypeError",
                       "Worker::__construct() expects a Closure or string");
-    if (args[0].t != T_CLOSURE)
-        tphp_vm_raise(vm, "TypeError",
-                      "Worker: string entry is not supported yet (use a Closure)");
     Program *prog = vm->prog;
-    uint32_t blen;
-    char *blob = worker_serialize_closure(prog, (TClosure *)args[0].u.p, &blen);
-    if (!blob)
-        tphp_vm_raise(vm, "TypeError",
-                      "Worker: entry closure cannot be shared (first-class "
-                      "builtin wrappers are not supported)");
+    Program *owner = prog;               /* 入口闭包所属 Program（跨线程共享给子线程） */
+    uint32_t blen = 0;
+    char *blob = NULL;
+    if (args[0].t == T_CLOSURE) {
+        blob = worker_serialize_closure(vm, (TClosure *)args[0].u.p, &blen, &owner);
+        if (!blob)
+            tphp_vm_raise(vm, "TypeError",
+                          "Worker: entry closure cannot be shared (first-class "
+                          "builtin wrappers are not supported)");
+    } else {
+        /* 字符串入口 = 主 Program 里的顶层函数名（无参数） */
+        TStr *name = (TStr *)args[0].u.p;
+        TFunc *fn = NULL;
+        for (int i = 0; i < prog->n_funcs; i++) {
+            TFunc *f = prog->funcs[i];
+            if (f->name && !f->is_closure && tstr_eq(f->name, name)) {
+                fn = f;
+                break;
+            }
+        }
+        if (!fn)
+            tphp_vm_raise(vm, "Error",
+                          "Worker: entry function %s() is not defined "
+                          "(must be a top-level function in the main script)",
+                          tstr_val(name));
+        blob = worker_serialize_func(prog, fn, &blen);
+        if (!blob)
+            tphp_vm_raise(vm, "TypeError",
+                          "Worker: entry function cannot be shared");
+    }
     WHandle *h = tm_malloc(sizeof *h);
     memset(h, 0, sizeof *h);
-    h->prog = prog;
+    h->prog = owner;      /* 入口闭包所属 Program（可能来自 inc_progs，已 freeze） */
     h->entry_blob = blob;
     h->entry_len = blen;
     wbox_init(&h->to_child);
@@ -398,6 +449,29 @@ static TVal nm_worker_recv(VM *vm, void *self, TVal *args, int n) {
         tm_free(data);
         fprintf(stderr, "PHP Warning: Worker recv(): malformed message\n");
         return TV_FALSE;
+    }
+    tm_free(data);
+    return v;
+}
+
+/* tryRecv()：非阻塞取一条消息。有 → 值；无 → null；对端关闭 → false。
+ * 与 recv() 的唯一区别是不挂起协程——UI 线程（如 webview 的 bind 回调）
+ * 可以安全调用它收割后台结果，不会冻结事件循环。 */
+static TVal nm_worker_try_recv(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    WHandle *h = worker_obj_handle(self);
+    if (!h) return TV_FALSE;
+    bool child_side = (g_self_handle == h);
+    WBox *box = child_side ? &h->to_child : &h->to_parent;
+    uint32_t len = 0;
+    bool eof = false;
+    char *data = wbox_take(box, &len, &eof);
+    if (!data) return eof ? TV_FALSE : TV_NULL;
+    TVal v;
+    if (!tphp_unserialize_val(vm, data, len, &v)) {
+        tm_free(data);
+        fprintf(stderr, "PHP Warning: Worker tryRecv(): malformed message\n");
+        return TV_NULL;
     }
     tm_free(data);
     return v;
@@ -467,7 +541,101 @@ static TVal nm_worker_self(VM *vm, TVal *args, int n) {
     return TV_OBJ(o);
 }
 
-/* ---- 类注册 ---- */
+/* ---- Tphp\Thread（真线程池）----
+ * spawn(callable)：起一个一次性 Worker，入口就是该 callable（在主脚本
+ *   编译，字节码跨线程共享）。callable 执行完线程自然退出，返回值经
+ *   to_parent 发回。
+ * wait()：按 spawn 顺序收集结果（阻塞等待，不能在 bind 回调里用）。
+ * detach()：不再跟踪——线程自己跑完，WHandle 由进程退出回收。
+ * 注意：这是真并行（OS 线程），不是协程；在 bind 回调里 spawn 是安全的
+ * （不依赖 main 挂起），但不能在子线程里再调 Tphp\Worker（类已内部化）。 */
+static _Thread_local TClass *g_thread_cls;
+
+/* detach 的 Worker 交给全局孤儿表：线程自己跑完，进程退出时统一回收。
+ * 不能在这里 release——Worker 线程可能还在访问其 props/闭包，提前 free
+ * 会在 mimalloc 退出校验时报堆损坏（实测 C 回调 + detach 场景）。 */
+static _Thread_local TArr *g_thread_orphans;
+
+static TVal nm_thread_construct(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *o = (TObj *)self;
+    o->props[0] = TV_ARR(tarr_new());
+    return TV_NULL;
+}
+
+static TVal nm_thread_spawn(VM *vm, void *self, TVal *args, int n) {
+    TObj *t = (TObj *)self;
+    if (n < 1)
+        tphp_vm_raise(vm, "ArgumentCountError",
+                      "Thread::spawn expects a callable");
+    /* 一次性 Worker：入口 = args[0]（主 Program 里的 thunk 闭包） */
+    TObj *w = tphp_obj_alloc(g_worker_cls);
+    nm_worker_construct(vm, w, args, n);
+    TArr *a = (TArr *)t->props[0].u.p;
+    tarr_append(a, TV_OBJ(w));     /* 数组持有 alloc 的那份 rc */
+    return TV_OBJ(w);
+}
+
+static TVal nm_thread_wait(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    TObj *t = (TObj *)self;
+    TArr *a = (TArr *)t->props[0].u.p;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        TVal wv = a->data[i];
+        if (wv.t != T_OBJ) { tarr_append(out, TV_NULL); continue; }
+        TVal r = nm_worker_recv(vm, wv.u.p, NULL, 0);   /* 阻塞等结果 */
+        tarr_append(out, r);
+        nm_worker_stop(vm, wv.u.p, NULL, 0);            /* join + 关闭 */
+    }
+    TVal old = t->props[0];
+    t->props[0] = TV_ARR(tarr_new());
+    tval_release(&old);
+    return TV_ARR(out);
+}
+
+static TVal nm_thread_detach(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    TObj *t = (TObj *)self;
+    TArr *a = (TArr *)t->props[0].u.p;
+    if (!g_thread_orphans) g_thread_orphans = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t == T_OBJ) {
+            tarr_append(g_thread_orphans, a->data[i]);   /* 引用移交孤儿表 */
+            a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+        }
+    }
+    TVal old = t->props[0];
+    t->props[0] = TV_ARR(tarr_new());
+    tval_release(&old);    /* 现在只剩空数组，释放安全 */
+    return TV_NULL;
+}
+
+static TVal nm_thread_count(VM *vm, void *self, TVal *args, int n) {
+    (void)vm; (void)args; (void)n;
+    return TV_INT(((TArr *)((TObj *)self)->props[0].u.p)->n);
+}
+
+/* poll()：非阻塞收割已完成 Worker 的返回值（main_ret 经 to_parent 回传）。
+ * 返回结果数组（按完成序）；已完成的 Worker 同步 stop 并移出跟踪。
+ * 与 wait() 的区别：不挂起协程——UI 线程（bind 回调）可安全调用。 */
+static TVal nm_thread_poll(VM *vm, void *self, TVal *args, int n) {
+    (void)args; (void)n;
+    TObj *t = (TObj *)self;
+    TArr *a = (TArr *)t->props[0].u.p;
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        TVal wv = a->data[i];
+        if (wv.t != T_OBJ) continue;
+        TVal m = nm_worker_try_recv(vm, wv.u.p, NULL, 0);
+        if (m.t == T_NULL || m.t == T_FALSE) continue;   /* 未完成/已关闭 */
+        tarr_append(out, m);
+        nm_worker_stop(vm, wv.u.p, NULL, 0);             /* 已完成：join */
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };   /* 移出跟踪 */
+    }
+    return TV_ARR(out);
+}
+
 
 static void worker_add_native(TClass *cls, const char *name, void *native,
                               bool is_static) {
@@ -516,6 +684,7 @@ void tphp_worker_init(void) {
     worker_add_native(w, "__construct", (void *)nm_worker_construct, false);
     worker_add_native(w, "post", (void *)nm_worker_post, false);
     worker_add_native(w, "recv", (void *)nm_worker_recv, false);
+    worker_add_native(w, "tryRecv", (void *)nm_worker_try_recv, false);
     worker_add_native(w, "on", (void *)nm_worker_on, false);
     worker_add_native(w, "stop", (void *)nm_worker_stop, false);
     worker_add_native(w, "isrunning", (void *)nm_worker_is_running, false);
@@ -531,4 +700,16 @@ void tphp_worker_init(void) {
     worker_add_native(c, "id", (void *)nm_worker_id, false);
     tphp_class_register(c);
     g_wctx_cls = c;
+
+    /* Tphp\Thread：真线程池（真并行，与协程组 TaskGroup 互补） */
+    TClass *th = worker_make_class("Tphp\\Thread");
+    th->m_ctor = (int16_t)th->n_methods;
+    worker_add_native(th, "__construct", (void *)nm_thread_construct, false);
+    worker_add_native(th, "spawn", (void *)nm_thread_spawn, false);
+    worker_add_native(th, "wait", (void *)nm_thread_wait, false);
+    worker_add_native(th, "detach", (void *)nm_thread_detach, false);
+    worker_add_native(th, "count", (void *)nm_thread_count, false);
+    worker_add_native(th, "poll", (void *)nm_thread_poll, false);
+    tphp_class_register(th);
+    g_thread_cls = th;
 }
