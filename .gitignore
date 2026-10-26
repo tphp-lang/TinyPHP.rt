@@ -18,3 +18,4 @@
 # ---- tooling / workspace ----
 .mimocode/
 .workbuddy-ai/
+.commandcode/
