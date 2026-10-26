@@ -148,17 +148,18 @@ $p1(3, 4)->wait();           // 启动并等待
 **内置类**（均在 `Tphp\` 下）：
 - `Tphp\Coroutine`（`isdone`/`getresult`/`cancel`/**`wait`**…）——`wait()` 是 `await()` 的对象式别名
 - `Tphp\Channel`（`send`/`recv`/`close`/`len`，`new Tphp\Channel(cap)`）——支持多消费者/多生产者（等待者 FIFO 唤醒），可直接当信号量做并发限流
-- `Tphp\TaskGroup` / `Tphp\Thread`（`spawn`/`wait`/`count`）——协程任务组，`wait()` 按登记序返回结果数组；`Thread` 是同义短名（注意语义是单线程内并发，真 OS 线程用 `Tphp\Worker`）
+- `Tphp\TaskGroup`（`spawn`/`wait`/`count`）——**协程**任务组，`wait()` 按登记序返回结果数组
 - `Tphp\Task`——`async()` 的返回物，`__invoke` 每次调用新建一个协程
+- `Tphp\Thread`（`spawn`/`wait`/`detach`/`count`/`poll`）——**真 OS 线程**池（不是协程！），见下节
 
 ```php
 use function Tphp\{async, await};
-use Tphp\Thread;
+use Tphp\TaskGroup;
 
-$threads = new Thread();
-$threads->spawn(task(1, 500));   // 自动包 thunk，task 不会先执行
-$threads->spawn(task(2, 900));
-$threads->wait();
+$group = new TaskGroup();
+$group->spawn(task(1, 500));   // 自动包 thunk，task 不会先执行
+$group->spawn(task(2, 900));
+$group->wait();
 ```
 
 ## 文件 I/O
@@ -171,7 +172,39 @@ $threads->wait();
 
 `gethostbyname` `gethostbynamel` `fsockopen` `stream_socket_server` `stream_socket_accept` `http_get`（含 HTTPS，mbedtls）
 
-## Worker（`Tphp\`，真 OS 线程）
+## Thread（`Tphp\`，真 OS 线程池）
+
+`Tphp\Thread` 是**真线程**（每个 `spawn` 起一个 OS 线程），不是协程。二者的关键差别：
+
+| | `Tphp\TaskGroup`（协程） | `Tphp\Thread`（真线程） |
+|---|---|---|
+| 并行度 | 单线程内交错 | 多核真并行 |
+| 阻塞调用 | 会卡住整个调度器（所有协程） | 只卡住该线程 |
+| 捕获变量 | 同一份内存（引用语义） | 跨线程**深拷贝**（serialize 协议） |
+| 适用 | I/O 密集、需大量并发 | 阻塞/计算密集，或在 UI 线程回调里跑长任务 |
+
+```php
+use Tphp\Thread;
+
+$t = new Thread();
+$t->spawn(fn() => heavy(1));   // 入口闭包在主脚本编译，字节码跨线程共享
+$t->spawn(fn() => heavy(2));
+$r = $t->wait();               // 按 spawn 序返回结果数组（阻塞）
+```
+
+- `spawn(callable)`——起一个一次性线程；入口闭包经 serialize 协议传给子线程
+- `wait()`——阻塞等待全部线程结束，按 spawn 序返回结果数组
+- `detach()`——fire-and-forget：立即返回，线程自己跑完（父侧不跟踪、不 join）
+- `count()`——当前跟踪中的线程数
+- `poll()`——非阻塞收割已完成线程的返回值（不挂起协程，UI 线程可安全调用）
+
+**捕获变量跨线程是深拷贝**：对象需实现 `__cloneState()`/`__restoreCloneState()` 才能被捕获（否则抛 `NotCloneableError`）；闭包本身可捕获（走 `T_CLOSURE` 序列化协议）。
+
+**为什么 UI 回调里必须用真线程**：协程调度器在 C 栈阻塞（如 WebView 的 `webview_run`）时永远不会让出，
+`spawn` 出来的协程永远得不到调度——表现为"点了按钮没反应"。真线程不依赖调度器让出，
+在 FFI/C 回调里 `spawn` 立即开跑。
+
+## Worker（`Tphp\`，真 OS 线程 + 消息传递）
 
 ```php
 $w = new Tphp\Worker(function () {

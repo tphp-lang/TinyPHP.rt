@@ -35,7 +35,7 @@ echo "hello\n";
 |---|---|
 | `tests/lang/` | 语言核心：算术/数组/字符串/控制流/闭包/命名空间 |
 | `tests/oop/` | OOP：类/接口/trait/enum/魔术方法/可见性/属性钩子 |
-| `tests/async/` | 协程：spawn/await/cancel/Channel/死锁/IO 并发 |
+| `tests/async/` | 协程：spawn/await/cancel/Channel/死锁/IO 并发；真线程 `Tphp\Thread`（spawn/wait/detach/poll） |
 | `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong |
 | `tests/ffi/` | FFI：CData/struct/union/系统库/拒绝预处理 |
 | `tests/lib/` | stdlib：json/date/array/require/bundle |
@@ -50,6 +50,31 @@ echo "hello\n";
 2. 顶部或行间写 `// EXPECT:` 期望行
 3. 跑 `run.ps1` 或 `tphp test tests/<dir>`
 4. **纯 ASCII，UTF-8 无 BOM**（中文注释曾导致换行被吞的坑）
+
+## 内存问题定位（ASAN）
+
+mimalloc 只报"堆损坏"这类**症状**（如 `corrupted free list entry`），不给根因。定位内存 bug 时另建一份
+ASAN 构建（**不定义** `TPHP_USE_MIMALLOC`，走 CRT malloc，ASAN 才能接管）：
+
+```bash
+# 编译 src/ + ext/ 带 -fsanitize=address，deps 对象复用主构建（不带 ASAN 也行）
+clang -O1 -g -std=c11 -fno-omit-frame-pointer -fsanitize=address -D_GNU_SOURCE \
+      -Isrc -Ideps/... -c src/*.c -o build/obj_asan/src_XXX.o
+# 链接时把 deps 目标文件一起带上
+clang -fsanitize=address build/obj_asan/src_*.o <deps .o> deps/libffi/lib/libffi.a \
+      -o build/tphp_asan.exe <系统库>
+```
+
+跑法与正式版一致（`./build/tphp_asan.exe run tests/xxx.php`），ASAN 会直接给出
+**分配点 / 释放点 / 使用点**三条栈，精确到行。`ASAN_OPTIONS=detect_leaks=0` 可关泄漏检查
+（线程模型下 worker 线程退出时的挂起引用不算 bug）。
+
+> 实例（2026-10-26）：`Tphp\Thread` 退出时报 `mimalloc: corrupted free list entry of size 64b`。
+> ASAN 报的是 `heap-use-after-free`——`nm_thread_spawn` 把 Worker 对象同时交给
+> 跟踪数组和 spawn 返回值两处持有，但 `tarr_append` 按约定**不做 addref**
+> （见 `src/vm.c` 的 `op_assign`：`tval_addref(val)` 后才 `tarr_append`），
+> 于是两处共用同一份引用计数：`wait()` 释放数组时提前 free，调用方帧随后再 release
+> 一次 → 二次释放。修法是 `tarr_append` 前显式 `tval_addref`，让两处各持一份独立引用。
 
 ## 基准（bench，11 项）
 

@@ -1,18 +1,22 @@
 # TinyPHP.rt
 
-小型的 **PHP 8 解释型运行时**——C11 实现，自有 opcode + VM，不是 AOT/JIT。
+小型的 **PHP 8 运行时**——C11 实现，自有 opcode + VM 解释器，热函数走 IR baseline JIT。
 
 ```
 源码 → lex/parse → 自有 opcode → VM 解释执行
+                                    └─ 热函数 → IR → 机器码（baseline JIT）
 ```
 
-- **无感异步**：fcontext 协程，同步写法透明挂起（无需 async/await）
+- **无感异步**：fcontext 协程，业务函数不用标记；显式并发用 `async(EXPR)` / `spawn`
 - **真线程 Worker**：独立 VM + 堆隔离 + Channel
+- **IR baseline JIT**：热函数编译为机器码（dstogov/ir 后端，与 PHP 8.4+ 官方 JIT 同源）
 - **FFI**：libffi 调 C 库（`FFI::cdef` / `CData`）
+- **生成器**：`yield` / `send` / `getReturn`
+- **正则**：`preg_*` 全批（vendor PCRE2）
 - **单文件应用**：`tphp build app.php --with assets/ -o app`（Windows/Linux/macOS）
 - **PHP 8 语义**：过程式 + 完整 OOP、数组全语义、异常、命名空间、PHP 8.4 属性钩子
 
-当前版本 `0.0.1`。内置函数与异步 API 清单见 **[doc/stdlib.md](doc/stdlib.md)**。
+当前版本 `0.0.2`。内置函数与异步 API 清单见 **[doc/stdlib.md](doc/stdlib.md)**。
 
 ## 构建
 
@@ -75,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 ./build/tphp test tests/lib
 ```
 
-当前 **194 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
+当前 **222 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
 
 ## 文档
 
@@ -99,7 +103,7 @@ src/     运行时核心引擎（~2 万行 C）
 ext/     内置扩展层（builtin/ ffi/ net/ io/ worker/ json/ serialize/ pkg/）
 lib/     PHP 层 stdlib（phpc 打进 exe）
 tests/   测试套件
-deps/    vendor：libuv mimalloc mbedtls libffi miniz asm
+deps/    vendor：libuv mimalloc mbedtls libffi miniz asm pcre2 ir(JIT)
 PLAN/    设计文档（权威规格）
 doc/     用户/开发者文档
 tools/   辅助脚本（phpt 转换等）
