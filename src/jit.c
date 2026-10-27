@@ -36,11 +36,9 @@ static CRITICAL_SECTION g_jit_mtx;
 static pthread_mutex_t g_jit_mtx = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64)
-#define JIT_PLAT_OK 0
-#else
+/* IR backend is available on x86_64 and aarch64 (both vendored in deps/ir;
+ * emit headers pre-generated: ir_emit_x86.h / ir_emit_aarch64.h). */
 #define JIT_PLAT_OK 1
-#endif
 
 static bool g_jit_on;
 

@@ -45,9 +45,9 @@ set PCRE2_DEFS=-DHAVE_CONFIG_H -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1
 set PCRE2_SRCS=pcre2_auto_possess pcre2_chartables pcre2_compile pcre2_config pcre2_context pcre2_chkdint pcre2_dfa_match pcre2_error pcre2_jit_compile pcre2_maketables pcre2_match pcre2_match_data pcre2_newline pcre2_ord2utf pcre2_pattern_info pcre2_serialize pcre2_string_utils pcre2_study pcre2_substitute pcre2_substring pcre2_tables pcre2_ucd pcre2_valid_utf pcre2_xclass pcre2_find_bracket pcre2_convert pcre2_extuni pcre2_script_run
 for %%f in (%PCRE2_SRCS%) do %CC% -w %CFLAGS% %PCRE2_DEFS% -Ideps\pcre2 -c "deps\pcre2\%%f.c" -o "%OBJ%\pcre2_%%f.o" || goto :fail
 
-echo [3d/5] compiling IR (JIT backend, x86_64 only)...
+echo [3d/5] compiling IR (JIT backend, x86_64)...
 rem objects go to %OBJ%\ir_*.o (no main - safe in the link glob); generated
-rem fold/x86 headers are vendored in-repo (force-added, see PLAN/ir-jit.md)
+rem fold/x86/aa64 emit headers are vendored in-repo (force-added, see PLAN/ir-jit.md)
 set IR_SRCS=ir ir_cfg ir_check ir_dump ir_emit ir_emit_c ir_gcm ir_gdb ir_load ir_mem2ssa ir_patch ir_ra ir_ra_simple ir_save ir_sccp ir_strtab
 for %%f in (%IR_SRCS%) do %CC% -w %CFLAGS% -DIR_TARGET_X64 -Ideps\ir -c "deps\ir\%%f.c" -o "%OBJ%\ir_%%f.o" || goto :fail
 rem clang dynamic alloca refs __chkstk; no libgcc on this toolchain

@@ -29,7 +29,7 @@ typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
  * "只调一次的大循环"（bench 闭包形态）永不触发；小体编译成本 ≪ 循环收益 */
 #define TPHP_JIT_EAGER_MAX_OPS 96
 
-/* Process-wide availability (TPHP_JIT=0 disables; aarch64 v1: off) */
+/* Process-wide availability (TPHP_JIT=0 disables) */
 bool tphp_jit_available(void);
 void tphp_jit_init(void);
 

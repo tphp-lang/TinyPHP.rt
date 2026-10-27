@@ -180,19 +180,24 @@ for f in $PCRE2_SRCS; do
   $CC -w $CFLAGS $PCRE2_DEFS -Ideps/pcre2 -c "deps/pcre2/$f.c" -o "$OBJ/pcre2_$f.o"
 done
 
-# ---- IR JIT backend (PLAN/ir-jit.md; x86_64 only) ----
-# aarch64: jit.c compiles as the disabled stub (no IR objects, no TPHP_JIT).
+# ---- IR JIT backend (PLAN/ir-jit.md; x86_64 + aarch64) ----
+# Target flag follows TARCH; emit headers pre-generated in deps/ir/.
 JIT_DEFS=""
-if [ "$TARCH" = "x86_64" ]; then
-  echo "[4c/6] compiling IR (JIT backend, x86_64)..."
+IR_TARGET=""
+case "$TARCH" in
+  x86_64) IR_TARGET="X64" ;;
+  aarch64|arm64) IR_TARGET="AARCH64" ;;
+esac
+if [ -n "$IR_TARGET" ]; then
+  echo "[4c/6] compiling IR (JIT backend, $IR_TARGET)..."
   INC="$INC -Ideps/ir"
   JIT_DEFS="-DTPHP_JIT"
   IR_SRCS="ir ir_cfg ir_check ir_dump ir_emit ir_emit_c ir_gcm ir_gdb ir_load ir_mem2ssa ir_patch ir_ra ir_ra_simple ir_save ir_sccp ir_strtab"
   for f in $IR_SRCS; do
-    $CC -w $CFLAGS -DIR_TARGET_X64 -Ideps/ir -c "deps/ir/$f.c" -o "$OBJ/ir_$f.o"
+    $CC -w $CFLAGS -DIR_TARGET_$IR_TARGET -Ideps/ir -c "deps/ir/$f.c" -o "$OBJ/ir_$f.o"
   done
 else
-  echo "[4c/6] JIT backend skipped (aarch64 v1: disabled stub)"
+  echo "[4c/6] JIT backend skipped (unsupported arch: $TARCH)"
 fi
 
 # ---- [5/6] tphp sources (src + ext) ----

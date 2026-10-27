@@ -10,7 +10,7 @@
 - 函数级编译，无 OSR（只 JIT 从入口进入的调用；循环型函数下次整函数调用即走 native，够用）
 - **封闭类型世界**：函数体只允许 int/float/bool/null 域值（见 §5 资格判定）——无 string/array/object/闭包/异常/生成器/FFI
 - 调用：仅静态解析的、同样通过资格判定的用户函数（fib 式递归/互递归）
-- 首发平台 Windows x64（IR 支持 ✓）；Linux/macOS x64 跟随；aarch64 后端就绪前运行时禁用
+- **首发平台**：Windows/Linux/macOS **x86_64 + aarch64**（IR 双后端，emit 头已预生成入库：`ir_emit_x86.h` / `ir_emit_aarch64.h`）
 
 **非目标（v1 明确不做）**：OSR、trace/侧路追踪、inline cache、对象/数组/字符串运算、异常路径 JIT（体内 raise 一律排除，见 §7）、闭包/方法调用、类型推断式的全 SSA 传播（交给 IR 的 SCCP）。
 
@@ -125,7 +125,7 @@ void tphp_jit_cmp_slow(VM *vm, int op, TVal a, TVal b, TVal *out);
 ## 10. 构建、平台与线程
 
 - **构建**：IR 源 16 个白名单（spike 同款）编入 `build/obj_ir/`（**绝不进 build/obj/**——通配链接会与 src_main 冲突）；`src/jit.c` 进常规 obj；链接行显式追加 `build/obj_ir/*.o` + `tools/chkstk_stub.S`；无 libgcc 机器上 chkstk 桩必需（spike 教训）
-- **运行时禁用**：`TPHP_JIT=0` 环境变量关闭；aarch64 在 IR 后端接入前恒禁（`jit_init` 探测）
+- **运行时禁用**：`TPHP_JIT=0` 环境变量关闭；x86_64 与 aarch64 均支持（IR 双后端）
 - **线程**：prog freeze 后跨 Worker 只读共享 ⇒ `TFunc.jit_entry` 全局一次写。v1 编译加**进程级 mutex** 串行化（防同 fn 双编译泄漏 code page）；生成码只读执行
 - **code 内存**：`ir_jit_compile` 返回的页由 IR 管理；进程退出随 OS 回收（CLI 场景足够；常驻 server 再议）
 
@@ -139,7 +139,7 @@ void tphp_jit_cmp_slow(VM *vm, int op, TVal a, TVal b, TVal *out);
 
 1. **v1.0**：§1–§10 全量——fib 达标（M1）
 2. **v1.1 候选**：POW/变量移位 slow helper、float 参数 prologue、闭包调用（SEND_CAP/CLOSURE_INIT 域化）、FETCH_DIM_R packed 快路进白名单（array-read 敏感簇）
-3. **v1.2 候选**：对象属性读（单态类 guard）、IR aarch64 接入、编译异步化
+3. **v1.3 候选**：对象属性读（单态类 guard）、编译异步化
 
 ## 13. 风险与不做清单（防翻案）
 
