@@ -49,7 +49,9 @@ void   tm_free(void *p);
 enum { GC_COLOR_UNMARKED = 0, GC_COLOR_BLACK, GC_COLOR_DEAD };
 enum { GC_KIND_STR = 1, GC_KIND_ARR = 2, GC_KIND_CLO = 3, GC_KIND_EX = 4,
        GC_KIND_OBJ = 5 };
-enum { GC_FLAG_INTERNED = 1, GC_FLAG_DTORED = 2, GC_FLAG_MFCC = 4 };
+enum { GC_FLAG_INTERNED = 1, GC_FLAG_DTORED = 2, GC_FLAG_MFCC = 4,
+       GC_FLAG_NONNUM_KEY = 8 };  /* interned string: NOT a canonical decimal
+                                   * int key → tval_norm_key skips digit scan */
 
 typedef struct GCHead {
     uint32_t rc;
@@ -287,6 +289,8 @@ TStr  *tstr_concat(TStr *a, TStr *b);              /* new heap string */
 /* `.=` in-place：dst 唯一引用且 cap 够时原地追加（perf-roadmap）；成功 true */
 bool   tstr_append_inplace(TStr *dst, const char *s, size_t n);
 uint32_t tstr_hash(TStr *s);
+/* inline hot path: interned strings have hash pre-set at intern time */
+#define TSTR_HASH(s) ((s)->hash ? (s)->hash : tstr_hash(s))
 static inline size_t tstr_len(const TStr *s) { return s->len; }
 static inline const char *tstr_val(const TStr *s) { return s->c; }
 bool tstr_eq(TStr *a, TStr *b);                    /* pointer-or-content equality */

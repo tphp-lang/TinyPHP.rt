@@ -7,9 +7,10 @@
  * lets IR's optimizer clean within-block redundancy. Slow paths call the
  * tval_* family (one semantic source).
  *
- * JitEntry ABI (PLAN/ir-jit.md §3):
- *   int fn(VM *vm, TVal *slots, TVal *args_in, TVal *ret);
- *   1 = *ret owned by caller; 0 = deopt (args_in/slots untouched).
+ * JitEntry ABI (PLAN/ir-jit.md §3, v1.2 direct-slot):
+ *   int fn(VM *vm, TVal *slots, TVal *ret);
+ *   slots[0..n_params-1] = params (INT guaranteed for JIT→JIT);
+ *   1 = *ret owned by caller; 0 = deopt (interpreter re-runs).
  */
 #include "value.h"
 #include "opcode.h"
@@ -135,12 +136,22 @@ void tphp_jit_cmp_slow(VM *vm, int32_t opi, TVal *dst,
     *dst = r;
 }
 
+/* Lookup jit_entry at runtime and call with pre-built slots (v1.2).
+ * Needed because recursive/self calls compile before jit_entry is set. */
+int tphp_jit_call_slots(VM *vm, TFunc *fn, TVal *slots, TVal *ret) {
+    JitEntry e = (JitEntry)fn->jit_entry;
+    if (!e) return 0;
+    return e(vm, slots, ret);
+}
+
 /* JIT->JIT call trampoline (section 8): TLS slot stack - closed-world
  * callees never raise and never touch vm->x.frame. Recursion safe via
- * bump pointer (fib depth ~28 x ~10 slots fits easily). */
+ * bump pointer (fib depth ~28 x ~10 slots fits easily).
+ * v1.2: params written directly to slots[0..n]; no args_in. */
 int tphp_jit_call(VM *vm, TFunc *fn, TVal *args_in, TVal *ret) {
     JitEntry e = (JitEntry)fn->jit_entry;
     if (!e) return 0;
+    uint32_t nparams = fn->n_params;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
     enum { JSIZE = 2048 };
     static _Thread_local TVal g_jstack[JSIZE];
@@ -148,9 +159,12 @@ int tphp_jit_call(VM *vm, TFunc *fn, TVal *args_in, TVal *ret) {
     if (g_jsp + nslots > JSIZE) return 0;
     TVal *slots = &g_jstack[g_jsp];
     g_jsp += nslots;
-    for (uint32_t i = 0; i < nslots; i++)
+    /* write params directly; init locals/tmps to UNDEF */
+    for (uint32_t i = 0; i < nparams; i++)
+        slots[i] = args_in[i];
+    for (uint32_t i = nparams; i < nslots; i++)
         slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
-    int ok = e(vm, slots, args_in, ret);
+    int ok = e(vm, slots, ret);
     g_jsp -= nslots;
     return ok;
 }
@@ -241,8 +255,10 @@ static bool lit_scalar(TVal v) {
            v.t == T_FALSE || v.t == T_NULL;
 }
 
-/* CFG 守卫（v1.1 临时）：IR codegen 对两类形态仍崩（ir_check 拦不住，
- * 见 memory/2026-10-26）——资格期静态拒绝，修好后删除：
+/* CFG 守卫（v1.1）：IR codegen 对两类形态仍崩（ir_check 拦不住）。
+ * O1 已跳过 SCCP（链式 TMP-ADD 已修），但这两形态在 O1 下仍崩——
+ * 是独立于 SCCP 的 codegen 缺陷（钻石 MERGE 嵌 LOOP 区域）。
+ * 资格期静态拒绝，修好后删除：
  *   1) 嵌套循环（≥2 个不同的回跳目标）
  *   2) 循环体内带 else 的 if/else（find_join 出现 else 分支） */
 static int find_join(TFunc *fn, uint32_t p, uint32_t T,
@@ -389,7 +405,7 @@ bool tphp_jit_eligible(TFunc *fn) {
 typedef struct {
     ir_ctx *ctx;
     TFunc *fn;
-    ir_ref r_vm, r_slots, r_args, r_ret;
+    ir_ref r_vm, r_slots, r_ret;
     /* loop stack（v1.1：支持嵌套 for/while，深度8） */
     enum { JIT_MAX_LOOPS = 8 };
     int loop_sp;
@@ -742,18 +758,30 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     TFunc *callee = j->p_callee;
     if (!callee || argc != callee->n_params) { j->fail = 1; return; }
 
-    ir_ref args_arr = ir_ALLOCA(ir_CONST_I64((uintptr_t)argc * TVAL_SZ));
+    /* v1.2 direct-slot call: ALLOCA callee slots, write params in place,
+     * call entry directly — no TLS trampoline, no UNDEF init for params,
+     * no args_in roundtrip. Locals beyond params: UNDEF (domain-closed
+     * eligible fns write-before-read for hot paths like fib). */
+    uint32_t nslots = (uint32_t)callee->n_locals + callee->n_tmps;
+    ir_ref slots_sc = ir_ALLOCA(ir_CONST_I64((uintptr_t)nslots * TVAL_SZ));
+    /* init locals/tmps to UNDEF (params get overwritten below) */
+    for (uint32_t k = callee->n_params; k < nslots; k++) {
+        ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        store_imm(j, d, (int32_t)T_UNDEF, ir_CONST_I64(0));
+    }
     for (uint32_t k = 0; k < argc; k++) {
         ir_ref sa = slot_addr(j, j->p_arg_slot[k]);
-        ir_ref d = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
         store_pay(j, d, load_pay(j, sa));
         store_tag(j, d, load_tag(j, sa));
     }
     ir_ref ret_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
-    ir_ref args_t[4] = { j->r_vm, ir_CONST_ADDR((uintptr_t)callee),
-                         args_arr, ret_sc };
-    ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_call),
-                          4, args_t);
+    /* tphp_jit_call_slots: runtime lookup of jit_entry (recursion-safe) */
+    ir_ref call_t[4] = { j->r_vm, ir_CONST_ADDR((uintptr_t)callee),
+                         slots_sc, ret_sc };
+    ir_ref ok = ir_CALL_N(IR_I32,
+                          ir_CONST_ADDR((uintptr_t)tphp_jit_call_slots),
+                          4, call_t);
     (void)ok;
     /* v1: callee prologue guards are unreachable (chained eligibility keeps
      * every arg in the closed INT world) — no deopt branch; load result. */
@@ -1116,30 +1144,14 @@ void tphp_jit_compile(TFunc *fn) {
             IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
     ctx->ret_type = IR_I32;
 
-    /* IR requires START before PARAMs (see deps/ir/examples 0001/0008) */
+    /* IR requires START before PARAMs (see deps/ir/examples 0001/0008).
+     * v1.2 direct-slot ABI: params already in slots[0..n_params-1] (INT
+     * guaranteed by caller for JIT→JIT; interpreter path guards in C).
+     * No prologue guard/copy — that was the fib call-overhead hot spot. */
     ir_START();
     j.r_vm = ir_PARAM(IR_ADDR, "vm", 1);
     j.r_slots = ir_PARAM(IR_ADDR, "slots", 2);
-    j.r_args = ir_PARAM(IR_ADDR, "args", 3);
-    j.r_ret = ir_PARAM(IR_ADDR, "ret", 4);
-
-    /* prologue: guard every param is INT (read-only pass), then move.
-     * Guard-fail is a sink (RETURN 0); the pass side stays live. */
-    for (uint16_t i = 0; i < fn->n_params; i++) {
-        ir_ref av = ir_ADD_A(j.r_args, ir_CONST_ADDR((uintptr_t)i * TVAL_SZ));
-        ir_ref tg = ir_LOAD_I32(ir_ADD_A(av, ir_CONST_ADDR(TVAL_TAG)));
-        ir_ref ifg = ir_IF(ir_NE(tg, ir_CONST_I32(JT_INT)));
-        ir_IF_TRUE(ifg);
-            ir_RETURN(ir_CONST_I32(0));
-        ir_IF_FALSE(ifg);
-    }
-    for (uint16_t i = 0; i < fn->n_params; i++) {
-        ir_ref av = ir_ADD_A(j.r_args, ir_CONST_ADDR((uintptr_t)i * TVAL_SZ));
-        ir_ref sv = slot_addr(&j, i);
-        store_pay(&j, sv, ir_LOAD_I64(av));
-        store_tag(&j, sv, ir_LOAD_I32(ir_ADD_A(av, ir_CONST_ADDR(TVAL_TAG))));
-        store_imm(&j, av, (int32_t)T_UNDEF, ir_CONST_I64(0));
-    }
+    j.r_ret = ir_PARAM(IR_ADDR, "ret", 3);
 
     uint32_t pc0 = 0;
     while (pc0 < fn->n_ops && fn->ops[pc0].op == OP_RECV) pc0++;
@@ -1155,7 +1167,11 @@ void tphp_jit_compile(TFunc *fn) {
             bool chk = ir_check(ctx);
             fprintf(stderr, "[jit] ir_check=%d\n", chk); fflush(stderr);
         }
-        entry = ir_jit_compile(ctx, 2, &size);
+        /* O1: skip SCCP. O2/SCCP has a multi-slot CALL bug (deps/ir
+         * ir_sccp_transform treats tail slots of 7-arg CALL as real insns
+         * and zeros an operand → codegen crash on chain TMP-ADD). See
+         * tools/ir_bisect.c repro; restore O2 after upstream fix. */
+        entry = ir_jit_compile(ctx, 1, &size);
         if (jit_dbg())
             fprintf(stderr, "[jit] compile(%s) entry=%p size=%zu\n",
                     fn->name ? tstr_val(fn->name) : "?", entry, size);

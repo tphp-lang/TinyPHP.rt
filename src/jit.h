@@ -16,10 +16,12 @@ typedef struct TFunc TFunc;
 typedef struct VM VM;
 typedef struct TVal TVal;
 
-/* JIT'd function entry (PLAN/ir-jit.md §3):
+/* JIT'd function entry (PLAN/ir-jit.md §3, v1.2 direct-slot ABI):
+ *   slots[0..n_params-1] = params (caller guarantees INT for JIT→JIT);
+ *   slots[n_params..]    = locals/tmps (caller inits to UNDEF);
  *   1 = *ret holds the owned return value;
- *   0 = deopt (params/locals untouched — interpreter re-runs safely) */
-typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *args_in, TVal *ret);
+ *   0 = deopt (should not happen for JIT→JIT; interpreter path re-runs) */
+typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
 
 /* Hotness threshold for the first compile attempt (zend jit_hot_func default) */
 #define TPHP_JIT_HOT_THRESHOLD 127

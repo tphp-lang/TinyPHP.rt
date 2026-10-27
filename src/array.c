@@ -19,7 +19,7 @@ static uint32_t key_hash(TVal key) {
         x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
         return (uint32_t)(x | 1);
     }
-    return tstr_hash((TStr *)key.u.p);
+    return TSTR_HASH((TStr *)key.u.p);
 }
 
 static bool key_eq(TVal a, TVal b) {

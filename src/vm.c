@@ -1642,35 +1642,50 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     /* IR baseline JIT (PLAN/ir-jit.md): frame ready, RECV deferred to
      * prologue. Guard-fail leaves slots UNDEF / args intact → interpreter. */
     if (tphp_jit_available()) {
-        /* v1.1 急切编译（n_ops<=96 首调即编）暂撤——暴露链式 TMP-ADD 的
-         * codegen 崩溃（sp=$a+$b+$c；memory/2026-10-27），修好后恢复 */
-        if (!fn->jit_entry && fn->hot != UINT16_MAX &&
-            ++fn->hot >= TPHP_JIT_HOT_THRESHOLD)
-            tphp_jit_compile(fn);
+        /* v1.1 eager: small functions (n_ops<=96) compile on first call;
+         * larger ones wait for hot threshold. Chain TMP-ADD crash fixed by
+         * O1 (skip SCCP — multi-slot CALL bug in deps/ir ir_sccp). */
+        if (!fn->jit_entry && fn->hot != UINT16_MAX) {
+            ++fn->hot;
+            if (fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+                fn->hot >= TPHP_JIT_HOT_THRESHOLD)
+                tphp_jit_compile(fn);
+        }
         if (fn->jit_entry && f->n_args_sent >= fn->n_params) {
-            TVal jret = { .u.i = 0, .t = T_NULL };
-            int jok = ((JitEntry)fn->jit_entry)(vm, f->slots,
-                                                &vm->x.args[rec->args_base],
-                                                &jret);
-            if (jok) {
-                VMCallRec *jr = &vm->x.calls[vm->x.n_calls - 1];
-                vm->x.n_calls--;
-                if (jr->dst_kind != OPD_UNUSED) {
-                    TVal *d = &vm->x.frame->prev->slots[jr->dst_slot];
-                    tval_release(d);
-                    *d = jret;
-                } else {
-                    tval_release(&jret);
-                }
-                VMFrame *jprev = f->prev;
-                frame_destroy(f);
-                vm->x.frame = jprev;
-                if (!vm->x.frame) vm->x.done = true;
-                /* caller pc was already advanced past DO_FCALL (frame-push
-                 * path line ~1633) — must NOT advance again (d=0) */
-                return 0;
+            /* v1.2 direct-slot ABI: interpreter path must guard params
+             * are INT and copy args→slots before calling (JIT→JIT callers
+             * already did this in their lowering). Guard-fail → deopt. */
+            TVal *args = &vm->x.args[rec->args_base];
+            bool guard_ok = true;
+            for (uint16_t i = 0; i < fn->n_params; i++) {
+                if (args[i].t != T_INT) { guard_ok = false; break; }
             }
-            /* deopt: guards precede writes; interpreter runs RECV normally */
+            if (guard_ok) {
+                for (uint16_t i = 0; i < fn->n_params; i++)
+                    f->slots[i] = args[i];
+                /* locals beyond params: frame alloc already UNDEF */
+                TVal jret = { .u.i = 0, .t = T_NULL };
+                int jok = ((JitEntry)fn->jit_entry)(vm, f->slots, &jret);
+                if (jok) {
+                    VMCallRec *jr = &vm->x.calls[vm->x.n_calls - 1];
+                    vm->x.n_calls--;
+                    if (jr->dst_kind != OPD_UNUSED) {
+                        TVal *d = &vm->x.frame->prev->slots[jr->dst_slot];
+                        tval_release(d);
+                        *d = jret;
+                    } else {
+                        tval_release(&jret);
+                    }
+                    VMFrame *jprev = f->prev;
+                    frame_destroy(f);
+                    vm->x.frame = jprev;
+                    if (!vm->x.frame) vm->x.done = true;
+                    /* caller pc was already advanced past DO_FCALL (frame-push
+                     * path line ~1633) — must NOT advance again (d=0) */
+                    return 0;
+                }
+                /* deopt: guards precede writes; interpreter runs RECV normally */
+            }
         }
     }
 #endif

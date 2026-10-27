@@ -1,14 +1,14 @@
 # backlog · 全量任务与未来规划（交接文档）
 
-> 状态：2026-10-25 建档，2026-10-26 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
-> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。当日日志：[../memory/2026-10-26.md](../memory/2026-10-26.md)。
+> 状态：2026-10-25 建档，2026-10-27 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
+> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。当日日志：[../memory/2026-10-27.md](../memory/2026-10-27.md)。
 
-## 0. 现状快照（截至 2026-10-26）
+## 0. 现状快照（截至 2026-10-27）
 
-- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1（M1 达成）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；协程组保留为 `Tphp\TaskGroup`）。
-- **测试基线**：`tests/run.ps1` = **222 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
-- **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态，首次全平台 CI 基线见 `memory/2026-10-23.md`）：
-  - fib(28)：x86_64 0.4×–2.7×（tphp JIT 已覆盖）；全套件几何均值 **≈7×（Linux CI）**；
+- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；协程组保留为 `Tphp\TaskGroup`）。
+- **测试基线**：`tests/run.ps1` = **223 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
+- **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态）：
+  - fib(28)：x86_64 ≈**1.27×**（14.0ms vs 10.9ms，direct-slot ABI 后）；
   - 未持平主体 = JIT 白名单外形态：array-read 20–51×、kv-read 15–27×、call 16×、object 7–12×；
   - aarch64 平台 tphp JIT 未启用（v1 = x86_64 only）。
 - **目标（用户拍板）**：持平或超越原生 PHP JIT。验收 = M2 全套件几何均值 ≥1.0、M3 敏感簇反超；工具：手动 `perf.yml` workflow + 本地 `tools/perf-compare.ps1`。
@@ -16,7 +16,7 @@
 
 ## 1. 工作协议（给新 AI 的红线）
 
-1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，222/222 才算完；禁改期望凑绿。
+1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，223/223 才算完；禁改期望凑绿。
 2. **文档同步**：动功能必须同步对应 PLAN 规格（语法→01、运行时→02、性能→perf-roadmap、JIT→ir-jit、任务账→本文）+ `memory/<date>.md` 当日日志；`memory/MEMORY.md` 完成态保持准确。
 3. **构建**：Windows `cmd /c build.cmd`（结构体变更必须全量）；Unix `./build.sh`。IR 对象隔离（Windows `build/obj_ir/`、Unix `build/obj/ir_*.o`），带 main 的对象绝不进 tphp 链接。
 4. **语义参考** = 本机 php 原生对拍；php-src 源码在 `C:\Users\kllxs\Desktop\php-src-php-8.5.7`。
@@ -33,9 +33,9 @@
 
 | # | 任务 | 验收 | 规格/落点 |
 |---|---|---|---|
-| P0-1 | **JIT v1.1 白名单扩容**（进行中，半成品在工作区）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；**阻塞 = IR codegen 三形态崩溃**（链式 TMP-ADD 图、循环内 if/else MERGE、嵌套循环——ir_check 拦不住；前者独立最小集已可编译见 tools/ir_chainadd.c，差在 tphp 实图与最小集的节点 diff；后两者由 jit_cfg_ok 守卫静态拒绝，修好删守卫）。急切编译已撤（暴露链式 ADD 崩溃），修好后恢复 | array-read/kv/call 进 2–5× 带；几何均值先 ≤3× | ir-jit §12.2；src/jit.c；memory/2026-10-26.md |
-| P0-2 | **trampoline 免装箱 + 槽位寄存器化**（arg 直传寄存器；评估 `IR_OPT_MEM2SSA`） | fib 2.7× → ~1× | ir-jit §12.2；`src/jit.c` |
-| P0-3 | **字面量键 hash 缓存**（opcode 预存字面量键 hash，kv 类 2.3× 形态差；JIT 外路径同受益） | kv 显著下降 | perf-roadmap §4 表 |
+| P0-1 | **JIT v1.1 白名单扩容**（部分完成）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；**链式 TMP-ADD 崩溃已修**（根因 = deps/ir SCCP 多槽位 CALL bug；workaround = O1 跳过 SCCP + 急切编译已恢复 `n_ops<=96` 首调即编）。**剩余：循环内 if/else MERGE、嵌套循环——O1 下仍崩**（独立于 SCCP 的 codegen 缺陷，钻石 MERGE 嵌 LOOP 区域），`jit_cfg_ok` 守卫保留 | array-read/kv/call 进 2–5× 带；几何均值先 ≤3× | ir-jit §12.2；src/jit.c；tools/ir_bisect.c；memory/2026-10-27.md |
+| P0-2 | **trampoline 免装箱 + 槽位寄存器化**（**已完成 v1.2 direct-slot ABI**）：JIT→JIT 直调（ALLOCA slots + 参数直写 + `tphp_jit_call_slots` 运行时查表），去掉 prologue guard/copy 与 TLS trampoline；MEM2SSA 评估 = 反效果（32.9ms）已弃。fib 20.8ms→**14.0ms**（vs PHP ~10.9ms ≈ 1.27×） | fib 进 1.5× 带 ✓；后续可评估 arg 直传寄存器进一步压缩 | ir-jit §12.2；src/jit.c；memory/2026-10-27.md |
+| P0-3 | **字面量键 hash 缓存**（**部分完成**）：`GC_FLAG_NONNUM_KEY` 标记非数字 interned 键 → `tval_norm_key` 跳过数字扫描；`TSTR_HASH` 内联。kv-read 88.1→**84.9ms**（~4%）。剩余：opcode 级预存 hash（需改 TOp/编译器）、变量键路径深度优化 | kv 类再降 20%+ | perf-roadmap §4 表；src/value.h；src/string.c；memory/2026-10-27.md |
 | P0-4 | **object / throw 路径审计**（vs JIT 7–12× / 4×）→ 解释器优化或进白名单 | 出审计结论并落地至少一半差距 | perf-roadmap §1.1；对象属性单态 guard 见 ir-jit §12.3 |
 | P0-5 | **aarch64 IR 后端接入**（IR 自带 AArch64；放开 `JIT_PLAT_OK`） | aarch64 fib 10–14× → 进 x86 同带 | ir-jit §12.3 |
 | P0-6 | **packed 恢复机制**（unset 打破后重归 packed；L5 表注后置项） | 混合负载读写保持快路 | perf-roadmap §4 L2 行 |

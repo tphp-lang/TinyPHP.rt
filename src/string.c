@@ -37,6 +37,19 @@ TStr *tstr_new(const char *s, size_t len) {
 typedef struct InternSlot { struct InternSlot *next; TStr *s; } InternSlot;
 static _Thread_local InternSlot *intern_tab[4096];
 
+/* canonical decimal integer string? (PHP array-key rule: "8"→8, "08" stays
+ * string, "-3"→-3, " 8" stays string). Used to set GC_FLAG_NONNUM_KEY. */
+static bool str_is_canonical_int(const char *s, size_t len) {
+    size_t i = 0;
+    bool neg = false;
+    if (len && s[0] == '-') { neg = true; i = 1; }
+    if (i >= len) return false;
+    for (size_t k = i; k < len; k++)
+        if (s[k] < '0' || s[k] > '9') return false;
+    if (len - i > 1 && s[i] == '0') return false;  /* leading zero */
+    return true;
+}
+
 TStr *tstr_intern(const char *s, size_t len) {
     uint32_t h = str_hash_calc(s, len);
     uint32_t idx = h & 4095;
@@ -46,6 +59,9 @@ TStr *tstr_intern(const char *s, size_t len) {
     TStr *str = tstr_alloc_raw((uint32_t)len, true);
     memcpy(str->c, s, len);
     str->hash = h;
+    /* cache "not a canonical int key" so tval_norm_key skips digit scan */
+    if (!str_is_canonical_int(s, len))
+        str->h.flags |= GC_FLAG_NONNUM_KEY;
     InternSlot *slot = tm_malloc(sizeof(InternSlot));
     slot->s = str;
     slot->next = intern_tab[idx];

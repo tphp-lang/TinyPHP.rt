@@ -514,6 +514,8 @@ bool tval_norm_key(TVal *key) {
     }
     case T_STR: {
         TStr *s = key->u.p;
+        /* interned non-numeric key: skip digit scan (P0-3 hash/norm cache) */
+        if (s->h.flags & GC_FLAG_NONNUM_KEY) return true;
         /* canonical decimal integer string -> int key (PHP rule: "8" -> 8,
          * "08" stays string, "-3" -> -3, " 8" stays string) */
         size_t i = 0;

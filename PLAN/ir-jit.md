@@ -1,6 +1,6 @@
 # ir-jit · IR JIT v1 规格（baseline，函数级）
 
-> 状态：**v1.0 已实现并达 M1（2026-10-25）**——`src/jit.c` + DO_FCALL 钩子 + build.cmd 接线；fib(28) 官方 bench **13.2ms vs PHP tracing JIT 10.9ms = 1.2×（持平带）**，比 tphp 解释器快 8.7×；全量 218/218。上级索引：[../PLAN.md](../PLAN.md)；战略背景见 [perf-roadmap](perf-roadmap.md) §1.1/§5。spike 先行验证（tools/ir_spike_fib.c）。
+> 状态：**v1.2 已实现（2026-10-27）**——direct-slot ABI（`JitEntry(vm,slots,ret)`，JIT→JIT 直调免 TLS trampoline + 去 prologue guard/copy）；fib(28) **14.0ms vs PHP tracing JIT 10.9ms ≈ 1.27×**；链式 TMP-ADD 崩溃已修（O1 跳 SCCP，deps/ir 多槽位 CALL bug）；急切编译 `n_ops<=96` 首调即编；全量 223/223。上级索引：[../PLAN.md](../PLAN.md)；战略背景见 [perf-roadmap](perf-roadmap.md) §1.1/§5。spike 先行验证（tools/ir_spike_fib.c）；SCCP 诊断工具 tools/ir_bisect.c。
 
 ## 1. 目标与 v1 范围
 
@@ -36,12 +36,16 @@ uint16_t hot;          /* 入口计数；UINT16_MAX = 编译已尝试且失败�
 void    *jit_entry;    /* JitEntry 或 NULL；写一次全局只读（线程安全见 §10） */
 
 typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
-/* 返回 1 = 已计算 *ret（owned by caller）；0 = deopt（slots 未被写，解释器重跑安全） */
+/* v1.2 direct-slot ABI：
+ *   slots[0..n_params-1] = 参数（JIT→JIT 调用方保证 INT；解释器路径在 C 侧 guard）
+ *   slots[n_params..]    = locals/tmps（调用方初始化为 UNDEF）
+ *   返回 1 = 已计算 *ret（owned by caller）；0 = deopt（解释器重跑） */
 ```
 
 - `slots` 布局与 VMFrame 完全一致：`[captures..][this?][params][locals][tmps]`（TFunc 槽位约定不变）
 - JIT 代码直接读写 TVal 内存槽（16B：`{union u; TType t}`）；块内寄存器中用拆开的 tag/payload 表示，进出槽位时装箱
-- prologue guard 失败路径**保证未写任何槽**（guard 全部前置于第一条写指令）→ DO_FCALL 回落解释器零副作用
+- **v1.2 直调路径**：JIT→JIT 调用在 IR 内 ALLOCA callee slots、参数直写、经 `tphp_jit_call_slots` 运行时查 `jit_entry` 后直调——无 TLS trampoline、无 prologue guard/copy（fib 20.8ms→14.0ms）
+- 解释器→JIT 路径在 C 侧 guard 参数 INT + 拷贝 args→slots 后调 entry；guard 失败回落解释器
 
 ## 4. 体内的值表示
 
