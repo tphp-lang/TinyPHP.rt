@@ -37,7 +37,7 @@
 | P0-2 | **trampoline 免装箱 + 槽位寄存器化**（**已完成 v1.2 direct-slot ABI**）：JIT→JIT 直调（ALLOCA slots + 参数直写 + `tphp_jit_call_slots` 运行时查表），去掉 prologue guard/copy 与 TLS trampoline；MEM2SSA 评估 = 反效果（32.9ms）已弃。fib 20.8ms→**14.0ms**（vs PHP ~10.9ms ≈ 1.27×） | fib 进 1.5× 带 ✓；后续可评估 arg 直传寄存器进一步压缩 | ir-jit §12.2；src/jit.c；memory/2026-10-27.md |
 | P0-3 | **字面量键 hash 缓存**（**部分完成**）：`GC_FLAG_NONNUM_KEY` 标记非数字 interned 键 → `tval_norm_key` 跳过数字扫描；`TSTR_HASH` 内联。kv-read 88.1→**84.9ms**（~4%）。剩余：opcode 级预存 hash（需改 TOp/编译器）、变量键路径深度优化 | kv 类再降 20%+ | perf-roadmap §4 表；src/value.h；src/string.c；memory/2026-10-27.md |
 | P0-4 | **object / throw 路径审计**（**审计完成**）：throw 在 Linux/aarch64 已 ~1×（反超），Windows 4.8× 待查；object 3–8×——属性 IC 已落（FETCH_PROP/ASSIGN_PROP 字面量名 → slot+1 缓存，~3%）；剩余 = 对象分配/方法调用/析构开销，属解释器工程质量 | object 进 3× 内；throw 全平台 ≤2× | perf-roadmap §1.1；src/vm.c IC；memory/2026-10-27.md |
-| P0-5 | **aarch64 IR 后端接入**（**已完成**）：`ir_emit_aarch64.h` 预生成入库（dynasm），build.sh 按 TARCH 选 `-DIR_TARGET_X64/AARCH64`，`JIT_PLAT_OK=1` 全平台。待 CI 验证 aarch64 fib | aarch64 fib 进 x86 同带 | ir-jit §12.3；src/jit.c；deps/ir/ir_emit_aarch64.h；memory/2026-10-27.md |
+| P0-5 | **aarch64 IR 后端接入**（**已完成，CI 验证通过**）：`ir_emit_aarch64.h` 预生成入库（dynasm），build.sh 按 TARCH 选 `-DIR_TARGET_X64/AARCH64`，`JIT_PLAT_OK=1` 全平台。CI 实测：Linux fib 1.57×、macOS 1.89× | aarch64 fib 进 x86 同带 ✓ | ir-jit §12.3；src/jit.c；deps/ir/ir_emit_aarch64.h；memory/2026-10-27.md |
 | P0-6 | **packed 恢复机制**（unset 打破后重归 packed；L5 表注后置项） | 混合负载读写保持快路 | perf-roadmap §4 L2 行 |
 | P0-7 | **真实负载样本**（tphp 重写的小工具当体感标尺——roadmap 判据 4 一直未做） | 1–2 个真实脚本进 bench | perf-roadmap §3 |
 | P0-8 | addref/release 热路径审计（视发现） | 出报告 | perf-roadmap §4 表 |
