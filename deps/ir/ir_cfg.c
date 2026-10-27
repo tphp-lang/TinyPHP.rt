@@ -1563,7 +1563,9 @@ static bool ir_should_align_loop(ir_ctx *ctx, ir_chain *chains, uint32_t b, ir_b
 
 static int ir_schedule_blocks_bottom_up(ir_ctx *ctx)
 {
-	uint32_t max_edges_count = ctx->cfg_edges_count / 2;
+	/* each BB can contribute up to 2 edges (IF branches); size generously
+	 * (was cfg_edges_count/2 which overflowed on dense nested-loop CFGs) */
+	uint32_t max_edges_count = ctx->cfg_blocks_count * 2 + 16;
 	uint32_t edges_count = 0;
 	uint32_t b, i, loop_depth;
 	float *bb_freq, freq;

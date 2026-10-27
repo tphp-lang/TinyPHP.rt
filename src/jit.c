@@ -253,12 +253,10 @@ static bool lit_scalar(TVal v) {
            v.t == T_FALSE || v.t == T_NULL;
 }
 
-/* CFG 守卫（v1.1）：IR codegen 对两类形态仍崩（ir_check 拦不住）。
- * O1 已跳过 SCCP（链式 TMP-ADD 已修），但这两形态在 O1 下仍崩——
- * 是独立于 SCCP 的 codegen 缺陷（钻石 MERGE 嵌 LOOP 区域）。
- * 资格期静态拒绝，修好后删除：
- *   1) 嵌套循环（≥2 个不同的回跳目标）
- *   2) 循环体内带 else 的 if/else（find_join 出现 else 分支） */
+/* CFG 守卫（v1.1）：曾用于拒绝嵌套循环/循环内 if-else（IR codegen 崩溃）。
+ * 2026-10-27 根因已修：deps/ir IR_BITSET_ONE 在 Windows LLP64 下 1UL<<32
+ * 回绕置位 bit0，污染 block scheduler bitset。守卫保留为深度护栏（>16 层），
+ * 但不再因这两形态拒绝。 */
 static int find_join(TFunc *fn, uint32_t p, uint32_t T,
                      uint32_t *join_out, uint32_t *else_out);
 static bool jit_cfg_ok(TFunc *fn) {
@@ -1205,6 +1203,11 @@ void tphp_jit_compile(TFunc *fn) {
             fprintf(stderr, "[jit] ir_check...\n"); fflush(stderr);
             bool chk = ir_check(ctx);
             fprintf(stderr, "[jit] ir_check=%d\n", chk); fflush(stderr);
+            /* dump IR graph for crash diagnosis (TPHP_JIT_DEBUG=2) */
+            if (getenv("TPHP_JIT_DEBUG")[0] == '2') {
+                FILE *df = fopen("build/ir_dump.txt", "w");
+                if (df) { ir_dump(ctx, df); fclose(df); }
+            }
         }
         /* O1: skip SCCP. O2/SCCP has a multi-slot CALL bug (deps/ir
          * ir_sccp_transform treats tail slots of 7-arg CALL as real insns

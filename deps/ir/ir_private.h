@@ -318,16 +318,9 @@ IR_ALWAYS_INLINE void ir_arena_release(ir_arena **arena_ptr, void *checkpoint)
 # define ir_bitset_ntz  ir_ntz
 #else
 # define IR_BITSET_BITS   64
-# ifdef _M_X64 /* MSVC (clang targeting Windows may also define it; ui64
-                 * suffix is MSVC-only — treat clang as GNU for this macro) */
-#  if defined(_MSC_VER) && !defined(__clang__)
-#   define IR_BITSET_ONE    1ui64
-#  else
-#   define IR_BITSET_ONE    1UL
-#  endif
-# else
-#  define IR_BITSET_ONE    1UL
-# endif
+/* Always 64-bit: Windows LLP64 has 32-bit unsigned long — 1UL << 32
+ * wraps to bit 0 and corrupts the bitset (nested-loop schedule crash). */
+# define IR_BITSET_ONE    1ULL
 # define ir_bitset_base_t uint64_t
 # define ir_bitset_ntz    ir_ntzl
 #endif
