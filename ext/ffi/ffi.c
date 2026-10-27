@@ -1879,11 +1879,19 @@ static TVal nm_ffi_cast(VM *vm, void *self, TVal *args, int n) {
     else if (args[1].t == T_OBJ) {
         FFCData *d = cdata_of(vm, args[1], "FFI::cast");
         p = d->ptr;
+    } else if (args[1].t == T_INT && t->code == FFI_PTR
+               && t->array_elem && t->array_elem->code == FFI_VOID) {
+        /* void* only: allow int -> opaque pointer (webview_t handle
+         * cross-thread pass). char-star / int-star etc still rejected
+         * (they enable typed memory access). void* cannot deref. */
+        p = (void *)(intptr_t)args[1].u.i;
     } else
-        /* 拒裸 int（ffi-security §8）：整数→指针是任意地址读写总入口，
-         * 合法地址来自 CData 或系统 API 返回值，不在此转换 */
+        /* reject bare int -> concrete type (ffi-security section 8):
+         * int -> pointer is an arbitrary address read/write entry point.
+         * Legal addresses come from CData or system API returns;
+         * only void-pointer types are exempt. */
         tphp_vm_raise(vm, "TypeError",
-                      "FFI::cast(): ptr must be CData or null");
+                      "FFI::cast(): ptr must be CData, null, or int (void* only)");
     return cdata_wrap(p, t, false, sc);
 }
 
