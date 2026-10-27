@@ -58,6 +58,7 @@
 | P1-7 | **FFI Unix 补齐核实**：02 记载 dlopen（Linux/macOS）后置，但 unix CI ffi 测试已绿——确认实际状态并同步 02 文档；缺则补 | 02 §FFI 实现行 | 文档一致性任务 |
 | P1-8 | 动态静态方法名 + 命名参数 `C::$v(a:1)`（现为加载期拒绝，01 §10 标注的唯一未实现项） | 01 §10 | 小项 |
 | P1-9 | **属性类型 FQCN 解析缺口**（实测 2026-10-27）：public \A \; 报 Parse error；PHP 允许。pebview 已用 docblock 绕开。落点 parse.c 属性类型 | 01 §2 类型声明 |
+| P1-10 | **Thread.spawn 库内函数支持**（2026-10-28 pebview bind 实测）：spawn 闭包序列化继承调用方 $this（FFI 指针炸）；静态方法不被接受；全局函数名必须在主脚本定义。阻塞 pebview 异步 bind（官方 webview compute 模式）。修法：spawn 按函数名解析时走 autoload | 02 §Thread；pebview src/Window.php | FFI cast("void*",int) 已放开（2b56c5f），异步技术基础就绪 |
 
 ## 4. P2 · 工程线
 
