@@ -420,6 +420,11 @@ typedef struct {
     uint32_t cur_pc;
     int p_dyn;                  /* 1 = INIT_DYN 动态调用 */
     uint32_t p_dyn_slot;        /* 闭包所在 CV 槽 */
+    /* pre-allocated call scratch (entry-block ALLOCA — loop-body ALLOCA
+     * stacks up under O1 and overflows after ~5k iterations) */
+    ir_ref r_call_args;         /* argv buffer, 9 * TVAL_SZ */
+    ir_ref r_call_clo;          /* closure TVal scratch */
+    ir_ref r_call_ret;          /* return TVal scratch */
 } JitC;
 
 /* ir_builder macros expand to `ctx` — every lowering fn binds it locally */
@@ -732,19 +737,20 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     JIT_CTX();
     uint32_t argc = j->p_argc;
     if (j->p_dyn) {
-        /* INIT_DYN 动态调用（$f(...)）：闭包值在 p_dyn_slot */
-        ir_ref args_arr = ir_ALLOCA(ir_CONST_I64((uintptr_t)argc * TVAL_SZ));
+        /* INIT_DYN 动态调用（$f(...)）：闭包值在 p_dyn_slot。
+         * Uses pre-allocated entry-block scratch (not loop-body ALLOCA). */
+        ir_ref args_arr = j->r_call_args;
         for (uint32_t k = 0; k < argc; k++) {
             ir_ref sa = slot_addr(j, j->p_arg_slot[k]);
             ir_ref d = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
             store_pay(j, d, load_pay(j, sa));
             store_tag(j, d, load_tag(j, sa));
         }
-        ir_ref clo_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+        ir_ref clo_sc = j->r_call_clo;
         ir_ref ca = slot_addr(j, j->p_dyn_slot);
         store_pay(j, clo_sc, load_pay(j, ca));
         store_tag(j, clo_sc, load_tag(j, ca));
-        ir_ref ret_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+        ir_ref ret_sc = j->r_call_ret;
         ir_ref t[5] = { j->r_vm, clo_sc, args_arr, ir_CONST_I32((int32_t)argc), ret_sc };
         ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t);
         if (doop->tr != OPD_UNUSED) {
@@ -758,12 +764,16 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     TFunc *callee = j->p_callee;
     if (!callee || argc != callee->n_params) { j->fail = 1; return; }
 
-    /* v1.2 direct-slot call: ALLOCA callee slots, write params in place,
-     * call entry directly — no TLS trampoline, no UNDEF init for params,
-     * no args_in roundtrip. Locals beyond params: UNDEF (domain-closed
-     * eligible fns write-before-read for hot paths like fib). */
+    /* v1.2 direct-slot call: pre-allocated entry-block scratch, write params
+     * in place, call entry via runtime lookup — no TLS, no loop ALLOCA.
+     * Small callees (≤9 slots) reuse the args buffer as slots. */
     uint32_t nslots = (uint32_t)callee->n_locals + callee->n_tmps;
-    ir_ref slots_sc = ir_ALLOCA(ir_CONST_I64((uintptr_t)nslots * TVAL_SZ));
+    ir_ref slots_sc;
+    if (nslots <= 9) {
+        slots_sc = j->r_call_args;
+    } else {
+        slots_sc = ir_ALLOCA(ir_CONST_I64((uintptr_t)nslots * TVAL_SZ));
+    }
     /* init locals/tmps to UNDEF (params get overwritten below) */
     for (uint32_t k = callee->n_params; k < nslots; k++) {
         ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
@@ -775,7 +785,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_pay(j, d, load_pay(j, sa));
         store_tag(j, d, load_tag(j, sa));
     }
-    ir_ref ret_sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+    ir_ref ret_sc = j->r_call_ret;
     /* tphp_jit_call_slots: runtime lookup of jit_entry (recursion-safe) */
     ir_ref call_t[4] = { j->r_vm, ir_CONST_ADDR((uintptr_t)callee),
                          slots_sc, ret_sc };
@@ -1124,6 +1134,22 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
 /* ================================================================
  * Compile entry
  * ================================================================ */
+/* Compile all direct callees first so their jit_entry is set when this
+ * function runs (direct-slot ABI: caller embeds TFunc* and looks up
+ * jit_entry at runtime — NULL entry would read garbage ret). */
+static void jit_compile_callees(TFunc *fn) {
+    for (uint32_t i = 0; i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if (op->op != OP_INIT_FCALL) continue;
+        TFunc *callee = (TFunc *)op->ic;
+        if (!op->ic || ((uintptr_t)op->ic & 1)) continue;
+        if (callee == fn) continue;           /* self-recursion: entry already set */
+        if (!callee->jit_entry && callee->hot != UINT16_MAX)
+            tphp_jit_compile(callee);         /* recursive; lock is re-entry safe
+                                               * via the jit_entry check below */
+    }
+}
+
 void tphp_jit_compile(TFunc *fn) {
     if (!g_jit_on || !fn) return;
     if (fn->jit_entry) return;
@@ -1131,6 +1157,9 @@ void tphp_jit_compile(TFunc *fn) {
         fn->hot = UINT16_MAX;
         return;
     }
+    /* ensure callees compiled first (before we take the lock — tphp_jit_compile
+     * re-locks; the jit_entry early-return makes it idempotent) */
+    jit_compile_callees(fn);
     jit_lock();
     if (fn->jit_entry) { jit_unlock(); return; }
 
@@ -1152,6 +1181,12 @@ void tphp_jit_compile(TFunc *fn) {
     j.r_vm = ir_PARAM(IR_ADDR, "vm", 1);
     j.r_slots = ir_PARAM(IR_ADDR, "slots", 2);
     j.r_ret = ir_PARAM(IR_ADDR, "ret", 3);
+
+    /* entry-block call scratch: one ALLOCA per function, reused by every
+     * call site (loop-body ALLOCA stacks up under O1 → overflow ~5k iters) */
+    j.r_call_args = ir_ALLOCA(ir_CONST_I64(9 * TVAL_SZ));
+    j.r_call_clo  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+    j.r_call_ret  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
 
     uint32_t pc0 = 0;
     while (pc0 < fn->n_ops && fn->ops[pc0].op == OP_RECV) pc0++;
