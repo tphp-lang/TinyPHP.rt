@@ -2873,7 +2873,22 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
         }
         return 1;
     }
-    int slot = tphp_class_find_prop(o->cls, tstr_val(name));
+    int slot;
+    /* inline cache (same as FETCH_PROP) */
+    if (op->t2 == OPD_CONST && op->ic) {
+        int cached = (int)(intptr_t)op->ic - 1;
+        if (cached >= 0 && cached < o->cls->n_props
+            && o->cls->props[cached].name == name) {
+            slot = cached;
+        } else {
+            slot = tphp_class_find_prop(o->cls, tstr_val(name));
+            if (slot >= 0) op->ic = (void *)(intptr_t)(slot + 1);
+        }
+    } else {
+        slot = tphp_class_find_prop(o->cls, tstr_val(name));
+        if (op->t2 == OPD_CONST && slot >= 0)
+            op->ic = (void *)(intptr_t)(slot + 1);
+    }
     if (slot >= 0) {
         /* PHP 8.4 asymmetric visibility：显式 (set) 与读可见性不同时，
          * 写入按 set 可见性判定，失败直接 Error（不回退 __set） */
@@ -3916,7 +3931,23 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
                 return 1;
             }
         }
-        int slot = tphp_class_find_prop(o->cls, tstr_val(name));
+        int slot;
+        /* inline cache: literal name → cached slot+1 in ic.
+         * Validate via interned-string pointer equality (TProp.name). */
+        if (op->t2 == OPD_CONST && op->ic) {
+            int cached = (int)(intptr_t)op->ic - 1;
+            if (cached >= 0 && cached < o->cls->n_props
+                && o->cls->props[cached].name == name) {
+                slot = cached;
+            } else {
+                slot = tphp_class_find_prop(o->cls, tstr_val(name));
+                if (slot >= 0) op->ic = (void *)(intptr_t)(slot + 1);
+            }
+        } else {
+            slot = tphp_class_find_prop(o->cls, tstr_val(name));
+            if (op->t2 == OPD_CONST && slot >= 0)
+                op->ic = (void *)(intptr_t)(slot + 1);
+        }
         if (slot < 0) {
             /* enum case introspection: ->value / ->name */
             if (o->cls->kind == CK_ENUM) {
