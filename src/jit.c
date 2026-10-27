@@ -807,8 +807,14 @@ static void lower_return(JitC *j, TOp *op) {
     if (op->t1 != OPD_UNUSED) {
         ir_ref ta = opnd_tag(j, op->t1, op->a1);
         ir_ref pa = opnd_pay(j, op->t1, op->a1);
+        /* move semantics: raw-copy to ret, clear source slot. frame_destroy
+         * sees UNDEF (no double-free); JIT→JIT caller owns the ref. */
         store_pay(j, j->r_ret, pa);
         store_tag(j, j->r_ret, ta);
+        if (op->t1 == OPD_CV || op->t1 == OPD_TMP) {
+            ir_ref sa = slot_addr(j, op->a1);
+            store_imm(j, sa, (int32_t)T_UNDEF, ir_CONST_I64(0));
+        }
     } else {
         store_imm(j, j->r_ret, JT_NULL, ir_CONST_I64(0));
     }
