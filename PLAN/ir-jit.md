@@ -1,6 +1,6 @@
 # ir-jit · IR JIT v1 规格（baseline，函数级）
 
-> 状态：**v1.2 已实现（2026-10-27）**——direct-slot ABI（`JitEntry(vm,slots,ret)`，JIT→JIT 直调免 TLS trampoline + 去 prologue guard/copy）；fib(28) **14.0ms vs PHP tracing JIT 10.9ms ≈ 1.27×**；链式 TMP-ADD 崩溃已修（O1 跳 SCCP，deps/ir 多槽位 CALL bug）；急切编译 `n_ops<=96` 首调即编；全量 223/223。上级索引：[../PLAN.md](../PLAN.md)；战略背景见 [perf-roadmap](perf-roadmap.md) §1.1/§5。spike 先行验证（tools/ir_spike_fib.c）；SCCP 诊断工具 tools/ir_bisect.c。
+> 状态：**v1.2 已实现（2026-10-27）**——direct-slot ABI（`JitEntry(vm,slots,ret)`，JIT→JIT 直调免 TLS trampoline + 去 prologue guard/copy）；fib(28) **14.0ms vs PHP tracing JIT 10.9ms ≈ 1.27×**；链式 TMP-ADD 崩溃已修（O1 跳 SCCP，deps/ir 多槽位 CALL bug）；急切编译 `n_ops<=96` 首调即编；全量 224/224。上级索引：[../PLAN.md](../PLAN.md)；战略背景见 [perf-roadmap](perf-roadmap.md) §1.1/§5。spike 先行验证（tools/ir_spike_fib.c）；SCCP 诊断工具 tools/ir_bisect.c。
 
 ## 1. 目标与 v1 范围
 

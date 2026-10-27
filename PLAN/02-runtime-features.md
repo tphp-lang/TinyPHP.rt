@@ -77,9 +77,13 @@ class Task {                                               // async($callable) �
 namespace tphp;
 
 class Worker {
-    public function __construct(string|Closure $entry, array $opts = []);
-    // $entry: 入口文件路径（推荐）或闭包（入口闭包特例：构造时其 TFunc 字节码只读共享、
-    //         捕获值按下方克隆协议拷贝到子线程，不经 mailbox 序列化——见 §3 克隆规则）
+    public function __construct(Closure|string|array $entry, array $opts = []);
+    // $entry 三形态（P1-10，与 Thread::spawn 相同，全局解析 main + inc_progs + builtins）：
+    //   Closure        —— 入口闭包特例：构造时其 TFunc 字节码只读共享、
+    //                     捕获值按下方克隆协议拷贝到子线程（捕获不可序列化
+    //                     → NotCloneableError，报错指向改函数名/静态方法形态）
+    //   string 'fn'    —— 全局函数名（require 进来的库/vendor 函数照样可作入口）
+    //   [Cls, 'method']—— 静态方法（类表每线程克隆，按类名+方法名重建；可触发 autoload）
     // $opts: ['stack_size' => 2*1024*1024, 'name' => 'my-worker']
 
     public function post(mixed $value): void;               // 投递给子线程（异步，内部克隆）
@@ -117,7 +121,13 @@ namespace Tphp;
 
 class Thread {
     public function __construct();
-    public function spawn(callable $fn): mixed;   // 起一次性 OS 线程；入口闭包字节码只读共享
+    // 入口三形态（P1-10，对齐 PHP 全局符号表心智）：
+    //   Closure            —— 按 Program 索引序列化（捕获必须可序列化）
+    //   string 'fn_name'   —— 全局解析（main + inc_progs + builtins）：
+    //                         require 进来的库/vendor 函数照样可作入口
+    //   [Cls, 'method']    —— 静态方法（按类名+方法名在子线程重建；
+    //                         类表每线程克隆，指针不可跨线程）
+    public function spawn(Closure|string|array $entry): mixed;  // 起一次性 OS 线程
     public function wait(): array;                // 阻塞等全部结束，按 spawn 序返回结果数组
     public function detach(): void;               // fire-and-forget：立即返回，线程自己跑完
     public function count(): int;                 // 当前跟踪中的线程数
@@ -137,11 +147,13 @@ class Thread {
 **为什么 UI 回调里必须用真线程**：协程是单线程协作式调度，`webview_run` 这类 C 阻塞调用占着唯一的 UI 线程 → 协程永远得不到调度（"点了按钮没反应"）；让 main 主动挂起则 UI 消息泵冻结。真线程不依赖调度器让出，在 FFI/C 回调里 `spawn` 立即开跑。
 
 **实现要点**：
-- 每次 `spawn` = 一个一次性 Worker（复用 §3 的 mailbox + 序列化基础设施），入口即该 callable
+- 每次 `spawn` = 一个一次性 Worker（复用 §3 的 mailbox + 序列化基础设施），入口 = 三形态之一（见上方签名；字符串/数组形态不建 thunk、不捕获 `$this`）
+- **子线程继承父线程全局 Program 视图**（P1-10）：入口 owner 作 `vm->prog`，主 + 其余 inc_progs 挂进子线程 `inc_progs`——入口函数跨文件调用、动态按名调用与父线程同一张全局符号表（PHP 单请求符号表的等价物）
 - `main` 返回值经 `tphp_sched_run(TVal *main_ret)` 传出 → 子线程 serialize 后经 mailbox 回传父线程
 - `poll()` 用非阻塞 `tryRecv`，供 UI 线程安全收割（不挂起协程）
 - `detach()` 把 Worker 引用移交进程级孤儿表（父侧不再跟踪、不 join）
-- **捕获对象需实现 `__cloneState()`/`__restoreCloneState()`**，否则抛 `NotCloneableError`；闭包可捕获（走 T_CLOSURE 序列化：Program id + 函数索引 + 递归捕获）
+- **捕获对象需实现 `__cloneState()`/`__restoreCloneState()`**，否则抛 `NotCloneableError`；闭包可捕获（走 T_CLOSURE 序列化：Program id + 函数索引 + 递归捕获）。入口闭包的捕获在构造时**预检**（worker_cap_ok），不可序列化（FFI CData / 无 `__cloneState` 的对象，典型 = 方法内普通闭包自动捕获的 `$this`）→ 报错并指引改用函数名/`[Cls,'method']`/`static function` 形态
+- 方法内定义的普通闭包自动捕获 `$this`（P1-3，PHP 对齐）；spawn 场景请用 `static function`（不绑 `$this`，`self::` 作用域仍生效）或函数名/静态方法形态——pebview `bindAsync` 即此改法
 
 ## 4. 标准库清单
 

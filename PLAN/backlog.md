@@ -5,18 +5,18 @@
 
 ## 0. 现状快照（截至 2026-10-27）
 
-- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；协程组保留为 `Tphp\TaskGroup`）。
-- **测试基线**：`tests/run.ps1` = **223 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
+- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；spawn 入口三形态 + 子线程继承全局符号表 = P1-10 已关；协程组保留为 `Tphp\TaskGroup`）。
+- **测试基线**：`tests/run.ps1` = **224 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
 - **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态）：
   - fib(28)：x86_64 ≈**1.27×**（14.0ms vs 10.9ms，direct-slot ABI 后）；
   - 未持平主体 = JIT 白名单外形态：array-read 20–51×、kv-read 15–27×、call 16×、object 7–12×；
-  - aarch64 平台 tphp JIT 未启用（v1 = x86_64 only）。
+  - aarch64 JIT **已 CI 验证启用**（P0-5：Linux fib 1.57×、macOS 1.89×，详见 memory/2026-10-27.md）。
 - **目标（用户拍板）**：持平或超越原生 PHP JIT。验收 = M2 全套件几何均值 ≥1.0、M3 敏感簇反超；工具：手动 `perf.yml` workflow + 本地 `tools/perf-compare.ps1`。
 - 关键事实：与 PHP 8.4+ 官方 JIT 同用 **dstogov/ir** 后端（`deps/ir/`）；spike 实测手写 fib IR 1.2ms vs Zend tracing JIT 10.9ms（9×）——**后端不是瓶颈，lowering 覆盖面才是**。
 
 ## 1. 工作协议（给新 AI 的红线）
 
-1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，223/223 才算完；禁改期望凑绿。
+1. **测试必须真跑**：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`，224/224 才算完；禁改期望凑绿。
 2. **文档同步**：动功能必须同步对应 PLAN 规格（语法→01、运行时→02、性能→perf-roadmap、JIT→ir-jit、任务账→本文）+ `memory/<date>.md` 当日日志；`memory/MEMORY.md` 完成态保持准确。
 3. **构建**：Windows `cmd /c build.cmd`（结构体变更必须全量）；Unix `./build.sh`。IR 对象隔离（Windows `build/obj_ir/`、Unix `build/obj/ir_*.o`），带 main 的对象绝不进 tphp 链接。
 4. **语义参考** = 本机 php 原生对拍；php-src 源码在 `C:\Users\kllxs\Desktop\php-src-php-8.5.7`。
@@ -58,7 +58,7 @@
 | P1-7 | **FFI Unix 补齐核实**：02 记载 dlopen（Linux/macOS）后置，但 unix CI ffi 测试已绿——确认实际状态并同步 02 文档；缺则补 | 02 §FFI 实现行 | 文档一致性任务 |
 | P1-8 | 动态静态方法名 + 命名参数 `C::$v(a:1)`（现为加载期拒绝，01 §10 标注的唯一未实现项） | 01 §10 | 小项 |
 | P1-9 | **属性类型 FQCN 解析缺口**（实测 2026-10-27）：public \A \; 报 Parse error；PHP 允许。pebview 已用 docblock 绕开。落点 parse.c 属性类型 | 01 §2 类型声明 |
-| P1-10 | **Thread.spawn 库内函数支持**（2026-10-28 pebview bind 实测）：spawn 闭包序列化继承调用方 $this（FFI 指针炸）；静态方法不被接受；全局函数名必须在主脚本定义。阻塞 pebview 异步 bind（官方 webview compute 模式）。修法：spawn 按函数名解析时走 autoload | 02 §Thread；pebview src/Window.php | FFI cast("void*",int) 已放开（2b56c5f），异步技术基础就绪 |
+| P1-10 | **Thread.spawn 库内函数支持**（**已完成 2026-10-27**）：入口三形态 Closure / string 全局函数名（main+inc_progs+builtins，`tphp_vm_resolve_fn_global`）/ `[Cls,'method']` 静态方法（`class_resolve_lc` 走 autoload）；子线程经 `tphp_vm_run_closure(prog, share, …)` 继承父线程 Program 快照（跨文件调用与父同表）；入口闭包捕获预检 `worker_cap_ok`（FFI CData/无 `__cloneState` → NotCloneableError 指引改三形态/static function）；`worker_unserialize_closure` 补 `clo->scope=NULL`（P1-3 漏改，tm_malloc 不清零）。pebview bindAsync spawn 闭包改 `static function`（方法内普通闭包自动捕获 $this）。测试 `tests/worker/test-thread-scope.php` 8 例 | 02 §Thread；pebview src/Window.php | GUI 端到端（index.php 慢 Sum）待手动跑；FFI cast 已放开（2b56c5f） |
 
 ## 4. P2 · 工程线
 

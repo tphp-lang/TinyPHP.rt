@@ -36,7 +36,7 @@ echo "hello\n";
 | `tests/lang/` | 语言核心：算术/数组/字符串/控制流/闭包/命名空间 |
 | `tests/oop/` | OOP：类/接口/trait/enum/魔术方法/可见性/属性钩子 |
 | `tests/async/` | 协程：spawn/await/cancel/Channel/死锁/IO 并发；真线程 `Tphp\Thread`（spawn/wait/detach/poll） |
-| `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong |
+| `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong；Thread 入口三形态与跨 Program 作用域（test-thread-scope） |
 | `tests/ffi/` | FFI：CData/struct/union/系统库/拒绝预处理 |
 | `tests/lib/` | stdlib：json/date/array/require/bundle |
 | `tests/pkg/` | 包管理：new/add/remove/install 骨架与依赖图 |

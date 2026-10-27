@@ -187,18 +187,24 @@ $group->wait();
 use Tphp\Thread;
 
 $t = new Thread();
-$t->spawn(fn() => heavy(1));   // 入口闭包在主脚本编译，字节码跨线程共享
-$t->spawn(fn() => heavy(2));
-$r = $t->wait();               // 按 spawn 序返回结果数组（阻塞）
+$t->spawn(fn() => heavy(1));        // 闭包入口：字节码跨线程共享
+$t->spawn('lib_job');               // 字符串 = 全局函数名（main + require 进来的文件）
+$t->spawn([Job::class, 'run']);     // [Cls, 'method'] 静态方法（可触发 autoload）
+$r = $t->wait();                    // 按 spawn 序返回结果数组（阻塞）
 ```
 
-- `spawn(callable)`——起一个一次性线程；入口闭包经 serialize 协议传给子线程
+- `spawn(Closure|string|array $entry)`——起一个一次性线程，入口三形态：
+  - **Closure**——按 Program 索引序列化；捕获须可序列化（见下）
+  - **string `'fn_name'`**——全局解析（main + `require` 的文件 + builtins），与 PHP 单请求全局符号表同心智；子线程继承同一张函数视图，入口跨文件调用照常
+  - **`[Cls, 'method']`**——静态方法入口（类表每线程克隆，按类名+方法名重建）
 - `wait()`——阻塞等待全部线程结束，按 spawn 序返回结果数组
 - `detach()`——fire-and-forget：立即返回，线程自己跑完（父侧不跟踪、不 join）
 - `count()`——当前跟踪中的线程数
 - `poll()`——非阻塞收割已完成线程的返回值（不挂起协程，UI 线程可安全调用）
 
-**捕获变量跨线程是深拷贝**：对象需实现 `__cloneState()`/`__restoreCloneState()` 才能被捕获（否则抛 `NotCloneableError`）；闭包本身可捕获（走 `T_CLOSURE` 序列化协议）。
+**捕获变量跨线程是深拷贝**：对象需实现 `__cloneState()`/`__restoreCloneState()` 才能被捕获（否则抛 `NotCloneableError`）；闭包本身可捕获（走 `T_CLOSURE` 序列化协议）。入口闭包捕获在构造时预检——捕获 FFI CData 指针、无 `__cloneState` 的对象（典型：方法内普通闭包自动捕获的 `$this`）直接报错并指引改用函数名/`[Cls,'method']`/`static function` 形态。
+
+> **坑**：方法内定义的普通闭包会自动捕获 `$this`（PHP 对齐）。在实例方法里 `spawn` 请用 `static function () use (...)`（不绑 `$this`，`self::` 作用域仍生效），或改用函数名/静态方法形态——pebview `bindAsync` 即此改法。
 
 **为什么 UI 回调里必须用真线程**：协程调度器在 C 栈阻塞（如 WebView 的 `webview_run`）时永远不会让出，
 `spawn` 出来的协程永远得不到调度——表现为"点了按钮没反应"。真线程不依赖调度器让出，
@@ -220,7 +226,7 @@ $w->isRunning();
 $w->id();
 ```
 
-独立线程 + 独立 VM 堆；值跨线程 serialize 克隆；入口仅支持 Closure。
+独立线程 + 独立 VM 堆；值跨线程 serialize 克隆；入口与 `Thread::spawn` 同三形态（Closure / string 全局函数名 / `[Cls,'method']`，见上节）。
 
 ## FFI
 

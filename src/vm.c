@@ -1015,6 +1015,12 @@ static void *resolve_fn(VM *vm, TStr *name, bool *is_builtin) {
     return NULL;
 }
 
+/* worker.c：全局函数解析（main + inc_progs + builtins）——PHP 单请求
+ * 全局符号表的等价物；Thread 入口按名解析走这里，不再只查主 Program。 */
+void *tphp_vm_resolve_fn_global(VM *vm, TStr *name, bool *is_builtin) {
+    return resolve_fn(vm, name, is_builtin);
+}
+
 /* 返回 true = 来自 inc_progs（调用方勿把指针写进共享 bytecode ic） */
 static bool resolve_fn_is_inc(VM *vm, TFunc *fn) {
     for (int pi = 0; pi < vm->n_inc_progs; pi++) {
@@ -5294,11 +5300,26 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
 }
 
 /* 以闭包为 main 跑一个独立 runtime（M5-c：Worker 子线程入口）。
- * prog 为共享只读字节码；本线程的 thread-local runtime 必须已初始化。 */
-int tphp_vm_run_closure(Program *prog, TClosure *clo, TVal *main_ret) {
+ * prog 为共享只读字节码；本线程的 thread-local runtime 必须已初始化。
+ * share/n_share（P1-10）：父线程的全局 Program 快照（主 + inc_progs）。
+ * 子线程原本只有入口 owner 一个 Program——入口函数跨文件调用/动态按名
+ * 调用会 "undefined function"（PHP 单请求全局符号表在子线程断了）。
+ * 这里把除 owner 外的 Program 挂进子线程 inc_progs，与父线程同一张视图；
+ * owner 即 vm->prog。Program 只读共享（入口侧已 freeze owner，主程序
+ * 启动时已 freeze；未 freeze 的 inc 由 resolve_fn_is_inc 挡住 ic 写）。 */
+int tphp_vm_run_closure(Program *prog, Program **share, int n_share,
+                        TClosure *clo, TVal *main_ret) {
     VM *vm = &g_vm;
     memset(vm, 0, sizeof *vm);
     vm->prog = prog;
+    if (n_share > 0 && share) {
+        vm->inc_progs = tm_malloc(sizeof(Program *) * (size_t)n_share);
+        vm->n_inc_progs = 0;
+        for (int i = 0; i < n_share; i++) {
+            if (share[i] && share[i] != prog)
+                vm->inc_progs[vm->n_inc_progs++] = share[i];
+        }
+    }
     vm_seed_consts(vm);
     tphp_vm_current = vm;
     tphp_raise_hook = vm_value_raise;

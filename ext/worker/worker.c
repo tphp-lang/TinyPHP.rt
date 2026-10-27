@@ -35,9 +35,11 @@ TStr *tstr_new(const char *s, size_t len);
 void  tphp_vm_raise(struct VM *vm, const char *cls, const char *fmt, ...)
     __attribute__((noreturn, format(printf, 3, 4)));
 TVal  tphp_vm_call_callable(struct VM *vm, TVal callable, TVal *args, int n);
-int   tphp_vm_run_closure(Program *prog, TClosure *clo, TVal *main_ret);
+int   tphp_vm_run_closure(Program *prog, Program **share, int n_share,
+                          TClosure *clo, TVal *main_ret);
 Program *tphp_vm_find_func_owner(TFunc *fn);   /* vm.c：函数所属 Program */
 void  tphp_prog_freeze(Program *p);            /* vm.c：幂等（flatten+IC 预解析） */
+void *tphp_vm_resolve_fn_global(VM *vm, TStr *name, bool *is_builtin); /* vm.c */
 void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */
 void  tphp_async_init(void);             /* sched.c */
 void  tphp_io_init(void);                /* io.c */
@@ -159,7 +161,10 @@ static char *wbox_recv(WBox *b, uint32_t *len_out) {
 typedef struct WHandle {
     int id;
     uv_thread_t tid;
-    Program *prog;               /* 共享只读（freeze 后） */
+    Program *prog;               /* 入口 owner（子线程的 vm->prog，freeze 后只读） */
+    Program **share;             /* P1-10：父线程全局 Program 快照（主 + inc_progs，
+                                 * 含 owner；子线程把非 owner 的挂进 inc_progs） */
+    int n_share;
     WBox to_child, to_parent;
     uv_sem_t ready;              /* 子线程 mailbox 就绪握手（PLAN/03 §5） */
     char *entry_blob;            /* 入口闭包序列化 */
@@ -224,6 +229,63 @@ static uint32_t prog_func_index(Program *p, TFunc *fn) {
     return UINT32_MAX;
 }
 
+/* ---- 入口闭包捕获预检（P1-10）----
+ * 对齐 serialize.c sw_val 的拒绝面，在序列化前给出指向三形态入口的明确
+ * 错误（而不是深处一句 NotCloneableError 让人去猜）。典型症状：spawn 的
+ * thunk/闭包继承调用方 $this，对象图里带 FFI CData 指针——指针是
+ * 线程本地注册表下标，跨线程毫无意义，必须拒绝。 */
+bool tphp_ffi_is_cdata_cls(TClass *cls);   /* ext/ffi/ffi.c */
+
+static bool worker_cap_ok(TVal v, char *why, size_t why_sz,
+                          TVal *seen, int *ns, int depth) {
+    if (depth > 24) return true;          /* 深图交给 serialize 自己判 */
+    if (v.t == T_ARR || v.t == T_OBJ || v.t == T_CLOSURE) {
+        for (int i = 0; i < *ns; i++)     /* 指针去重防环 */
+            if (seen[i].t == v.t && seen[i].u.p == v.u.p) return true;
+        if (*ns < 64) { seen[*ns] = v; (*ns)++; }
+    }
+    switch (v.t) {
+    case T_NULL: case T_FALSE: case T_TRUE: case T_INT: case T_FLOAT:
+    case T_STR:
+        return true;
+    case T_ARR: {
+        TArr *a = (TArr *)v.u.p;
+        for (uint32_t i = 0; i < a->dused; i++)
+            if (a->data[i].t != T_UNDEF &&
+                !worker_cap_ok(a->data[i], why, why_sz, seen, ns, depth + 1))
+                return false;
+        return true;
+    }
+    case T_OBJ: {
+        TObj *o = (TObj *)v.u.p;
+        if (o->cls->kind == CK_ENUM) return true;   /* enum case：按名重建 */
+        if (tphp_ffi_is_cdata_cls(o->cls)) {
+            snprintf(why, why_sz, "an FFI CData pointer");
+            return false;
+        }
+        if (!tphp_class_find_method(o->cls, "__clonestate")) {
+            snprintf(why, why_sz, "an instance of %s", tstr_val(o->cls->name));
+            return false;
+        }
+        return true;                    /* 有 __cloneState：状态内容由 serialize 续判 */
+    }
+    case T_CLOSURE: {
+        TClosure *c = (TClosure *)v.u.p;
+        if (c->bfn) {
+            snprintf(why, why_sz, "a first-class builtin wrapper");
+            return false;
+        }
+        for (uint16_t i = 0; i < c->n_cap; i++)
+            if (!worker_cap_ok(c->captures[i], why, why_sz, seen, ns, depth + 1))
+                return false;
+        return true;
+    }
+    default:
+        snprintf(why, why_sz, "this value type");
+        return false;
+    }
+}
+
 /* 入口闭包序列化：自动定位所属 Program（主 或 inc_progs）。
  * inc_progs 未 freeze（IC 运行期写）→ 共享前对 owner 执行 freeze
  * （幂等：flatten 跳过已完成，IC 只解析空位 → 此后字节码只读）。
@@ -235,13 +297,24 @@ static char *worker_serialize_closure(VM *vm, TClosure *clo,
     if (owner != vm->prog) tphp_prog_freeze(owner);
     uint32_t fi = prog_func_index(owner, clo->fn);
     if (fi == UINT32_MAX) return NULL;
+    /* 捕获预检先行（raise 不回头，必须在 WBuf 分配前） */
+    for (uint16_t i = 0; i < clo->n_cap; i++) {
+        char why[160];
+        TVal seen[64];
+        int ns = 0;
+        if (!worker_cap_ok(clo->captures[i], why, sizeof why, seen, &ns, 0))
+            tphp_vm_raise(vm, "NotCloneableError",
+                          "Worker: entry closure captures %s that cannot "
+                          "cross threads. Pass a function name string or "
+                          "[Class, 'method'] as the entry instead.", why);
+    }
     WBuf b = { NULL, 0, 0 };
     wbuf_put(&b, "W", 1);
     wbuf_put(&b, &fi, 4);
     uint32_t nc = clo->n_cap;
     wbuf_put(&b, &nc, 4);
     for (uint16_t i = 0; i < clo->n_cap; i++) {
-        TStr *s = tphp_serialize_val(NULL, clo->captures[i]);
+        TStr *s = tphp_serialize_val(vm, clo->captures[i]);
         uint32_t sl = (uint32_t)s->len;
         wbuf_put(&b, &sl, 4);
         wbuf_put(&b, tstr_val(s), s->len);
@@ -302,6 +375,9 @@ static char *worker_serialize_func(Program *p, TFunc *fn, uint32_t *out_len) {
     clo->bfn = NULL;
     clo->n_cap = (uint16_t)nc;
     clo->captures = caps;        /* 转移 */
+    clo->scope = NULL;           /* P1-3 字段：tm_malloc 不清零；入口闭包
+                                  * 无 bindTo 作用域，called_cls 落到
+                                  * fn->decl_cls（静态方法入口依赖这个回落） */
     return clo;
 }
 
@@ -341,7 +417,7 @@ static void worker_thread(void *arg) {
     h->entry_blob = NULL;
 
     TVal ret = TV_NULL;
-    tphp_vm_run_closure(h->prog, clo, &ret);
+    tphp_vm_run_closure(h->prog, h->share, h->n_share, clo, &ret);
     TStr *rs = tphp_serialize_val(NULL, ret);
     tval_release(&ret);              /* main 返回值的引用归本线程持有 */
     char *rdata = tm_malloc(rs->len);
@@ -362,47 +438,104 @@ static WHandle *worker_obj_handle(void *selfv) {
     return handle_get(o->props[0].u.i);
 }
 
-/* new Worker(entry, opts = []) */
+/* new Worker(entry, opts = [])
+ * entry 三形态（P1-10，对齐 PHP 全局符号表心智）：
+ *   Closure            —— 按 Program 索引序列化（捕获须可序列化）
+ *   string 'fn_name'   —— **全局解析**（main + inc_progs + builtins）
+ *   [Cls, 'method']    —— 静态方法（按类名+方法名在子线程重建） */
 static TVal nm_worker_construct(VM *vm, void *self, TVal *args, int n) {
     (void)self;
     TObj *o = (TObj *)self;
-    if (n < 1 || (args[0].t != T_CLOSURE && args[0].t != T_STR))
+    if (n < 1 || (args[0].t != T_CLOSURE && args[0].t != T_STR &&
+                  args[0].t != T_ARR))
         tphp_vm_raise(vm, "TypeError",
-                      "Worker::__construct() expects a Closure or string");
+                      "Worker::__construct() expects a Closure, function "
+                      "name string, or [Class, 'method']");
     Program *prog = vm->prog;
-    Program *owner = prog;               /* 入口闭包所属 Program（跨线程共享给子线程） */
+    Program *owner = prog;
     uint32_t blen = 0;
     char *blob = NULL;
     if (args[0].t == T_CLOSURE) {
         blob = worker_serialize_closure(vm, (TClosure *)args[0].u.p, &blen, &owner);
         if (!blob)
             tphp_vm_raise(vm, "TypeError",
-                          "Worker: entry closure cannot be shared (first-class "
-                          "builtin wrappers are not supported)");
-    } else {
-        /* 字符串入口 = 主 Program 里的顶层函数名（无参数） */
-        TStr *name = (TStr *)args[0].u.p;
-        TFunc *fn = NULL;
-        for (int i = 0; i < prog->n_funcs; i++) {
-            TFunc *f = prog->funcs[i];
-            if (f->name && !f->is_closure && tstr_eq(f->name, name)) {
-                fn = f;
-                break;
-            }
+                          "Worker: entry closure cannot be shared (captures "
+                          "must serialize; first-class builtin wrappers are "
+                          "not supported). Use a function name string or "
+                          "[Class, 'method'] instead.");
+    } else if (args[0].t == T_ARR) {
+        TArr *a = (TArr *)args[0].u.p;
+        TVal *p0 = tarr_get(a, TV_INT(0));
+        TVal *p1 = tarr_get(a, TV_INT(1));
+        if (a->n != 2 || !p0 || !p1 || p0->t != T_STR || p1->t != T_STR)
+            tphp_vm_raise(vm, "TypeError",
+                          "Worker: array entry must be [Class, 'method']");
+        TStr *cn = (TStr *)p0->u.p;
+        TStr *mn = (TStr *)p1->u.p;
+        char cls_lc[128], m_lc[128];
+        size_t k = 0;
+        for (; k < cn->len && k + 1 < sizeof cls_lc; k++) {
+            char ch = cn->c[k];
+            cls_lc[k] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
         }
-        if (!fn)
+        cls_lc[k] = 0;
+        if (cls_lc[0] == '\\') memmove(cls_lc, cls_lc + 1, strlen(cls_lc));
+        k = 0;
+        for (; k < mn->len && k + 1 < sizeof m_lc; k++) {
+            char ch = mn->c[k];
+            m_lc[k] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+        }
+        m_lc[k] = 0;
+        /* 走 class_resolve_lc：未加载时触发 spl_autoload（P1-10 backlog
+         * 修法"按名解析走 autoload"；类形态入口对 vendor 类必须可用） */
+        TClass *cls = class_resolve_lc(cls_lc);
+        if (!cls)
+            tphp_vm_raise(vm, "Error", "Worker: class %s not found",
+                          tstr_val(cn));
+        TMethod *m = tphp_class_find_method(cls, m_lc);
+        if (!m || !m->fn || !m->is_static || m->is_abstract)
             tphp_vm_raise(vm, "Error",
-                          "Worker: entry function %s() is not defined "
-                          "(must be a top-level function in the main script)",
+                          "Worker: %s::%s() is not a concrete static method",
+                          tstr_val(cn), tstr_val(mn));
+        owner = tphp_vm_find_func_owner(m->fn);
+        if (!owner)
+            tphp_vm_raise(vm, "Error", "Worker: method has no owning Program");
+        if (owner != vm->prog) tphp_prog_freeze(owner);
+        blob = worker_serialize_func(owner, m->fn, &blen);
+        if (!blob)
+            tphp_vm_raise(vm, "TypeError", "Worker: entry method cannot be shared");
+    } else {
+        TStr *name = (TStr *)args[0].u.p;
+        bool is_builtin = false;
+        void *hit = tphp_vm_resolve_fn_global(vm, name, &is_builtin);
+        if (!hit || is_builtin)
+            tphp_vm_raise(vm, "Error",
+                          "Worker: entry function %s() not found in any "
+                          "loaded file", tstr_val(name));
+        TFunc *fn = (TFunc *)hit;
+        owner = tphp_vm_find_func_owner(fn);
+        if (!owner)
+            tphp_vm_raise(vm, "Error",
+                          "Worker: entry function %s() has no owning Program",
                           tstr_val(name));
-        blob = worker_serialize_func(prog, fn, &blen);
+        if (owner != vm->prog) tphp_prog_freeze(owner);
+        blob = worker_serialize_func(owner, fn, &blen);
         if (!blob)
             tphp_vm_raise(vm, "TypeError",
                           "Worker: entry function cannot be shared");
     }
     WHandle *h = tm_malloc(sizeof *h);
     memset(h, 0, sizeof *h);
-    h->prog = owner;      /* 入口闭包所属 Program（可能来自 inc_progs，已 freeze） */
+    h->prog = owner;
+    /* P1-10：父线程全局 Program 快照（主 + inc_progs，含 owner）。
+     * 子线程 tphp_vm_run_closure 把非 owner 的挂进 inc_progs——入口函数
+     * 跨文件调用、动态按名调用与父线程同一张全局符号表。 */
+    h->n_share = 0;
+    h->share = tm_malloc(sizeof(Program *) *
+                         (size_t)(1 + (vm->n_inc_progs > 0 ? vm->n_inc_progs : 0)));
+    h->share[h->n_share++] = vm->prog;
+    for (int i = 0; i < vm->n_inc_progs; i++)
+        h->share[h->n_share++] = vm->inc_progs[i];
     h->entry_blob = blob;
     h->entry_len = blen;
     wbox_init(&h->to_child);
@@ -411,12 +544,11 @@ static TVal nm_worker_construct(VM *vm, void *self, TVal *args, int n) {
     handle_register(h);
     o->props[0] = TV_INT(h->id);
 
-    wbox_bind_rx(&h->to_parent, tphp_sched_loop());  /* 父接收侧 */
+    wbox_bind_rx(&h->to_parent, tphp_sched_loop());
     uv_thread_create(&h->tid, worker_thread, h);
-    uv_sem_wait(&h->ready);       /* 等子线程 mailbox 就绪（PLAN/03 §5） */
+    uv_sem_wait(&h->ready);
     return TV_NULL;
 }
-
 /* post($value)：serialize → 对向 mailbox（父→子 / 子→父 按视角） */
 static TVal nm_worker_post(VM *vm, void *self, TVal *args, int n) {
     if (n < 1)
@@ -548,9 +680,12 @@ static TVal nm_worker_self(VM *vm, TVal *args, int n) {
 }
 
 /* ---- Tphp\Thread（真线程池）----
- * spawn(callable)：起一个一次性 Worker，入口就是该 callable（在主脚本
- *   编译，字节码跨线程共享）。callable 执行完线程自然退出，返回值经
- *   to_parent 发回。
+ * spawn(entry)：起一个一次性 Worker，entry 三形态（P1-10，与
+ *   new Worker 相同，见 nm_worker_construct）：
+ *     Closure          —— 按 Program 索引序列化（捕获须可序列化）
+ *     string 'fn_name' —— 全局解析（main + inc_progs + builtins）
+ *     [Cls, 'method']  —— 静态方法（类名+方法名重建，可触发 autoload）
+ *   callable 执行完线程自然退出，返回值经 to_parent 发回。
  * wait()：按 spawn 顺序收集结果（阻塞等待，不能在 bind 回调里用）。
  * detach()：不再跟踪——线程自己跑完，WHandle 由进程退出回收。
  * 注意：这是真并行（OS 线程），不是协程；在 bind 回调里 spawn 是安全的
@@ -574,7 +709,8 @@ static TVal nm_thread_spawn(VM *vm, void *self, TVal *args, int n) {
     if (n < 1)
         tphp_vm_raise(vm, "ArgumentCountError",
                       "Thread::spawn expects a callable");
-    /* 一次性 Worker：入口 = args[0]（主 Program 里的 thunk 闭包） */
+    /* 一次性 Worker：入口 = args[0]（三形态直传 nm_worker_construct：
+     * 字符串/数组形态不建 thunk、不捕获 $this） */
     TObj *w = tphp_obj_alloc(g_worker_cls);
     nm_worker_construct(vm, w, args, n);
     TArr *a = (TArr *)t->props[0].u.p;
