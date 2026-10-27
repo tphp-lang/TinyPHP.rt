@@ -1204,9 +1204,10 @@ void tphp_jit_compile(TFunc *fn) {
             bool chk = ir_check(ctx);
             fprintf(stderr, "[jit] ir_check=%d\n", chk); fflush(stderr);
             /* dump IR graph for crash diagnosis (TPHP_JIT_DEBUG=2) */
-            if (getenv("TPHP_JIT_DEBUG")[0] == '2') {
-                FILE *df = fopen("build/ir_dump.txt", "w");
-                if (df) { ir_dump(ctx, df); fclose(df); }
+            if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2') {
+                fprintf(stderr, "[jit] ir dump:\n");
+                ir_dump(ctx, stderr);
+                fflush(stderr);
             }
         }
         /* O1: skip SCCP. O2/SCCP has a multi-slot CALL bug (deps/ir
