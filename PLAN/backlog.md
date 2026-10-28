@@ -33,7 +33,7 @@
 
 | # | 任务 | 验收 | 规格/落点 |
 |---|---|---|---|
-| P0-1 | **JIT v1.1 白名单扩容**（**主体完成**）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；**三形态崩溃全修**——①链式 TMP-ADD = SCCP 多槽位 CALL bug（O1 跳过）②嵌套循环/循环内 if-else = **Windows LLP64 `1UL<<32` 回绕污染 bitset**（IR_BITSET_ONE→1ULL）。急切编译已恢复 `n_ops<=96`。array-read/nested 已可 JIT | array-read/kv/call 进 2–5× 带；几何均值先 ≤3× | ir-jit §12.2；src/jit.c；deps/ir；memory/2026-10-27.md |
+| P0-1 | **JIT v1.1 白名单扩容**（**已完成**）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；三形态崩溃全修（SCCP 多槽 CALL、LLP64 bitset 回绕、急切编译恢复 n_ops≤96）；**收尾（10-28）**：T_STR 字面量 + `ARRAY_APPEND` 放行（`tphp_jit_lit_set`/`tphp_jit_array_append` helper），连带修 `OP_COPY` 裸 store 双重释放（`tphp_jit_tv_copy`）。array-read 21.97→**4.22×**、kv-read 19.69→**5.84×**、throw 30.78→**3.32×**，几何均值 ~5.3→**~3.5×** | array-read 进 2–5× ✓；几何均值 ≤3× 差 ~0.5×（余量见 P0-3/P0-4） | ir-jit §12.2；src/jit.c；deps/ir；memory/2026-10-27.md、2026-10-28.md |
 | P0-2 | **trampoline 免装箱 + 槽位寄存器化**（**已完成 v1.2 direct-slot ABI**）：JIT→JIT 直调（ALLOCA slots + 参数直写 + `tphp_jit_call_slots` 运行时查表），去掉 prologue guard/copy 与 TLS trampoline；MEM2SSA 评估 = 反效果（32.9ms）已弃。fib 20.8ms→**14.0ms**（vs PHP ~10.9ms ≈ 1.27×） | fib 进 1.5× 带 ✓；后续可评估 arg 直传寄存器进一步压缩 | ir-jit §12.2；src/jit.c；memory/2026-10-27.md |
 | P0-3 | **字面量键 hash 缓存**（**部分完成**）：`GC_FLAG_NONNUM_KEY` 标记非数字 interned 键 → `tval_norm_key` 跳过数字扫描；`TSTR_HASH` 内联。kv-read 88.1→**84.9ms**（~4%）。剩余：opcode 级预存 hash（需改 TOp/编译器）、变量键路径深度优化 | kv 类再降 20%+ | perf-roadmap §4 表；src/value.h；src/string.c；memory/2026-10-27.md |
 | P0-4 | **object / throw 路径审计**（**审计完成**）：throw 在 Linux/aarch64 已 ~1×（反超），Windows 4.8× 待查；object 3–8×——属性 IC 已落（FETCH_PROP/ASSIGN_PROP 字面量名 → slot+1 缓存，~3%）；剩余 = 对象分配/方法调用/析构开销，属解释器工程质量 | object 进 3× 内；throw 全平台 ≤2× | perf-roadmap §1.1；src/vm.c IC；memory/2026-10-27.md |

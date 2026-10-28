@@ -1690,7 +1690,12 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                      * path line ~1633) — must NOT advance again (d=0) */
                     return 0;
                 }
-                /* deopt: guards precede writes; interpreter runs RECV normally */
+                /* deopt: guards precede writes; interpreter runs RECV
+                 * normally. builtin-raise deopt (tphp_jit_bcall failed):
+                 * IR frame already returned — raise from this C frame,
+                 * RtlUnwind never crosses an IR frame (no UNWIND_INFO). */
+                if (vm->x.exception)
+                    longjmp(vm->x.unwind, 1);
             }
         }
     }

@@ -194,6 +194,56 @@ void tphp_jit_assign_append(VM *vm, TVal *base, TVal *val) {
     tarr_append(a, *val);
 }
 
+/* ARRAY_APPEND（array literal 元素，P0-1）：镜像 do_dim_write 的
+ * append/keyed 两形态——dim_cow + addref val + tarr_set(内部 addref key)。
+ * key==NULL 为 append 形态（t2==UNUSED）。literal 构建序列里 base 恒为
+ * 紧邻 ARRAY_INIT 刚建的数组、键为标量/串——防御 raise 分支实际不可达
+ * （若可达则同 fetch_dim_r 的已知边界：helper raise 跨 IR longjmp 未测）。 */
+void tphp_jit_array_append(VM *vm, TVal *base, TVal *key, TVal *val) {
+    if (base->t == T_UNDEF) {
+        tval_release(base);
+        *base = TV_ARR(tarr_new());
+    }
+    if (base->t != T_ARR)
+        tphp_vm_raise(vm, "TypeError", NULL,
+                      "Cannot use a scalar value as an array");
+    TArr *a = tarr_cow((TArr *)base->u.p);
+    if (a != (TArr *)base->u.p) {
+        tval_release(base);
+        *base = TV_ARR(a);
+    }
+    tval_addref(*val);
+    if (!key) {
+        tarr_append(a, *val);
+        return;
+    }
+    TVal k = *key;
+    if (!tval_norm_key(&k)) {
+        tval_release(val);
+        tphp_vm_raise(vm, "TypeError", NULL, "Illegal offset type");
+    }
+    tarr_set(a, k, *val);
+}
+
+/* OP_CONST 字符串字面量（P0-1）：镜像 op_const——addref（lit_str 恒
+ * intern → no-op）+ 释放旧 dst（wtake 语义）+ 落值。标量走 store_imm 快路。 */
+void tphp_jit_lit_set(TVal *dst, TVal *lit) {
+    TVal v = *lit;
+    tval_addref(v);
+    tval_release(dst);
+    *dst = v;
+}
+
+/* OP_COPY/OP_ASSIGN（P0-1）：镜像 op_copy——addref src + release 旧 dst。
+ * 标量两操作皆 no-op，仅付一次 C 调用；引用计数值（数组/串）否则会
+ * 双重释放（tmp-rc 探针 0xC0000409 实测）。 */
+void tphp_jit_tv_copy(TVal *dst, TVal *src) {
+    TVal v = *src;
+    tval_addref(v);
+    tval_release(dst);
+    *dst = v;
+}
+
 /* FETCH_DIM_R：镜像 op_fetch_dim_r 的数组分支（string/FFI 形态不进白名单） */
 void tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
     TVal base_v = *base;
@@ -243,6 +293,29 @@ void tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) 
     }
     *ret = tphp_vm_call_callable(vm, clo, args_in, n);
 }
+
+/* INIT_FCALL..DO_FCALL builtin 调用（P0-1：闭包尾部校验 echo→print 等
+ * 形态进 JIT）：argv 按值借用（槽位持有真引用，scratch 无需释放），
+ * 返回值 +1 转移给 dst——与解释器 DO_FCALL builtin 分支同语义。
+ * builtin raise 由本地 setjmp 接住（vm->x.exception 保留），返回 0 让
+ * IR 端走 deopt（return 0 退出 JIT）——**longjmp 绝不跨 IR 机器码帧**：
+ * ucrt 的 longjmp 走 RtlUnwind SEH 展开，IR 帧无 UNWIND_INFO，跨它
+ * 即 0xC00000FF 栈溢出（2026-10-28 cdb/gdb 实测定位）。返回 1 = 正常。 */
+int tphp_jit_bcall(VM *vm, void *bfn, int argc, TVal *argv, TVal *ret) {
+    TVal (*bf)(VM *, TVal *, int) = (TVal (*)(VM *, TVal *, int))bfn;
+    jmp_buf outer, mine;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (setjmp(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        *ret = bf(vm, argv, argc);
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+    /* raise landed here: keep vm->x.exception, restore the interpreter's
+     * target, report failure so IR deopts out (exit via normal return) */
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    return 0;
+}
 /* ================================================================
  * Eligibility (PLAN/ir-jit.md §5)
  * ================================================================ */
@@ -255,8 +328,10 @@ static bool lit_scalar(TVal v) {
 
 /* CFG 守卫（v1.1）：曾用于拒绝嵌套循环/循环内 if-else（IR codegen 崩溃）。
  * 2026-10-27 根因已修：deps/ir IR_BITSET_ONE 在 Windows LLP64 下 1UL<<32
- * 回绕置位 bit0，污染 block scheduler bitset。守卫保留为深度护栏（>16 层），
- * 但不再因这两形态拒绝。 */
+ * 回绕置位 bit0，污染 block scheduler bitset（3470e7e）。守卫现只保留
+ * 深度护栏（>16 层回跳头即拒，nh>=16 处）——嵌套循环与循环内 if-else
+ * 不再拒绝（曾漏改末行 nh<=1，array-read/kv-read 双层循环因此从不进
+ * JIT，2026-10-28 修复）。 */
 static int find_join(TFunc *fn, uint32_t p, uint32_t T,
                      uint32_t *join_out, uint32_t *else_out);
 static bool jit_cfg_ok(TFunc *fn) {
@@ -272,17 +347,8 @@ static bool jit_cfg_ok(TFunc *fn) {
             if (nh >= 16) return false;
             hdr[nh++] = H;
         }
-        /* 回跳环内找带 else 的前向 if/else */
-        for (uint32_t q = H; q < i; q++) {
-            TOp *e = &fn->ops[q];
-            if (e->op != OP_JMPZ && e->op != OP_JMPNZ) continue;
-            if (e->ar <= q) continue;
-            uint32_t join, els;
-            if (find_join(fn, q, e->ar, &join, &els) && els)
-                return false;
-        }
     }
-    return nh <= 1;                     /* 单层循环 */
+    return true;                        /* 深度护栏已在 nh>=16 生效 */
 }
 
 static bool jit_eligible_inner(TFunc *fn, int depth) {
@@ -323,9 +389,13 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             recv_seen++;
             if (recv_seen > fn->n_params) return false;
             break;
-        case OP_CONST:
-            if (!lit_scalar(fn->lits[op->a1])) return false;
+        case OP_CONST: {
+            TVal v = fn->lits[op->a1];
+            /* T_STR 放行（P0-1 收尾）：array-read/kv-read 的 echo/键串，
+             * lit_str 恒 intern → addref/release 皆 no-op，按值存槽安全 */
+            if (!lit_scalar(v) && v.t != T_STR) return false;
             break;
+        }
         case OP_COPY: case OP_ASSIGN: case OP_INC: case OP_DEC:
         case OP_NEG: case OP_POS: case OP_BOOL_NOT: case OP_BOOL_VAL:
         case OP_ARRAY_INIT:
@@ -369,12 +439,29 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             break;
         case OP_INIT_FCALL: {
             TFunc *callee = (TFunc *)op->ic;
-            if (!op->ic || ((uintptr_t)op->ic & 1)) return false;
+            if (!op->ic) return false;
+            if ((uintptr_t)op->ic & 1)
+                break;   /* builtin (ic|1): folded into tphp_jit_bcall (P0-1) */
             if (callee != fn && !jit_eligible_inner(callee, depth + 1))
                 return false;
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR:
+            if (op->t1 == OPD_CONST &&
+                !lit_scalar(fn->lits[op->a1]) && fn->lits[op->a1].t != T_STR)
+                return false;   /* arg_copy stores consts as immediates */
+            break;
+        case OP_ARRAY_APPEND:
+            /* array literal 元素（keyed/append 双形态）：base 必须是槽，
+             * key/value 槽位或字面量 */
+            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) return false;
+            if (op->t2 == OPD_CONST &&
+                !lit_scalar(fn->lits[op->a2]) && fn->lits[op->a2].t != T_STR)
+                return false;
+            if (op->tr == OPD_CONST &&
+                !lit_scalar(fn->lits[op->ar]) && fn->lits[op->ar].t != T_STR)
+                return false;
+            break;
         case OP_DO_FCALL:
             break;
         default:
@@ -390,8 +477,9 @@ bool tphp_jit_eligible(TFunc *fn) {
     bool ok = jit_eligible_inner(fn, 0);
     static int dbg;
     if (!dbg) { const char *e = getenv("TPHP_JIT_DEBUG"); dbg = e && e[0] ? 2 : 1; }
-    if (dbg == 2 && fn && fn->name)
-        fprintf(stderr, "[jit] eligible(%s)=%d\n", tstr_val(fn->name), ok);
+    if (dbg == 2 && fn)
+        fprintf(stderr, "[jit] eligible(%s)=%d\n",
+                fn->name ? tstr_val(fn->name) : "?", ok);
     return ok;
 }
 
@@ -411,6 +499,7 @@ typedef struct {
     int fail;
     /* folded call in progress (INIT_FCALL/INIT_DYN … DO_FCALL) */
     TFunc *p_callee;
+    void *p_bfn;                   /* builtin target (ic&1 form), P0-1 */
     uint32_t p_argc, p_arg_slot[9];
     int fail_line;
     uint32_t cur_pc;
@@ -617,7 +706,12 @@ static void lower_un(JitC *j, TOp *op) {
     ir_ref ta = load_tag(j, aa), pa = load_pay(j, aa);
     switch (op->op) {
     case OP_COPY: case OP_ASSIGN:
-        store_pay(j, da, pa); store_tag(j, da, ta); break;
+        /* P0-1：裸 store 对数组/串双重释放 → 走 rc helper（标量 no-op） */
+        {
+            ir_ref t[2] = { da, aa };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_tv_copy), 2, t);
+        }
+        break;
     case OP_BOOL_NOT: {
         ir_ref t = make_truthy(j, ta, pa, aa);
         store_bool(j, da, ir_NOT_B(t));
@@ -728,20 +822,64 @@ static void lower_incdec(JitC *j, TOp *op) {
     ir_MERGE_2(eFast, eSlow);
 }
 
+/* copy folded-call arg k into dst TVal (packed: kind<<24 | idx) — SEND
+ * operands may be CONST literals, not slots (2026-10-28: strlen(1,2,3)
+ * sent consts, loaded lits idx as slot idx -> garbage TVal into builtin) */
+static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
+    JIT_CTX();
+    uint32_t packed = j->p_arg_slot[k];
+    uint8_t kind = (uint8_t)(packed >> 24);
+    uint32_t idx = packed & 0xFFFFFF;
+    if (kind == OPD_CONST) {
+        TVal v = j->fn->lits[idx];
+        store_imm(j, dst, (int32_t)v.t, ir_CONST_I64(v.u.i));
+    } else {
+        ir_ref sa = slot_addr(j, idx);
+        store_pay(j, dst, load_pay(j, sa));
+        store_tag(j, dst, load_tag(j, sa));
+    }
+}
+
 /* finish a folded call at DO_FCALL (args already recorded in j->p_*) */
 static void lower_call_finish(JitC *j, TOp *doop) {
     JIT_CTX();
     uint32_t argc = j->p_argc;
+    if (j->p_bfn) {
+        /* builtin call: argv scratch copy by value (slots own the refs) */
+        ir_ref args_sc = j->r_call_args;
+        for (uint32_t k = 0; k < argc; k++)
+            arg_copy(j, ir_ADD_A(args_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ)), k);
+        ir_ref ret_sc = j->r_call_ret;
+        ir_ref t[5] = { j->r_vm, ir_CONST_ADDR((uintptr_t)j->p_bfn),
+                        ir_CONST_I32((int32_t)argc), args_sc, ret_sc };
+        ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_bcall), 5, t);
+        /* raise -> bcall returns 0: leave the JIT immediately (IR frames
+         * carry no Windows UNWIND_INFO — the interpreter re-raises from C
+         * frames at op_do_fcall's deopt point). Idiom per ir-master
+         * examples/0008: IF_TRUE { RETURN } IF_FALSE { ... } — both sides
+         * terminate on their own; NO END/MERGE after an in-branch RETURN
+         * (_ir_RETURN kills control; a following END emits ref 0 and
+         * ir_check reports "missing reference"). The false side stays
+         * open: emit_seq continues the main sequence inside it until the
+         * function-tail RETURN terminates the whole chain. */
+        ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+        ir_IF_TRUE(ifx);
+            ir_RETURN(ir_CONST_I32(0));   /* deopt: interpreter unwinds */
+        ir_IF_FALSE(ifx);
+            if (doop->tr != OPD_UNUSED) {
+                ir_ref da = slot_addr(j, doop->ar);
+                store_pay(j, da, ir_LOAD_I64(ret_sc));
+                store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
+            }
+        j->p_bfn = NULL;
+        return;
+    }
     if (j->p_dyn) {
         /* INIT_DYN 动态调用（$f(...)）：闭包值在 p_dyn_slot。
          * Uses pre-allocated entry-block scratch (not loop-body ALLOCA). */
         ir_ref args_arr = j->r_call_args;
-        for (uint32_t k = 0; k < argc; k++) {
-            ir_ref sa = slot_addr(j, j->p_arg_slot[k]);
-            ir_ref d = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
-            store_pay(j, d, load_pay(j, sa));
-            store_tag(j, d, load_tag(j, sa));
-        }
+        for (uint32_t k = 0; k < argc; k++)
+            arg_copy(j, ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ)), k);
         ir_ref clo_sc = j->r_call_clo;
         ir_ref ca = slot_addr(j, j->p_dyn_slot);
         store_pay(j, clo_sc, load_pay(j, ca));
@@ -776,10 +914,8 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_imm(j, d, (int32_t)T_UNDEF, ir_CONST_I64(0));
     }
     for (uint32_t k = 0; k < argc; k++) {
-        ir_ref sa = slot_addr(j, j->p_arg_slot[k]);
         ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
-        store_pay(j, d, load_pay(j, sa));
-        store_tag(j, d, load_tag(j, sa));
+        arg_copy(j, d, k);
     }
     ir_ref ret_sc = j->r_call_ret;
     /* tphp_jit_call_slots: runtime lookup of jit_entry (recursion-safe) */
@@ -917,8 +1053,43 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_CONST: {
             JIT_CTX();
             TVal v = j->fn->lits[op->a1];
-            store_imm(j, slot_addr(j, op->ar), (int32_t)v.t,
-                      ir_CONST_I64(v.u.i));
+            if (v.t == T_STR) {
+                /* 字符串字面量走 helper（释放旧值 + addref 语义）；标量快路 */
+                ir_ref t[2] = { slot_addr(j, op->ar),
+                                ir_CONST_ADDR((uintptr_t)&j->fn->lits[op->a1]) };
+                ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_lit_set), 2, t);
+            } else {
+                store_imm(j, slot_addr(j, op->ar), (int32_t)v.t,
+                          ir_CONST_I64(v.u.i));
+            }
+            pc++;
+            break;
+        }
+        case OP_ARRAY_APPEND: {   /* array literal 元素（P0-1）：base=o1, key=o2?, val=(tr,ar) */
+            JIT_CTX();
+            ir_ref base = slot_addr(j, op->a1);
+            ir_ref key = ir_CONST_ADDR(0);   /* NULL → append 形态 */
+            if (op->t2 != OPD_UNUSED) {
+                if (op->t2 == OPD_CONST) {
+                    TVal kv = j->fn->lits[op->a2];
+                    ir_ref sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                    store_imm(j, sc, (int32_t)kv.t, ir_CONST_I64(kv.u.i));
+                    key = sc;
+                } else {
+                    key = slot_addr(j, op->a2);
+                }
+            }
+            ir_ref val;
+            if (op->tr == OPD_CONST) {
+                TVal vv = j->fn->lits[op->ar];
+                ir_ref sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                store_imm(j, sc, (int32_t)vv.t, ir_CONST_I64(vv.u.i));
+                val = sc;
+            } else {
+                val = slot_addr(j, op->ar);
+            }
+            ir_ref t[4] = { j->r_vm, base, key, val };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_array_append), 4, t);
             pc++;
             break;
         }
@@ -989,22 +1160,25 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
-            j->p_callee = (TFunc *)op->ic;
+            if (j->p_callee || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if ((uintptr_t)op->ic & 1)
+                j->p_bfn = (void *)((uintptr_t)op->ic & ~(uintptr_t)1);
+            else
+                j->p_callee = (TFunc *)op->ic;
             j->p_dyn = 0;
             j->p_argc = 0;
             pc++;
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
-            if (!j->p_callee && !j->p_dyn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (j->p_argc >= 9) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
-            j->p_arg_slot[j->p_argc++] = op->a1;
+            j->p_arg_slot[j->p_argc++] = ((uint32_t)op->t1 << 24) | op->a1;
             pc++;
             break;
         }
         case OP_DO_FCALL: {
-            if (!j->p_callee && !j->p_dyn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_call_finish(j, op);
             if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             pc++;
