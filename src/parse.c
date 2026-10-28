@@ -1369,14 +1369,25 @@ static bool is_arith_binop(AExpr *e) {
 }
 
 static AExpr *parse_concat_level(Parser *p) {
+    /* paren 豁免（P0-7 修复）：AST 不保留括号标记，is_arith_binop 会把
+     * `($a % 60)` 这类已括号形态误杀（真 PHP 8.5 全形态接受——该禁令
+     * 本为掩盖 tphp `.` 优先级低于 `+` 的分歧，见 concat 优先级 compat
+     * 待办）。用起点 token 是否 '(' 判定括号包裹；无括号混合仍拦截。 */
+    bool lparen = (p->tok.kind == P_LPAREN);
     AExpr *e = parse_shift_level(p);
+    bool e_arith = is_arith_binop(e);
     while (p->tok.kind == P_DOT) {
         int line = p->tok.line;
         advance(p);
+        bool rparen = (p->tok.kind == P_LPAREN);
         AExpr *r = parse_shift_level(p);
-        if (is_arith_binop(r))
+        if (is_arith_binop(r) && !rparen)
+            p_error(p, "Mixing '.' and arithmetic without parentheses is not allowed; add parentheses");
+        if (e_arith && !lparen)
             p_error(p, "Mixing '.' and arithmetic without parentheses is not allowed; add parentheses");
         e = bin_new(P_DOT, e, r, line);
+        e_arith = false;      /* concat 结果不再是纯算术 */
+        lparen = false;
     }
     return e;
 }
