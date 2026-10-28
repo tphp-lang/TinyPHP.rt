@@ -42,6 +42,8 @@
 | P0-7 | **真实负载样本**（tphp 重写的小工具当体感标尺——roadmap 判据 4 一直未做） | 1–2 个真实脚本进 bench | perf-roadmap §3 |
 | P0-8 | addref/release 热路径审计（视发现） | 出报告 | perf-roadmap §4 表 |
 | P0-9 | **第二层结构性反超**（无 `&$ref` 红利兑现：逃逸分析/栈上临时值/拷贝消除；静态槽位深化；轻量协程挂起）——长期线 | 逐项立项 | perf-roadmap §4 第二层 |
+| P0-10 | **带键 ASSIGN_DIM 白名单**（**已完成**）：`tphp_jit_assign_dim` 统一 append/keyed 两形态（镜像 do_dim_write 检查序），emit deopt 分支。**连带三修**：①raise 跨 IR 崩溃实证修复——`tphp_raise_guarded`（setjmp 守卫，gdb/cdb 定位真凶之一是 helper 内 `tphp_vm_raise` 多传 NULL 当 fmt→vsnprintf(NULL) 崩）②deopt 传播链闭环（helper→IR RETURN 0→call_slots/dyn 逐层→op_do_fcall C 帧 longjmp，try/catch 捕获实测✓）③**热路径 setjmp 快慢路分离**（setjmp+2×jmp_buf ≈20ns/call 使 array-push +24ms，成功路径归零）。array-rmw 12.9→**5.7ms（6.79→3.0×）**，几何均值 ~3.5→**~3.29×** | array-rmw 进 5× 带 ✓（3.0×） | src/jit.c eligibility+helper；memory/2026-10-28.md |
+| P0-11 | **macOS x64 解释器病态排查**（CI 10-28：object 110×/throw 90×/call 28× 而 fib 正常=JIT 路径健康，PHP 侧持平 → 指向解释器分发在 x86_64-darwin 退化或 runner 环境；先取 CPU/复跑单项再定位） | x64-mac 几何均值回到 arm64-mac 同带 | memory/2026-10-28.md CI 节 |
 
 **里程碑判据**：M2 = perf.yml 几何均值 ≥1.0；M3 = 敏感簇（fib/call/read/push/kv/rmw/object）全部 ≤1.0×。aarch64 门槛在 P0-5 后从"仅报告"改为硬门。
 

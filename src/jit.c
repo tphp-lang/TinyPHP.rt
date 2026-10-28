@@ -1,4 +1,4 @@
-/*
+﻿/*
  * TinyPHP.rt - a small PHP runtime
  * jit.c - IR baseline JIT (PLAN/ir-jit.md v1)
  *
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
@@ -176,53 +177,107 @@ void tphp_jit_array_init(VM *vm, TVal *dst) {
     *dst = TV_ARR(tarr_new());
 }
 
-/* ASSIGN_DIM 无键形态（$a[] = $v）：镜像 do_dim_write append 路径 */
-void tphp_jit_assign_append(VM *vm, TVal *base, TVal *val) {
-    if (base->t == T_UNDEF) {
-        tval_release(base);
-        *base = TV_ARR(tarr_new());
+/* 冷路径 raise 守卫（P0-10）：setjmp 接住 tphp_vm_raise 的 longjmp 并恢复
+ * 调用方的 unwind 目标——raise 永不跨 IR 帧展开（IR 机器码无 UNWIND_INFO，
+ * RtlUnwind 跨它即 0xC0000005/0xC00000FF，2026-10-28 cdb/gdb 实测）。
+ * 仅供错误冷路径调用（热路径成功段禁止 setjmp：实测 array-push +24ms）。 */
+static void tphp_raise_guarded(VM *vm, const char *cls, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void tphp_raise_guarded(VM *vm, const char *cls, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    jmp_buf outer, mine;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (setjmp(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        tphp_vm_raise(vm, cls, "%s", buf);   /* noreturn：longjmp 落回 mine */
     }
-    if (base->t != T_ARR)
-        tphp_vm_raise(vm, "TypeError", NULL,
-                      "Cannot use scalar value as array");
-    TArr *a = tarr_cow((TArr *)base->u.p);
-    if (a != (TArr *)base->u.p) {
-        tval_release(base);
-        *base = TV_ARR(a);
-    }
-    tval_addref(*val);
-    tarr_append(a, *val);
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
 }
 
 /* ARRAY_APPEND（array literal 元素，P0-1）：镜像 do_dim_write 的
  * append/keyed 两形态——dim_cow + addref val + tarr_set(内部 addref key)。
- * key==NULL 为 append 形态（t2==UNUSED）。literal 构建序列里 base 恒为
- * 紧邻 ARRAY_INIT 刚建的数组、键为标量/串——防御 raise 分支实际不可达
- * （若可达则同 fetch_dim_r 的已知边界：helper raise 跨 IR longjmp 未测）。 */
-void tphp_jit_array_append(VM *vm, TVal *base, TVal *key, TVal *val) {
-    if (base->t == T_UNDEF) {
-        tval_release(base);
-        *base = TV_ARR(tarr_new());
+ * key==NULL 为 append 形态（t2==UNUSED）。base 恒为紧邻 ARRAY_INIT 的数组，
+ * 但键表达式可为运行期数组（`[$k => 1]`）→ norm_key 可 raise。
+ * 快慢路分离（P0-10 性能教训）：成功路径零 setjmp（热循环不付
+ * setjmp+2×jmp_buf memcpy ≈20ns/call，array-push 实测 +24ms）；
+ * 仅错误冷路径进守卫段。1 = 正常，0 = raise landed（IR deopt）。 */
+int tphp_jit_array_append(VM *vm, TVal *base, TVal *key, TVal *val) {
+    TVal k;
+    TVal *kp = NULL;
+    /* 检查顺序镜像解释器 do_dim_write：base 类型优先于 key norm */
+    if (base->t == T_UNDEF)
+        *base = TV_ARR(tarr_new());          /* UNDEF 非 rc，免释放 */
+    if (base->t != T_ARR) {
+        tphp_raise_guarded(vm, "TypeError",
+                           "Cannot use a scalar value as an array");
+        return 0;
     }
-    if (base->t != T_ARR)
-        tphp_vm_raise(vm, "TypeError", NULL,
-                      "Cannot use a scalar value as an array");
-    TArr *a = tarr_cow((TArr *)base->u.p);
-    if (a != (TArr *)base->u.p) {
-        tval_release(base);
-        *base = TV_ARR(a);
+    if (key) {
+        k = *key;
+        if (!tval_norm_key(&k)) {
+            tphp_raise_guarded(vm, "TypeError", "Illegal offset type");
+            return 0;
+        }
+        kp = &k;
     }
-    tval_addref(*val);
-    if (!key) {
-        tarr_append(a, *val);
-        return;
+    {
+        TArr *a = tarr_cow((TArr *)base->u.p);
+        if (a != (TArr *)base->u.p) {
+            tval_release(base);
+            *base = TV_ARR(a);
+        }
+        tval_addref(*val);
+        if (kp) tarr_set(a, *kp, *val);
+        else    tarr_append(a, *val);
     }
-    TVal k = *key;
-    if (!tval_norm_key(&k)) {
-        tval_release(val);
-        tphp_vm_raise(vm, "TypeError", NULL, "Illegal offset type");
+    return 1;
+}
+
+/* 带键/无键 ASSIGN_DIM（P0-10，$a[$k] = $v / $a[] = $v）：镜像 do_dim_write。
+ * base UNDEF → auto-viv；T_STR 报 string-offset（M1 文案）；其余非数组报
+ * TypeError；key==NULL 为 append 形态。检查顺序与解释器一致：base 类型
+ * 优先于 key norm。FFI CData 分支不可达（CData 仅 FFI ops 产生，不在白名单）。
+ * 快慢路分离：成功路径零 setjmp（热循环 1e6 次 append 实测 setjmp 版
+ * +24ms），错误冷路径进 raise_guarded——longjmp 不跨 IR 帧。
+ * 1 = 正常，0 = raise landed（IR deopt 传播）。 */
+int tphp_jit_assign_dim(VM *vm, TVal *base, TVal *key, TVal *val) {
+    TVal k;
+    TVal *kp = NULL;
+    if (base->t == T_UNDEF)
+        *base = TV_ARR(tarr_new());            /* auto-viv（UNDEF 非 rc，免释放） */
+    if (base->t == T_STR) {
+        tphp_raise_guarded(vm, "Error",
+                           "Cannot use a string offset as an array in M1");
+        return 0;
     }
-    tarr_set(a, k, *val);
+    if (base->t != T_ARR) {
+        tphp_raise_guarded(vm, "TypeError",
+                           "Cannot use a scalar value as an array");
+        return 0;
+    }
+    if (key) {
+        k = *key;
+        if (!tval_norm_key(&k)) {
+            tphp_raise_guarded(vm, "TypeError", "Illegal offset type");
+            return 0;
+        }
+        kp = &k;
+    }
+    {
+        TArr *a = tarr_cow((TArr *)base->u.p);
+        if (a != (TArr *)base->u.p) {
+            tval_release(base);
+            *base = TV_ARR(a);
+        }
+        tval_addref(*val);
+        if (kp) tarr_set(a, *kp, *val);
+        else    tarr_append(a, *val);          /* append 形态（key==NULL） */
+    }
+    return 1;
 }
 
 /* OP_CONST 字符串字面量（P0-1）：镜像 op_const——addref（lit_str 恒
@@ -249,20 +304,20 @@ void tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
     TVal base_v = *base;
     TVal key = *key_in;
     if (base_v.t != T_ARR)
-        tphp_vm_raise(vm, "TypeError", NULL,
+        tphp_vm_raise(vm, "TypeError",
                       "Cannot access offset on %s",
                       base_v.t == T_NULL ? "null" : base_v.t == T_INT ? "int" :
                       base_v.t == T_FLOAT ? "float" :
                       (base_v.t == T_TRUE || base_v.t == T_FALSE) ? "bool" : "value");
     TArr *arr = (TArr *)base_v.u.p;
     if (!tval_norm_key(&key))
-        tphp_vm_raise(vm, "TypeError", NULL, "Illegal offset type");
+        tphp_vm_raise(vm, "TypeError", "Illegal offset type");
     TVal *v = tarr_get(arr, key);
     if (!v) {
         if (key.t == T_INT)
-            tphp_vm_raise(vm, "UndefinedError", NULL, "Undefined array key %lld",
+            tphp_vm_raise(vm, "UndefinedError", "Undefined array key %lld",
                           (long long)key.u.i);
-        tphp_vm_raise(vm, "UndefinedError", NULL, "Undefined array key \"%s\"",
+        tphp_vm_raise(vm, "UndefinedError", "Undefined array key \"%s\"",
                       tstr_val((TStr *)key.u.p));
     }
     tval_addref(*v);
@@ -274,24 +329,32 @@ void tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
 void tphp_jit_closure_init(VM *vm, TVal *dst, TFunc *self, uint32_t fn_idx) {
     Program *prog = self->prog ? self->prog : vm->prog;
     if (!prog || fn_idx >= (uint32_t)prog->n_funcs)
-        tphp_vm_raise(vm, "Error", NULL, "Internal: closure function missing");
+        tphp_vm_raise(vm, "Error", "Internal: closure function missing");
     TClosure *c = tphp_tclo_alloc0(prog->funcs[fn_idx]);
     tval_release(dst);
     *dst = TV_CLO(c);
 }
 
 /* INIT_DYN..DO_FCALL 动态调用（$f(...)）：JIT'd 无捕获闭包走 trampoline，
- * 其余回落 tphp_vm_call_callable（语义统一入口） */
-void tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
+ * 其余回落 tphp_vm_call_callable（语义统一入口）。
+ * 返回 0 = callee deopt（exception 已设）→ IR 立即 RETURN 0 沿链传播；
+ * 不可落回解释器重跑（双重副作用 + exception 悬挂）。
+ * tphp_jit_call 返 0 但无 exception（!entry / g_jsp 溢出，未执行）→
+ * 仍走解释器 fallback。 */
+int tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
     TVal clo = *clo_slot;
     if (clo.t == T_CLOSURE) {
         TClosure *c = (TClosure *)clo.u.p;
         if (c->fn && !c->bfn && c->n_cap == 0 && c->fn->jit_entry) {
             if (tphp_jit_call(vm, c->fn, args_in, ret))
-                return;
+                return 1;
+            if (vm->x.exception)
+                return 0;          /* callee deopt：传播，禁重跑 */
+            /* !entry / 栈溢出：callee 未执行，fallback 安全 */
         }
     }
     *ret = tphp_vm_call_callable(vm, clo, args_in, n);
+    return 1;
 }
 
 /* INIT_FCALL..DO_FCALL builtin 调用（P0-1：闭包尾部校验 echo→print 等
@@ -401,8 +464,15 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         case OP_ARRAY_INIT:
             break;
         case OP_ASSIGN_DIM:
-            /* v1.1 仅 append 形态（$a[] = $v）；带键走解释器 */
-            if (op->t2 != OPD_UNUSED) return false;
+            /* append 形态（$a[] = $v）+ 带键形态（P0-10，$a[$k] = $v）：
+             * base 必为槽；key/val 可为槽或标量/串字面量（emit 物化） */
+            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) return false;
+            if (op->t2 != OPD_UNUSED && op->t2 == OPD_CONST &&
+                !lit_scalar(fn->lits[op->a2]) && fn->lits[op->a2].t != T_STR)
+                return false;
+            if (op->tr == OPD_CONST &&
+                !lit_scalar(fn->lits[op->ar]) && fn->lits[op->ar].t != T_STR)
+                return false;
             break;
         case OP_FETCH_DIM_R:
             if (op->t2 == OPD_UNUSED) return false;
@@ -886,7 +956,12 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_tag(j, clo_sc, load_tag(j, ca));
         ir_ref ret_sc = j->r_call_ret;
         ir_ref t[5] = { j->r_vm, clo_sc, args_arr, ir_CONST_I32((int32_t)argc), ret_sc };
-        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t);
+        ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t);
+        /* callee deopt → 同步传播（RETURN 0，IF_FALSE 留开继续） */
+        ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+        ir_IF_TRUE(ifd);
+            ir_RETURN(ir_CONST_I32(0));
+        ir_IF_FALSE(ifd);
         if (doop->tr != OPD_UNUSED) {
             ir_ref da = slot_addr(j, doop->ar);
             store_pay(j, da, ir_LOAD_I64(ret_sc));
@@ -897,6 +972,10 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     }
     TFunc *callee = j->p_callee;
     if (!callee || argc != callee->n_params) { j->fail = 1; return; }
+    /* callee 编译失败（hot=UINT16_MAX, entry NULL）→ caller 拒编走解释器：
+     * 否则运行时 call_slots 返 0 读垃圾 ret（修复既有隐患，compile_callees
+     * 只尝试不保证成功）。self 递归跳过（执行时自身 entry 必已设）。 */
+    if (callee != j->fn && !callee->jit_entry) { j->fail = 1; return; }
 
     /* v1.2 direct-slot call: pre-allocated entry-block scratch, write params
      * in place, call entry via runtime lookup — no TLS, no loop ALLOCA.
@@ -924,9 +1003,14 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     ir_ref ok = ir_CALL_N(IR_I32,
                           ir_CONST_ADDR((uintptr_t)tphp_jit_call_slots),
                           4, call_t);
-    (void)ok;
-    /* v1: callee prologue guards are unreachable (chained eligibility keeps
-     * every arg in the closed INT world) — no deopt branch; load result. */
+    /* callee deopt（内含 raise，exception 已设）→ caller 同样立即 RETURN 0
+     * 沿 JIT→JIT 链逐层传播，直到解释器 op_do_fcall C 帧 longjmp（不跨 IR）。
+     * ok==0 仅此一种可达：entry-NULL 已在上面拒绝，g_jsp 溢出只在
+     * tphp_jit_call（dyn 路径）。 */
+    ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifd);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
         store_pay(j, da, ir_LOAD_I64(ret_sc));
@@ -1089,7 +1173,14 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 val = slot_addr(j, op->ar);
             }
             ir_ref t[4] = { j->r_vm, base, key, val };
-            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_array_append), 4, t);
+            ir_ref ok = ir_CALL_N(IR_I32,
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_array_append),
+                                  4, t);
+            /* raise → 0：同 assign_dim，IF_TRUE RETURN / IF_FALSE 留开 */
+            ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifx);
+                ir_RETURN(ir_CONST_I32(0));
+            ir_IF_FALSE(ifx);
             pc++;
             break;
         }
@@ -1100,10 +1191,39 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
-        case OP_ASSIGN_DIM: {   /* append 形态（资格判定已限 t2==UNUSED） */
+        case OP_ASSIGN_DIM: {   /* append（key==NULL）+ 带键（P0-10）：base=o1, key=o2?, val=(tr,ar) */
             JIT_CTX();
-            ir_ref t[3] = { j->r_vm, slot_addr(j, op->a1), slot_addr(j, op->ar) };
-            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_assign_append), 3, t);
+            ir_ref base = slot_addr(j, op->a1);
+            ir_ref key = ir_CONST_ADDR(0);   /* NULL → append 形态 */
+            if (op->t2 != OPD_UNUSED) {
+                if (op->t2 == OPD_CONST) {
+                    TVal kv = j->fn->lits[op->a2];
+                    ir_ref sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                    store_imm(j, sc, (int32_t)kv.t, ir_CONST_I64(kv.u.i));
+                    key = sc;
+                } else {
+                    key = slot_addr(j, op->a2);
+                }
+            }
+            ir_ref val;
+            if (op->tr == OPD_CONST) {
+                TVal vv = j->fn->lits[op->ar];
+                ir_ref sc = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                store_imm(j, sc, (int32_t)vv.t, ir_CONST_I64(vv.u.i));
+                val = sc;
+            } else {
+                val = slot_addr(j, op->ar);
+            }
+            ir_ref t[4] = { j->r_vm, base, key, val };
+            ir_ref ok = ir_CALL_N(IR_I32,
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_assign_dim),
+                                  4, t);
+            /* raise → 0：IR 立即 deopt（bcall 同款，0008 因子式——
+             * IF_TRUE RETURN / IF_FALSE 留开继续，绝不跨 IR 帧 longjmp） */
+            ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifx);
+                ir_RETURN(ir_CONST_I32(0));
+            ir_IF_FALSE(ifx);
             pc++;
             break;
         }
