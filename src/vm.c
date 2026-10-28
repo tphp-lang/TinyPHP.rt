@@ -632,7 +632,15 @@ static int32_t op_fetch_dim_r(VM *vm, TOp *op) {
         TArr *a = (TArr *)base.u.p;
         if (!tval_norm_key(&key))
             vm_raise(vm, ex_class("TypeError"), op, "Illegal offset type");
-        TVal *v = tarr_get(a, key);
+        /* P0-13：per-site IC（op->ic 对 DIM 类 opcode 空闲，懒分配 24B；
+         * op->ic 指针写竞态最坏一次性泄漏，DimIC 内容竞态最坏 miss——
+         * 验证链推理见 value.h DimIC / array.c tarr_get_ic 注释） */
+        DimIC *ic = (DimIC *)op->ic;
+        if (!ic) {
+            op->ic = ic = tm_malloc(sizeof(DimIC));
+            ic->arr = NULL;
+        }
+        TVal *v = tarr_get_ic(a, key, ic);
         if (!v) fatal_missing_key(vm, op, key);
         tval_addref(*v);
         wtake(vm, op, *v);

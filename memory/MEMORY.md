@@ -11,6 +11,13 @@
 - **引用计数约定（2026-10-26 P1 教训）**：`tarr_append`/`tarr_set` **不做 addref**——数组接管调用方那份引用，调用方若要自己继续持有必须**先 `tval_addref`**（范例：`src/vm.c` `op_assign` 与 `vm.c:1527` "the array takes its own ref"）。同一对象被两处持有时**两份都要独立计数**，否则先释放的一方会提前 free，后释放方 → UAF/二次释放。native 方法返回值默认转移所有权（调用方不再 addref）。排查内存 bug 用 **ASAN 构建**（不定义 `TPHP_USE_MIMALLOC` → CRT malloc）：能直接给出分配/释放/使用三条栈，比 mimalloc 的 fail-fast 信息强得多；流程见 `doc/testing.md`「内存问题定位（ASAN）」。
 - OOP 审计（2026-10-15，~70 探针 vs PHP 8.6-dev 对拍）：主体与 PHP 逐字节一致；**P0：①跨帧 catch 断裂（调用是 try 体最后一条 op 时接不住，compile.c ex 表 end_pc 差一 + vm.c:1162 压帧前推 pc；修法 end_pc=end+1）②__destruct 永不触发**；P1：typed 属性全线 Parse error（与文档矛盾）、用户异常类不可 extends/catch（TExClass 与 TClass 两套系统）、Closure 类缺失；P2：nullsafe/new 命名参数/方法命名参数/方法 first-class callable 均为 "lands in M3" 占位桩（PLAN/01 §11 示例自相矛盾）、类常量表达式全拒、trait 常量不导入、子类静态属性重声明失效、数组/字符串 callable ❌；P3：override 签名/私有 ctor 不校验、接口方法体被接受、ValueError 缺失。测试盲区：现有套件只测同帧 catch、无 typed 属性/析构测试。
 
+## 2026-10-28 JSC JIT 借鉴立项（PLAN/jsc-lessons.md = 权威规格）
+
+- 分析对象：桌面 `JavaScriptCore-7611.3.10.1.3`（Safari 17.x JSC 全源码树）。结论：**模式级借鉴，代码不可搬**（NaN-boxing/Butterfly/Concurrent GC vs tval/hashtable/mimalloc）。核心洞察：tphp 缺的是 JSC "Baseline 档"（IC+profile），不是更强 JIT 后端。
+- 四机制立项：**P0-13** per-site 单态 IC（kv/array/object，P0-3 并入收敛）、**P0-14** profile 驱动 JIT 准入（deopt 兜底=P0-12 已就绪）、**P1-12** 循环 OSR（M3 反超钥匙，规格先行）、**P2-13** 补 JSC JITWorklist 参照。不搬：DFG/FTL 整体、NaN-boxing、Butterfly、Concurrent GC。
+- LLInt threaded dispatch（`jmp [opcodeMap+opcode]`）佐证 P2-16 全宏化方向正确。实施批次：批1 IC+profile→M2 收口；批2 object IC；批3 OSR→M3。
+- **P0-13 v1 已落地（10-28）**：`DimIC{arr,bk,boff,val_off}` 挂 TOp.ic（DIM 类空闲字段），解释器+JIT helper 双路，kv-read -14%/array-read -8% 无回退 224 绿；未达 2× 带——剩余=helper 调用框架，v2=IC 命中路径内联进 IR（详见 jsc-lessons §2）。教训：JIT 白名单无 CONCAT/OP_CAST(str)，探针形态必须字面量数组构建。
+
 ## 交接入口（2026-10-25）PLAN/backlog.md = 下一步任务清单（零上下文 AI 可直接接手）：现状快照 + 工作协议红线 + P0 性能（JIT v1.1 白名单扩容打 7× 几何均值→M2）+ P1 功能 + P2 工程 + 工具速查。perf 手动对比 = Actions→Perf workflow。
 
 ## 2026-10-15 OOP 审计修复（P0+P1 全闭环，116/116）

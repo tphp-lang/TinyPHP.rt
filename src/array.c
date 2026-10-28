@@ -249,6 +249,35 @@ TVal *tarr_get(TArr *a, TVal key) {
     return b ? &a->data[b->val_off] : NULL;
 }
 
+TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
+    /* key 已由调用方 norm。packed int 键快路同 tarr_get（IC 无意义）。 */
+    if (a->packed && key.t == T_INT) {
+        int64_t i = key.u.i;
+        return (i >= 0 && (uint32_t)i < a->n) ? &a->data[i] : NULL;
+    }
+    /* IC 快路径：验证链（a==arr / a->buckets==bk / 桶 key / val_off 非
+     * tombstone）全部锚定**当前 a** 的真实状态——DimIC 字段的任何非原子
+     * 竞态写（Worker 多线程同 site 装填）最多造成 miss，不会错命中。 */
+    if (ic && !a->bpending && a == ic->arr && a->buckets == ic->bk) {
+        ABucket *b = ic->b;
+        if (b->val_off == ic->val_off && b->val_off != UINT32_MAX &&
+            key_eq(b->key, key))
+            return &a->data[b->val_off];
+    }
+    ABucket *b = arr_find(a, key, NULL);
+    if (!b) {
+        if (ic) ic->arr = NULL;   /* absent：防陈旧快照下轮假 miss 循环 */
+        return NULL;
+    }
+    if (ic && !a->bpending) {
+        ic->arr = a;
+        ic->bk = a->buckets;
+        ic->b = b;
+        ic->val_off = b->val_off;
+    }
+    return &a->data[b->val_off];
+}
+
 bool tarr_has(TArr *a, TVal key) {
     if (!tval_norm_key(&key)) return false;
     if (a->packed && key.t == T_INT) {   /* 快路同 tarr_get，免无谓 sync */

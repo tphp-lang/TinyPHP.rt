@@ -316,6 +316,18 @@ void  tarr_free(TArr *a);
 bool  tarr_set(TArr *a, TVal key, TVal val);       /* inserts or replaces */
 bool  tarr_append(TArr *a, TVal val);              /* $a[] = v */
 TVal *tarr_get(TArr *a, TVal key);                 /* NULL when absent */
+/* P0-13 per-site dim read IC（PLAN/jsc-lessons §2）：key 必须**已 norm**。
+ * 命中 = 当前数组与快照 arr/bk 一致 + 桶 key 匹配 + val_off 一致且非
+ * tombstone → 直取 data（跳过 hash/探测/串比较）。miss 走 arr_find 并
+ * 回填快照；absent 时置空 ic->arr 防陈旧。ic 传 NULL = 普通 get。 */
+typedef struct DimIC {
+    TArr    *arr;      /* 快照：容器指针（仅值比较，从不解引用——数组
+                          释放后指针可作值比较，mimalloc 非移动 GC） */
+    ABucket *bk;       /* 快照：桶表基址（rehash/扩容/惰性重建即失效） */
+    ABucket *b;        /* 快照：命中桶直指针（= bk+boff，免 IR 乘法寻址） */
+    uint32_t val_off;  /* 快照：命中 data 下标（tombstone UINT32_MAX 必不匹配） */
+} DimIC;
+TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic);
 /* 惰性桶同步：bpending>0 时从 data[0..n) 全量重建 buckets（键全 int）；
  * 否则 no-op。所有直接遍历/写入 a->buckets 的代码入口必须先调用。 */
 void  tarr_sync_buckets(TArr *a);

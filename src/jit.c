@@ -343,7 +343,7 @@ void tphp_jit_tv_copy(TVal *dst, TVal *src) {
  * $s[0] 返回字符，原版报 TypeError）——镜像解释器 string 分支。
  * FFI CData base 仍落 "value" TypeError（FFI ops 不进白名单，边界记录）。
  * 1 = 正常，0 = raise landed（IR deopt）。 */
-int tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
+int tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in, DimIC *ic) {
     TVal base_v = *base;
     TVal key = *key_in;
     if (base_v.t == T_STR) {
@@ -381,7 +381,7 @@ int tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
             tphp_raise_guarded(vm, "TypeError", "Illegal offset type");
             return 0;
         }
-        TVal *v = tarr_get(arr, key);
+        TVal *v = tarr_get_ic(arr, key, ic);   /* P0-13: per-site IC（emit 侧懒分配） */
         if (!v) {
             if (key.t == T_INT)
                 tphp_raise_guarded(vm, "UndefinedError", "Undefined array key %lld",
@@ -1318,10 +1318,16 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             } else {
                 key_addr = slot_addr(j, op->a2);
             }
-            ir_ref t[4] = { j->r_vm, slot_addr(j, op->ar),
-                            slot_addr(j, op->a1), key_addr };
+            /* P0-13：per-site IC（编译时刻懒分配，emit 在编译线程单次执行） */
+            if (!op->ic) {
+                op->ic = tm_malloc(sizeof(DimIC));
+                ((DimIC *)op->ic)->arr = NULL;
+            }
+            ir_ref t[5] = { j->r_vm, slot_addr(j, op->ar),
+                            slot_addr(j, op->a1), key_addr,
+                            ir_CONST_ADDR((uintptr_t)op->ic) };
             ir_ref ok = ir_CALL_N(IR_I32,
-                                  ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 4, t);
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 5, t);
             /* raise → 0：deopt（P0-12，IF_TRUE RETURN / IF_FALSE 留开） */
             ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
             ir_IF_TRUE(ifd);

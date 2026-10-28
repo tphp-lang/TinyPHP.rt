@@ -29,7 +29,7 @@
 
 ## 2. P0 · 性能主线（7× 几何均值 → M2/M3）
 
-按预期收益排序；全部已在 perf-roadmap/ir-jit 立过项，无新账。
+按预期收益排序；全部已在 perf-roadmap/ir-jit/jsc-lessons 立过项。**P0-13/P0-14 为 2026-10-28 JSC 借鉴立项**（规格 PLAN/jsc-lessons.md，用户拍板"先搬知识、以后慢慢完成"）。
 
 | # | 任务 | 验收 | 规格/落点 |
 |---|---|---|---|
@@ -45,6 +45,8 @@
 | P0-10 | **带键 ASSIGN_DIM 白名单**（**已完成**）：`tphp_jit_assign_dim` 统一 append/keyed 两形态（镜像 do_dim_write 检查序），emit deopt 分支。**连带三修**：①raise 跨 IR 崩溃实证修复——`tphp_raise_guarded`（setjmp 守卫，gdb/cdb 定位真凶之一是 helper 内 `tphp_vm_raise` 多传 NULL 当 fmt→vsnprintf(NULL) 崩）②deopt 传播链闭环（helper→IR RETURN 0→call_slots/dyn 逐层→op_do_fcall C 帧 longjmp，try/catch 捕获实测✓）③**热路径 setjmp 快慢路分离**（setjmp+2×jmp_buf ≈20ns/call 使 array-push +24ms，成功路径归零）。array-rmw 12.9→**5.7ms（6.79→3.0×）**，几何均值 ~3.5→**~3.29×** | array-rmw 进 5× 带 ✓（3.0×） | src/jit.c eligibility+helper；memory/2026-10-28.md |
 | P0-11 | **macOS x64 "病态"排查**（**已结案 10-28：非 bug**）：perf.yml `macos-x86_64` 本就是 **ARM64 runner 交叉编译 → Rosetta 2 转译运行 + PHP 侧 arm64 原生**的不对等对比（workflow 注释原文 report-only）——解释器 threaded dispatch 是 Rosetta 转译弱项，精确解释"fib 正常（简单循环转译质量高）、解释器 10–50×"指纹。**防再误读落地**：perf-compare.ps1 报告头加 **arch 对等检查**（php_uname vs tphp -v 架构不一致 → 大字 WARNING 不可比）+ perf.yml 两 macOS job 加环境转储（uname/CPU/`sysctl.proc_translated`）+ job 注释显式标注。**遗留小尾巴**：arm64-mac（原生）object 211ms vs linux-arm 68ms 的 3×——疑 runner CPU 代差，下轮 CI 环境转储数据到后判定 | x64-mac 数据自解释 ✓；arm64-mac 3× 待 CPU 数据 | tools/perf-compare.ps1；.github/workflows/perf.yml；memory/2026-10-28.md CI 节 |
 | P0-12 | **残留跨 IR raise 修复**（**已完成**）：`fetch_dim_r`（raise 全走 `raise_guarded` 冷守卫，成功路径零 setjmp，补 **string offset 读语义**——原版跨 IR 且错报 TypeError，解释器 $s[0] 返回字符）+ `binop_slow`/`cmp_slow`（tval_* 内部 raise 必须事前 setjmp，bcall 同构 wrapper，成本仅慢路径）+ emit 全 6 调用点 deopt 分支（call_slow 封装内加，调用方零改动）。四场景 JIT/解释器输出一致（Undefined array key、Uninitialized string offset、Unsupported operand types、负索引 $s[-1]=c） | 残留跨 IR raise 清零（余 closure_init 内部错误/dyn fallback/FFI base 三项边界记录在案）；224/224 绿；perf 同带 | src/jit.c；memory/2026-10-28.md |
+| P0-13 | **per-site 单态 IC**（**v1+v2.1 已完成 10-28，未达验收**）：`DimIC{arr,bk,b,val_off}` 32B 快照挂 `TOp.ic`（DIM 类空闲字段，b=命中桶直指针免乘法寻址）；解释器 `op_fetch_dim_r` + JIT helper `tphp_jit_fetch_dim_r`（emit 传 IC 指针）双路接入；失效链 = arr+buckets 指针+桶 key+val_off 非 tombstone（竞态安全推理见 value.h/array.c 注释）；**P0-3 并入收敛**。**实测：kv-read 58.4→~50ms（-14%）、array-read 15.6→13.4ms（-14%），全表无回退、224/224 绿**。**未达 2× 带**：剩余 ~31ns/次 = helper 调用框架 + JitEntry 开销，IC 已削掉 norm/hash/探测 | **v2 完整内联（下轮）**：IR 嵌套 IF 链直发比较+load（设计/偏移表/IR 原语已侦察，见 memory/2026-10-28.md） | PLAN/jsc-lessons.md §2 v1 实测；src/value.h、src/array.c、src/vm.c、src/jit.c |
+| P0-14 | **profile 驱动 JIT 准入**（**立项 10-28，未开工**）：JSC ArrayProfile/value profile 模式——per-site 观察计数（可复用 P0-13 IC 槽状态，顺风车），opcode 形态稳定 N 次 = "热且形态单一" → 准入 JIT；deopt 兜底已就绪（P0-12 传播链闭环）；与 ir-jit §13 "v1 不做数组/字符串体内"不冲突（准入面扩大仍走 helper+deopt）；形态翻转计数清零+超限永久拒绝防 deopt 风暴 | 白名单外 site 覆盖比例↑；几何均值向 ≤3× 收敛 | PLAN/jsc-lessons.md §3；src/jit.c、src/compile.c |
 
 **里程碑判据**：M2 = perf.yml 几何均值 ≥1.0；M3 = 敏感簇（fib/call/read/push/kv/rmw/object）全部 ≤1.0×。aarch64 门槛在 P0-5 后从"仅报告"改为硬门。
 
@@ -63,6 +65,7 @@
 | P1-9 | **属性类型 FQCN 解析缺口**（实测 2026-10-27）：public \A \; 报 Parse error；PHP 允许。pebview 已用 docblock 绕开。落点 parse.c 属性类型 | 01 §2 类型声明 |
 | P1-10 | **Thread.spawn 库内函数支持**（**已完成 2026-10-27**）：入口三形态 Closure / string 全局函数名（main+inc_progs+builtins，`tphp_vm_resolve_fn_global`）/ `[Cls,'method']` 静态方法（`class_resolve_lc` 走 autoload）；子线程经 `tphp_vm_run_closure(prog, share, …)` 继承父线程 Program 快照（跨文件调用与父同表）；入口闭包捕获预检 `worker_cap_ok`（FFI CData/无 `__cloneState` → NotCloneableError 指引改三形态/static function）；`worker_unserialize_closure` 补 `clo->scope=NULL`（P1-3 漏改，tm_malloc 不清零）。pebview bindAsync spawn 闭包改 `static function`（方法内普通闭包自动捕获 $this）。测试 `tests/worker/test-thread-scope.php` 8 例 | 02 §Thread；pebview src/Window.php | GUI 端到端（index.php 慢 Sum）待手动跑；FFI cast 已放开（2b56c5f） |
 | P1-11 | **P0-7 实测暴露的 compat 三缺口**：①`json_decode` 默认 assoc——tphp 默认 true 且**无 stdClass 基建**（注释误称"PHP7+默认 array"，PHP 实为 stdClass/`json_decode($j,true)` 才是数组；修需 stdClass 动态属性对象）②**arsort/asort/ksort 排序族缺失**（有 sort/rsort/usort，真实代码高频——logstat 被迫手写 top 遍历）③**concat "Mixing" 禁令比 PHP 严**（真 PHP 8.5 全形态接受 `$a+$b."c"`；根因 tphp `.` 优先级低于 `+` 与 PHP 同级左结合不同——正解是对齐 PHP 优先级后删禁令，paren 豁免已先行落地 parse.c） | 真实代码不再遇三缺口 | ext/json/json.c；ext/builtin；src/parse.c concat 层级；memory/2026-10-28.md |
+| P1-12 | **循环 OSR**（**立项 10-28**，大工程规格先行）：JSC 模式（dfg/DFGOSREntry.cpp 416 行 / DFGOSRExit.cpp 921 行 + availability analysis）——解释器热循环进 JIT 代码、投机失败逐 slot 恢复回退；函数级准入抓不住"循环体含白名单外 op"的函数，敏感簇 call/read/kv 与 A6 dispatch 67ns 大量发生在循环内。**M3 敏感簇反超主力组合**（循环 OSR + P0-13 IC + P0-14 profile 准入）。规格前提：循环体 op 子集、VMFrame→JIT slots 映射、loop header entry 检查成本上限、exit 与异常/协程交互（复用 P0-12 框架） | M3 敏感簇反超 | PLAN/jsc-lessons.md §4；关联 P0-9、P0-11 |
 
 ## 4. P2 · 工程线
 
@@ -80,7 +83,7 @@
 | P2-10 | doc/ffi.md 信任声明（"装包即信任"一句话） | memory 余项 |
 | P2-11 | `date()` 时区差异拍板：tphp 固定 UTC vs PHP 本地时区——记入 01 §10 还是改实现 | memory/2026-10-23.md L84 |
 | P2-12 | 01 §10 内部矛盾拍板：`&get` 一行说"后置"、§12.3 说"不做（与 &$ref 冲突）"——统一权威表述 | 01 §10 vs §12.3 |
-| P2-13 | **JIT 编译异步化**（后台线程编译，ir-jit §12.3） | ir-jit §12.3 |
+| P2-13 | **JIT 编译异步化**（后台线程编译，ir-jit §12.3）——2026-10-28 补 JSC 参照：`jit/JITWorklist.cpp`（344 行）任务队列+后台工作线程+完成回调 arm，当前帧继续解释；约束=编译线程不得触碰 VM 堆，候选形态=仅读 freeze 后只读 Program，产物原子挂回 | ir-jit §12.3；jsc-lessons §5 |
 | P2-14 | Transpiler 磁盘缓存（键=内容哈希；需 AST 可序列化改造——记账不急） | perf-roadmap §6 表 |
 | P2-15 | **Profiler 立项**（做时学 Bun 分级 trace 埋点式；现有 TPHP_TRACE 逐指令太重） | perf-roadmap §6 表 |
 | P2-16 | L4 VM 全宏化（computed-goto threaded interpreter）——**独立立项候选**，非近期，防翻案记录在案 | perf-roadmap §4 L4 行 |
