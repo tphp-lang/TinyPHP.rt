@@ -87,8 +87,13 @@ _Static_assert(sizeof(TVal) == 16, "TVal size");
 #define JT_INT   ((int32_t)T_INT)
 #define JT_FLOAT ((int32_t)T_FLOAT)
 
-/* ---- slow helpers ---- */
-void tphp_jit_binop_slow(VM *vm, int32_t opi, TVal *dst,
+/* ---- slow helpers ----
+ * P0-12 残留跨 IR raise 修复：raise 源自 tval_* 内部（vm_value_raise →
+ * longjmp），无法后置到冷分支——与 bcall 同构：入口事前 setjmp 登记，
+ * raise 落本地 mine → restore → 返回 0 让 IR deopt（不跨 IR 帧）。
+ * 成本仅在慢路径（类型分发本身 ≥20ns），both-int 快路径不触。
+ * 1 = 正常，0 = raise landed（exception 已设，IR RETURN 0 传播）。 */
+static void binop_slow_body(VM *vm, int32_t opi, TVal *dst,
                          int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
     (void)vm;
     TVal a = { .u.i = pa, .t = (TType)ta };
@@ -115,8 +120,41 @@ void tphp_jit_binop_slow(VM *vm, int32_t opi, TVal *dst,
     *dst = r;
 }
 
-void tphp_jit_cmp_slow(VM *vm, int32_t opi, TVal *dst,
+static void binop_slow_body(VM *vm, int32_t opi, TVal *dst,
+                         int32_t ta, int64_t pa, int32_t tb, int64_t pb);
+static void cmp_slow_body(VM *vm, int32_t opi, TVal *dst,
+                          int32_t ta, int64_t pa, int32_t tb, int64_t pb);
+
+int tphp_jit_binop_slow(VM *vm, int32_t opi, TVal *dst,
+                        int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
+    jmp_buf outer, mine;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (setjmp(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        binop_slow_body(vm, opi, dst, ta, pa, tb, pb);
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    return 0;
+}
+
+int tphp_jit_cmp_slow(VM *vm, int32_t opi, TVal *dst,
                        int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
+    jmp_buf outer, mine;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (setjmp(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        cmp_slow_body(vm, opi, dst, ta, pa, tb, pb);
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    return 0;
+}
+
+static void cmp_slow_body(VM *vm, int32_t opi, TVal *dst,
+                          int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
     (void)vm;
     TVal a = { .u.i = pa, .t = (TType)ta };
     TVal b = { .u.i = pb, .t = (TType)tb };
@@ -299,30 +337,65 @@ void tphp_jit_tv_copy(TVal *dst, TVal *src) {
     *dst = v;
 }
 
-/* FETCH_DIM_R：镜像 op_fetch_dim_r 的数组分支（string/FFI 形态不进白名单） */
-void tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
+/* FETCH_DIM_R：镜像 op_fetch_dim_r（P0-12：raise 全走 raise_guarded 冷
+ * 守卫——成功路径零 setjmp，热路径（array-read 1e6 fetch）无成本）。
+ * 补 string offset 读分支（原版直接 raise 既跨 IR 又错语义：解释器
+ * $s[0] 返回字符，原版报 TypeError）——镜像解释器 string 分支。
+ * FFI CData base 仍落 "value" TypeError（FFI ops 不进白名单，边界记录）。
+ * 1 = 正常，0 = raise landed（IR deopt）。 */
+int tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in) {
     TVal base_v = *base;
     TVal key = *key_in;
-    if (base_v.t != T_ARR)
-        tphp_vm_raise(vm, "TypeError",
-                      "Cannot access offset on %s",
-                      base_v.t == T_NULL ? "null" : base_v.t == T_INT ? "int" :
-                      base_v.t == T_FLOAT ? "float" :
-                      (base_v.t == T_TRUE || base_v.t == T_FALSE) ? "bool" : "value");
-    TArr *arr = (TArr *)base_v.u.p;
-    if (!tval_norm_key(&key))
-        tphp_vm_raise(vm, "TypeError", "Illegal offset type");
-    TVal *v = tarr_get(arr, key);
-    if (!v) {
-        if (key.t == T_INT)
-            tphp_vm_raise(vm, "UndefinedError", "Undefined array key %lld",
-                          (long long)key.u.i);
-        tphp_vm_raise(vm, "UndefinedError", "Undefined array key \"%s\"",
-                      tstr_val((TStr *)key.u.p));
+    if (base_v.t == T_STR) {
+        /* 镜像解释器 string offset 分支（vm.c op_fetch_dim_r） */
+        TStr *s = (TStr *)base_v.u.p;
+        if (!tval_norm_key(&key) || key.t != T_INT) {
+            tphp_raise_guarded(vm, "TypeError",
+                               "Cannot access offset of type %s on string",
+                               key.t == T_INT ? "int" : key.t == T_STR ? "string" : "unsupported");
+            return 0;
+        }
+        int64_t i = key.u.i;
+        if (i < 0) i += s->len;
+        if (i < 0 || i >= (int64_t)s->len) {
+            tphp_raise_guarded(vm, "UndefinedError",
+                               "Uninitialized string offset %lld",
+                               (long long)key.u.i);
+            return 0;
+        }
+        tval_release(dst);
+        *dst = TV_STR(tstr_new(s->c + i, 1));   /* tstr_new rc=1 直属 dst */
+        return 1;
     }
-    tval_addref(*v);
-    tval_release(dst);
-    *dst = *v;
+    if (base_v.t != T_ARR) {
+        tphp_raise_guarded(vm, "TypeError",
+                           "Cannot access offset on %s",
+                           base_v.t == T_NULL ? "null" : base_v.t == T_INT ? "int" :
+                           base_v.t == T_FLOAT ? "float" :
+                           (base_v.t == T_TRUE || base_v.t == T_FALSE) ? "bool" : "value");
+        return 0;
+    }
+    {
+        TArr *arr = (TArr *)base_v.u.p;
+        if (!tval_norm_key(&key)) {
+            tphp_raise_guarded(vm, "TypeError", "Illegal offset type");
+            return 0;
+        }
+        TVal *v = tarr_get(arr, key);
+        if (!v) {
+            if (key.t == T_INT)
+                tphp_raise_guarded(vm, "UndefinedError", "Undefined array key %lld",
+                                   (long long)key.u.i);
+            else
+                tphp_raise_guarded(vm, "UndefinedError", "Undefined array key \"%s\"",
+                                   tstr_val((TStr *)key.u.p));
+            return 0;
+        }
+        tval_addref(*v);
+        tval_release(dst);
+        *dst = *v;
+    }
+    return 1;
 }
 
 /* CLOSURE_INIT 无捕获形态：镜像 op_closure_init（n_cap=0 时不碰 caps 栈） */
@@ -623,17 +696,27 @@ static ir_ref opnd_pay(JitC *j, uint8_t kind, uint32_t a) {
     return load_pay(j, slot_addr(j, a));
 }
 
+/* P0-12：slow 调用带 deopt 分支（raise → helper 返 0 → IR RETURN 0 传播）。
+ * 分支留开：调用方后续 END/续接自然落在 IF_FALSE 内（bcall 同款结构）。 */
 static void call_slow_binop(JitC *j, int opi, ir_ref da,
                             ir_ref ta, ir_ref pa, ir_ref tb, ir_ref pb) {
     JIT_CTX();
     ir_ref args[7] = { j->r_vm, ir_CONST_I32(opi), da, ta, pa, tb, pb };
-    ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_binop_slow), 7, args);
+    ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_binop_slow), 7, args);
+    ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifd);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ifd);
 }
 static void call_slow_cmp(JitC *j, int opi, ir_ref da,
                           ir_ref ta, ir_ref pa, ir_ref tb, ir_ref pb) {
     JIT_CTX();
     ir_ref args[7] = { j->r_vm, ir_CONST_I32(opi), da, ta, pa, tb, pb };
-    ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_cmp_slow), 7, args);
+    ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_cmp_slow), 7, args);
+    ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifd);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ifd);
 }
 
 static ir_ref make_truthy(JitC *j, ir_ref tag, ir_ref pay, ir_ref addr) {
@@ -882,12 +965,10 @@ static void lower_incdec(JitC *j, TOp *op) {
         ir_ref eFast = ir_END();
     ir_IF_FALSE(ifx);
         double fd2 = op->op == OP_INC ? 1.0 : -1.0;
-        ir_ref args[7] = {
-            j->r_vm, ir_CONST_I32(op->op == OP_INC ? OP_ADD : OP_SUB),
-            da, ta, pa, ir_CONST_I32(JT_FLOAT),
-            ir_BITCAST_U64(ir_CONST_DOUBLE(fd2))
-        };
-        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_binop_slow), 7, args);
+        /* 走 call_slow_binop 封装（P0-12：内含 deopt 分支） */
+        call_slow_binop(j, op->op == OP_INC ? OP_ADD : OP_SUB, da, ta, pa,
+                        ir_CONST_I32(JT_FLOAT),
+                        ir_BITCAST_U64(ir_CONST_DOUBLE(fd2)));
         ir_ref eSlow = ir_END();
     ir_MERGE_2(eFast, eSlow);
 }
@@ -1239,7 +1320,13 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             }
             ir_ref t[4] = { j->r_vm, slot_addr(j, op->ar),
                             slot_addr(j, op->a1), key_addr };
-            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 4, t);
+            ir_ref ok = ir_CALL_N(IR_I32,
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 4, t);
+            /* raise → 0：deopt（P0-12，IF_TRUE RETURN / IF_FALSE 留开） */
+            ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifd);
+                ir_RETURN(ir_CONST_I32(0));
+            ir_IF_FALSE(ifd);
             pc++;
             break;
         }
