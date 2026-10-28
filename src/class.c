@@ -988,18 +988,21 @@ bool tphp_vis_ok(uint8_t vis, TClass *owner, TClass *from) {
     return false;
 }
 
-/* ---- object allocation ---- */
+/* ---- object allocation ----
+ * TObj+props 单次分配（P0-4：原两次 tm_malloc/free 使 A1 new+unset 达
+ * 294ns/轮，php 仅 40——zend 对象表同样 inline 单次 emalloc。props 尾部
+ * 紧贴（o+1），释放侧 tobj_free 配对同 commit 只 free 一次。） */
 TObj *tphp_obj_alloc(TClass *cls) {
     tphp_class_ensure_flat(cls);
-    TObj *o = tm_malloc(sizeof(TObj));
+    int np = cls->n_props;
+    TObj *o = tm_malloc(sizeof(TObj) + sizeof(TVal) * (size_t)(np ? np : 1));
     o->h.rc = 1; o->h.color = GC_COLOR_UNMARKED; o->h.kind = GC_KIND_OBJ;
     o->h.flags = 0;
     gc_register(&o->h);
     o->cls = cls;
     extern _Thread_local uint32_t tphp_obj_next_id;
     o->oid = tphp_obj_next_id++;
-    int np = cls->n_props;
-    o->props = tm_malloc(sizeof(TVal) * (size_t)(np ? np : 1));
+    o->props = (TVal *)(o + 1);              /* 尾部紧贴，随对象一次释放 */
     for (int i = 0; i < np; i++) {
         TProp *p = &cls->props[i];
         if (p->def_thunk) {

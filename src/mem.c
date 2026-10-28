@@ -179,7 +179,7 @@ void tobj_free(TObj *o) {
         o->cls->native_dtor(o);   /* M5.5 FFI\CData owned-buffer release */
     for (int i = 0; i < o->cls->n_props; i++)
         tval_release(&o->props[i]);
-    tm_free(o->props);
+    /* props 尾部紧贴（tphp_obj_alloc 单次分配，P0-4）→ 随对象一次 free */
     gc_unregister(&o->h);
     tm_free(o);
 }

@@ -2380,8 +2380,12 @@ void tphp_vm_run_nested_deep(VM *vm, VMFrame *f) { run_frame_until_pop_deep(vm, 
  * must NOT release the args again. Returns false when the method does not
  * exist. */
 static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
-                          const char *name, TVal *args, int n, TVal *out) {
-    TMethod *m = tphp_class_find_method(owner, name);
+                          const char *name, TVal *args, int n, TVal *out);
+
+/* 按已知 TMethod* 直调魔术方法（P0-4：调用者已持索引/方法指针时免
+ * find_method 按名线性扫表——tstr_case_eq 每次析构扫 "__destruct" 白付） */
+static bool vm_call_magic_method(VM *vm, TOp *op, TObj *o, TMethod *m,
+                                 TClass *owner, TVal *args, int n, TVal *out) {
     if (!m || !m->fn || m->is_abstract) return false;
     if (vm->x.n_args + n > VM_MAX_ARGS)
         vm_raise(vm, ex_class("Error"), op, "Too many arguments");
@@ -2439,6 +2443,13 @@ static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
     }
     *out = vm->x.thunk_ret;
     return true;
+}
+
+static bool vm_call_magic(VM *vm, TOp *op, TObj *o, TClass *owner,
+                          const char *name, TVal *args, int n, TVal *out) {
+    TMethod *m = tphp_class_find_method(owner, name);
+    if (!m || !m->fn || m->is_abstract) return false;
+    return vm_call_magic_method(vm, op, o, m, owner, args, n, out);
 }
 
 /* ---- PHP 8.4 property hook invocation ----
@@ -4914,8 +4925,9 @@ void tphp_obj_run_dtor(TObj *o) {
     memset(&g_magic_stub, 0, sizeof g_magic_stub);
     if (setjmp(vm->x.unwind) == 0) {
         TVal out;
-        if (vm_call_magic(vm, &g_magic_stub, o, o->cls, "__destruct",
-                          NULL, 0, &out))
+        /* 按索引直调（P0-4）：m 已在上方校验，免 vm_call_magic 按名扫表 */
+        if (vm_call_magic_method(vm, &g_magic_stub, o, m, o->cls,
+                                 NULL, 0, &out))
             tval_release(&out);
         memcpy(vm->x.unwind, saved, sizeof(jmp_buf));
     } else {
