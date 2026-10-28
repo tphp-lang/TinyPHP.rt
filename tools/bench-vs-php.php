@@ -94,4 +94,39 @@ bench("object 1e5", function () {
     }
 });
 
+// ---- P0-7 真实负载样本（真实工具，非微基准）----
+define("TPHP_BENCH", 1);
+require __DIR__ . "/real/logstat.php";
+
+bench("real-logstat", function () {
+    $log = logstat_make_log(20000);   // ~1.5MB combined 日志（生成在计时外的部分=样本装配）
+    $r = logstat($log);
+    if ($r !== "lines=20001 ips=5 bytes=11990000 errs=1177 top=4000/10.0.0.1")
+        echo "logstat-FAIL\n";
+});
+
+bench("real-jsonagg", function () {
+    $rows = [];
+    for ($i = 0; $i < 2000; $i++)
+        $rows[] = ["id" => $i, "cat" => $i % 7, "amt" => $i % 1000];
+    $j = json_encode($rows);
+    $sum = 0; $max = 0; $grp = [];
+    for ($r = 0; $r < 5; $r++) {
+        // 显式 assoc=true：PHP json_decode 默认返回 stdClass，tphp 无
+        // stdClass 基建且默认 true（compat 缺口记录 backlog）——true 是
+        // 双端一致的惯用写法
+        $d = json_decode($j, true);
+        foreach ($d as $row) {
+            $sum += $row["amt"];
+            $c = $row["cat"];
+            if (isset($grp[$c])) $grp[$c] = $grp[$c] + 1; else $grp[$c] = 1;
+            if ($row["amt"] > $max) $max = $row["amt"];
+        }
+    }
+    // Σ(i%1000) i=0..1999 = 999000；5 轮 = 4995000；max = 999；
+    // grp 横跨 5 轮累加：cat0 = 286×5 = 1430（双端独立一致印证）
+    if ($sum !== 4995000 || $max !== 999 || $grp[0] !== 1430)
+        echo "jsonagg-FAIL\n";
+});
+
 echo "all-ok\n";
