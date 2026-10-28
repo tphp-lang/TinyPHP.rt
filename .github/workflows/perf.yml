@@ -113,6 +113,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # runner profile: CPU model feeds the arm64-mac vs linux-arm
+      # comparison (same tphp, gaps there are machine differences)
+      - name: Environment (arch/CPU)
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+
       - name: Install deps
         run: |
           brew install libffi || true
@@ -136,11 +143,21 @@ jobs:
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
+  # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
+  # Rosetta 2 - arch-mismatched, ratios not comparable. Interpreter
+  # threaded dispatch is Rosetta's weak spot (fake 10-50x gaps seen);
+  # keep only as a build/run smoke check of the x86_64 codegen.
   macos-x86_64:
     name: macOS x86_64 (cross)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Environment (arch/CPU/Rosetta)
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n sysctl.proc_translated || true
 
       - name: Install deps
         run: |

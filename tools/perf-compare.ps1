@@ -83,6 +83,27 @@ Write-Host ("       " + (& $Tphp -v 2>&1 | Select-Object -First 1))
 Write-Host "php  : $Php"
 Write-Host ("       " + (& $Php -v 2>&1 | Select-Object -First 1))
 Write-Host "       strongest: opcache.enable_cli=1 + opcache.jit=tracing + 128M buffer"
+
+# arch parity check (P0-11): mismatched arch = cross-emulation numbers,
+# ratios meaningless - perf.yml macos-x86_64 is exactly that shape
+# (arm64 runner: native arm64 PHP vs x86_64 tphp under Rosetta 2;
+#  interpreter dispatch is Rosetta's weak spot -> fake 10-50x gaps).
+$phpArch = ""
+try { $phpArch = (& $Php -r "echo php_uname('m');" 2>$null | Select-Object -First 1) } catch {}
+$tphpArch = ""
+$tphpV = (& $Tphp -v 2>&1 | Select-Object -First 1)
+if ($tphpV -match '\((x86_64|aarch64|arm64)[-.)]') { $tphpArch = $Matches[1] }
+function Norm-Arch([string]$a) {
+    if ($a -match 'arm64|aarch64') { "arm64" }
+    elseif ($a -match 'x86_64|x64|amd64') { "x64" }
+    else { $a }
+}
+$pa = Norm-Arch $phpArch; $ta = Norm-Arch $tphpArch
+$archLine = "arch  : php=$phpArch tphp=$tphpArch (ok)"
+if ($pa -and $ta -and $pa -ne $ta) {
+    $archLine = "WARNING: arch mismatch php=$phpArch vs tphp=$tphpArch - ratios NOT comparable (cross-arch/Rosetta; perf.yml macos-x86_64 is report-only by design)"
+}
+Write-Host $archLine
 Write-Host ""
 
 $rT = Invoke-Bench $Tphp @($Script)
@@ -129,6 +150,7 @@ if ($Report) {
     $md += ""
     $md += ("- tphp: ``$Tphp``")
     $md += ("- php : ``$Php`` (opcache.enable_cli=1, opcache.jit=tracing, buffer=128M)")
+    $md += ("- $archLine")
     $md += ""
     $md += $table
     $md += ""
