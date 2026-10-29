@@ -179,6 +179,11 @@ static void cmp_slow_body(VM *vm, int32_t opi, TVal *dst,
 int tphp_jit_call_slots(VM *vm, TFunc *fn, TVal *slots, TVal *ret) {
     JitEntry e = (JitEntry)fn->jit_entry;
     if (!e) return 0;
+    /* 批5: 参数 INT 契约（v1.2 "caller guarantees INT"）在非 INT 实参的
+     * 静态调用上从未被踩过（logstat 批3 进 JIT 后首次）——非 INT → 返 0
+     * 走 caller 既有 deopt 链（IF(ok==0) RETURN 0 → 解释器接管） */
+    for (uint16_t i = 0; i < fn->n_params; i++)
+        if (slots[i].t != T_INT) return 0;
     return e(vm, slots, ret);
 }
 
@@ -674,6 +679,15 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         case OP_ISSET_PROP: case OP_UNSET_PROP:
             /* P0-14 批2-2：prop 单 op pad 执行（emit 见 lower_replay） */
             break;
+        case OP_FE_RESET: case OP_FE_FETCH:
+            /* P0-14 批3：foreach 单 op pad 执行（emit 见 lower_replay）——
+             * 真 handler 读自身操作数写帧槽（itmp/ctmp 游标/val/key/htmp
+             * 全在帧槽，跨迭代回放保持），raise 走 opseq deopt 门 */
+            break;
+        case OP_ISSET_DIM:
+            /* P0-14 批4：isset($a[$k]) 单 op pad 执行——真 handler 用 rd
+             * raw read（UNDEF 安全，isset 语义本就静默）+ wtake，零 raise */
+            break;
         default:
             rej = tphp_op_name(op->op);   /* 白名单外 opcode（主审计目标） */
             goto out;
@@ -714,6 +728,18 @@ typedef struct {
     uint32_t loop_hdr[JIT_MAX_LOOPS];
     ir_ref loop_ref[JIT_MAX_LOOPS];
     int loop_cond[JIT_MAX_LOOPS];   /* 1 = 等待头部的第一个 JMPZ（循环条件） */
+    /* P0-14 批5: if 内 continue 的 pending 回边——分支 ir_END() 暂存，
+     * 体尾 trap_lb 处 MERGE_N(+体尾) 后统一 LOOP_END（LOOP_BEGIN 保持
+     * 单回边 pos2，零 deps/ir 改动） */
+    enum { JIT_LB_MAX = 16 };
+    ir_ref lb_pend[JIT_MAX_LOOPS][JIT_LB_MAX];
+    int lb_np[JIT_MAX_LOOPS];
+    int lb_jmpnz[JIT_MAX_LOOPS];  /* 批5挡板: 本层循环体内 emit 过 JMPNZ(||)
+                                   * ——||结果喂 continue 的 pending 与 MERGE_N
+                                   * 组合在 O1 下值错（ms1/ms2/ms5 最小复现，
+                                   * join/dump 全对仍错 = codegen 域）→ push
+                                   * 点拒编回退；||喂普通 if（logstat 形态）
+                                   * 实测正确不受影响 */
     int fail;
     /* folded call in progress (INIT_FCALL/INIT_DYN … DO_FCALL) */
     TFunc *p_callee;
@@ -1469,7 +1495,10 @@ static int find_join(TFunc *fn, uint32_t p, uint32_t T,
             break;
         case OP_JMP:
             if (depth == 0) {
-                if (op->ar <= q || op->ar < T) return 0;
+                /* P0-14 批5: 回跳=continue（跳出 then 至循环头）——不参与
+                 * join 判定，继续扫 jends 定 join；前跳短于 T 仍拒 */
+                if (op->ar <= q) break;
+                if (op->ar < T) return 0;
                 *join_out = op->ar; *else_out = T;
                 return 1;
             }
@@ -1489,6 +1518,12 @@ static int find_join(TFunc *fn, uint32_t p, uint32_t T,
     return 0;
 }
 
+/* P0-14 批5: || 短路（JMPNZ→真值区 [CONST true; JMP jend]）的 find_join
+ * 深扫会越过 jend 错位。直取 jend 方案（find_or_join）实测 compile 过但
+ * 值错（ms2 族）——已撤；现行为=深扫下 tB END@jend≠join → 自然 fail →
+ * 回退解释器（语义安全）。|| 进 JIT = 独立户：真值区/jend/合流需整体
+ * 重设计（backlog P0-14 余量）。JMPNZ 极性修正（ifx=truthy）保留打底。 */
+
 static int is_backedge_target(TFunc *fn, uint32_t pc) {
     for (uint32_t i = 0; i < fn->n_ops; i++) {
         TOp *op = &fn->ops[i];
@@ -1503,6 +1538,19 @@ static Trap trap_end(ir_ref e, uint32_t t) { Trap x = { TR_END, e, t }; return x
 static Trap trap_ret(void)  { Trap x = { TR_RET, 0, 0 }; return x; }
 static Trap trap_fail(void) { Trap x = { TR_FAIL, 0, 0 }; return x; }
 static Trap trap_lb(void)   { Trap x = { TR_LOOPBACK, 0, 0 }; return x; }
+
+/* P0-14 批5: if 内 continue——分支回边 END 暂存当前层 pending。
+ * 1 = 存入；0 = 挡板触发/无循环层/超上限（调用方 fail 回退解释器）。 */
+static int lb_push(JitC *j, ir_ref e) {
+    if (j->loop_sp <= 0) return 0;
+    int k = j->loop_sp - 1;
+    if (j->lb_jmpnz[k]) return 0;               /* ||×continue 挡板（见字段注） */
+    /* 同层 pending ≤2：≥3（MERGE_N≥4 输入）在 key 等布局组合下亦有 O1
+     * 值错（cont_multisite vs ms6 对照——key 有无改变结局）→ 保守挡 */
+    if (j->lb_np[k] >= 2) return 0;
+    j->lb_pend[k][j->lb_np[k]++] = e;
+    return 1;
+}
 
 static int stop_has(const uint32_t *stops, int n, uint32_t pc) {
     for (int i = 0; i < n; i++) if (stops[i] == pc) return 1;
@@ -1542,6 +1590,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->loop_ref[j->loop_sp] = ir_LOOP_BEGIN(ein);
             j->loop_hdr[j->loop_sp] = pc;
             j->loop_cond[j->loop_sp] = 1;
+            j->lb_np[j->loop_sp] = 0;          /* 批5: 层复用前清 pending/||标记 */
+            j->lb_jmpnz[j->loop_sp] = 0;
             j->loop_sp++;
         }
 
@@ -1773,6 +1823,29 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
+        case OP_FE_RESET: case OP_FE_FETCH: {
+            /* P0-14 批5：单 op pad 执行；FE_FETCH 即回跳目标=循环头，
+             * 其后 JMPZ 由既有 loopcond 分支消费（形态零适配）。
+             * 挡板（嵌套 loop×FE）：FE_RESET 必在函数级（loop_sp==0）、
+             * FE_FETCH 必在自身循环头（sp==1 且 hdr==pc）——被外层 loop
+             * 包裹的 foreach 此前 O1 下崩（tv_copy 实参 src=0，O0 全对 =
+             * coalesce/live_ranges/reg_alloc 链残余，批3 emit_arguments 同
+             * 族第二形态）→ fail 回退解释器，根修后放开（backlog P0-14）。 */
+            if (op->op == OP_FE_RESET ? j->loop_sp != 0
+                                      : !(j->loop_sp == 1 && j->loop_hdr[0] == pc)) {
+                j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            }
+            lower_replay(j, pc, pc + 1);
+            pc++;
+            break;
+        }
+        case OP_ISSET_DIM: {
+            /* P0-14 批4：单 op pad 执行——真 handler raw read 操作数
+             * （base/key 任意槽形态含 CONST 皆自读）写 dst bool 槽 */
+            lower_replay(j, pc, pc + 1);
+            pc++;
+            break;
+        }
         case OP_UNSET_CV: {
             /* 解释器 op_unset_cv 同款：释放槽值 + 置 UNDEF（dtor defer 于
              * mem.c，release 不进用户码不 raise → 无需 deopt 门） */
@@ -1886,8 +1959,24 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                             pc, T, j->loop_sp, (int)tb.kind);
                 if (tb.kind == TR_FAIL) return tb;
                 if (tb.kind == TR_LOOPBACK) {
-                    ir_ref le = ir_LOOP_END();
-                    ir_MERGE_SET_OP(j->loop_ref[j->loop_sp - 1], 2, le);
+                    /* P0-14 批5: if 内 continue 的 pending 回边与体尾回跳
+                     * 一次性 MERGE 后再 LOOP_END——LOOP_BEGIN 保持单回边
+                    * pos2（多回边需 3+ 输入，零 deps/ir 改动的代价是统一
+                     * 汇合点：控制流等价，PHI 无涉——本发射器无 SSA phi） */
+                    int k = j->loop_sp - 1;
+                    ir_ref le;
+                    if (j->lb_np[k] > 0) {
+                        ir_ref in[JIT_LB_MAX + 1];
+                        int n = j->lb_np[k];
+                        for (int bi = 0; bi < n; bi++) in[bi] = j->lb_pend[k][bi];
+                        in[n] = ir_END();          /* 体尾回跳区 */
+                        j->lb_np[k] = 0;
+                        ir_MERGE_N((ir_ref)(n + 1), in);
+                        le = ir_LOOP_END();
+                    } else {
+                        le = ir_LOOP_END();
+                    }
+                    ir_MERGE_SET_OP(j->loop_ref[k], 2, le);
                 } else {
                     do { j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
                 }
@@ -1899,6 +1988,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             }
 
             uint32_t join, else_start;
+            if (op->op == OP_JMPNZ && j->loop_sp > 0)
+                j->lb_jmpnz[j->loop_sp - 1] = 1;   /* || 求值标记（挡板因子） */
             if (!find_join(j->fn, pc, T, &join, &else_start))
                 do { j->fail_line = __LINE__; return trap_fail(); } while (0);
 
@@ -1906,12 +1997,27 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
             ir_ref truthy = make_truthy(j, ta, pa, ad);
             int jmp_on_true = (op->op == OP_JMPNZ);
-            ir_ref ifx = ir_IF(jmp_on_true ? ir_NOT_B(truthy) : truthy);
+            /* P0-14 批5: ifx 恒 truthy。JMPNZ（||短路）原 NOT_B 极性反置
+             * 且 tA=END@T 漏 emit 跳转目标体——该路径此前 100% fail 回退
+             * （fail-safe 从未出错码），本次修正为对称两分支：
+             * 真→emit(T..join) 跳转目标体；假→emit(pc+1..) fallthrough */
+            ir_ref ifx = ir_IF(truthy);
 
             ir_IF_TRUE(ifx);
             Trap tA;
             if (jmp_on_true) {
-                tA = trap_end(ir_END(), T);
+                uint32_t st[11]; int ns = nstops + 1;
+                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (nstops) memcpy(st, stops, (size_t)nstops * 4);
+                st[nstops] = join;
+                tA = emit_seq(j, T, st, ns);   /* 真跳目标体 → join */
+                if (tA.kind == TR_FAIL) return tA;
+                if (tA.kind == TR_LOOPBACK) {
+                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    tA = trap_ret();
+                }
+                if (tA.kind == TR_END && tA.target != join)
+                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             } else {
                 uint32_t st[11]; int ns = nstops + 1;
                 if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
@@ -1919,7 +2025,12 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 st[nstops] = T;
                 tA = emit_seq(j, pc + 1, st, ns);
                 if (tA.kind == TR_FAIL) return tA;
-                if (tA.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (tA.kind == TR_LOOPBACK) {
+                    /* P0-14 批5: then 内 continue——分支 END 存 pending，
+                     * 按终端参与既有 RET 合流（ir_END 已闭合本区） */
+                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    tA = trap_ret();
+                }
                 if (tA.kind == TR_END && tA.target != join &&
                     !(else_start && tA.target == else_start))
                     do { j->fail_line = __LINE__; return trap_fail(); } while (0);
@@ -1937,20 +2048,30 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     st[nstops] = join;
                     tB = emit_seq(j, else_start, st, ns);
                     if (tB.kind == TR_FAIL) return tB;
-                    if (tB.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    if (tB.kind == TR_LOOPBACK) {
+                        /* P0-14 批5: else 内 continue——同 tA 转终端 */
+                        if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                        tB = trap_ret();
+                    }
                     if (tB.kind == TR_END && tB.target != join)
                         do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 }
             } else {
-                uint32_t st[11]; int ns = nstops + 1;
+                /* P0-14 批5: JMPNZ 假侧 fallthrough → join（stops 含 T：
+                 * 若中途落 T=else_start 则保守 END@T → 合流 fail 回退） */
+                uint32_t st[12]; int ns = nstops + 2;
                 if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = T;
+                st[nstops + 1] = join;
                 tB = emit_seq(j, pc + 1, st, ns);
                 if (tB.kind == TR_FAIL) return tB;
-                if (tB.kind == TR_LOOPBACK) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (tB.kind == TR_LOOPBACK) {
+                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    tB = trap_ret();
+                }
                 if (tB.kind == TR_END && tB.target != join &&
-                    !(else_start && tB.target == else_start))
+                    !(tB.target == T))
                     do { j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
@@ -1994,7 +2115,14 @@ static void jit_compile_callees(TFunc *fn) {
         TFunc *callee = (TFunc *)op->ic;
         if (!op->ic || ((uintptr_t)op->ic & 1)) continue;
         if (callee == fn) continue;           /* self-recursion: entry already set */
-        if (!callee->jit_entry && callee->hot != UINT16_MAX)
+        /* 批5: 尊重急切/热阈值——绕过阈值连带编译把大 callee 的编译成本
+         * 塞进 caller 首次调用的计时（logstat n_ops=106 被闭包连带编译
+         * +85ms 实测）。阈值不满足→不编→下方 lower_call_finish 的
+         * `!callee->jit_entry → fail` 让 caller 回退解释器（既有兜底）；
+         * callee 被解释器调热(hot≥127)后自然编译，caller 随后可编。 */
+        if (!callee->jit_entry && callee->hot != UINT16_MAX &&
+            (callee->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+             callee->hot >= TPHP_JIT_HOT_THRESHOLD))
             tphp_jit_compile(callee);         /* recursive; lock is re-entry safe
                                                * via the jit_entry check below */
     }

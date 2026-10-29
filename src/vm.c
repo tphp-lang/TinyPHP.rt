@@ -2371,7 +2371,9 @@ run:    ;
                        o->op == OP_SEND_VAR || o->op == OP_DO_FCALL ||
                        o->op == OP_NEW_USER ||
                        o->op == OP_FETCH_PROP || o->op == OP_ASSIGN_PROP ||
-                       o->op == OP_ISSET_PROP || o->op == OP_UNSET_PROP) {
+                       o->op == OP_ISSET_PROP || o->op == OP_UNSET_PROP ||
+                       o->op == OP_FE_RESET || o->op == OP_FE_FETCH ||
+                       o->op == OP_ISSET_DIM) {
                 d = ((OpHandler)o->handler)(vm, o);
             } else {
                 d = 1;               /* 表达式 op：JIT 已求值，跳过 */
