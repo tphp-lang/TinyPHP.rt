@@ -236,6 +236,45 @@ static void tphp_raise_guarded(VM *vm, const char *cls, const char *fmt, ...) {
     memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
 }
 
+/* CONCAT（P0-14 审计最大户）：镜像 op_concat（.= 原地 append 快路由 emit
+ * 传 inplace，编译期判同槽）。快慢路分离（P0-10 教训）：
+ * - 快路 = 两端 ∈ {STR,INT,FLOAT,BOOL,NULL}（tval_to_str 字面量集无
+ *   raise 面）——零 setjmp，覆盖 `$out .=`/`"v".$i` 等 concat 主流；
+ * - 慢路（OBJ/ARR/RES/UNDEF 混入，tostr hook 可 raise）→ 事前 setjmp
+ *   wrapper（binop_slow 同款，每次拼接都付但仅冷形态）。
+ * 1 = 正常，0 = raise landed（IR deopt → 调用侧 RETURN 0 → P0-12 链）。 */
+int tphp_jit_concat(VM *vm, TVal *dst, TVal *a, TVal *b, int inplace) {
+    TVal av = *a, bv = *b;
+    bool fast = (av.t == T_STR || av.t == T_INT || av.t == T_FLOAT ||
+                 av.t == T_TRUE || av.t == T_FALSE || av.t == T_NULL) &&
+                (bv.t == T_STR || bv.t == T_INT || bv.t == T_FLOAT ||
+                 bv.t == T_TRUE || bv.t == T_FALSE || bv.t == T_NULL);
+    if (fast) {
+        if (inplace && av.t == T_STR && bv.t == T_STR &&
+            tstr_append_inplace((TStr *)av.u.p, ((TStr *)bv.u.p)->c,
+                                ((TStr *)bv.u.p)->len))
+            return 1;   /* 同槽原地成功：dst 即 a 槽，值已更新（op_concat 同） */
+        TVal r = tval_concat(av, bv);
+        tval_release(dst);
+        *dst = r;
+        return 1;
+    }
+    {
+        jmp_buf outer, mine;
+        memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+        if (setjmp(mine) == 0) {
+            memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+            TVal r = tval_concat(av, bv);
+            memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+            tval_release(dst);
+            *dst = r;
+            return 1;
+        }
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 0;   /* raise：dst 不动，IR deopt */
+    }
+}
+
 /* ARRAY_APPEND（array literal 元素，P0-1）：镜像 do_dim_write 的
  * append/keyed 两形态——dim_cow + addref val + tarr_set(内部 addref key)。
  * key==NULL 为 append 形态（t2==UNUSED）。base 恒为紧邻 ARRAY_INIT 的数组，
@@ -517,19 +556,20 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
     }
 
     uint32_t recv_seen = 0;
+    const char *rej = NULL;          /* P0-14 审计：拒因（TPHP_JIT_DEBUG） */
     for (uint32_t i = 0; i < fn->n_ops; i++) {
         TOp *op = &fn->ops[i];
         switch (op->op) {
         case OP_RECV:
-            if (i != recv_seen) return false;   /* leading block only */
+            if (i != recv_seen) { rej = "RECV not leading"; goto out; }
             recv_seen++;
-            if (recv_seen > fn->n_params) return false;
+            if (recv_seen > fn->n_params) { rej = "extra RECV"; goto out; }
             break;
         case OP_CONST: {
             TVal v = fn->lits[op->a1];
-            /* T_STR 放行（P0-1 收尾）：array-read/kv-read 的 echo/键串，
+            /* T_STR 放行（P0-1 收尾）：array-read/kv-read 的 echo/键串,
              * lit_str 恒 intern → addref/release 皆 no-op，按值存槽安全 */
-            if (!lit_scalar(v) && v.t != T_STR) return false;
+            if (!lit_scalar(v) && v.t != T_STR) { rej = "CONST non-scalar lit"; goto out; }
             break;
         }
         case OP_COPY: case OP_ASSIGN: case OP_INC: case OP_DEC:
@@ -539,26 +579,26 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         case OP_ASSIGN_DIM:
             /* append 形态（$a[] = $v）+ 带键形态（P0-10，$a[$k] = $v）：
              * base 必为槽；key/val 可为槽或标量/串字面量（emit 物化） */
-            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) return false;
+            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) { rej = "ASSIGN_DIM base/形态"; goto out; }
             if (op->t2 != OPD_UNUSED && op->t2 == OPD_CONST &&
                 !lit_scalar(fn->lits[op->a2]) && fn->lits[op->a2].t != T_STR)
-                return false;
+                { rej = "ASSIGN_DIM key lit"; goto out; }
             if (op->tr == OPD_CONST &&
                 !lit_scalar(fn->lits[op->ar]) && fn->lits[op->ar].t != T_STR)
-                return false;
+                { rej = "ASSIGN_DIM val lit"; goto out; }
             break;
         case OP_FETCH_DIM_R:
-            if (op->t2 == OPD_UNUSED) return false;
+            if (op->t2 == OPD_UNUSED) { rej = "FETCH_DIM_R no key"; goto out; }
             break;
         case OP_CLOSURE_INIT:
-            if (op->a2 != 0) return false;   /* 带捕获不进 v1.1 */
+            if (op->a2 != 0) { rej = "CLOSURE_INIT captured"; goto out; }
             break;
         case OP_INIT_DYN:
             break;
         case OP_CAST: {
-            if (op->t2 != OPD_CONST) return false;
+            if (op->t2 != OPD_CONST) { rej = "CAST non-ct"; goto out; }
             int64_t ct = fn->lits[op->a2].u.i;
-            if (ct != 1 && ct != 2 && ct != 3) return false;  /* int/bool/float */
+            if (ct != 1 && ct != 2 && ct != 3) { rej = "CAST type(int/bool/float only)"; goto out; }
             break;
         }
         case OP_ADD: case OP_SUB: case OP_MUL:
@@ -566,54 +606,76 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE:
         case OP_LT: case OP_LE: case OP_CMP:
             break;
-        case OP_DIV: case OP_MOD: {
-            if (op->t2 != OPD_CONST) return false;
-            TVal d = fn->lits[op->a2];
-            if (d.t == T_INT ? d.u.i == 0 : !(d.t == T_FLOAT && d.u.d != 0.0))
-                return false;
+        case OP_DIV: case OP_MOD:
+            /* 编译器把字面量先物化进槽（trace：CONST; MOD 槽对槽）——t2 恒
+             * 槽，旧 t2==CONST 检查形同虚设地过严（P0-14 审计）。零除由
+             * slow helper raise + P0-12 deopt 兜底，槽形态全放行；仅保留
+             * 字面量除数编译期可判的零（防御万一某路径产 const 形态） */
+            if (op->t2 == OPD_CONST) {
+                TVal d = fn->lits[op->a2];
+                if (d.t == T_INT ? d.u.i == 0 : !(d.t == T_FLOAT && d.u.d != 0.0))
+                    { rej = "DIV by zero ct"; goto out; }
+            }
             break;
-        }
+        case OP_CONCAT:
+            /* 【暂缓放行 10-29】audit 最大户（5/9），helper/emit 已就绪且
+             * 单发/双连形态通过（g1-g5/s1 全绿），但 **LOOP 内 ≥3-4 个
+             * CONCAT CALL 触发 backend 执行错**（IR dump 参数正确、
+             * ir_check=1，第 N 个 call 的 slot 地址参数在执行期变野值——
+             * s2=4连无 MOD 崩、b4=2连过、MOD 独立 s1 过——deps/ir
+             * codegen 层 live-range/栈参数累积 bug 嫌疑，复现式见
+             * memory/2026-10-29，ir_bisect 工具在）。撤回 default 拒，待
+             * 上游排查后重放行 */
+            { rej = "CONCAT (loop multi-call backend bug, held)"; goto out; }
         case OP_SHL: case OP_SHR:
             if (op->t2 != OPD_CONST || fn->lits[op->a2].t != T_INT)
-                return false;
+                { rej = "SHL/SHR non-int ct"; goto out; }
             break;
         case OP_JMP: case OP_JMPZ: case OP_JMPNZ:
         case OP_RETURN:
             break;
         case OP_INIT_FCALL: {
             TFunc *callee = (TFunc *)op->ic;
-            if (!op->ic) return false;
+            if (!op->ic) { rej = "INIT_FCALL unresolved"; goto out; }
             if ((uintptr_t)op->ic & 1)
                 break;   /* builtin (ic|1): folded into tphp_jit_bcall (P0-1) */
             if (callee != fn && !jit_eligible_inner(callee, depth + 1))
-                return false;
+                { rej = "callee ineligible"; goto out; }
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR:
             if (op->t1 == OPD_CONST &&
                 !lit_scalar(fn->lits[op->a1]) && fn->lits[op->a1].t != T_STR)
-                return false;   /* arg_copy stores consts as immediates */
+                { rej = "SEND const lit"; goto out; }
             break;
         case OP_ARRAY_APPEND:
             /* array literal 元素（keyed/append 双形态）：base 必须是槽，
              * key/value 槽位或字面量 */
-            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) return false;
+            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) { rej = "ARRAY_APPEND base/形态"; goto out; }
             if (op->t2 == OPD_CONST &&
                 !lit_scalar(fn->lits[op->a2]) && fn->lits[op->a2].t != T_STR)
-                return false;
+                { rej = "ARRAY_APPEND key lit"; goto out; }
             if (op->tr == OPD_CONST &&
                 !lit_scalar(fn->lits[op->ar]) && fn->lits[op->ar].t != T_STR)
-                return false;
+                { rej = "ARRAY_APPEND val lit"; goto out; }
             break;
         case OP_DO_FCALL:
             break;
         default:
-            return false;
+            rej = tphp_op_name(op->op);   /* 白名单外 opcode（主审计目标） */
+            goto out;
         }
     }
-    if (recv_seen != fn->n_params) return false;
-    if (!jit_cfg_ok(fn)) return false;   /* v1.1 codegen 临时守卫 */
+    if (recv_seen != fn->n_params) { rej = "RECV count mismatch"; goto out; }
+    if (!jit_cfg_ok(fn)) { rej = "cfg guard"; goto out; }   /* v1.1 codegen 临时守卫 */
     return true;
+out:
+    /* P0-14 审计：拒因分布（pc 级）——TPHP_JIT_DEBUG=1 时输出 */
+    if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0]) {
+        fprintf(stderr, "[jit] reject(%s): %s (n_ops=%u)\n",
+                fn->name ? tstr_val(fn->name) : "?", rej ? rej : "?", fn->n_ops);
+    }
+    return false;
 }
 
 bool tphp_jit_eligible(TFunc *fn) {
@@ -1589,6 +1651,31 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_BW_AND: case OP_BW_OR: case OP_BW_XOR:
         case OP_DIV: case OP_MOD: case OP_SHL: case OP_SHR:
             lower_binop(j, op); pc++; break;
+        case OP_CONCAT: {
+            /* P0-14：镜像 op_concat——tphp_jit_concat 快慢路（双 STR/标量
+             * 零 setjmp；OBJ 等冷路 setjmp wrapper），raise → deopt
+             * （P0-12 IF_TRUE RETURN / IF_FALSE 留开姿势） */
+            ir_ref dstA = slot_addr(j, op->ar);
+            ir_ref aA = slot_addr(j, op->a1);
+            ir_ref bA;
+            if (op->t2 == OPD_CONST) {
+                TVal kv = j->fn->lits[op->a2];
+                bA = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+                store_imm(j, bA, (int32_t)kv.t, ir_CONST_I64(kv.u.i));
+            } else {
+                bA = slot_addr(j, op->a2);
+            }
+            int inplace = (op->t1 == op->tr && op->a1 == op->ar) ? 1 : 0;
+            ir_ref t[5] = { j->r_vm, dstA, aA, bA, ir_CONST_I32(inplace) };
+            ir_ref ok = ir_CALL_N(IR_I32,
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_concat), 5, t);
+            ir_ref ifc = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifc);
+                ir_RETURN(ir_CONST_I32(0));
+            ir_IF_FALSE(ifc);
+            pc++;
+            break;
+        }
         case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE:
         case OP_LT: case OP_LE: case OP_CMP:
             lower_cmp(j, op); pc++; break;
