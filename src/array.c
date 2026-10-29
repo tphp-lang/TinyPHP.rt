@@ -250,19 +250,21 @@ TVal *tarr_get(TArr *a, TVal key) {
 }
 
 TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
-    /* key 已由调用方 norm。packed int 键快路同 tarr_get（IC 无意义）。 */
+    /* packed int 键快路同 tarr_get（IC 无意义——IR packed 直取同款）。 */
     if (a->packed && key.t == T_INT) {
         int64_t i = key.u.i;
         return (i >= 0 && (uint32_t)i < a->n) ? &a->data[i] : NULL;
     }
-    /* IC 快路径：验证链（a==arr / a->buckets==bk / 桶 key / val_off 非
-     * tombstone）全部锚定**当前 a** 的真实状态——DimIC 字段的任何非原子
-     * 竞态写（Worker 多线程同 site 装填）最多造成 miss，不会错命中。 */
+    /* IC 多 case 快路径（v3）：共享 arr/bk 层 + cases[] 按序 key 比较——
+     * 全部锚定**当前 a** 的真实状态，任何非原子竞态写最坏 miss 不会错
+     * 命中（写序铁律见 value.h：cases 先于共享 arr/bk）。 */
     if (ic && !a->bpending && a == ic->arr && a->buckets == ic->bk) {
-        ABucket *b = ic->b;
-        if (b->val_off == ic->val_off && b->val_off != UINT32_MAX &&
-            key_eq(b->key, key))
-            return &a->data[b->val_off];
+        for (int i = 0; i < DIM_IC_CASES; i++) {
+            ABucket *b = ic->cases[i];
+            if (b != &ic->dead && b->val_off != UINT32_MAX &&
+                key_eq(b->key, key))
+                return &a->data[b->val_off];
+        }
     }
     ABucket *b = arr_find(a, key, NULL);
     if (!b) {
@@ -270,12 +272,30 @@ TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
         return NULL;
     }
     if (ic && !a->bpending) {
-        ic->arr = a;
-        ic->bk = a->buckets;
-        ic->b = b;
-        ic->val_off = b->val_off;
+        if (ic->arr != a || ic->bk != a->buckets) {
+            /* 数组/桶表变化：先重置 cases 为哨兵（写序：cases 先于
+             * 共享层），再刷共享快照——读侧 L0/L1 是安全门 */
+            for (int i = 0; i < DIM_IC_CASES; i++) ic->cases[i] = &ic->dead;
+            ic->next = 0;
+            ic->arr = a;
+            ic->bk = a->buckets;
+        }
+        ic->cases[ic->next++ & (DIM_IC_CASES - 1)] = b;   /* FIFO 装填 */
     }
     return &a->data[b->val_off];
+}
+
+/* IC 分配后的统一初始化（emit 懒分配与解释器懒分配共用）：哨兵恒非
+ * NULL 是 IR 链"每 case 单 bool 线性递归"的前提 */
+void tphp_dim_ic_init(DimIC *ic) {
+    ic->arr = NULL;
+    ic->bk = NULL;
+    ic->misses = 0;
+    ic->next = 0;
+    ic->dead.key = TV_NULL;
+    ic->dead.val_off = UINT32_MAX;
+    for (int i = 0; i < DIM_IC_CASES; i++)
+        ic->cases[i] = &ic->dead;
 }
 
 bool tarr_has(TArr *a, TVal key) {

@@ -744,6 +744,181 @@ static void store_bool(JitC *j, ir_ref da, ir_ref cond) {
     ir_MERGE_2(eT, eF);
 }
 
+/* ---- P0-13 v2：FETCH_DIM_R 命中路径全内联（JSC Baseline IC 形态）----
+ * 两条互斥快路：packed int 直取（array-read 主形态）/ DimIC hash 快照
+ * （kv-read 主形态）。IC 链序照抄 tarr_get_ic：arr→buckets→bpending→
+ * bp→val_off→key tag→key pay——buckets(ic->bk) 比较先于 bp 解引用，是
+ * 跨线程撕裂写序（arr 先写）下垃圾 bp 的安全门；v1 的语义论证照搬：
+ * 链全锚定 live 数组状态，miss 兜底 helper（norm/raise/装填/absent 防
+ * 陈旧全在其中），raw key≠norm 时链必 miss→helper——内联只赚“预规范化
+ * 形态成立”的热路径。结构 = 逐层 IF + END + MERGE_2（lower_binop 既
+ * 有姿势；LOOP 内 diamond 已由现有 binop/deopt 路径证明可用）。 */
+typedef struct DimIcCtx {
+    JitC *j;
+    ir_ref dst, base, key, ic, a, kt, kp;
+} DimIcCtx;
+
+/* miss：整链落 v1 helper + deopt（线留开供 MERGE；RETURN 线不参与）。
+ * count=true = 进过 IC 链的失败——misses++（generic 回退门计数，锁死
+ * 态与非数组/packed 越界形态不计）。 */
+static void dimic_miss(DimIcCtx *g, bool count) {
+    JitC *j = g->j;
+    JIT_CTX();
+    if (count) {
+        ir_ref ma = ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, misses)));
+        ir_STORE(ma, ir_ADD_I32(ir_LOAD_I32(ma), ir_CONST_I32(1)));
+    }
+    ir_ref t[5] = { g->j->r_vm, g->dst, g->base, g->key, g->ic };
+    ir_ref ok = ir_CALL_N(IR_I32,
+                          ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 5, t);
+    ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifd);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ifd);
+}
+
+/* v3.1 take 全内联（镜像 tval_addref/tval_release 热路径，顺序严格与 C
+ * 一致：**先 addref v 后 release dst**——v 与 dst 可能同对象，先增后减
+ * 防归零）：
+ *   addref: tag∈[T_STR,T_CLOSURE] && !(flags&INTERNED) → rc++；其余 skip
+ *   release: tag∈[T_STR,CLOSURE] && !INTERNED && rc>1 → rc--（color DEAD
+ *     与正常色 rc>1 都是 rc--，正交等价，无需查 color）；标量/interned/
+ *     rc==1（= DEAD rc-- 或 switch destroy 慢路）→ call tval_release 原样
+ *   misses 清零（叶子命中 = 形态稳定）随取值一并生成 */
+static void dimic_take(DimIcCtx *g, ir_ref vaddr) {
+    JitC *j = g->j;
+    JIT_CTX();
+    ir_STORE(ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, misses))),
+             ir_CONST_I32(0));
+    ir_ref vtag = ir_LOAD_I32(ir_ADD_A(vaddr, ir_CONST_ADDR(TVAL_TAG)));
+
+    /* --- addref v --- */
+    ir_ref ifv = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(vtag, ir_CONST_I32(T_STR)), ir_LE(vtag, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifv);
+        ir_ref gcv = ir_LOAD_A(vaddr);
+        ir_ref fv = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcv, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifiv = ir_IF(ir_EQ(ir_AND_I32(fv, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifiv);
+            ir_ref rcv = ir_LOAD_I32(gcv);   /* rc @0 */
+            ir_STORE(gcv, ir_ADD_I32(rcv, ir_CONST_I32(1)));
+            ir_ref eV1 = ir_END();
+        ir_IF_FALSE(ifiv);
+            ir_ref eV0 = ir_END();
+        ir_MERGE_2(eV1, eV0);
+        ir_ref eRefV = ir_END();
+    ir_IF_FALSE(ifv);
+        ir_ref eScV = ir_END();
+    ir_MERGE_2(eRefV, eScV);
+
+    /* --- release dst --- */
+    ir_ref td = ir_LOAD_I32(ir_ADD_A(g->dst, ir_CONST_ADDR(TVAL_TAG)));
+    ir_ref ifd = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(td, ir_CONST_I32(T_STR)), ir_LE(td, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifd);
+        ir_ref gcd = ir_LOAD_A(g->dst);
+        ir_ref fd = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcd, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifid = ir_IF(ir_EQ(ir_AND_I32(fd, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifid);
+            ir_ref rcd = ir_LOAD_I32(gcd);
+            ir_ref ifrc = ir_IF(ir_GT(rcd, ir_CONST_I32(1)));
+            ir_IF_TRUE(ifrc);
+                ir_STORE(gcd, ir_SUB_I32(rcd, ir_CONST_I32(1)));
+                ir_ref eDec = ir_END();
+            ir_IF_FALSE(ifrc);
+                /* rc==1（含 GC DEAD 特例）：慢路原样（destroy/释放链） */
+                ir_ref tr[1] = { g->dst };
+                ir_CALL_N(IR_VOID,
+                          ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+                ir_ref eSlow = ir_END();
+            ir_MERGE_2(eDec, eSlow);
+            ir_ref eD1 = ir_END();
+        ir_IF_FALSE(ifid);
+            ir_ref eD0 = ir_END();   /* interned dst：C 同款 skip */
+        ir_MERGE_2(eD1, eD0);
+        ir_ref eRefD = ir_END();
+    ir_IF_FALSE(ifd);
+        ir_ref eScD = ir_END();
+    ir_MERGE_2(eRefD, eScD);
+
+    /* --- 16B store（pay 先、tag 后） --- */
+    ir_STORE(g->dst, ir_LOAD_I64(vaddr));
+    ir_STORE(ir_ADD_A(g->dst, ir_CONST_ADDR(TVAL_TAG)), vtag);
+}
+
+/* v3 多态链：lvl 0..2 = 共享层（arr/buckets/bpending，失败 = 整链 miss
+ * 计数）；lvl 3..10 = cases[0..7] 按序（哨兵恒非 NULL → 每 case 归一单
+ * bool，T=直接叶子取值、F=下一 case；第 8 case F 才 miss 计数）。结构
+ * 仍是逐层 IF+END+MERGE_2——T/F 只有一个递归分支，线性无膨胀。 */
+static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
+    JitC *j = g->j;
+    JIT_CTX();
+    ir_ref bp = IR_UNUSED;
+    ir_ref cond;
+    switch (lvl) {
+    case 0:
+        cond = ir_EQ(ir_LOAD_A(ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, arr)))), g->a);
+        break;
+    case 1:
+        cond = ir_EQ(ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, buckets)))),
+                     ir_LOAD_A(ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, bk)))));
+        break;
+    case 2:
+        cond = ir_EQ(ir_LOAD_U32(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, bpending)))),
+                     ir_CONST_U32(0));
+        break;
+    default: {
+        int ci = lvl - 3;
+        bp = ir_LOAD_A(ir_ADD_A(g->ic,
+              ir_CONST_ADDR(offsetof(DimIC, cases) + (uintptr_t)ci * sizeof(ABucket *))));
+        ir_ref bkey = ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, key)));
+        /* tag+pay 合并 key 同一性（norm 后 intern 串指针等 / int 值等），
+         * val_off 非 tombstone——全部对 bp 安全解引用（哨兵保证） */
+        cond = ir_AND(IR_BOOL,
+                  ir_AND(IR_BOOL,
+                         ir_EQ(g->kt, ir_LOAD_I32(ir_ADD_A(bkey, ir_CONST_ADDR(TVAL_TAG)))),
+                         ir_EQ(g->kp, ir_LOAD_I64(bkey))),
+                  ir_NE(ir_LOAD_U32(ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off)))),
+                        ir_CONST_U32(0xFFFFFFFFu)));
+        break;
+    }
+    }
+    bool leaf_here = (lvl >= 3);   /* case 条件通过即命中取值 */
+    bool last = (lvl == 3 + DIM_IC_CASES - 1);
+    ir_ref ifx = ir_IF(cond);
+    ir_IF_TRUE(ifx);
+        ir_ref ct;
+        if (leaf_here) {
+            ir_ref voff = ir_LOAD_U32(
+                ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
+            ir_ref data = ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
+            dimic_take(g, ir_ADD_A(data,
+                         ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+            ct = ir_END();
+        } else {
+            ct = dimic_ic_chain(g, lvl + 1);
+        }
+    ir_IF_FALSE(ifx);
+        ir_ref cf;
+        if (leaf_here) {
+            if (last) {          /* 8 case 全败 = 整链失败 → 计数 */
+                dimic_miss(g, true);
+                cf = ir_END();
+            } else {
+                cf = dimic_ic_chain(g, lvl + 1);   /* 下一 case */
+            }
+        } else {
+            dimic_miss(g, true);  /* 共享层失败 = 数组级失效 → 计数 */
+            cf = ir_END();
+        }
+    ir_MERGE_2(ct, cf);
+    return ir_END();
+}
+
 static void lower_binop(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
@@ -1318,21 +1493,71 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             } else {
                 key_addr = slot_addr(j, op->a2);
             }
-            /* P0-13：per-site IC（编译时刻懒分配，emit 在编译线程单次执行） */
+            /* P0-13：per-site IC（编译时刻懒分配，emit 在编译线程单次
+             * 执行；v3 统一初始化——共享快照+cases 哨兵恒非 NULL） */
             if (!op->ic) {
                 op->ic = tm_malloc(sizeof(DimIC));
-                ((DimIC *)op->ic)->arr = NULL;
+                tphp_dim_ic_init(op->ic);
             }
-            ir_ref t[5] = { j->r_vm, slot_addr(j, op->ar),
-                            slot_addr(j, op->a1), key_addr,
-                            ir_CONST_ADDR((uintptr_t)op->ic) };
-            ir_ref ok = ir_CALL_N(IR_I32,
-                                  ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 5, t);
-            /* raise → 0：deopt（P0-12，IF_TRUE RETURN / IF_FALSE 留开） */
-            ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
-            ir_IF_TRUE(ifd);
-                ir_RETURN(ir_CONST_I32(0));
-            ir_IF_FALSE(ifd);
+            /* P0-13 v2：命中路径全内联（packed 直取 / DimIC 链），miss/
+             * 非数组/raise 全落 v1 helper+deopt——对外语义与 v1 单 call
+             * 完全一致，仅热路径消掉 call 框架与 TVal 拷贝。 */
+            DimIcCtx g;
+            g.j = j;
+            g.dst = slot_addr(j, op->ar);
+            g.base = slot_addr(j, op->a1);
+            g.key = key_addr;
+            g.ic = ir_CONST_ADDR((uintptr_t)op->ic);
+            g.a = g.kt = g.kp = IR_UNUSED;
+            g.kt = load_tag(j, g.key);
+            g.kp = load_pay(j, g.key);
+            ir_ref ifa = ir_IF(ir_EQ(load_tag(j, g.base), ir_CONST_I32(T_ARR)));
+            ir_IF_TRUE(ifa);
+                g.a = load_pay(j, g.base);
+                /* 互斥键路径：packed int 直取 vs hash 快照 */
+                ir_ref pcond = ir_AND(IR_BOOL,
+                    ir_NE(ir_LOAD_U8(ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, packed)))),
+                          ir_CONST_U8(0)),
+                    ir_EQ(g.kt, ir_CONST_I32(JT_INT)));
+                ir_ref ifp = ir_IF(pcond);
+                ir_IF_TRUE(ifp);
+                    /* (u64)key < (u64)n 单条无符号比较：天然覆盖 i<0
+                     * （负数 = 巨大无符号）与 i>=n，与 helper 的
+                     * i>=0 && (uint32)i<n 等价 */
+                    ir_ref n64 = ir_ZEXT(IR_U64,
+                        ir_LOAD_U32(ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, n)))));
+                    ir_ref ifb = ir_IF(ir_ULT(ir_BITCAST_U64(g.kp), n64));
+                    ir_IF_TRUE(ifb);
+                        ir_ref data = ir_LOAD_A(
+                            ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, data))));
+                        dimic_take(&g, ir_ADD_A(data,
+                            ir_SHL_U64(ir_BITCAST_U64(g.kp), ir_CONST_U64(4))));
+                        ir_ref eP1 = ir_END();
+                    ir_IF_FALSE(ifb);
+                        dimic_miss(&g, false);   /* packed 越界非 IC 键形态 */
+                        ir_ref eP0 = ir_END();
+                    ir_MERGE_2(eP1, eP0);
+                    ir_ref ePack = ir_END();
+                ir_IF_FALSE(ifp);
+                    /* generic 回退门（JSC 同款）：单态假设破灭的 site
+                     * （轮转键/形态翻转）≥8 次链失败 → 跳链直 call
+                     * helper（v1 成本），不再付失败链 */
+                    ir_ref mc = ir_LOAD_I32(
+                        ir_ADD_A(g.ic, ir_CONST_ADDR(offsetof(DimIC, misses))));
+                    ir_ref ifg = ir_IF(ir_LT(mc, ir_CONST_I32(8)));
+                    ir_IF_TRUE(ifg);
+                        ir_ref eChain = dimic_ic_chain(&g, 0);
+                    ir_IF_FALSE(ifg);
+                        dimic_miss(&g, false);   /* 锁死态不计数 */
+                        ir_ref eLocked = ir_END();
+                    ir_MERGE_2(eChain, eLocked);
+                    ir_ref eIc = ir_END();
+                ir_MERGE_2(ePack, eIc);
+                ir_ref ct = ir_END();
+            ir_IF_FALSE(ifa);
+                dimic_miss(&g, false);   /* 非数组 TypeError 走 helper 语义 */
+                ir_ref cf = ir_END();
+            ir_MERGE_2(ct, cf);   /* 主尾活线，emit_seq 继续 */
             pc++;
             break;
         }

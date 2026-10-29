@@ -319,15 +319,36 @@ TVal *tarr_get(TArr *a, TVal key);                 /* NULL when absent */
 /* P0-13 per-site dim read IC（PLAN/jsc-lessons §2）：key 必须**已 norm**。
  * 命中 = 当前数组与快照 arr/bk 一致 + 桶 key 匹配 + val_off 一致且非
  * tombstone → 直取 data（跳过 hash/探测/串比较）。miss 走 arr_find 并
- * 回填快照；absent 时置空 ic->arr 防陈旧。ic 传 NULL = 普通 get。 */
+ * 回填快照；absent 时置空 ic->arr 防陈旧。ic 传 NULL = 普通 get。
+ *
+ * v3 多态 N-case 链（2026-10-29，jsc §2"多态 ≤N case 链式分发"）：
+ * 单槽对轮转键（kv 的 8-key 循环）必然锁死——共享数组级快照 arr/bk +
+ * cases[8] 个 key case（FIFO 装填），IR 按序比 case 直取。
+ * - **空槽哨兵**：cases[i].b 恒非 NULL（空槽 = &ic->dead，其 val_off=
+ *   UINT32_MAX 恒拦）→ 每 case 归一为单 bool 比较，IR 线性递归无两
+ *   入口膨胀；key 比较对哨兵解引用安全（dead.key 初始化 TV_NULL）。
+ * - **写序铁律：cases（重置为哨兵/新 b）先于共享 arr/bk**——读侧
+ *   L0/L1（arr/bk 比较）是安全门，看到新共享值 ⇒ cases 已安全；指针
+ *   对齐单指令写原子，撕裂最坏 miss 不错命中。
+ * - 多线程 next/cases 竞态最坏重复装填或脏 slot——验证链全值比较兜底。
+ */
+#define DIM_IC_CASES 8   /* power of two */
 typedef struct DimIC {
-    TArr    *arr;      /* 快照：容器指针（仅值比较，从不解引用——数组
+    TArr    *arr;      /* 共享快照：容器指针（仅值比较，从不解引用——数组
                           释放后指针可作值比较，mimalloc 非移动 GC） */
-    ABucket *bk;       /* 快照：桶表基址（rehash/扩容/惰性重建即失效） */
-    ABucket *b;        /* 快照：命中桶直指针（= bk+boff，免 IR 乘法寻址） */
-    uint32_t val_off;  /* 快照：命中 data 下标（tombstone UINT32_MAX 必不匹配） */
+    ABucket *bk;       /* 共享快照：桶表基址（rehash/扩容/惰性重建即失效） */
+    uint32_t misses;   /* v2：内联链失败累计（P0-13 generic 回退门，JSC
+                          同款）——IR 链失败 ++，仅 IR 叶子命中清零（helper
+                          回填不清，防轮转键 site 被反复解锁）；≥8 = 该
+                          site 单态假设破灭，IR 跳链直 call helper（v1 成
+                          本），永久锁死——JSC 失败计数超限永久 generic 同
+                          思想。非原子竞态最坏计数漂移，只影响何时回退 */
+    uint32_t next;     /* FIFO 装填游标（next & (DIM_IC_CASES-1)） */
+    ABucket *cases[DIM_IC_CASES];  /* key case 快照（&dead = 空槽） */
+    ABucket  dead;     /* 空槽哨兵：val_off=UINT32_MAX 恒拦任何 key */
 } DimIC;
 TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic);
+void  tphp_dim_ic_init(DimIC *ic);   /* 懒分配后统一初始化（含哨兵） */
 /* 惰性桶同步：bpending>0 时从 data[0..n) 全量重建 buckets（键全 int）；
  * 否则 no-op。所有直接遍历/写入 a->buckets 的代码入口必须先调用。 */
 void  tarr_sync_buckets(TArr *a);

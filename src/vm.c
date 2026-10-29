@@ -638,7 +638,7 @@ static int32_t op_fetch_dim_r(VM *vm, TOp *op) {
         DimIC *ic = (DimIC *)op->ic;
         if (!ic) {
             op->ic = ic = tm_malloc(sizeof(DimIC));
-            ic->arr = NULL;
+            tphp_dim_ic_init(ic);   /* P0-13 v3：共享快照+cases+哨兵 */
         }
         TVal *v = tarr_get_ic(a, key, ic);
         if (!v) fatal_missing_key(vm, op, key);
