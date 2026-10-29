@@ -463,12 +463,30 @@ int tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
     TVal clo = *clo_slot;
     if (clo.t == T_CLOSURE) {
         TClosure *c = (TClosure *)clo.u.p;
-        if (c->fn && !c->bfn && c->n_cap == 0 && c->fn->jit_entry) {
-            if (tphp_jit_call(vm, c->fn, args_in, ret))
-                return 1;
-            if (vm->x.exception)
-                return 0;          /* callee deopt：传播，禁重跑 */
-            /* !entry / 栈溢出：callee 未执行，fallback 安全 */
+        /* P0-15 C：合并 call_dyn→tphp_jit_call 两层 C 帧；entry 查表提前；
+         * 补 n==nparams 防越界（原版直接拷 nparams 个，n<nparams 读越界）。 */
+        if (c->fn && !c->bfn && c->n_cap == 0) {
+            JitEntry e = (JitEntry)c->fn->jit_entry;
+            if (e) {
+                uint32_t nparams = c->fn->n_params;
+                uint32_t nslots = (uint32_t)c->fn->n_locals + c->fn->n_tmps;
+                enum { JSIZE = 2048 };
+                static _Thread_local TVal g_jstack[JSIZE];
+                static _Thread_local uint32_t g_jsp;
+                if (nparams == (uint32_t)n && g_jsp + nslots <= JSIZE) {
+                    TVal *slots = &g_jstack[g_jsp];
+                    g_jsp += nslots;
+                    for (uint32_t i = 0; i < nparams; i++)
+                        slots[i] = args_in[i];
+                    for (uint32_t i = nparams; i < nslots; i++)
+                        slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                    int ok = e(vm, slots, ret);
+                    g_jsp -= nslots;
+                    if (ok) return 1;
+                    if (vm->x.exception)
+                        return 0;
+                }
+            }
         }
     }
     *ret = tphp_vm_call_callable(vm, clo, args_in, n);
@@ -756,6 +774,7 @@ typedef struct {
     /* pre-allocated call scratch (entry-block ALLOCA — loop-body ALLOCA
      * stacks up under O1 and overflows after ~5k iterations) */
     ir_ref r_call_args;         /* argv buffer, 9 * TVAL_SZ */
+    ir_ref r_call_slots;        /* P0-15 B dyn direct-call slots, 64 * TVAL_SZ */
     ir_ref r_call_clo;          /* closure TVal scratch */
     ir_ref r_call_ret;          /* return TVal scratch */
 } JitC;
@@ -1394,13 +1413,60 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_pay(j, clo_sc, load_pay(j, ca));
         store_tag(j, clo_sc, load_tag(j, ca));
         ir_ref ret_sc = j->r_call_ret;
-        ir_ref t[5] = { j->r_vm, clo_sc, args_arr, ir_CONST_I32((int32_t)argc), ret_sc };
-        ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t);
-        /* callee deopt → 同步传播（RETURN 0，IF_FALSE 留开继续） */
+        /* P0-15 B: closure direct-call fast path (bug1 fix: LOAD_A(clo_sc)
+         * not double-deref; bug2 fix: is_method excluded). */
+        ir_ref slow[7]; uint32_t nslow = 0;
+        ir_ref if1 = ir_IF(ir_NE(load_tag(j, clo_sc), ir_CONST_I32(T_CLOSURE)));
+        ir_IF_TRUE(if1); slow[nslow++] = ir_END(); ir_IF_FALSE(if1);
+        ir_ref c = ir_LOAD_A(clo_sc);
+        ir_ref if2 = ir_IF(ir_NE(ir_LOAD_I64(ir_ADD_A(c,
+            ir_CONST_ADDR(offsetof(TClosure, bfn)))), ir_CONST_I64(0)));
+        ir_IF_TRUE(if2); slow[nslow++] = ir_END(); ir_IF_FALSE(if2);
+        ir_ref fn = ir_LOAD_A(ir_ADD_A(c, ir_CONST_ADDR(offsetof(TClosure, fn))));
+        ir_ref if3 = ir_IF(ir_EQ(fn, ir_CONST_I64(0)));
+        ir_IF_TRUE(if3); slow[nslow++] = ir_END(); ir_IF_FALSE(if3);
+        ir_ref if4 = ir_IF(ir_NE(ir_LOAD_U16(ir_ADD_A(c,
+            ir_CONST_ADDR(offsetof(TClosure, n_cap)))), ir_CONST_I32(0)));
+        ir_IF_TRUE(if4); slow[nslow++] = ir_END(); ir_IF_FALSE(if4);
+        ir_ref entry = ir_LOAD_I64(ir_ADD_A(fn,
+            ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
+        ir_ref if5 = ir_IF(ir_EQ(entry, ir_CONST_I64(0)));
+        ir_IF_TRUE(if5); slow[nslow++] = ir_END(); ir_IF_FALSE(if5);
+        ir_ref nsl = ir_ADD(IR_I32,
+            ir_ZEXT(IR_I32, ir_LOAD_U16(ir_ADD_A(fn,
+                ir_CONST_ADDR(offsetof(TFunc, n_locals))))),
+            ir_ZEXT(IR_I32, ir_LOAD_U16(ir_ADD_A(fn,
+                ir_CONST_ADDR(offsetof(TFunc, n_tmps))))));
+        ir_ref if6 = ir_IF(ir_GT(nsl, ir_CONST_I32(64)));
+        ir_IF_TRUE(if6); slow[nslow++] = ir_END(); ir_IF_FALSE(if6);
+        ir_ref if7 = ir_IF(ir_NE(ir_LOAD_U8(ir_ADD_A(fn,
+            ir_CONST_ADDR(offsetof(TFunc, is_method)))), ir_CONST_I32(0)));
+        ir_IF_TRUE(if7); slow[nslow++] = ir_END(); ir_IF_FALSE(if7);
+        ir_ref slots = j->r_call_slots;
+        for (uint32_t k = 0; k < argc; k++) {
+            ir_ref sa = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+            ir_ref d = ir_ADD_A(slots, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+            store_pay(j, d, ir_LOAD_I64(sa));
+            store_tag(j, d, ir_LOAD_I32(ir_ADD_A(sa, ir_CONST_ADDR(TVAL_TAG))));
+        }
+        ir_ref dir_t[3] = { j->r_vm, slots, ret_sc };
+        ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
         ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
         ir_IF_TRUE(ifd);
             ir_RETURN(ir_CONST_I32(0));
         ir_IF_FALSE(ifd);
+        ir_ref efast = ir_END();
+        ir_MERGE_N((ir_ref)nslow, slow);
+        ir_ref t5[5] = { j->r_vm, clo_sc, args_arr,
+                         ir_CONST_I32((int32_t)argc), ret_sc };
+        ir_ref ok2 = ir_CALL_N(IR_I32,
+                               ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t5);
+        ir_ref ifd2 = ir_IF(ir_EQ(ok2, ir_CONST_I32(0)));
+        ir_IF_TRUE(ifd2);
+            ir_RETURN(ir_CONST_I32(0));
+        ir_IF_FALSE(ifd2);
+        ir_ref eslow = ir_END();
+        ir_MERGE_2(eslow, efast);
         if (doop->tr != OPD_UNUSED) {
             ir_ref da = slot_addr(j, doop->ar);
             store_pay(j, da, ir_LOAD_I64(ret_sc));
@@ -1415,6 +1481,10 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * 否则运行时 call_slots 返 0 读垃圾 ret（修复既有隐患，compile_callees
      * 只尝试不保证成功）。self 递归跳过（执行时自身 entry 必已设）。 */
     if (callee != j->fn && !callee->jit_entry) { j->fail = 1; return; }
+    /* P0-15 bug3：静态方法 TFunc（批2-2 解禁后带 jit_entry）帧布局不同
+     * （$this slot0 / 参数从 slot1，poff=1）——直调用函数布局参数错位。
+     * 保守回退解释器（与批2-2 前行为一致），方法直调布局留批3-3。 */
+    if (callee->is_method) { j->fail = 1; return; }
 
     /* v1.2 direct-slot call: pre-allocated entry-block scratch, write params
      * in place, call entry via runtime lookup — no TLS, no loop ALLOCA.
@@ -1436,12 +1506,25 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         arg_copy(j, d, k);
     }
     ir_ref ret_sc = j->r_call_ret;
-    /* tphp_jit_call_slots: runtime lookup of jit_entry (recursion-safe) */
-    ir_ref call_t[4] = { j->r_vm, ir_CONST_ADDR((uintptr_t)callee),
-                         slots_sc, ret_sc };
-    ir_ref ok = ir_CALL_N(IR_I32,
-                          ir_CONST_ADDR((uintptr_t)tphp_jit_call_slots),
-                          4, call_t);
+    /* P0-15 A: static direct call - runtime entry load + indirect CALL;
+     * INT contract per-param IF chain, failure -> RETURN 0 (same semantics
+     * as call_slots returning 0: callee not executed, caller deopts). */
+    ir_ref entry = ir_LOAD_I64(ir_ADD_A(ir_CONST_ADDR((uintptr_t)callee),
+                                        ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
+    ir_ref ife = ir_IF(ir_EQ(entry, ir_CONST_I64(0)));
+    ir_IF_TRUE(ife);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ife);
+    for (uint32_t k = 0; k < argc; k++) {
+        ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        ir_ref tg = ir_LOAD_I32(ir_ADD_A(a, ir_CONST_ADDR(TVAL_TAG)));
+        ir_ref ift = ir_IF(ir_NE(tg, ir_CONST_I32(T_INT)));
+        ir_IF_TRUE(ift);
+            ir_RETURN(ir_CONST_I32(0));
+        ir_IF_FALSE(ift);
+    }
+    ir_ref dir_t[3] = { j->r_vm, slots_sc, ret_sc };
+    ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
     /* callee deopt（内含 raise，exception 已设）→ caller 同样立即 RETURN 0
      * 沿 JIT→JIT 链逐层传播，直到解释器 op_do_fcall C 帧 longjmp（不跨 IR）。
      * ok==0 仅此一种可达：entry-NULL 已在上面拒绝，g_jsp 溢出只在
@@ -2159,12 +2242,20 @@ void tphp_jit_compile(TFunc *fn) {
     j.r_vm = ir_PARAM(IR_ADDR, "vm", 1);
     j.r_slots = ir_PARAM(IR_ADDR, "slots", 2);
     j.r_ret = ir_PARAM(IR_ADDR, "ret", 3);
+    /* P0-15 B: callee fills locals+tmps with UNDEF (n_locals INCLUDES
+     * params: slots=[0..n_locals) CVs, [n_locals..+n_tmps) tmps). */
+    for (uint32_t k = fn->n_locals;
+         k < (uint32_t)fn->n_locals + fn->n_tmps; k++) {
+        ir_ref d = ir_ADD_A(j.r_slots, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        store_imm(&j, d, (int32_t)T_UNDEF, ir_CONST_I64(0));
+    }
 
     /* entry-block call scratch: one ALLOCA per function, reused by every
      * call site (loop-body ALLOCA stacks up under O1 → overflow ~5k iters) */
     j.r_call_args = ir_ALLOCA(ir_CONST_I64(9 * TVAL_SZ));
     j.r_call_clo  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
     j.r_call_ret  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+    j.r_call_slots = ir_ALLOCA(ir_CONST_I64(64 * TVAL_SZ));
 
     uint32_t pc0 = 0;
     while (pc0 < fn->n_ops && fn->ops[pc0].op == OP_RECV) pc0++;

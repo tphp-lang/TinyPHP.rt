@@ -18,6 +18,13 @@
 - LLInt threaded dispatch（`jmp [opcodeMap+opcode]`）佐证 P2-16 全宏化方向正确。实施批次：批1 IC+profile→M2 收口；批2 object IC；批3 OSR→M3。
 - **P0-13 v1 已落地（10-28）**：`DimIC{arr,bk,boff,val_off}` 挂 TOp.ic（DIM 类空闲字段），解释器+JIT helper 双路，kv-read -14%/array-read -8% 无回退 224 绿；未达 2× 带——剩余=helper 调用框架，v2=IC 命中路径内联进 IR（详见 jsc-lessons §2）。教训：JIT 白名单无 CONCAT/OP_CAST(str)，探针形态必须字面量数组构建。
 
+## 2026-10-29 晚 P0-15 call 特化 v1（A/C/B 全落地，227/229）
+
+- **A 静态直调**（entry load + 间接 ir_CALL 消 call_slots C 帧）、**C call_dyn 帧合并**（+n==nparams 防越界）、**B 闭包直调 FAST**（7 层检查链 → MERGE_N 慢块 → MERGE_2 合流读 ret_sc；entry 块 64-slot scratch；callee prologue 自填）。
+- **bug 三连教训**：①ir_LOAD_A(load_pay())=双重解引用（load 值不能再当地址 load）；②**is_method TFunc 布局不同**（$this slot0/参数 slot1，批2-2 解禁后静态方法带 jit_entry）——dyn FAST 与 static 直调双侧都必须排除/特判；③**TFunc.n_locals 含参数**（slots=[0..n_locals) CV、[n_locals..+n_tmps) tmps）——prologue 自填起点=n_locals。
+- 实测：call -9%、kv-read -25%、array-read -28%、object -22%；遗留 test-fe-jit-001/test-loopcfg-jit-001 与 B FAST 交互 2 失败（fe_kv_sum kv-foreach，下轮定位）。
+- 新铁律：ir_ZEXT 提升窄 load 后才能进宽算术；循环内 call-site ALLOCA 栈累积（必须 entry 块 scratch）；大 hunk 回退宁整文件回 HEAD。
+
 ## 交接入口（2026-10-25）PLAN/backlog.md = 下一步任务清单（零上下文 AI 可直接接手）：现状快照 + 工作协议红线 + P0 性能（JIT v1.1 白名单扩容打 7× 几何均值→M2）+ P1 功能 + P2 工程 + 工具速查。perf 手动对比 = Actions→Perf workflow。
 
 ## 2026-10-15 OOP 审计修复（P0+P1 全闭环，116/116）
