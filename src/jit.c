@@ -618,15 +618,12 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             }
             break;
         case OP_CONCAT:
-            /* 【暂缓放行 10-29】audit 最大户（5/9），helper/emit 已就绪且
-             * 单发/双连形态通过（g1-g5/s1 全绿），但 **LOOP 内 ≥3-4 个
-             * CONCAT CALL 触发 backend 执行错**（IR dump 参数正确、
-             * ir_check=1，第 N 个 call 的 slot 地址参数在执行期变野值——
-             * s2=4连无 MOD 崩、b4=2连过、MOD 独立 s1 过——deps/ir
-             * codegen 层 live-range/栈参数累积 bug 嫌疑，复现式见
-             * memory/2026-10-29，ir_bisect 工具在）。撤回 default 拒，待
-             * 上游排查后重放行 */
-            { rej = "CONCAT (loop multi-call backend bug, held)"; goto out; }
+            /* P0-14：任意形态放行（helper 快慢路 + raise→deopt 已覆盖）。
+             * 历史 LOOP 多连崩 = deps/ir call 实参装载乱序（MEM/CONST->
+             * REG 装载晚于 REG->REG 洗牌，dst==src 同值实参读到未物化
+             * 寄存器），已在 ir_emit_{x86,aarch64}(.dasc+生成头) 三 pass
+             * 调序修复，复现 tmp-s2 → tests/lang/test-concat-loop-001.php */
+            break;
         case OP_SHL: case OP_SHR:
             if (op->t2 != OPD_CONST || fn->lits[op->a2].t != T_INT)
                 { rej = "SHL/SHR non-int ct"; goto out; }
@@ -1913,7 +1910,7 @@ void tphp_jit_compile(TFunc *fn) {
          * ir_sccp_transform treats tail slots of 7-arg CALL as real insns
          * and zeros an operand → codegen crash on chain TMP-ADD). See
          * tools/ir_bisect.c repro; restore O2 after upstream fix. */
-        entry = ir_jit_compile(ctx, 1, &size);
+        entry = ir_jit_compile(ctx, 1, &size);   /* O1 */
         if (jit_dbg())
             fprintf(stderr, "[jit] compile(%s) entry=%p size=%zu\n",
                     fn->name ? tstr_val(fn->name) : "?", entry, size);
@@ -1942,3 +1939,4 @@ void tphp_jit_init(void) {}
 void tphp_jit_compile(TFunc *fn) { fn->hot = UINT16_MAX; }
 
 #endif
+

@@ -1,7 +1,7 @@
 # PLAN/jsc-lessons.md · JSC JIT 借鉴与准入策略升级规格
 
 > 状态：2026-10-28 立项（用户拍板："先记录、有帮助的先搬过来、以后慢慢完成——v0.0.2 不用担心"）。
-> 分析对象 = 本机 `C:\Users\kllxs\Desktop\JavaScriptCore-7611.3.10.1.3`（完整 WebKit/Safari 17.x JSC 源码树，jit/ 120 文件）。
+> 分析对象 = 本机 `C:\Users\28249\Desktop\JavaScriptCore-7611.3.10.1.3`（完整 WebKit/Safari 17.x JSC 源码树，jit/ 120 文件）。
 > 定位：**模式级借鉴，代码不可搬**——值布局（NaN-boxing/Butterfly）、并发 GC、C++/asm 工具链全不同；搬的是分层策略与四机制设计。任务账：backlog P0-13 / P0-14 / P1-12 / P2-13（防双账，细节只在本文件）。
 > 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)。JIT 规格：[ir-jit](ir-jit.md)。
 

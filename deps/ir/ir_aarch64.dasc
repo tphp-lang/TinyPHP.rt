@@ -6448,13 +6448,12 @@ static int32_t ir_emit_arguments(ir_ctx *ctx, ir_ref def, ir_insn *insn, const i
 		}
 	}
 
-	/* 2. move all arguments that should be passed from one register to another (REG->REG movs) */
-	if (count) {
-		ir_parallel_copy(ctx, copies, count, tmp_reg, tmp_fp_reg);
-	}
-	ir_mem_free(copies);
-
-	/* 3. move the remaining memory and immediate values */
+	/* 2. move the remaining memory and immediate values BEFORE the REG->REG
+	 *    shuffle: a REG->REG copy may read a register that these MEM/CONST
+	 *    loads materialize (the same value passed in two arguments, e.g.
+	 *    dst==src of an in-place concat), so loads must execute first.
+	 *    Load targets cannot clash with other copies' sources: linear scan
+	 *    reserves every arg reg by a fixed range at the call's load pos. */
 	if (do_pass3) {
 		stack_offset = 0;
 		int_param = 0;
@@ -6544,6 +6543,12 @@ static int32_t ir_emit_arguments(ir_ctx *ctx, ir_ref def, ir_insn *insn, const i
 			}
 		}
 	}
+
+	/* 3. move all arguments that should be passed from one register to another (REG->REG movs) */
+	if (count) {
+		ir_parallel_copy(ctx, copies, count, tmp_reg, tmp_fp_reg);
+	}
+	ir_mem_free(copies);
 	return used_stack;
 }
 
