@@ -56,3 +56,38 @@ function new_no_ctor() {
     return 3;
 }
 echo new_no_ctor(), "\n";
+
+// ---- 批2-2：prop 单 op pad 执行（FETCH/ASSIGN/ISSET/UNSET_PROP）----
+class Pd {
+    public $v;
+    public $w;   // tphp 语义：未声明属性无 __set 时赋值静默丢弃（非 PHP 动态创建）
+    function __construct($v) { $this->v = $v; }
+}
+// EXPECT: 6|yes|gone
+function prop_rw($n) {
+    $o = new Pd($n);
+    $o->w = $o->v + 3;
+    $a = $o->w;
+    $k = isset($o->w) ? "yes" : "no";
+    unset($o->w);
+    $g = isset($o->w) ? "y" : "gone";
+    unset($o);
+    return $a . "|" . $k . "|" . $g;
+}
+echo prop_rw(3), "\n";
+
+class Mg {
+    public $a = 1;
+    function __get($n) { return "get:" . $n; }
+    function __set($n, $v) { $this->a = 9; }
+}
+// EXPECT: get:zz|9
+function magic_rw() {
+    $o = new Mg();
+    $x = $o->zz;      // 未声明 → __get（magic 走真 handler，回放内同步跑）
+    $o->zz = "v";     // 未声明 → __set（把 a 置 9）
+    $y = $o->a;
+    unset($o);
+    return $x . "|" . $y;
+}
+echo magic_rw(), "\n";

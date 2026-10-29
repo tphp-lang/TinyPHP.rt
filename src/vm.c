@@ -1670,13 +1670,19 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
              * are INT and copy args→slots before calling (JIT→JIT callers
              * already did this in their lowering). Guard-fail → deopt. */
             TVal *args = &vm->x.args[rec->args_base];
+            /* 方法帧 $this@slot0、参数从 1..（compile.c get_var("this")，
+             * RECV 目标 CV=1..）——旧版直写 slots[0..n_params) 覆盖 $this
+             * 且漏搬首参（潜伏；批2-2 prop 准入后 get/add 获 jit_entry
+             * 实测暴露）。JIT→JIT 静态调用到不了方法（INIT_FCALL 不解析
+             * 方法），本路径=方法进 JIT 的唯一入口。 */
+            uint32_t poff = rec->is_method ? 1 : 0;
             bool guard_ok = true;
             for (uint16_t i = 0; i < fn->n_params; i++) {
                 if (args[i].t != T_INT) { guard_ok = false; break; }
             }
             if (guard_ok) {
                 for (uint16_t i = 0; i < fn->n_params; i++)
-                    f->slots[i] = args[i];
+                    f->slots[poff + i] = args[i];
                 /* locals beyond params: frame alloc already UNDEF */
                 TVal jret = { .u.i = 0, .t = T_NULL };
                 int jok = ((JitEntry)fn->jit_entry)(vm, f->slots, &jret);
@@ -2363,7 +2369,9 @@ run:    ;
                 d = init_mcall_core(vm, o, *recv_sc, mname);
             } else if (o->op == OP_INIT_NEW || o->op == OP_SEND_VAL ||
                        o->op == OP_SEND_VAR || o->op == OP_DO_FCALL ||
-                       o->op == OP_NEW_USER) {
+                       o->op == OP_NEW_USER ||
+                       o->op == OP_FETCH_PROP || o->op == OP_ASSIGN_PROP ||
+                       o->op == OP_ISSET_PROP || o->op == OP_UNSET_PROP) {
                 d = ((OpHandler)o->handler)(vm, o);
             } else {
                 d = 1;               /* 表达式 op：JIT 已求值，跳过 */

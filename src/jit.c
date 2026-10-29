@@ -529,10 +529,14 @@ static bool jit_cfg_ok(TFunc *fn) {
 
 static bool jit_eligible_inner(TFunc *fn, int depth) {
     if (depth > 16) return false;
-    if (!fn || fn->is_main || fn->is_method ||
+    if (!fn || fn->is_main ||
         fn->is_variadic || fn->is_generator || fn->n_ex > 0 ||
         fn->n_cap > 0 || fn->n_params > 8)
-        return false;   /* is_closure 允许（v1.1）：n_cap>0 已在上一行拒绝 */
+        return false;   /* is_closure 允许（v1.1）：n_cap>0 已在上一行拒绝。
+                         * is_method 批2-2 解禁：$this@slot0/参数 1.. 布局由
+                         * op_do_fcall 直入 poff 承接（vm.c）——方法进 JIT
+                         * 唯一入口就是该直入（INIT_FCALL 不解析方法，JIT→JIT
+                         * 到不了方法体），旧禁令=该布局债的另一半 */
     if (fn->param_types) {
         for (uint16_t i = 0; i < fn->n_params; i++)
             if (fn->param_types[i]) return false;
@@ -665,6 +669,10 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
              * （= 不编译，回退解释器，语义安全） */
             break;
         case OP_UNSET_CV:
+            break;
+        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        case OP_ISSET_PROP: case OP_UNSET_PROP:
+            /* P0-14 批2-2：prop 单 op pad 执行（emit 见 lower_replay） */
             break;
         default:
             rej = tphp_op_name(op->op);   /* 白名单外 opcode（主审计目标） */
@@ -1186,10 +1194,57 @@ static void lower_un(JitC *j, TOp *op) {
     }
 }
 
-static void lower_incdec(JitC *j, TOp *op) {
+/* INC/DEC suffix 的 dst 写（do_incdec res=old 镜像）：UNDEF→NULL 归一 +
+ * 非标量 addref——tv_copy 不做 UNDEF→NULL，故独立小件。仅慢形态被调
+ * （标量走 IR 直存，热路径 $i++ 零调用——批2-2 实测 tv_copy 每迭代
+ *  一次使 array-read +33%、kv +9%，标量直存后归零）。 */
+static void tphp_jit_inc_olddst(TVal *dst, TVal *src) {
+    TVal old = src->t == T_UNDEF ? TV_NULL : *src;
+    tval_addref(old);
+    tval_release(dst);
+    *dst = old;
+}
+
+/* 死 dst 检测（保守）：dst 槽在全函数（除本 op）零提及 → 不可能被读 →
+ * 跳过写。for 的 $i++ 经 tmp_dst 恒建 o3 tmp 但从不读，每迭代白付
+ * tag/payload 双载+分支+双存（array-read +14%、kv +1.3ms 实测）。
+ * 正确性只依赖"零提及=不可读"：任何提及（含他 op 写复用同槽）都保留
+ * 写 → 仅省略确定死的写。 */
+static bool dst_slot_unused(TFunc *fn, uint32_t skip_pc, uint8_t kind, uint32_t slot) {
+    for (uint32_t i = 0; i < fn->n_ops; i++) {
+        if (i == skip_pc) continue;
+        TOp *o = &fn->ops[i];
+        if ((o->t1 == kind && o->a1 == slot) ||
+            (o->t2 == kind && o->a2 == slot) ||
+            (o->tr == kind && o->ar == slot))
+            return false;
+    }
+    return true;
+}
+
+static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
     JIT_CTX();
+    if (op->t2 != OPD_UNUSED) { j->fail = 1; do { j->fail_line = __LINE__; return; } while (0); }  /* dim 形态 $a[$i]++ 走解释器（本 lower 只镜像 var-RMW） */
     ir_ref aa = slot_addr(j, op->a1), da = aa;
+    bool has_dst = (op->tr != OPD_UNUSED) &&
+                   !dst_slot_unused(j->fn, pc, op->tr, op->ar);
+    bool prefix = op->ext != 0;
+    ir_ref dstA = has_dst ? slot_addr(j, op->ar) : aa;
     ir_ref ta = load_tag(j, aa), pa = load_pay(j, aa);
+    if (has_dst && !prefix) {
+        /* suffix（res=old）：src 未更新，标量旧值直存；非标量/UNDEF →
+         * helper（UNDEF→NULL + addref，与 do_incdec 逐位同语义） */
+        ir_ref ifs = ir_IF(ir_LT(ta, ir_CONST_I32(5)));   /* T_STR=5 起非标量 */
+        ir_IF_TRUE(ifs);
+            store_pay(j, dstA, pa);          /* 动态 tag/payload：store_imm 的 */
+            store_tag(j, dstA, ta);          /* tag 是立即数，传 ref 会存 ref-id */
+            ir_ref eS = ir_END();
+        ir_IF_FALSE(ifs);
+            ir_ref th[2] = { dstA, aa };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_inc_olddst), 2, th);
+            ir_ref eH = ir_END();
+        ir_MERGE_2(eS, eH);
+    }
     ir_ref isint = ir_EQ(ta, ir_CONST_I32(JT_INT));
     ir_ref d1 = op->op == OP_INC ? ir_CONST_I64(1) : ir_CONST_I64(-1);
     ir_ref ifx = ir_IF(isint);
@@ -1217,6 +1272,21 @@ static void lower_incdec(JitC *j, TOp *op) {
                         ir_BITCAST_U64(ir_CONST_DOUBLE(fd2)));
         ir_ref eSlow = ir_END();
     ir_MERGE_2(eFast, eSlow);
+    if (has_dst && prefix) {
+        /* prefix（res=nv）：src 已是新值——标量直存；非标量（如 "abc"++
+         * 增量得新串）→ tv_copy（release+copy+addref） */
+        ir_ref nt = load_tag(j, aa), np = load_pay(j, aa);
+        ir_ref ifp = ir_IF(ir_LT(nt, ir_CONST_I32(5)));
+        ir_IF_TRUE(ifp);
+            store_pay(j, dstA, np);
+            store_tag(j, dstA, nt);
+            ir_ref eP = ir_END();
+        ir_IF_FALSE(ifp);
+            ir_ref tp[2] = { dstA, aa };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_tv_copy), 2, tp);
+            ir_ref ePC = ir_END();
+        ir_MERGE_2(eP, ePC);
+    }
 }
 
 /* copy folded-call arg k into dst TVal (packed: kind<<24 | idx) — SEND
@@ -1237,12 +1307,12 @@ static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
     }
 }
 
-/* P0-14 批2：调用序回放发射（vm.c tphp_jit_opseq）——表达式已由 JIT
+/* P0-14 批2：调用序/op 回放发射（vm.c tphp_jit_opseq）——表达式已由 JIT
  * 求值；dst 由真 handler 写回 frame 槽，IR 端只做 deopt 门（P0-12 姿样：
  * IF_TRUE RETURN0 / IF_FALSE 留开；无 dst store、无 MERGE）。 */
-static void lower_seq_replay(JitC *j, uint32_t pc_end) {
+static void lower_replay(JitC *j, uint32_t pc_start, uint32_t pc_end) {
     JIT_CTX();
-    ir_ref t[4] = { j->r_vm, ir_CONST_I32((int32_t)j->p_seq_pc),
+    ir_ref t[4] = { j->r_vm, ir_CONST_I32((int32_t)pc_start),
                     ir_CONST_I32((int32_t)pc_end), j->r_call_clo };
     ir_ref ok = ir_CALL_N(IR_I32,
                           ir_CONST_ADDR((uintptr_t)tphp_jit_opseq), 4, t);
@@ -1689,7 +1759,17 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_NEW_USER: {
             if (j->p_seq != 1) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
-            lower_seq_replay(j, pc + 1);
+            lower_replay(j, j->p_seq_pc, pc + 1);
+            pc++;
+            break;
+        }
+        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        case OP_ISSET_PROP: case OP_UNSET_PROP: {
+            /* P0-14 批2-2：单 op pad 执行——真 handler 读自身操作数（动态
+             * 名/槽皆活在本位）+ 写 dst 槽；magic __get/__set 与 raise 走
+             * tphp_jit_opseq 同款 deopt 门。p_seq 内的实参表达式形态同样
+             * 适用（本位先行求值，序回放跳过它）。 */
+            lower_replay(j, pc, pc + 1);
             pc++;
             break;
         }
@@ -1709,7 +1789,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_CAST:
             lower_un(j, op); pc++; break;
         case OP_INC: case OP_DEC:
-            lower_incdec(j, op); pc++; break;
+            lower_incdec(j, op, pc); pc++; break;
         case OP_ADD: case OP_SUB: case OP_MUL:
         case OP_BW_AND: case OP_BW_OR: case OP_BW_XOR:
         case OP_DIV: case OP_MOD: case OP_SHL: case OP_SHR:
@@ -1768,7 +1848,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_DO_FCALL: {
             if (j->p_seq == 2) {   /* P0-14 批2: mcall 序回放 */
-                lower_seq_replay(j, pc + 1);
+                lower_replay(j, j->p_seq_pc, pc + 1);
                 pc++;
                 break;
             }
