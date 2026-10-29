@@ -2310,6 +2310,75 @@ static void run_frame_until_pop_deep(VM *vm, VMFrame *f) {
     }
 }
 
+static int32_t init_mcall_core(VM *vm, TOp *op, TVal objv, TStr *mname);
+static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped);
+
+/* P0-14 批2：JIT 内回放调用序（规格 memory/2026-10-29 "INIT_NEW 对象链"）。
+ * [pc, pc_end) 内只执行调用调度类 op——表达式 op 已由 JIT 求值，跳过；
+ * SEND 由真 handler 从槽读值（与既有 arg_copy-at-DO 同时点同值）；
+ * INIT_MCALL 用 recv_sc 快照（接收者槽可能已被后续实参表达式复用；
+ * emit 侧已限方法名字面量）。用户函数体由 op_do_fcall/new_user 帧切换 +
+ * 深跑同步执行（帧内可再入 JIT：C 直调 entry，deopt longjmp 落回本
+ * pad），dst 由真 handler 写回（= JIT 帧槽），IR 端不再 store。
+ * raise 落本地 bounded pad（floor=JIT 帧）：逃逸 → exception 必已设 →
+ * 返 0，IR RETURN0 沿链传播（vm.c:1701 deopt 铁律：无 exception 的返 0
+ * 只许出现在入口守卫前）。catch 命中 → 重注册继续跑。 */
+int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
+    jmp_buf outer;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    VMFrame *jf = vm->x.frame;
+    volatile uint32_t vpc = pc;
+    if (setjmp(vm->x.unwind) == 0)
+        goto run;
+    for (;;) {
+        bool escaped = false;
+        vm_unwind_core(vm, jf, &escaped);
+        if (escaped) {
+            /* rec/args 残留由后续 catch/整帧弹出的 n_calls/n_args 回卷清理
+             * （vm_unwind_core 4187-88 同款；JIT 帧无 try → 必然弹帧） */
+            memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+            return 0;
+        }
+        if (setjmp(vm->x.unwind) != 0)
+            continue;               /* 恢复执行中再次 raise */
+run:    ;
+        while (vpc < pc_end) {
+            if (vm->x.frame != jf) {
+                /* 帧切换（do_fcall/new_user 返 0 且已自推 jf->pc）：深跑
+                 * 至回到 JIT 帧（callee 可含 try/catch、嵌套调用） */
+                while (vm->x.frame && vm->x.frame != jf) {
+                    VMFrame *df = vm->x.frame;
+                    TOp *cop = &df->fn->ops[df->pc];
+                    int32_t d = ((OpHandler)cop->handler)(vm, cop);
+                    if (d) df->pc += (uint32_t)d;
+                }
+                vpc = jf->pc;
+                continue;
+            }
+            TOp *o = &jf->fn->ops[vpc];
+            jf->pc = vpc;            /* 归因（trace/unwind）与回放同步 */
+            int32_t d;
+            if (o->op == OP_INIT_MCALL) {
+                TStr *mname = op_member_name(vm, o, 3);  /* emit 已限 CONST */
+                d = init_mcall_core(vm, o, *recv_sc, mname);
+            } else if (o->op == OP_INIT_NEW || o->op == OP_SEND_VAL ||
+                       o->op == OP_SEND_VAR || o->op == OP_DO_FCALL ||
+                       o->op == OP_NEW_USER) {
+                d = ((OpHandler)o->handler)(vm, o);
+            } else {
+                d = 1;               /* 表达式 op：JIT 已求值，跳过 */
+            }
+            if (vm->x.frame == jf) {
+                if (d) jf->pc = vpc + (uint32_t)d;
+                vpc = jf->pc;
+            }   /* else: 下轮循环深跑，jf->pc 已由切换 op 自推 */
+        }
+        break;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    return 1;
+}
+
 static void frame_destroy(VMFrame *f);
 
 /* ---- frame/slots TLS 池（perf-roadmap L1）----
@@ -2603,9 +2672,10 @@ static int32_t op_prophook(VM *vm, TOp *op) {
     return 1;
 }
 
-static int32_t op_init_mcall(VM *vm, TOp *op) {
-    TVal objv = rdv(vm, op, 1);
-    TStr *mname = op_member_name(vm, op, 3);   /* C1: CONST 字面量或动态名 */
+/* P0-14 批2：从 op_init_mcall 抽出的实现体——JIT 调用序回放
+ * （tphp_jit_opseq）用快照 recv 调此函数（实参表达式可能已复用接收者
+ * 槽），解释器入口 op_init_mcall 原样包一层，语义零重复。 */
+static int32_t init_mcall_core(VM *vm, TOp *op, TVal objv, TStr *mname) {
     VMCallRec *rec = call_push(vm, op);
     /* P1-3: $closure->call()/bindTo() —— TClosure 接收者派发到内部
      * Closure 类（native；self 传 TClosure*）。 */
@@ -2698,6 +2768,12 @@ static int32_t op_init_mcall(VM *vm, TOp *op) {
     rec->uf = m->fn;
     rec->scope_decl = m->decl;
     return 1;
+}
+
+static int32_t op_init_mcall(VM *vm, TOp *op) {
+    TVal objv = rdv(vm, op, 1);
+    TStr *mname = op_member_name(vm, op, 3);   /* C1: CONST 字面量或动态名 */
+    return init_mcall_core(vm, op, objv, mname);
 }
 
 /* OP_INIT_NEW: snapshot args_base before ctor sends (spread-safe count;

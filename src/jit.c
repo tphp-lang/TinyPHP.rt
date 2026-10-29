@@ -24,6 +24,7 @@
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
 TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
+int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
 
 #ifdef TPHP_JIT
 
@@ -658,6 +659,13 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             break;
         case OP_DO_FCALL:
             break;
+        case OP_INIT_NEW: case OP_NEW_USER: case OP_INIT_MCALL:
+            /* P0-14 批2：对象链——调用序回放（vm.c tphp_jit_opseq）；
+             * 嵌套/动态方法名/NEW_EX-LATE-DYN 等形态在 emit 侧 fail
+             * （= 不编译，回退解释器，语义安全） */
+            break;
+        case OP_UNSET_CV:
+            break;
         default:
             rej = tphp_op_name(op->op);   /* 白名单外 opcode（主审计目标） */
             goto out;
@@ -707,6 +715,10 @@ typedef struct {
     uint32_t cur_pc;
     int p_dyn;                  /* 1 = INIT_DYN 动态调用 */
     uint32_t p_dyn_slot;        /* 闭包所在 CV 槽 */
+    /* P0-14 批2: 调用序回放（INIT_NEW…NEW_USER / INIT_MCALL…DO_FCALL）。
+     * 1 = new 序，2 = mcall 序，值即 p_seq_pc 起点 op 下标 */
+    int p_seq;
+    uint32_t p_seq_pc;
     /* pre-allocated call scratch (entry-block ALLOCA — loop-body ALLOCA
      * stacks up under O1 and overflows after ~5k iterations) */
     ir_ref r_call_args;         /* argv buffer, 9 * TVAL_SZ */
@@ -1225,6 +1237,22 @@ static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
     }
 }
 
+/* P0-14 批2：调用序回放发射（vm.c tphp_jit_opseq）——表达式已由 JIT
+ * 求值；dst 由真 handler 写回 frame 槽，IR 端只做 deopt 门（P0-12 姿样：
+ * IF_TRUE RETURN0 / IF_FALSE 留开；无 dst store、无 MERGE）。 */
+static void lower_seq_replay(JitC *j, uint32_t pc_end) {
+    JIT_CTX();
+    ir_ref t[4] = { j->r_vm, ir_CONST_I32((int32_t)j->p_seq_pc),
+                    ir_CONST_I32((int32_t)pc_end), j->r_call_clo };
+    ir_ref ok = ir_CALL_N(IR_I32,
+                          ir_CONST_ADDR((uintptr_t)tphp_jit_opseq), 4, t);
+    ir_ref ifs = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifs);
+        ir_RETURN(ir_CONST_I32(0));
+    ir_IF_FALSE(ifs);
+    j->p_seq = 0;
+}
+
 /* finish a folded call at DO_FCALL (args already recorded in j->p_*) */
 static void lower_call_finish(JitC *j, TOp *doop) {
     JIT_CTX();
@@ -1631,10 +1659,48 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_INIT_DYN: {
             /* 动态调用折叠：$f(...) —— 闭包槽 a1，SEND…DO_FCALL 同静态折叠 */
-            if (j->p_callee) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_dyn = 1;
             j->p_dyn_slot = op->a1;
             j->p_argc = 0;
+            pc++;
+            break;
+        }
+        case OP_INIT_NEW: {
+            /* P0-14 批2：new 序起点（回放 op_init_new→SENDs→NEW_USER） */
+            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            j->p_seq = 1;
+            j->p_seq_pc = pc;
+            pc++;
+            break;
+        }
+        case OP_INIT_MCALL: {
+            /* $o->m(...) 序起点：recv 快照进 entry scratch（实参表达式可
+             * 复用接收者槽）；方法名限字面量（动态名 → fail 回退解释器） */
+            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (op->tr != OPD_CONST || (op->t1 != OPD_CV && op->t1 != OPD_TMP)) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            ir_ref ra = slot_addr(j, op->a1);
+            store_pay(j, j->r_call_clo, load_pay(j, ra));
+            store_tag(j, j->r_call_clo, load_tag(j, ra));
+            j->p_seq = 2;
+            j->p_seq_pc = pc;
+            pc++;
+            break;
+        }
+        case OP_NEW_USER: {
+            if (j->p_seq != 1) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            lower_seq_replay(j, pc + 1);
+            pc++;
+            break;
+        }
+        case OP_UNSET_CV: {
+            /* 解释器 op_unset_cv 同款：释放槽值 + 置 UNDEF（dtor defer 于
+             * mem.c，release 不进用户码不 raise → 无需 deopt 门） */
+            if (op->t1 != OPD_CV) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            ir_ref da = slot_addr(j, op->a1);
+            ir_ref tr1[1] = { da };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr1);
+            store_imm(j, da, (int32_t)T_UNDEF, ir_CONST_I64(0));
             pc++;
             break;
         }
@@ -1682,7 +1748,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_bfn || j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             if ((uintptr_t)op->ic & 1)
                 j->p_bfn = (void *)((uintptr_t)op->ic & ~(uintptr_t)1);
             else
@@ -1693,13 +1759,19 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
-            if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_seq) { pc++; break; }   /* P0-14 批2: 回放中由真 SEND handler 读槽 */
             if (j->p_argc >= 9) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_arg_slot[j->p_argc++] = ((uint32_t)op->t1 << 24) | op->a1;
             pc++;
             break;
         }
         case OP_DO_FCALL: {
+            if (j->p_seq == 2) {   /* P0-14 批2: mcall 序回放 */
+                lower_seq_replay(j, pc + 1);
+                pc++;
+                break;
+            }
             if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_call_finish(j, op);
             if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
