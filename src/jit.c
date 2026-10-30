@@ -1449,6 +1449,9 @@ static void lower_call_finish(JitC *j, TOp *doop) {
             store_pay(j, d, ir_LOAD_I64(sa));
             store_tag(j, d, ir_LOAD_I32(ir_ADD_A(sa, ir_CONST_ADDR(TVAL_TAG))));
         }
+        /* （非参数槽的 UNDEF 保护在 callee 侧只填 CV 区——见
+         * tphp_jit_compile 的 prologue 注；此地曾试填满 64 上界，
+         * 实测 126 store/调用把 P0-15 收益全吃掉 kv 39→53 已撤） */
         ir_ref dir_t[3] = { j->r_vm, slots, ret_sc };
         ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
         ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
@@ -2242,13 +2245,14 @@ void tphp_jit_compile(TFunc *fn) {
     j.r_vm = ir_PARAM(IR_ADDR, "vm", 1);
     j.r_slots = ir_PARAM(IR_ADDR, "slots", 2);
     j.r_ret = ir_PARAM(IR_ADDR, "ret", 3);
-    /* P0-15 B: callee fills locals+tmps with UNDEF (n_locals INCLUDES
-     * params: slots=[0..n_locals) CVs, [n_locals..+n_tmps) tmps). */
-    for (uint32_t k = fn->n_locals;
-         k < (uint32_t)fn->n_locals + fn->n_tmps; k++) {
-        ir_ref d = ir_ADD_A(j.r_slots, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
-        store_imm(&j, d, (int32_t)T_UNDEF, ir_CONST_I64(0));
-    }
+    /* P0-15 B 的未初始化槽保护（10-30 CI 定位，当前态=S1 无自填）：
+     * 原 tmps-only 自填被 O1 跨 FE replay call 折叠成循环 load=UNDEF/NULL
+     *（fe_kv_sum $v=NULL gdb 实锤，删即绿）；改填 CV 区 [n_params..n_locals)
+     * 又因方法 poff=1 布局起点错覆盖参数（18 OOP 失败）。caller 填满 64
+     * 上界则 126 store/调用吃光 P0-15 收益（kv 39→53）。三案全撤。
+     * 残留理论风险：B FAST r_call_slots 的非参数 CV 未初始化读语义
+     *（无测试暴露，出现即修——正解=IR 动态循环填 [argc..nlocals)，需 phi
+     * 结构，与嵌套 loop 雷区同域慎入）。 */
 
     /* entry-block call scratch: one ALLOCA per function, reused by every
      * call site (loop-body ALLOCA stacks up under O1 → overflow ~5k iters) */
