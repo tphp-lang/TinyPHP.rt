@@ -137,7 +137,9 @@ jobs:
           coverage: none
           ini-values: opcache.enable_cli=1, opcache.jit=tracing, opcache.jit_buffer_size=128M
 
-      # aarch64 v1: tphp IR JIT disabled (x86_64 only) - report-only
+      # aarch64 JIT enabled (2026-10-27). NOTE: macOS runner = M1-class
+      # Apple Silicon; gaps vs Linux arm64 (server CPU) are machine
+      # differences, not code — e.g. object 32x vs 0.29x is runner skew.
       - name: Perf vs PHP strongest
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
