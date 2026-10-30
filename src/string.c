@@ -35,7 +35,32 @@ TStr *tstr_new(const char *s, size_t len) {
  * pointers (INTERNED strings never refcount), runtime interning in worker
  * threads only affects dedup within that thread. */
 typedef struct InternSlot { struct InternSlot *next; TStr *s; } InternSlot;
-static _Thread_local InternSlot *intern_tab[4096];
+static _Thread_local InternSlot **intern_tab = NULL;
+static _Thread_local uint32_t intern_bcap = 0;   /* 桶数（2 的幂） */
+static _Thread_local uint32_t intern_n = 0;      /* 条目数 */
+
+/* 均摊 O(1)：负载（条目/桶）达 2 时倍增 rehash。原固定 4096 桶在唯一键
+ * 累积场景退化为 O(n²)——kv-fill 50 万键实测每插入 1038→3384ns 递增
+ * （PHP 恒 ~90ns），根因即每桶链长随 n/4096 线性增长、每键 intern 都扫链。 */
+static void intern_grow(void) {
+    uint32_t nb = intern_bcap ? intern_bcap * 2 : 4096;
+    InternSlot **nt = tm_malloc(sizeof(InternSlot *) * nb);
+    for (uint32_t i = 0; i < nb; i++) nt[i] = NULL;
+    uint32_t mask = nb - 1;
+    for (uint32_t i = 0; i < intern_bcap; i++) {
+        InternSlot *p = intern_tab[i];
+        while (p) {
+            InternSlot *nx = p->next;
+            uint32_t idx = p->s->hash & mask;
+            p->next = nt[idx];
+            nt[idx] = p;
+            p = nx;
+        }
+    }
+    if (intern_tab) tm_free(intern_tab);
+    intern_tab = nt;
+    intern_bcap = nb;
+}
 
 /* canonical decimal integer string? (PHP array-key rule: "8"→8, "08" stays
  * string, "-3"→-3, " 8" stays string). Used to set GC_FLAG_NONNUM_KEY. */
@@ -52,7 +77,8 @@ static bool str_is_canonical_int(const char *s, size_t len) {
 
 TStr *tstr_intern(const char *s, size_t len) {
     uint32_t h = str_hash_calc(s, len);
-    uint32_t idx = h & 4095;
+    if (intern_n * 2 >= intern_bcap) intern_grow();
+    uint32_t idx = h & (intern_bcap - 1);
     for (InternSlot *p = intern_tab[idx]; p; p = p->next) {
         if (p->s->len == len && memcmp(p->s->c, s, len) == 0) return p->s;
     }
@@ -66,6 +92,7 @@ TStr *tstr_intern(const char *s, size_t len) {
     slot->s = str;
     slot->next = intern_tab[idx];
     intern_tab[idx] = slot;
+    intern_n++;
     return str;
 }
 
