@@ -22,27 +22,80 @@
 #define TM_ALLOC_FN  mi_malloc
 #define TM_REALLOC_FN mi_realloc
 #define TM_FREE_FN   mi_free
-#else
-/* ASAN/debug builds: plain CRT allocator (mimalloc and ASAN are mutually
- * exclusive, per PLAN/03 §7) */
-#define TM_ALLOC_FN  malloc
-#define TM_REALLOC_FN realloc
-#define TM_FREE_FN   free
-#endif
+
+/* ---- 尺寸 bins shim（P0-16 批3③，ZEND_MM 思路的最小版）----
+ * 对拍实锤：本机 mimalloc/CRT 小对象 malloc+free 均 ~50ns/对，而 PHP
+ * ZEND_MM（chunk 内 bump + 尺寸 bin freelist）配额下 arr-lit 全周期
+ * 15ns——通用分配器到不了 arena 级。此处对 ≤1024B 块做 16B 步进
+ * freelist：分配 = 链表 pop，释放 = push（头插 + 尺寸记在块头 16B）；
+ * 超界 passthrough mimalloc。thread_local（与 intern 表同策略：VM/
+ * GC 对象跨线程只经 serialize 克隆，各自线程内分配释放）。
+ * ASAN/debug 构建走 #else CRT 路径（自动关闭——ASAN 需接管真分配），
+ * TPHP_NO_BINS 可强制关。 */
+#define TM_BINS_MAX_CLASS 64            /* 16B 步进 → ≤1024B */
+static _Thread_local void *g_bins[TM_BINS_MAX_CLASS + 1];
 
 void *tm_malloc(size_t n) {
-    void *p = TM_ALLOC_FN(n);
+    uint32_t b = (uint32_t)((n + 15) >> 4);
+    if (b <= TM_BINS_MAX_CLASS) {
+        if (b == 0) b = 1;
+        void *p = g_bins[b];
+        if (p) { g_bins[b] = *(void **)p; return p; }
+        char *c = (char *)mi_malloc(((size_t)b << 4) + 16);
+        if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
+        *(uint32_t *)c = b;
+        return c + 16;
+    }
+    char *c = (char *)mi_malloc(n + 16);
+    if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
+    *(uint32_t *)c = UINT32_MAX;
+    return c + 16;
+}
+
+void *tm_realloc(void *p, size_t n) {
+    if (!p) return tm_malloc(n);
+    uint32_t b = *(uint32_t *)((char *)p - 16);
+    if (b <= TM_BINS_MAX_CLASS) {
+        size_t old = (size_t)b << 4;
+        if (n <= old) return p;         /* 原地（缩容/同级） */
+        void *q = tm_malloc(n);
+        memcpy(q, p, old);
+        tm_free(p);
+        return q;
+    }
+    char *c = (char *)mi_realloc((char *)p - 16, n + 16);
+    if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
+    return c + 16;
+}
+
+void tm_free(void *p) {
+    if (!p) return;
+    uint32_t b = *(uint32_t *)((char *)p - 16);
+    if (b <= TM_BINS_MAX_CLASS) {
+        *(void **)p = g_bins[b];
+        g_bins[b] = p;
+        return;
+    }
+    mi_free((char *)p - 16);
+}
+
+#else
+/* ASAN/debug builds: plain CRT allocator (mimalloc and ASAN are mutually
+ * exclusive, per PLAN/03 §7)——直通 CRT，bins shim 关闭（ASAN 须接管真分配） */
+void *tm_malloc(size_t n) {
+    void *p = malloc(n);
     if (!p) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
     return p;
 }
 
 void *tm_realloc(void *p, size_t n) {
-    void *q = TM_REALLOC_FN(p, n);
+    void *q = realloc(p, n);
     if (!q) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
     return q;
 }
 
-void tm_free(void *p) { TM_FREE_FN(p); }
+void tm_free(void *p) { free(p); }
+#endif
 
 /* ---- registry (per-OS-thread, M5: each worker runtime owns its heap) ---- */
 static _Thread_local GCHead *gc_list = NULL;
