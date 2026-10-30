@@ -4302,6 +4302,11 @@ static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped) {
             tval_release(&ov);        /* 帧销毁已释放槽内引用，此处收尾 base */
         }
     }
+    /* bounded 无 floor（FFI 跨线程回调在 uv_run 空闲态上执行，vm->x.frame
+     * 为空）：帧弹尽即逃逸到栈底——异常交还 tphp_vm_call_bounded 的
+     * warning 路径。不落下面的 Uncaught 报告（会误报 fatal + 污染
+     * exit_code）。vm_unwind 传 escaped=NULL，不受影响照旧走到底。 */
+    if (escaped) { *escaped = true; return; }
     /* bottom reached: uncaught。main 协程就地打印 fatal 并定退出码；
      * 子协程（coro_result != NULL）静默收尾——异常保留在执行上下文，
      * 由 await 透传，或在脚本结束时由调度器统一报 fatal（M4 sched.c） */

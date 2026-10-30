@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>   /* teardown 钩子的跨线程注册/读取 */
 
 /* vm.c */
 VM *tphp_vm_instance(void);
@@ -273,6 +274,8 @@ static void sched_entry(TFiber *fb) {
 /* 挂起前记录协程的 PHP 挂起位置（死锁报告用） */
 static void record_suspend_pos(TCont *c) {
     VM *vm = tphp_vm_instance();
+    if (!c)   /* 非协程上下文（FFI 跨线程回调 drain）：禁止挂起 */
+        tphp_vm_raise(vm, "Error", "no current coroutine");
     if (vm->x.frame && vm->x.frame->fn && vm->x.frame->pc < vm->x.frame->fn->n_ops) {
         c->sus_fn = vm->x.frame->fn->name ? tstr_val(vm->x.frame->fn->name)
                                           : "{closure}";
@@ -356,6 +359,15 @@ void tphp_sched_check_cancel(void) {
 
 struct uv_loop_s *tphp_sched_loop(void) { return &g_loop; }
 bool tphp_sched_active(void) { return g_sched_active; }
+
+/* 常驻 uv handle 的 teardown 钩子（ext/ffi 跨线程回调唤醒器）：
+ * sched_cleanup 关 loop 前调用。fn 进程内恒定（各线程注册同一函数），
+ * atomic 存取避免跨线程注册/读取的数据竞争。 */
+static _Atomic(uintptr_t) g_loop_teardown;
+void tphp_sched_loop_on_teardown(void (*fn)(void)) {
+    atomic_store_explicit(&g_loop_teardown, (uintptr_t)fn,
+                          memory_order_relaxed);
+}
 
 /* ---- 定时器挂起（sleep/usleep 的底层） ---- */
 
@@ -652,6 +664,8 @@ TVal tphp_async_spawn(VM *vm, TVal *args, int n) {
  * 挂起时在 target->waiter 登记（cancel 摘除用），恢复后检查取消。 */
 static TVal await_one_coro(VM *vm, TCont *target) {
     if (target->state != TCS_DONE) {
+        if (!g_cur)   /* 非协程上下文禁止挂起（FFI 跨线程回调 drain） */
+            tphp_vm_raise(vm, "Error", "no current coroutine");
         if (target->waiter && target->waiter != g_cur)
             tphp_vm_raise(vm, "Error", "Coroutine is already being awaited");
         g_waiting++;
@@ -786,6 +800,8 @@ TVal tphp_async_any(VM *vm, TVal *args, int n) {
             goto done;                        /* 空转保护（不会到达） */
         }
         /* 挂起：任一协程完成都会唤醒（cont_finish 唤醒 waiter） */
+        if (!g_cur)   /* 非协程上下文禁止挂起（FFI 跨线程回调 drain） */
+            tphp_vm_raise(vm, "Error", "no current coroutine");
         g_cur->multi_wait = true;
         record_suspend_pos(g_cur);
         g_waiting++;
@@ -814,6 +830,8 @@ TVal tphp_async_run(VM *vm, TVal *args, int n) {
 
 TVal tphp_async_suspend(VM *vm, TVal *args, int n) {
     (void)args; (void)n;
+    if (!g_cur)   /* 非协程上下文禁止挂起（FFI 跨线程回调 drain） */
+        tphp_vm_raise(vm, "Error", "no current coroutine");
     sched_ready(g_cur);               /* 立即重新入队（协作式让出一次） */
     record_suspend_pos(g_cur);
     sched_suspend(TCS_READY);
@@ -954,6 +972,8 @@ static TVal nm_chan_send(VM *vm, void *self, TVal *args, int n) {
         return TV_NULL;
     }
     /* 满：入 send 队列挂起（多生产者 FIFO） */
+    if (!g_cur)   /* 非协程上下文禁止挂起（FFI 跨线程回调 drain） */
+        tphp_vm_raise(vm, "Error", "no current coroutine");
     g_cur->chan_val = args[0];
     tval_addref(g_cur->chan_val);
     chan_q_push(&ch->send_head, &ch->send_tail, g_cur);
@@ -986,6 +1006,8 @@ static TVal chan_recv_impl(VM *vm, void *self) {
     if (ch->closed)
         return TV_NULL;               /* closed 且空 → null */
     /* 空：入 recv 队列挂起（多消费者 FIFO） */
+    if (!g_cur)   /* 非协程上下文禁止挂起（FFI 跨线程回调 drain） */
+        tphp_vm_raise(vm, "Error", "no current coroutine");
     g_cur->chan_val = TV_NULL;
     chan_q_push(&ch->recv_head, &ch->recv_tail, g_cur);
     record_suspend_pos(g_cur);
@@ -1212,6 +1234,13 @@ static void sched_cleanup(void) {
     g_waiting = 0;
     g_any_uncaught = false;
     g_sched_active = false;
+    /* ext 挂接的常驻 handle（ffi 跨线程回调 async）先摘——必须早于
+     * uv_loop_close：否则 EBUSY，且 g_loop_inited 复位重建后句柄悬垂 */
+    {
+        void (*td)(void) = (void (*)(void))atomic_load_explicit(
+            &g_loop_teardown, memory_order_relaxed);
+        if (td) td();
+    }
     uv_loop_close(&g_loop);           /* 句柄已清空；EBUSY 则随进程退出 */
     g_loop_inited = false;            /* 复位：允许下一次 tphp_sched_run 重建
                                        * loop（pkg fetch 会多次 run_source） */

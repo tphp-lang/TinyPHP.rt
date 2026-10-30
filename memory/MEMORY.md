@@ -27,6 +27,15 @@
 - 新铁律：ir_ZEXT 提升窄 load 后才能进宽算术；循环内 call-site ALLOCA 栈累积（必须 entry 块 scratch）；大 hunk 回退宁整文件回 HEAD。
 - **10-30 收口（230/230）**：批5遗留 2 失败=S1 撤 prologue 自填（O1 跨 call 折叠，gdb 实锤）；批2 per-site fn 快照（INIT_DYN 的 op->ic 存 TFunc* 单字）；**后续① callee 编译缺口修复**——`tphp_vm_call_callable`（call_dyn 慢路/call_user_func/usort/FFI 回调统一汇聚点）补 hot++/eager 门 → 同轮 stash A/B call 58.0→7.9ms（**-86%**），bench call 10.6 vs PHP 49.4 **首次反超**，13 项零回退；**批3-3 INIT_SMCALL 静态方法直调**（jit_smcallee 编译期解析可判子集+op->ic 缓存+poff=1 emit+opseq 派发表补漏；static::/动态名/enum/native/magic 全拒回解释器；对拍实证 **PHP __callStatic 接管"不可访问"静态调用**）。反超带=fib/call/array-read/kv/string；余大户=serialize 5.3×/logstat 4.3×/throw 2.5×（**serialize 实测双侧均匀 ~3.5×=tstr_new/tarr_new+gc_register vs PHP emalloc 的分配/GC 结构差，非算法单点**）。
 
+## 2026-10-30 FFI 跨线程回调 marshaling（方案1，233/233）
+
+- **问题**：civetweb 等外部 C 线程触发 trampoline 时 `tphp_vm_current==NULL`，旧代码在 vm 判定**之前** decode → `cdata_wrap` 拿 NULL 的 `g_cdata_cls` TLS → 0xC0000005（teb start+handler+http_get 实证）。
+- **设计（ffi.c）**：`CBQ`（uv_mutex+uv_cond+uv_async，**堆分配进程级保活**、async unref 挂归属线程 loop）+ `CBTask` 节点放**外线程 trampoline 栈上**（args/ret 借 trampoline/libffi 帧，阻塞期间恒有效，零拷贝）。流程=外线程入队+锁内 `uv_async_send`+`uv_cond_timedwait(10s)` → 归属线程 async cb drain（`cb_exec_on_vm`：ctx_ensure→decode→bounded→encode）→ DONE+broadcast → 外线程拿返回值回 C 调用方。超时/停机：外线程**自摘节点**（栈节点绝不能留悬垂链）+ 零值返回+warning；RUN 态则无上限等收尾。`closure_create` 时 `cbq_arm()` 惰性 init（uv_async_init 必须在 loop 线程）。
+- **配套三处**：①sched.c 新增 `tphp_sched_loop_on_teardown` 钩子（atomic fn ptr，`sched_cleanup` 关 loop 前调，drain 的 async 在 uv_close+NOWAIT 冲刷）；②6 个挂起点 `g_cur==NULL` 守卫 raise `"no current coroutine"`（record_suspend_pos/await/any/suspend/chan send/recv——drain 里 sleep/await 会 AV）；③vm.c `vm_unwind_core` 帧弹尽且 `escaped!=NULL`（bounded 无 floor）→ 逃逸到栈底，不落 Uncaught 报告（防误 fatal+污染 exit_code）。
+- **drain 上下文铁律**：uv_run 期间 `vm->x` 是 resume_cont 的空闲态（全零）→ `cb_exec_on_vm` 里 `tphp_ctx_ensure` 兜底，**执行完必须就地归还**（free calls/args/caps + memset + done=true）——下次 resume 整块覆盖 vm->x，堆指针没有第二回收点。
+- **顺带揪出的 bug（上一条 bug 修复的回马枪）**：顶层 `typedef (*cb)(...)` 的 **alias 分支只拷 fields/array_elem/ffi、漏拷 fn_ret/fn_params/fn_n** → 入表的是空签名壳 → 闭包传入该参数 `closure_create` 解引用 `sig->fn_ret` AV。qsort 走内联声明不经 alias，所以 parse-only 测试从未暴露；closure_create 已加无签名 raise 兜底。
+- **验证**：`tests/ffi/test-ffi-callback-cross-thread.php`（Windows CreateThread/pthread，共享槽验 arg decode、GetExitCodeThread/join 返回值验 encode 回传）；**233 passed 0 failed**；teb 矩阵三连绿（CALLBACK-REACHED + http_get len=30 + stop exit=0，原 0xC0000005）。回调内不可 suspend（守卫抛 Error 转 warning+零值）；跨 run 依赖下一次 closure_create 重新 arm。
+
 ## 交接入口（2026-10-25）PLAN/backlog.md = 下一步任务清单（零上下文 AI 可直接接手）：现状快照 + 工作协议红线 + P0 性能（JIT v1.1 白名单扩容打 7× 几何均值→M2）+ P1 功能 + P2 工程 + 工具速查。perf 手动对比 = Actions→Perf workflow。
 
 ## 2026-10-15 OOP 审计修复（P0+P1 全闭环，116/116）
@@ -109,4 +118,5 @@
 - ~~下次：阶段 B → C → D~~ **已完成（2026-10-21，HEAD 见 1b57f0c 之后的 pkg 提交）**：add/remove/install/upload + 失败诊断测试 + path_join3 修复 + Windows Root 信任库 + GitHub URL v2 语义 + 覆盖 fail-closed；基线 179/179
 
 ## 独立 Bug 记录文件索引
-- **[bug-ffi-incomplete-struct-fnptr.md](bug-ffi-incomplete-struct-fnptr.md)**（2026-10-30）：tphp 自带 FFI 的 `cdef` 解析器不支持「函数签名里的不完整结构体指针（`struct X *`）」与「函数指针 typedef」，导致 civetweb 类 FFI 头（`teb.h`）在 `tphp run` 下崩 `unknown type "mg_connection"`；真 PHP 原生 FFI 可正常解析（已实证对照）。关联：teb.dll 未导出 `mg_websocket_write`/`mg_websocket_client_write`，teb.h 与 dll 脱节（独立 bug）。修复方向 = 补 tphp ext/ffi 的指针/函数指针解析。
+- **[bug-ffi-incomplete-struct-fnptr.md](bug-ffi-incomplete-struct-fnptr.md)**（2026-10-30，**已修复**）：tphp FFI `cdef` 不支持不完整结构体指针与函数指针 typedef → teb（civetweb 封装）加载即崩。修复=parse_struct_body miss 建占位 tag + parse_named_body 复用填充 + 顶层 struct 回退路径修复（删错误回退，保留 sname）+ 前向声明登记 tag + typedef 走 parse_declarator（接 FFI_FUNC_PTR）+ 按值不完整三消费点拦截 + 顺带 CData 字符串保活（FFCData.keep，rvalue 串悬垂 UAF）。同场发现 teb 侧 3 独立 bug（char*[2] 缺 NULL 终止槽=AV 根因、request 漏 return $this——均已修；hello EXPECT 与实现不符未改）。回归 tests/ffi/test-ffi-incomplete-types.php，基线 **232/232**。教训：**FFCData 逐字段赋值无 memset——给 struct 加字段必查所有构造点**；真 PHP 对 `char*[2]` 越界"恰好活"是 zend 分配器 UB 运气，不可当行为基准。
+  - **后续（同日）**：typedef alias 分支漏拷 fn_ret/fn_params/fn_n（空签名壳 → closure_create AV，见「FFI 跨线程回调」节）已修；跨线程回调 marshaling 落地（teb handler 崩溃根治），基线 **233/233**（新增 test-ffi-callback-cross-thread.php）。

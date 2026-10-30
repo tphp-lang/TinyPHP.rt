@@ -18,6 +18,10 @@
 #include "class.h"
 #include "tffi.h"
 #include "pack.h"
+#include <uv.h>            /* 跨线程回调投递：uv_mutex/uv_cond/uv_async
+                            * （须先于 windows.h——uv.h 内部按正确序引
+                            * winsock2.h，后置的 windows.h 命中头卫即可） */
+#include "tsched.h"        /* tphp_sched_loop / loop_init / teardown 钩子 */
 #include <ffi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,7 +92,21 @@ typedef struct FFCData {
     FFIType *type;
     bool owned;
     FFIScope *scope;
+    /* 保活：字符串→char* 写入的持有（真 PHP 拒绝该类赋值，tphp 放行故必须
+     * 自持——rvalue TStr 赋值表达式结束即释放，元素/字段里的裸 c 指针随即
+     * 悬垂；teb Web::start 的 char*[2] options → mg_start 读取即 UAF 实证） */
+    TVal *keep; int n_keep, cap_keep;
 } FFCData;
+
+/* 把写入 CData 的字符串挂进宿主保活表（addref 到 CData 析构时 release） */
+static void cdata_keep_str(FFCData *d, TVal s) {
+    tval_addref(s);
+    if (d->n_keep == d->cap_keep) {
+        d->cap_keep = d->cap_keep ? d->cap_keep * 2 : 4;
+        d->keep = tm_realloc(d->keep, sizeof(TVal) * (size_t)d->cap_keep);
+    }
+    d->keep[d->n_keep++] = s;
+}
 
 /* ---- 类指针（每线程） ---- */
 static _Thread_local TClass *g_ffi_cls;
@@ -333,6 +351,7 @@ static void parse_param_list(CParser *cp, FFIScope *sc,
                              FFIType **params, int max, int *np, bool *variadic);
 static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                                  const char *sname);
+static void scope_add_type(FFIScope *sc, FFIType *t);
 
 /* parse_type 入口：struct/union/enum 转发；已命名类型若无 { 则查表引用 */
 static FFIType *parse_struct_body(CParser *cp, FFIScope *sc, bool is_enum) {
@@ -355,7 +374,15 @@ static FFIType *parse_struct_body(CParser *cp, FFIScope *sc, bool is_enum) {
         for (int i = 0; i < sc->n_types; i++)
             if (sc->types[i]->name && strcmp(sc->types[i]->name, nbuf) == 0)
                 return sc->types[i];
-        tphp_raise("ValueError", "FFI::cdef(): unknown type \"%s\"", nbuf);
+        /* 未定义 tag 的引用 = 隐式引入不完整类型（C/PHP-FFI 同语义）：
+         * `struct X *`、`typedef struct X *p`、参数位 const struct X * 全合法；
+         * 按值使用在消费点（parse_function/字段/FFI::new）校验 size==0 报错。
+         * 建占位并登记 tag——后续完整定义经 parse_named_body 复用填充。 */
+        FFIType *inc = type_new(is_enum ? FFI_ENUM : FFI_STRUCT,
+                                is_enum ? 4 : 0, is_enum ? 4 : 1);
+        inc->name = xstrdup(nbuf);
+        scope_add_type(sc, inc);
+        return inc;
     }
     return parse_named_body(cp, sc, is_enum, NULL);
 }
@@ -664,6 +691,18 @@ typedef struct {
 
 /* 简化：每次变参调用重建（额外参数 ≤12） */
 
+/* 按值使用的不完整类型检测：解链数组后核心仍是 0-field/0-size struct
+ * （隐式占位）→ C 同样非法；指针/函数指针/enum 占位（size4）不受影响 */
+static void check_complete_byval(FFIType *t, const char *what) {
+    FFIType *c = t;
+    while (c && c->code == FFI_ARRAY) c = c->array_elem;
+    if (c && c->code == FFI_STRUCT && c->n_fields == 0 && c->size == 0)
+        tphp_raise("ValueError",
+                   "FFI::cdef(): incomplete type \"%s\" used by value in %s "
+                   "(only pointers to it are allowed)",
+                   c->name ? c->name : "?", what);
+}
+
 static void parse_function(CParser *cp, FFIScope *sc, FFIType *ret, const char *fname) {
     if (!cis(cp, "("))
         tphp_raise("ValueError", "FFI::cdef(): expected \"(\" after function name");
@@ -704,6 +743,11 @@ params_semicolon:
     fn->params = np ? tm_malloc(sizeof(FFIType *) * (size_t)np) : NULL;
     for (int i = 0; i < np; i++) fn->params[i] = params[i];
 
+    /* 修5：按值不完整类型在此拦截（返回值/参数）；指针路径天然不命中 */
+    check_complete_byval(ret, fname);
+    for (int i = 0; i < np; i++)
+        check_complete_byval(params[i], fname);
+
     /* ffi_prep_cif 只保存 arg_types 指针、不拷贝——必须堆分配并与 cif
      * 同寿命。栈数组在 parse_function 返回后悬垂（普通构建靠运气活着，
      * ASAN use-after-return / 栈复用即崩：M5.5 FFI 调用类 0xC0000005 根因）。 */
@@ -736,12 +780,14 @@ static void parse_toplevel(CParser *cp, FFIScope *sc) {
             FFIType *base = parse_type(cp, sc);
             if (!base)
                 tphp_raise("ValueError", "FFI::cdef(): bad typedef");
-            FFIType *t = apply_pointers(cp, base);
-            if (cp->tkind != 1)
+            /* 走 declarator 而非裸标识符检查：支持指针别名（int *p）与
+             * 函数指针 typedef（int (*cb)(...) → FFI_FUNC_PTR，回调 v1 复用）。
+             * 旧实现在 apply_pointers 后直接要求标识符，撞 `(` 报
+             * "typedef needs a name"（bug-ffi-incomplete-struct-fnptr case 7）。 */
+            char name[128] = {0};
+            FFIType *t = parse_declarator(cp, sc, base, name, sizeof name, false);
+            if (!name[0])
                 tphp_raise("ValueError", "FFI::cdef(): typedef needs a name");
-            char name[128];
-            snprintf(name, sizeof name, "%s", cp->tok);
-            cnext(cp);
             if (t->code == FFI_STRUCT && !t->name) {
                 t->name = xstrdup(name);
                 scope_add_type(sc, t);
@@ -753,7 +799,15 @@ static void parse_toplevel(CParser *cp, FFIScope *sc) {
                 alias->fields = t->fields;
                 alias->n_fields = t->n_fields;
                 alias->ffi = t->ffi;
-                t->fields = NULL;   /* 所有权移交 alias */
+                /* 函数指针签名必须随行（bug：typedef (*cb)(...) 的 alias
+                 * 漏拷 → 入表的是 fn_ret=NULL 的空壳 → 闭包传入该参数时
+                 * closure_create 解引用空签名 0xC0000005）。t 不入表，
+                 * 签名指针所有权移交 alias（同 fields 模式）。 */
+                alias->fn_ret = t->fn_ret;
+                alias->fn_params = t->fn_params;
+                alias->fn_n = t->fn_n;
+                t->fields = NULL;
+                t->fn_params = NULL;   /* 所有权移交 alias */
                 scope_add_type(sc, alias);
             }
             cexpect(cp, ";");
@@ -767,21 +821,30 @@ static void parse_toplevel(CParser *cp, FFIScope *sc) {
             char sname[128] = {0};
             bool have_name = false;
             if (cp->tkind == 1) {
-                const char *save = cp->p;
                 snprintf(sname, sizeof sname, "%s", cp->tok);
                 cnext(cp);
                 if (cis(cp, ";")) {
+                    /* 前向声明：登记不完整 tag（PHP-FFI 对拍：后续
+                     * `struct X *fn` 查表须命中；旧实现忽略不登记 →
+                     * 二次引用 unknown type） */
+                    FFIType *inc = type_new(en ? FFI_ENUM : FFI_STRUCT,
+                                            en ? 4 : 0, en ? 4 : 1);
+                    inc->name = xstrdup(sname);
+                    bool dup = false;
+                    for (int i = 0; i < sc->n_types; i++)
+                        if (sc->types[i]->name &&
+                            strcmp(sc->types[i]->name, sname) == 0) { dup = true; break; }
+                    if (!dup) scope_add_type(sc, inc);
                     cnext(cp);
-                    continue;   /* 前向声明，忽略 */
+                    continue;
                 }
                 if (cis(cp, "{")) {
                     have_name = true;
-                } else {
-                    /* 不是定义：回退到名字，交给函数/类型路径 */
-                    cp->p = save;
-                    cnext(cp);
-                    sname[0] = 0;
                 }
+                /* 否则不是定义（token 停在名字后，如 `*`/函数名）：
+                 * 保留 sname 落入下方"函数返回类型"路径（830）。
+                 * 旧实现在此错误回退 p 并清空 sname——重读出的是 `*` 而非
+                 * 名字，parse_type 返 NULL → "unexpected token \"*\""。 */
             }
             if (cis(cp, "{") || have_name) {
                 /* 构造伪流不现实——直接把名字塞回 tok 再调 parse_struct_body
@@ -826,7 +889,7 @@ static void parse_toplevel(CParser *cp, FFIScope *sc) {
                 cexpect(cp, ";");
                 continue;
             }
-            /* 回退路径：可能是函数返回类型 struct Foo（已回退到名字） */
+            /* 回退路径：可能是函数返回类型 struct Foo（名字已消费） */
             if (sname[0]) {
                 FFIType *named = NULL;
                 for (int i = 0; i < sc->n_types; i++) {
@@ -835,7 +898,14 @@ static void parse_toplevel(CParser *cp, FFIScope *sc) {
                         break;
                     }
                 }
-                if (named) {
+                if (!named) {
+                    /* 未声明 tag 的函数返回类型 = 隐式不完整类型（同 parse_struct_body） */
+                    named = type_new(en ? FFI_ENUM : FFI_STRUCT,
+                                     en ? 4 : 0, en ? 4 : 1);
+                    named->name = xstrdup(sname);
+                    scope_add_type(sc, named);
+                }
+                {
                     FFIType *ret = apply_pointers(cp, named);
                     if (cp->tkind == 1) {
                         char fname[128];
@@ -904,10 +974,25 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
         return t;
     }
 
-    FFIType *t = type_new(FFI_STRUCT, 0, 1);
+    FFIType *t = NULL;
     if (sname && sname[0]) {
-        t->name = xstrdup(sname);
-        scope_add_type(sc, t);
+        /* 前向/隐式不完整占位（parse_struct_body miss 时已登记）→ 本次
+         * 定义直接填充同一对象——否则查表永远先命中 0-size 占位（布局不
+         * 生效），同名还会双份登记 */
+        for (int i = 0; i < sc->n_types; i++)
+            if (sc->types[i]->name && strcmp(sc->types[i]->name, sname) == 0) {
+                t = sc->types[i];
+                break;
+            }
+        if (t && (t->code != FFI_STRUCT || t->n_fields > 0 || t->fields))
+            t = NULL;   /* 已有完整定义：保持旧行为（重复定义新建+登记） */
+    }
+    if (!t) {
+        t = type_new(FFI_STRUCT, 0, 1);
+        if (sname && sname[0]) {
+            t->name = xstrdup(sname);
+            scope_add_type(sc, t);
+        }
     }
 
     int cap = 8;
@@ -989,6 +1074,8 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
                 cap *= 2;
                 t->fields = tm_realloc(t->fields, sizeof(*t->fields) * (size_t)cap);
             }
+            /* 修5：内嵌按值不完整（指针字段经 apply_pointers 后不命中） */
+            check_complete_byval(emb, fname[0] ? fname : "(struct field)");
             t->fields[t->n_fields].name = xstrdup(fname);
             t->fields[t->n_fields].type = emb;
             t->fields[t->n_fields].offset = 0;
@@ -1002,6 +1089,8 @@ static FFIType *parse_named_body(CParser *cp, FFIScope *sc, bool is_enum,
         for (;;) {
             char fname[128] = {0};
             FFIType *ft = parse_declarator(cp, sc, base, fname, sizeof fname, false);
+            /* 修5：按值不完整字段（指针字段/数组指针不受影响） */
+            check_complete_byval(ft, fname[0] ? fname : "(struct field)");
             if (t->n_fields >= cap) {
                 cap *= 2;
                 t->fields = tm_realloc(t->fields, sizeof(*t->fields) * (size_t)cap);
@@ -1096,6 +1185,7 @@ static FFIFunc *scope_find_func(FFIScope *sc, const char *name) {
 
 static TVal cdata_wrap(void *ptr, FFIType *t, bool owned, FFIScope *sc) {
     FFCData *d = tm_malloc(sizeof *d);
+    memset(d, 0, sizeof *d);   /* 无 memset 时 keep/n_keep/cap_keep 是垃圾值 */
     d->ptr = ptr;
     d->type = t;
     d->owned = owned;
@@ -1119,6 +1209,14 @@ static void cdata_dtor(TObj *o) {
         tm_free(d->ptr);
         d->ptr = NULL;
         d->owned = false;
+    }
+    /* 保活表释放（幂等：置 NULL 后二次 dtor 为空操作） */
+    if (d && d->keep) {
+        for (int k = 0; k < d->n_keep; k++)
+            tval_release(&d->keep[k]);
+        tm_free(d->keep);
+        d->keep = NULL;
+        d->n_keep = 0;
     }
 }
 
@@ -1208,14 +1306,48 @@ static void wbuf_free_all(void) {
  * 进程不死（对齐 PHP；longjmp 不穿 ffi_call 的 C 栈）。
  * ============================================================ */
 
-typedef struct FFIClosure {
+typedef struct FFIClosure FFIClosure;
+
+/* ---- 跨线程回调投递（方案1：外部 C 线程 → 归属线程执行 → 结果回传）----
+ * VM/类表/cdata 注册表全是「创建闭包线程」的 TLS；civetweb 这类外部 C
+ * 线程上 tphp_vm_current==NULL，就地 decode 会拿 NULL 类表直接 AV（bug
+ * 实证）。改为投递：外部线程把 CBTask 挂进归属线程的队列（args/ret 指
+ * 向本线程 trampoline/libffi 栈帧——阻塞等待期间恒有效，无需拷贝），
+ * uv_async_send 唤醒归属线程事件循环，drain 里 decode→bounded→encode，
+ * 置 DONE 后 broadcast，外部线程带着返回值回到 C 调用方。
+ * 10s 未被调度（归属线程阻塞在纯 native 调用里）→ 摘除节点放弃并零值
+ * 返回 + warning，绝不无限吊死对端线程。
+ * 队列堆分配、进程级保活（对端线程可能晚于归属线程退出）。 */
+enum { CB_PEND, CB_RUN, CB_DONE };
+
+typedef struct CBTask {
+    struct CBTask *next, *prev;   /* 队列链（节点在外线程栈上） */
+    FFIClosure *fc;
+    void **args;                  /* trampoline 栈上的实参数组 */
+    void *ret;                    /* libffi 返回缓冲 */
+    int state;                    /* CB_PEND → CB_RUN → CB_DONE */
+} CBTask;
+
+typedef struct CBQ {
+    uv_mutex_t mu;
+    uv_cond_t cv;
+    CBTask *head, *tail;
+    uv_async_t async;             /* 归属线程 loop 的唤醒器（unref） */
+    bool async_inited;
+    bool dead;                    /* loop teardown 后拒收 */
+} CBQ;
+
+struct FFIClosure {
     ffi_closure *cl;
     void *exec;              /* 可执行地址（传给 C 的值） */
     ffi_cif cif;             /* 回调签名 */
     ffi_type **cif_atypes;
     TVal fn;                 /* PHP 闭包（已 addref） */
     FFIType *sig;            /* FFI_FUNC_PTR（借用 scope 类型，活到线程结束） */
-} FFIClosure;
+    CBQ *q;                  /* 归属线程的投递队列（创建闭包时 arm） */
+};
+
+static _Thread_local CBQ *g_cbq;
 
 static _Thread_local FFIClosure **g_closures;
 static _Thread_local int g_n_closures, g_cap_closures;
@@ -1354,45 +1486,191 @@ extern TVal tphp_vm_call_callable(struct VM *vm, TVal callable,
 extern bool tphp_vm_call_bounded(struct VM *vm, TVal callable,
                                  TVal *args, int n, TVal *out);
 
-static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
-                          void *user_data) {
-    (void)cif;
-    FFIClosure *fc = (FFIClosure *)user_data;
+#define CB_WAIT_NS ((uint64_t)10 * 1000000000ull)   /* 投递等待上限 10s */
+
+/* 在「持有 VM 的线程」上执行一次回调（同线程直调与跨线程 drain 共用）。
+ * ctx_ensure 兜底 drain 的 uv_run 空闲态（vm->x 三件套为 NULL）；同线程
+ * 路径的 ctx 属于外层协程、早已存在——ensure 是无副作用的空操作。
+ * 归还只在 drain 侧做（那里才允许动 vm->x）。 */
+static void cb_exec_on_vm(VM *vm, FFIClosure *fc, void *ret, void **args) {
     FFIType *sig = fc->sig;
-    VM *vm = (VM *)tphp_vm_current;
     tphp_ffi_cb_depth++;
+    tphp_ctx_ensure(&vm->x);
     int n = sig->fn_n > CB_MAX_ARGS ? CB_MAX_ARGS : sig->fn_n;
     TVal argv[CB_MAX_ARGS];
     for (int i = 0; i < n; i++)
         argv[i] = cb_decode_arg(sig->fn_params[i], args[i]);
     TVal r = TV_NULL;
-    if (vm) {
-        if (!tphp_vm_call_bounded(vm, fc->fn, argv, n, &r)) {
-            /* 逃逸：对齐 PHP E_WARNING——未捕获异常 warning + 零值返回，
-             * 进程不死；回调内 try/catch 已在 bounded 内处理 */
-            TExObj *ex = vm->x.exception;
-            if (ex) {
-                const char *cls = (ex->wrap && ex->wrap->cls->name)
-                    ? tstr_val(ex->wrap->cls->name) : ex->cls->name;
-                const char *file = ex->file ? ex->file : "-";
-                fprintf(stderr,
-                        "PHP Warning: Uncaught %s: %s in %s:%d in FFI callback\n"
-                        "  thrown in %s on line %d\n",
-                        cls, tstr_val(ex->message), file, ex->line,
-                        file, ex->line);
-                TVal xv = TV_OBJ(ex);
-                vm->x.exception = NULL;
-                tval_release(&xv);
-            }
-            r = TV_NULL;              /* 零值返回（cb_encode_ret 宽松语义） */
+    if (!tphp_vm_call_bounded(vm, fc->fn, argv, n, &r)) {
+        /* 逃逸：对齐 PHP E_WARNING——未捕获异常 warning + 零值返回，
+         * 进程不死；回调内 try/catch 已在 bounded 内处理 */
+        TExObj *ex = vm->x.exception;
+        if (ex) {
+            const char *cls = (ex->wrap && ex->wrap->cls->name)
+                ? tstr_val(ex->wrap->cls->name) : ex->cls->name;
+            const char *file = ex->file ? ex->file : "-";
+            fprintf(stderr,
+                    "PHP Warning: Uncaught %s: %s in %s:%d in FFI callback\n"
+                    "  thrown in %s on line %d\n",
+                    cls, tstr_val(ex->message), file, ex->line,
+                    file, ex->line);
+            TVal xv = TV_OBJ(ex);
+            vm->x.exception = NULL;
+            tval_release(&xv);
         }
-    } else {
-        fprintf(stderr, "PHP Warning: FFI callback invoked without a VM\n");
+        r = TV_NULL;                  /* 零值返回（cb_encode_ret 宽松语义） */
     }
     for (int i = 0; i < n; i++) tval_release(&argv[i]);
     cb_encode_ret(sig->fn_ret, ret, r);
     tval_release(&r);
     tphp_ffi_cb_depth--;
+}
+
+/* drain 后把 vm->x 还原成 resume_cont 置位的空闲态（memset + done）。
+ * 三件套是 cb_exec_on_vm 现分配的，必须就地归还——下次 resume 会把
+ * vm->x 整块覆盖成协程自己的 ctx，堆指针没有第二个回收点。 */
+static void cb_ctx_restore(VM *vm) {
+    if (vm->x.calls) tm_free(vm->x.calls);
+    if (vm->x.args) tm_free(vm->x.args);
+    if (vm->x.caps) tm_free(vm->x.caps);
+    memset(&vm->x, 0, sizeof vm->x);
+    vm->x.done = true;
+}
+
+/* uv_async 回调（归属线程事件循环内）：把队列里等待的外部线程逐个放行。
+ * 节点在外线程栈上：置 DONE 前持有 mu（对端只能等 mu），broadcast 后
+ * 本函数不再触碰该节点——对端唤醒返回即回收栈帧，无 UAF。 */
+static void cb_async_drain(uv_async_t *a) {
+    CBQ *q = (CBQ *)a->data;
+    VM *vm = (VM *)tphp_vm_current;
+    for (;;) {
+        uv_mutex_lock(&q->mu);
+        CBTask *t = q->head;
+        if (!t) { uv_mutex_unlock(&q->mu); return; }
+        q->head = t->next;
+        if (q->head) q->head->prev = NULL; else q->tail = NULL;
+        t->next = t->prev = NULL;
+        t->state = CB_RUN;
+        uv_mutex_unlock(&q->mu);
+        if (vm) {
+            cb_exec_on_vm(vm, t->fc, t->ret, t->args);
+            cb_ctx_restore(vm);
+        } else {
+            /* 理论不可达：loop 能跑说明线程在 run 中（VM 恒在） */
+            fprintf(stderr, "PHP Warning: FFI callback: no VM on owning "
+                            "thread\n");
+        }
+        uv_mutex_lock(&q->mu);
+        t->state = CB_DONE;
+        uv_cond_broadcast(&q->cv);
+        uv_mutex_unlock(&q->mu);
+    }
+}
+
+/* sched_cleanup 钩子（归属线程执行）：loop 关闭前摘掉常驻 async。
+ * 持锁置 dead + 撤 inited → 对端要么已送完、要么看 dead 拒收，
+ * 之后 uv_close 不会与 uv_async_send 竞态；broadcast 放走阻塞中的
+ * 外部线程（它们自行摘节点 + 零值返回）。 */
+static void cbq_detach(void) {
+    CBQ *q = g_cbq;
+    if (!q || !q->async_inited) return;
+    uv_mutex_lock(&q->mu);
+    q->dead = true;
+    q->async_inited = false;
+    uv_cond_broadcast(&q->cv);
+    uv_mutex_unlock(&q->mu);
+    uv_close((uv_handle_t *)&q->async, NULL);
+    uv_run(tphp_sched_loop(), UV_RUN_NOWAIT);   /* 冲刷 close（异步完成） */
+}
+
+/* 惰性建队列 + 把 async 挂上本线程 loop（closure_create 在归属线程调用
+ * ——uv_async_init 必须在 loop 线程做；外部线程只 send）。跨 run 复用：
+ * 下一次 run 重建 loop 后由新的 closure_create 重新 arm。 */
+static CBQ *cbq_arm(void) {
+    CBQ *q = g_cbq;
+    if (!q) {
+        q = tm_malloc(sizeof *q);
+        memset(q, 0, sizeof *q);
+        uv_mutex_init(&q->mu);
+        uv_cond_init(&q->cv);
+        g_cbq = q;
+    }
+    if (!q->async_inited) {
+        tphp_sched_loop_init();
+        uv_async_init(tphp_sched_loop(), &q->async, cb_async_drain);
+        q->async.data = q;
+        uv_unref((uv_handle_t *)&q->async);      /* 项目红线：handle 必须 unref */
+        uv_mutex_lock(&q->mu);
+        q->dead = false;
+        q->async_inited = true;
+        uv_mutex_unlock(&q->mu);
+        tphp_sched_loop_on_teardown(cbq_detach);
+    }
+    return q;
+}
+
+/* 外部 C 线程：入队 + 唤醒 + 阻塞等结果（encode 由归属线程写进 ret，
+ * 本线程栈上——醒来后直接把返回值交回 C 调用方）。 */
+static void cb_post_and_wait(FFIClosure *fc, void *ret, void **args) {
+    FFIType *sig = fc->sig;
+    if (sig->fn_ret->size)
+        memset(ret, 0, sig->fn_ret->size);   /* 放弃路径的零值返回 */
+    CBQ *q = fc->q;
+    CBTask t;
+    t.next = t.prev = NULL;
+    t.fc = fc;
+    t.args = args;
+    t.ret = ret;
+    t.state = CB_PEND;
+    uv_mutex_lock(&q->mu);
+    if (q->dead) {
+        uv_mutex_unlock(&q->mu);
+        fprintf(stderr, "PHP Warning: FFI callback dropped: owning "
+                        "runtime is shutting down\n");
+        return;
+    }
+    t.prev = q->tail;
+    if (q->tail) q->tail->next = &t; else q->head = &t;
+    q->tail = &t;
+    /* 锁内 send：与 cbq_detach 的 uv_close 互斥（send 完成后才许 close） */
+    if (q->async_inited) uv_async_send(&q->async);
+    bool timed_out = false;
+    for (;;) {
+        if (t.state == CB_DONE) { uv_mutex_unlock(&q->mu); return; }
+        if (t.state == CB_PEND && (q->dead || timed_out)) {
+            /* 超时/停机时节点可能仍在队列：自摘，绝不留外线程栈上的悬垂链 */
+            bool shut = q->dead;
+            if (t.prev) t.prev->next = t.next; else q->head = t.next;
+            if (t.next) t.next->prev = t.prev; else q->tail = t.prev;
+            uv_mutex_unlock(&q->mu);
+            fprintf(stderr, shut
+                    ? "PHP Warning: FFI callback dropped: owning runtime "
+                      "is shutting down\n"
+                    : "PHP Warning: FFI callback timed out: owning thread "
+                      "did not run it within 10s\n");
+            return;
+        }
+        if (timed_out)
+            uv_cond_wait(&q->cv, &q->mu);       /* 已在执行：等它收尾 */
+        else if (uv_cond_timedwait(&q->cv, &q->mu, CB_WAIT_NS)
+                 == UV_ETIMEDOUT)
+            timed_out = true;
+    }
+}
+
+static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
+                          void *user_data) {
+    (void)cif;
+    FFIClosure *fc = (FFIClosure *)user_data;
+    VM *vm = (VM *)tphp_vm_current;
+    if (vm) {
+        /* 持 VM 的线程（同线程 ffi_call 内直调 / 归属线程 drain） */
+        cb_exec_on_vm(vm, fc, ret, args);
+        return;
+    }
+    /* 外部 C 线程：无 VM（decode 里 cdata 类表也是 NULL——先于一切
+     * decode 投递），投递归属线程执行并阻塞等回传 */
+    cb_post_and_wait(fc, ret, args);
 }
 
 /* 闭包 → 可执行 trampoline 地址；失败 raise。
@@ -1403,6 +1681,10 @@ static void cb_trampoline(ffi_cif *cif, void *ret, void **args,
  * 不去重（v1 范围外）。 */
 static void *closure_create(VM *vm, FFIType *sig, TVal fn,
                             const char *fname, int idx) {
+    if (!sig->fn_ret || (sig->fn_n > 0 && !sig->fn_params))
+        tphp_vm_raise(vm, "Error",
+                      "%s(): Argument #%d callback has no signature",
+                      fname, idx + 1);
     if (sig->fn_n > CB_MAX_ARGS)
         tphp_vm_raise(vm, "Error",
                       "%s(): Argument #%d callback has too many parameters "
@@ -1418,6 +1700,7 @@ static void *closure_create(VM *vm, FFIType *sig, TVal fn,
     FFIClosure *fc = tm_malloc(sizeof *fc);
     memset(fc, 0, sizeof *fc);
     fc->sig = sig;
+    fc->q = cbq_arm();          /* 跨线程投递队列归属本线程（async 挂本 loop） */
     fc->fn = fn;
     tval_addref(fn);
     ffi_type **ats = tm_malloc(sizeof(ffi_type *) *
@@ -1797,6 +2080,12 @@ static TVal nm_ffi_new(VM *vm, void *self, TVal *args, int n) {
             sc = g_scopes[fo->props[0].u.i];
     }
     FFIType *t = parse_type_string(vm, ((TStr *)args[0].u.p)->c, sc);
+    /* 修5：按值分配不完整类型 → 明确报错（旧实现 tm_malloc(0→1) 静默分配） */
+    if (t->code == FFI_STRUCT && t->n_fields == 0 && t->size == 0)
+        tphp_vm_raise(vm, "ValueError",
+                      "FFI::new(): type \"%s\" is incomplete (size unknown); "
+                      "only pointers to it can be declared",
+                      t->name ? t->name : "?");
     void *buf = tm_malloc(t->size ? t->size : 1);
     memset(buf, 0, t->size ? t->size : 1);
     return cdata_wrap(buf, t, owned, sc);
@@ -2137,16 +2426,14 @@ bool tphp_ffi_assign_prop(VM *vm, TObj *o, TStr *name, TVal val) {
             if (val.t == T_STR) {
                 TStr *s = (TStr *)val.u.p;
                 if (ft->array_elem && ft->array_elem->code == FFI_WCHAR) {
-                    size_t nels = 0;
-                    void *w = utf8_to_wide(s->c, s->len, &nels);
-                    /* 注意：字段持有的 wide 缓冲需长期存活——简化为直接
-                     * 存 UTF-8 指针（调用方保证字符串存活）或报错。
-                     * 完整方案需给 CData 加 owned wide 缓冲表；M5.5 先
-                     * 用 UTF-8 直存，文档注明 wchar 字段赋值限制。 */
-                    tm_free(w);   /* 不使用临时转换 */
+                    /* wchar 字段暂直存 UTF-8 指针（转换后置，见 M5.5 注释）；
+                     * 同样挂保活——rvalue TStr 释放即悬垂 */
+                    cdata_keep_str(d, val);
                     *(void **)fp = (void *)s->c;
                     return true;
                 }
+                /* 保活：字段里的裸 c 指针，rvalue TStr 释放后即悬垂 */
+                cdata_keep_str(d, val);
                 *(void **)fp = (void *)s->c;
                 return true;
             }
@@ -2292,6 +2579,8 @@ bool tphp_ffi_assign_dim(VM *vm, TVal base, TVal key, TVal val) {
     if (el->code == FFI_PTR) {
         if (val.t == T_NULL) { *(void **)ep = NULL; return true; }
         if (val.t == T_STR) {
+            /* 保活：裸 c 指针存进数组元素，rvalue TStr 释放后即悬垂 */
+            cdata_keep_str(d, val);
             *(void **)ep = (void *)((TStr *)val.u.p)->c;
             return true;
         }

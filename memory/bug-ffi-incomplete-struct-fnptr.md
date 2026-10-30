@@ -2,7 +2,7 @@
 
 - **日期**：2026-10-30
 - **发现场景**：用 `tphp.exe run` 跑 `C:\project\tphp\teb\tests\hello.php`（teb = 基于 civetweb 的 FFI 扩展包，`Tphp\Teb\Web` 通过 `FFI::cdef(include/teb.h, teb.dll)` 包 C 动态库）
-- **状态**：未修复（tphp 侧能力缺口）；已定位、已对照真 PHP 验证
+- **状态**：**已修复（2026-10-30）**——tphp 侧「修复方向」两项全部落地 + 顺带三项；回归固化 `tests/ffi/test-ffi-incomplete-types.php`（232/232 全绿）；teb 端到端 `tests/hello.php` exit 0。teb 项目侧另发现 3 个独立 bug（见文末「修复记录」）。
 - **严重度**：中（仅影响依赖「不完整结构体指针 / 函数指针 typedef」的 FFI 头；teb 这类 civetweb 封装直接中招）
 
 ---
@@ -109,3 +109,30 @@ C:\project\tphp\TinyPHP.rt\build\tphp.exe run C:\project\tphp\teb\tests\hello.ph
 :: 真 PHP 侧（解析通过；teb.h 未修前会在 mg_websocket_write 符号解析处报 Failed resolving）
 C:\env\php-8.4.13-nts-Win32-vs17-x64\php.exe C:\project\tphp\teb\tests\hello.php
 ```
+
+---
+
+## 修复记录（2026-10-30，全部落于 `ext/ffi/ffi.c`）
+
+### tphp 侧（本 bug）
+1. **`parse_struct_body` 查表 miss → 隐式不完整类型占位**（建 0-size/0-field struct/union 占位并登记 tag；enum 占位 size=4；后续完整定义经 `parse_named_body` **复用填充同一对象**，防双份登记）——覆盖参数位/typedef/成员位所有 `struct X` 引用
+2. **顶层 `struct X *fn` 路径**：删错误回退（旧代码重读出 `*` 而非名字 → `unexpected token "*"`），保留 sname 走返回类型路径；查表 miss 同样建占位
+3. **前向声明 `struct X;` 登记占位 tag**（旧实现忽略不登记 → 二次引用 unknown type）
+4. **typedef 分支改走 `parse_declarator`**——接入已有的 `(*name)(params)` → `FFI_FUNC_PTR` 解析（函数指针 typedef 从此可用，回调 v1 trampoline 路径直接受益）
+5. **按值不完整类型三消费点拦截**（`check_complete_byval`：解链数组后核心仍 0-size struct → ValueError，C 同非法）：`parse_function` 返回值/参数、结构体字段（普通+内嵌两路径）、`FFI::new`
+6. **顺带：CData 字符串保活**（`FFCData.keep` 表 + `cdata_keep_str`）——字符串→`char*` 写入元素/字段存裸 `c` 指针，rvalue 非 interned 串释放即悬垂；`cdata_wrap` 补 `memset`（新字段防垃圾值）
+
+### teb 项目侧（同场发现的独立 bug，已在用户 clone 上修复 1、3）
+1. **`Web::start` options 数组缺 NULL 终止槽**：`new("char *[2]")` → civetweb 读 `options[2]` 越界（tphp 堆布局读到垃圾指针 → AV；真 PHP 恰好读到 0 而"活"——两端标准定义都是 UB）。已改 `char *[3]`（[2] memset 零即终止）
+2. **`Web::request` 漏 `return $this;`**（声明 `: self` 返回 null → TypeError，真 PHP 同样会报）。已补
+3. **`hello.php` 的 `// EXPECT: smoke=...` 与实现不符**：已修（2026-10-30，用户拍板「冒烟测试型 + 回调返回 body」契约）——`Web::run()` 改真阻塞（PHP 层 `sleep(1)` 循环保 uv loop 存活，供跨线程回调 drain，禁 FFI `Sleep()` 死等）；`request()` 包装闭包改为 `$cb` 返回响应体 → 拼 `HTTP/1.1 200` 头（Content-Length + Connection: close）→ `mg_write` → **`return 1`**（civetweb 签名 `int (conn,cbdata)`，返回 0 会被当未处理回 404）；`stop()` 置 `ctx=null` 防 `__destruct` 双重 `mg_stop`；`hello.php` 改为 start → 注册 handler → `http_get` 自请求（请求自带 `Connection: close`，服务端收 EOF 不挂）→ 打印 `smoke=<body>` → stop。实测：`smoke=hello from Tphp\Teb` exit 0；常驻形态外部 curl `/hi`→pong、`/nope`→404、进程存活
+
+### 验证
+- 8 形态实证表全 OK（对拍真 PHP 列全 ✅）；teb.h 全量 cdef OK；`mg_init_library/mg_version/mg_start/mg_stop` 双端一致；`mg_set_request_handler` 回调 trampoline 工作；hello.php exit 0
+- `tests/ffi/test-ffi-incomplete-types.php` 新增（14 行 EXPECT，含 strcpy 保活探针），套件 **232 passed / 0 failed**
+
+### 后续追加（同日晚，跨线程回调 + typedef alias 回归，套件 233/233）
+
+1. **typedef alias 空签名 bug（本修复第 4 项的回马枪）**：顶层 `typedef (*cb)(...)` 走 alias 分支时只拷了 `fields/array_elem/ffi`，**漏拷 `fn_ret/fn_params/fn_n`** → 入表的是 `fn_ret=NULL, fn_n=0` 的空壳；闭包传入该 typedef 参数 → `closure_create` 解引用 `sig->fn_ret` → 0xC0000005。qsort 走内联声明（不经 alias）所以 parse-only 测试从未暴露。已补三字段拷贝 + `closure_create` 无签名 raise 兜底。
+2. **teb handler 的真正崩溃点 = 跨线程回调**（`start+handler+http_get` 的 0xC0000005）：handler 在 civetweb worker 线程被调，该线程 `tphp_vm_current==NULL` 且 `g_cdata_cls` TLS 为 NULL，旧 trampoline **在 vm 判定之前 decode** → `cdata_wrap` 拿 NULL 类表即 AV。修复=方案 1 跨线程投递 marshaling（ffi.c CBQ/CBTask + `uv_async_send` 唤醒归属线程事件循环 drain 执行 + cond 回传结果，10s 超时零值返回；sched.c teardown 钩子 + 6 挂起点 `no current coroutine` 守卫；vm.c bounded 无 floor 逃逸），详见 MEMORY.md「2026-10-30 FFI 跨线程回调 marshaling」。
+3. **端到端验证**：`tests/ffi/test-ffi-callback-cross-thread.php`（CreateThread 真外部线程 → 主线程执行 → `GetExitCodeThread`=42 验返回值回传）；teb 矩阵三连绿——`tmp-reach`：CALLBACK-REACHED + `http_get len=30` + `C: stopped` exit 0（原 AV）；`tmp-nohandler`：404 body 正常；hello.php 回归 exit 0。

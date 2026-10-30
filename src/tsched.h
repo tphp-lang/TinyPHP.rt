@@ -51,6 +51,10 @@ struct uv_loop_s;
 struct uv_loop_s *tphp_sched_loop(void);
 bool tphp_sched_active(void);
 void tphp_sched_loop_init(void);   /* 幂等 loop init（Worker 子线程用） */
+/* 常驻 uv handle 的 teardown 钩子：sched_cleanup 关 loop 前调用（ext/ffi
+ * 跨线程回调的唤醒器用）。fn 进程内恒定，可重复注册；在各线程的
+ * sched_cleanup 上执行（钩子内读的是本线程状态）。 */
+void tphp_sched_loop_on_teardown(void (*fn)(void));
 
 /* Tphp\ 内置（注册进 builtin 表；名字走命名空间解析） */
 TVal tphp_async_spawn(VM *vm, TVal *args, int n);     /* spawn(callable, ...) */
