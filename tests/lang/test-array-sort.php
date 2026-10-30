@@ -66,3 +66,30 @@ echo json_encode($m), "\n";
 // EXPECT: {"i":9,"f":9.5,"s":"10"}
 echo "sort-done\n";
 // EXPECT: sort-done
+
+// ---- 批：sort/rsort/usort 归并核（O(n log n)）+ sort flags 补齐 ----
+$m = ["10", "9", "100"];
+sort($m, SORT_NUMERIC);
+echo json_encode($m), "\n";
+// EXPECT: ["9","10","100"]
+$m = ["10", "9", "100"];
+sort($m, SORT_STRING);
+echo json_encode($m), "\n";
+// EXPECT: ["10","100","9"]
+$m = [3, 1, 2];
+rsort($m);
+echo json_encode($m), "\n";
+// EXPECT: [3,2,1]
+$assoc = ["z" => 3, "a" => 1];
+sort($assoc);
+echo json_encode($assoc), "\n";
+// EXPECT: [1,3]
+$u = [3, 1, 2];
+usort($u, function ($x, $y) { return $y - $x; });
+echo json_encode($u), "\n";
+// EXPECT: [3,2,1]
+// usort 稳定性（PHP 8.0+）：零比较器保持原序
+$u = ["bb", "aa", "cc", "dd"];
+usort($u, function ($x, $y) { return 0; });
+echo json_encode($u), "\n";
+// EXPECT: ["bb","aa","cc","dd"]

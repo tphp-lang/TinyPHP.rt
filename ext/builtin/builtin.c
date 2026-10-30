@@ -945,6 +945,8 @@ static TVal bi_array_sum(VM *vm, TVal *args, int n) {
 
 static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 
+TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);   /* vm.c */
+
 /* ---- asort/arsort/ksort/krsort（P1-11）：键保持排序 ----
  * flags 语义对齐 PHP：REGULAR=tval_compare（PHP 8 数值串感知）、
  * NUMERIC=转数值、STRING=字节序（FLAG_CASE=不区分大小写）；
@@ -958,6 +960,15 @@ static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 #define PHP_SORT_FLAG_CASE     8
 
 typedef struct { TVal key; TVal val; } SortPair;
+
+/* 排序上下文：flags 路径（asort 族/sort 族）或回调路径（usort） */
+typedef struct {
+    int flags;
+    bool desc, by_key;
+    VM *vm;
+    TVal cb;                /* usort 回调（args 存活期内借用） */
+    bool use_cb;
+} SortCtx;
 
 static int sort_flags_cmp(TVal x, TVal y, int flags) {
     bool ci = (flags & PHP_SORT_FLAG_CASE) != 0;
@@ -994,18 +1005,32 @@ static int sort_flags_cmp(TVal x, TVal y, int flags) {
     }
 }
 
+static int sort_pair_cmp(SortCtx *c, TVal x, TVal y) {
+    if (c->use_cb) {
+        TVal pair[2] = { x, y };
+        TVal r = tphp_vm_call_callable(c->vm, c->cb, pair, 2);
+        int64_t v = tval_to_int(r);
+        tval_release(&r);
+        return v > 0 ? 1 : v < 0 ? -1 : 0;
+    }
+    return sort_flags_cmp(x, y, c->flags);
+}
+
+static TVal sort_pair_elem(SortPair *p, SortCtx *c) {
+    return c->by_key ? p->key : p->val;
+}
+
 static void sort_pairs_merge(SortPair *a, SortPair *tmp, uint32_t lo, uint32_t hi,
-                             int flags, bool desc, bool by_key) {
+                             SortCtx *c) {
     if (hi - lo < 2) return;
     uint32_t mid = lo + (hi - lo) / 2;
-    sort_pairs_merge(a, tmp, lo, mid, flags, desc, by_key);
-    sort_pairs_merge(a, tmp, mid, hi, flags, desc, by_key);
+    sort_pairs_merge(a, tmp, lo, mid, c);
+    sort_pairs_merge(a, tmp, mid, hi, c);
     uint32_t i = lo, j = mid, t = lo;
     while (i < mid && j < hi) {
-        int c = sort_flags_cmp(by_key ? a[i].key : a[i].val,
-                               by_key ? a[j].key : a[j].val, flags);
+        int r = sort_pair_cmp(c, sort_pair_elem(&a[i], c), sort_pair_elem(&a[j], c));
         /* 稳定：相等取左（PHP 8.0+ 排序稳定） */
-        tmp[t++] = (desc ? c >= 0 : c <= 0) ? a[i++] : a[j++];
+        tmp[t++] = (c->desc ? r >= 0 : r <= 0) ? a[i++] : a[j++];
     }
     while (i < mid) tmp[t++] = a[i++];
     while (j < hi)  tmp[t++] = a[j++];
@@ -1036,7 +1061,9 @@ static TVal bi_keep_sort(VM *vm, TVal *args, int n, bool by_key, bool desc,
         tval_addref(key);
         k++;
     }
-    sort_pairs_merge(kv, tmp, 0, k, flags, desc, by_key);
+    SortCtx c = { .flags = flags, .desc = desc, .by_key = by_key,
+                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+    sort_pairs_merge(kv, tmp, 0, k, &c);
     /* 清空原数组（同 bi_sort：data 值 + bucket 字符串键；interned 键
      * release no-op，防御式保留判断） */
     for (uint32_t i = 0; i < a->dused; i++) {
@@ -1083,28 +1110,26 @@ static TVal bi_krsort(VM *vm, TVal *args, int n) {
 
 
 static TVal bi_sort(VM *vm, TVal *args, int n) {
-    (void)n;
     TArr *a = need_arr(vm, &args[0], "sort", "#1 ($array)");
+    int flags = n >= 2 ? (int)tval_to_int(args[1]) : 0;
     tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
-    /* 原地排序：收集（+1）→ 插入排序 → 清空原数组 → 按序写回。
-     * 旧实现重建新数组后写回 args[0]——args 是实参副本，调用方的槽
-     * 永远收不到，sort/rsort 实际是空操作（2026-10-15 修）。 */
-    TVal *vals = tm_malloc(sizeof(TVal) * cnt);
+    /* 原地排序（P1-11 批：归并核 O(n log n)，替换插入排序 O(n²)；
+     * 旧实现写回 args[0] 无效——args 是实参副本，靠共享 TArr 指针原地改） */
+    SortPair *kv = tm_malloc(sizeof(SortPair) * (size_t)cnt);
+    SortPair *tmp = tm_malloc(sizeof(SortPair) * (size_t)cnt);
     uint32_t k = 0;
     for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        vals[k] = a->data[i];
-        tval_addref(vals[k]);
+        kv[k].val = a->data[i];
+        tval_addref(kv[k].val);
+        kv[k].key = TV_NULL;            /* sort 重排索引，键不参与 */
         k++;
     }
-    for (uint32_t i = 1; i < k; i++) {
-        TVal key = vals[i];
-        int64_t j = (int64_t)i - 1;
-        while (j >= 0 && loose_cmp(vals[j], key) > 0) { vals[j + 1] = vals[j]; j--; }
-        vals[j + 1] = key;
-    }
+    SortCtx c = { .flags = flags, .desc = false, .by_key = false,
+                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+    sort_pairs_merge(kv, tmp, 0, k, &c);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
             tval_release(&a->data[i]);
@@ -1121,32 +1146,31 @@ static TVal bi_sort(VM *vm, TVal *args, int n) {
     a->free_head = UINT32_MAX;
     a->dused = 0;
     for (uint32_t i = 0; i < k; i++)
-        tarr_append(a, vals[i]);   /* 所有权转移 */
-    tm_free(vals);
+        tarr_append(a, kv[i].val);   /* 所有权转移 */
+    tm_free(kv);
+    tm_free(tmp);
     return TV_TRUE;
 }
 
 static TVal bi_rsort(VM *vm, TVal *args, int n) {
-    (void)n;
     TArr *a = need_arr(vm, &args[0], "rsort", "#1 ($array)");
+    int flags = n >= 2 ? (int)tval_to_int(args[1]) : 0;
     tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
-    /* 原地排序（同 bi_sort；旧实现写回 args[0] 无效） */
-    TVal *vals = tm_malloc(sizeof(TVal) * cnt);
+    SortPair *kv = tm_malloc(sizeof(SortPair) * (size_t)cnt);
+    SortPair *tmp = tm_malloc(sizeof(SortPair) * (size_t)cnt);
     uint32_t k = 0;
     for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        vals[k] = a->data[i];
-        tval_addref(vals[k]);
+        kv[k].val = a->data[i];
+        tval_addref(kv[k].val);
+        kv[k].key = TV_NULL;
         k++;
     }
-    for (uint32_t i = 1; i < k; i++) {
-        TVal key = vals[i];
-        int64_t j = (int64_t)i - 1;
-        while (j >= 0 && loose_cmp(vals[j], key) < 0) { vals[j + 1] = vals[j]; j--; }
-        vals[j + 1] = key;
-    }
+    SortCtx c = { .flags = flags, .desc = true, .by_key = false,
+                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+    sort_pairs_merge(kv, tmp, 0, k, &c);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
             tval_release(&a->data[i]);
@@ -1163,8 +1187,9 @@ static TVal bi_rsort(VM *vm, TVal *args, int n) {
     a->free_head = UINT32_MAX;
     a->dused = 0;
     for (uint32_t i = 0; i < k; i++)
-        tarr_append(a, vals[i]);   /* 所有权转移 */
-    tm_free(vals);
+        tarr_append(a, kv[i].val);
+    tm_free(kv);
+    tm_free(tmp);
     return TV_TRUE;
 }
 
@@ -1742,29 +1767,20 @@ static TVal bi_usort(VM *vm, TVal *args, int n) {
     tarr_sync_buckets(a);
     uint32_t cnt = a->n;
     if (cnt <= 1) return TV_TRUE;
-    /* 收集元素 */
-    TVal *items = tm_malloc(sizeof(TVal) * cnt);
+    /* 收集元素（P1-11 批：归并核 O(n log n)，替换插入排序 O(n²)） */
+    SortPair *kv = tm_malloc(sizeof(SortPair) * (size_t)cnt);
+    SortPair *tmp = tm_malloc(sizeof(SortPair) * (size_t)cnt);
     uint32_t k = 0;
     for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        items[k++] = a->data[i];
-        tval_addref(items[k - 1]);
+        kv[k].val = a->data[i];
+        tval_addref(kv[k].val);
+        kv[k].key = TV_NULL;
+        k++;
     }
-    /* 插入排序（stable，小数组够用；大数组后续换 qsort） */
-    for (uint32_t i = 1; i < k; i++) {
-        TVal key = items[i];
-        uint32_t j = i;
-        while (j > 0) {
-            TVal pair[2] = { items[j - 1], key };
-            TVal r = tphp_vm_call_callable(vm, args[1], pair, 2);
-            int64_t c = tval_to_int(r);
-            tval_release(&r);
-            if (c <= 0) break;
-            items[j] = items[j - 1];
-            j--;
-        }
-        items[j] = key;
-    }
+    SortCtx c = { .flags = 0, .desc = false, .by_key = false,
+                  .vm = vm, .cb = args[1], .use_cb = true };
+    sort_pairs_merge(kv, tmp, 0, k, &c);
     /* 清空原数组后按序写回（int 键 0..n-1） */
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
@@ -1783,8 +1799,9 @@ static TVal bi_usort(VM *vm, TVal *args, int n) {
     a->dused = 0;
     /* 重新填充 */
     for (uint32_t i = 0; i < k; i++)
-        tarr_append(a, items[i]);   /* 所有权转移 */
-    tm_free(items);
+        tarr_append(a, kv[i].val);   /* 所有权转移 */
+    tm_free(kv);
+    tm_free(tmp);
     return TV_TRUE;
 }
 
