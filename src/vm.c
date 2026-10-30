@@ -5309,6 +5309,20 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     }
     if (!fn)
         vm_raise(vm, ex_class("Error"), NULL, "Value is not callable");
+#ifdef TPHP_JIT
+    /* P0-15①: 动态调用兜底（call_dyn 慢路 / call_user_func / usort 族 /
+     * FFI 回调 全走本函数）此前绕过 op_do_fcall 的 hot++/eager 编译门
+     * （~1662）→ 被动态调用的 callee 永不获 jit_entry → JIT'd caller 的
+     * B FAST 链恒败于 entry==0（if5）、门2 快照永无填充（50M 调用 0 命中
+     * 插桩实证）。与主路径同式补门；编译失败/ineligible 由
+     * tphp_jit_compile 置 hot=UINT16_MAX 自动停表，无重复尝试开销。 */
+    if (tphp_jit_available() && !fn->jit_entry && fn->hot != UINT16_MAX) {
+        ++fn->hot;
+        if (fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+            fn->hot >= TPHP_JIT_HOT_THRESHOLD)
+            tphp_jit_compile(fn);
+    }
+#endif
     if (recv) {
         /* method frame: $this lives in slot 0 (owned ref — the closure's /
          * array's reference is separate), RECV moves params, extras die */
