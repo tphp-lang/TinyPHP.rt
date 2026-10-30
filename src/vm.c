@@ -1666,9 +1666,16 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                 tphp_jit_compile(fn);
         }
         if (fn->jit_entry && f->n_args_sent >= fn->n_params) {
-            /* v1.2 direct-slot ABI: interpreter path must guard params
-             * are INT and copy args→slots before calling (JIT→JIT callers
-             * already did this in their lowering). Guard-fail → deopt. */
+            /* v1.2 direct-slot ABI: interpreter path copies args→slots before
+             * calling (JIT→JIT callers already did this in their lowering).
+             * 准入期已拒绝 typed/defaulted/captured/variadic 参数，且 JIT
+             * prologue 整体跳过 RECV（jit.c pc0 循环），故解释器侧仅剩一个
+             * 守卫：具名参数洞（UNDEF）→ deopt 让 RECV 走默认值/arity 报错。
+             * 任意参数类型放行（旧 INT-only 守卫令 f($arr) 从顶层调用时
+             * 永远进不了 JIT——编译成功也每次静默 deopt）：引用计数值
+             * addref 拷入 slot，成功后在此消费 arg 引用（RECV 永不执行）；
+             * 普通 deopt 则留给解释器 RECV（release slot 副本 + move arg）；
+             * 异常 deopt 帧弹出时 RECV 没跑过，arg 引用须在此释放。 */
             TVal *args = &vm->x.args[rec->args_base];
             /* 方法帧 $this@slot0、参数从 1..（compile.c get_var("this")，
              * RECV 目标 CV=1..）——旧版直写 slots[0..n_params) 覆盖 $this
@@ -1678,15 +1685,21 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
             uint32_t poff = rec->is_method ? 1 : 0;
             bool guard_ok = true;
             for (uint16_t i = 0; i < fn->n_params; i++) {
-                if (args[i].t != T_INT) { guard_ok = false; break; }
+                if (args[i].t == T_UNDEF) { guard_ok = false; break; }
             }
             if (guard_ok) {
-                for (uint16_t i = 0; i < fn->n_params; i++)
+                for (uint16_t i = 0; i < fn->n_params; i++) {
                     f->slots[poff + i] = args[i];
+                    tval_addref(args[i]);
+                }
                 /* locals beyond params: frame alloc already UNDEF */
                 TVal jret = { .u.i = 0, .t = T_NULL };
                 int jok = ((JitEntry)fn->jit_entry)(vm, f->slots, &jret);
                 if (jok) {
+                    for (uint16_t i = 0; i < fn->n_params; i++) {
+                        tval_release(&args[i]);
+                        args[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                    }
                     VMCallRec *jr = &vm->x.calls[vm->x.n_calls - 1];
                     vm->x.n_calls--;
                     if (jr->dst_kind != OPD_UNUSED) {
@@ -1704,12 +1717,19 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                      * path line ~1633) — must NOT advance again (d=0) */
                     return 0;
                 }
-                /* deopt: guards precede writes; interpreter runs RECV
-                 * normally. builtin-raise deopt (tphp_jit_bcall failed):
-                 * IR frame already returned — raise from this C frame,
-                 * RtlUnwind never crosses an IR frame (no UNWIND_INFO). */
-                if (vm->x.exception)
+                /* deopt: interpreter re-runs RECV from pc 0 (slot copies get
+                 * released there, arg refs moved). builtin-raise deopt
+                 * (tphp_jit_bcall failed): IR frame already returned — raise
+                 * from this C frame, RtlUnwind never crosses an IR frame (no
+                 * UNWIND_INFO). 异常路径帧会被弹掉、RECV 永远不跑——arg
+                 * 引用若不在此释放即泄漏（slot 副本由 frame_destroy 收）。 */
+                if (vm->x.exception) {
+                    for (uint16_t i = 0; i < fn->n_params; i++) {
+                        if (args[i].t != T_UNDEF) tval_release(&args[i]);
+                        args[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                    }
                     longjmp(vm->x.unwind, 1);
+                }
             }
         }
     }
