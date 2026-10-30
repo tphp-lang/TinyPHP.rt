@@ -107,3 +107,6 @@
 - 附带运行时修复（锚点）：①class_resolve_lc2(lc,orig)——spl_autoload 收原始大小写类名（PSR-4 必需，全调用点已换）②TFunc.prog 反查——动态 require 的独立 Program funcs 表，CLOSURE_INIT 用 vm->prog 会越界 0xC0000005 ③嵌套循环两套语义：默认 run_frame_until_pop 保持旧"帧切换即退出"（改深=析构/magic 时序崩、大面积 0xC0000005）；仅 autoload 用 run_frame_until_pop_deep，且**必须先缓存 stop=f->prev（f 弹出即 free，条件读 f->prev 是 UAF）**
 - 杂项坑：stdlib 无 strncmp（生成代码用 substr）；build 每次重生成 bundle_data.c——stash/checkout 撞它先 restore；PS 把 `stash@{0}` 的花括号剥掉
 - ~~下次：阶段 B → C → D~~ **已完成（2026-10-21，HEAD 见 1b57f0c 之后的 pkg 提交）**：add/remove/install/upload + 失败诊断测试 + path_join3 修复 + Windows Root 信任库 + GitHub URL v2 语义 + 覆盖 fail-closed；基线 179/179
+
+## 独立 Bug 记录文件索引
+- **[bug-ffi-incomplete-struct-fnptr.md](bug-ffi-incomplete-struct-fnptr.md)**（2026-10-30）：tphp 自带 FFI 的 `cdef` 解析器不支持「函数签名里的不完整结构体指针（`struct X *`）」与「函数指针 typedef」，导致 civetweb 类 FFI 头（`teb.h`）在 `tphp run` 下崩 `unknown type "mg_connection"`；真 PHP 原生 FFI 可正常解析（已实证对照）。关联：teb.dll 未导出 `mg_websocket_write`/`mg_websocket_client_write`，teb.h 与 dll 脱节（独立 bug）。修复方向 = 补 tphp ext/ffi 的指针/函数指针解析。
