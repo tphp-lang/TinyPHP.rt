@@ -223,6 +223,11 @@ bool tval_loose_eq(TVal a, TVal b) {
 static bool strict_eq_val(TVal a, TVal b);
 
 static bool strict_eq_arr(TArr *x, TArr *y) {
+    /* L5 惰性桶：比较器裸读 buckets——bpending>0 的数组（append/顺序 int
+     * 快路后）桶落后，先补齐（潜伏 bug：tarr_set 顺序 int 快路经
+     * unserialize round-trip `===` 暴露，[1] 单元素即可复现） */
+    tarr_sync_buckets(x);
+    tarr_sync_buckets(y);
     if (x->n != y->n) return false;
     uint32_t seen = 0;
     for (uint32_t i = 0; i < x->dused; i++) {

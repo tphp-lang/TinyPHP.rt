@@ -163,6 +163,21 @@ void tarr_sync_buckets(TArr *a) {
 bool tval_norm_key(TVal *key); /* value.c */
 
 bool tarr_set(TArr *a, TVal key, TVal val) {
+    /* PHP parity（批4 剖面）：$m[$i]=$v 且 $i==next_idx 就是追加——
+     * zend_hash nextFreeElement 快路同构。顺序 int 键此前走全探测
+     * （kv-comp 剖面：+105ns vs append 地板，PHP 仅 +2ns）。packed
+     * 不变量保证 key 必不存在（0..next_idx-1 已在），纯插入零探测。 */
+    if (a->packed && key.t == T_INT && key.u.i == a->next_idx) {
+        if (a->dused == a->dcap) {
+            a->dcap = a->dcap ? a->dcap * 2 : 8;
+            a->data = tm_realloc(a->data, sizeof(TVal) * a->dcap);
+        }
+        a->data[a->dused++] = val;
+        a->n++;
+        a->next_idx++;
+        a->bpending++;
+        return true;
+    }
     if (!tval_norm_key(&key)) return false;
     /* L3 键 intern（PHP zend hash 同款）：查找键比较 memcmp → 指针相等；
      * interned 串不 refcount、addref/release 为 no-op。永久驻留（CLI 单
