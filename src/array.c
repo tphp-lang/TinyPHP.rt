@@ -176,45 +176,56 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
      * 不变量：packed=true ⇒ data[i] 恒为键 i（i=0..n-1）无洞。 */
     if (!a->packed || key.t != T_INT || key.u.i != a->next_idx)
         a->packed = false;
-    ABucket *b = arr_find(a, key, NULL);
+    /* 单次探测（批2①）：find 同时取 free_slot——键存在→替换；不存在时
+     * 仅在 grow/compact 改变桶布局后才重新探测（原先第二次 arr_find 无
+     * 条件执行，miss 路径每插入多付一次 hash+probe）。 */
+    uint32_t free_slot;
+    ABucket *b = arr_find(a, key, &free_slot);
     if (b) {
         tval_release(&a->data[b->val_off]);
         a->data[b->val_off] = val;
         return true;
     }
+    uint32_t bcap0 = a->bcap, dused0 = a->dused;
     arr_maybe_grow(a);
     /* too many holes from unsets: compact before appending */
     if (a->dused >= 8 && a->dused - a->n >= a->dused / 2)
         arr_compact(a);
-    uint32_t free_slot;
-    b = arr_find(a, key, &free_slot); /* re-find after possible rehash */
-    if (!b) {
-        if (free_slot == UINT32_MAX) {
-            arr_grow_buckets(a, a->bcap * 2);
-            b = arr_find(a, key, &free_slot);
+    if (a->bcap != bcap0 || a->dused != dused0) {
+        b = arr_find(a, key, &free_slot); /* 桶布局已变：重探 */
+        if (b) {                          /* 防御：grow/compact 不产生新键 */
+            tval_release(&a->data[b->val_off]);
+            a->data[b->val_off] = val;
+            return true;
         }
-        uint32_t slot = free_slot;
-        if (slot == UINT32_MAX) {
-            /* table full of tombstones: rebuild and retry */
-            arr_grow_buckets(a, a->bcap);
-            b = arr_find(a, key, &slot);
-            if (b) {
-                tval_release(&a->data[b->val_off]);
-                a->data[b->val_off] = val;
-                return true;
-            }
-        }
-        b = &a->buckets[slot];
-        b->key = key;
-        tval_addref(key);
-        uint32_t di = arr_take_data_slot(a);
-        b->val_off = di;
-        a->data[di] = val;
-        a->n++;
-    } else {
-        tval_release(&a->data[b->val_off]);
-        a->data[b->val_off] = val;
     }
+    if (free_slot == UINT32_MAX) {
+        arr_grow_buckets(a, a->bcap * 2);
+        b = arr_find(a, key, &free_slot);
+        if (b) {                          /* 防御：同上 */
+            tval_release(&a->data[b->val_off]);
+            a->data[b->val_off] = val;
+            return true;
+        }
+    }
+    uint32_t slot = free_slot;
+    if (slot == UINT32_MAX) {
+        /* table full of tombstones: rebuild and retry */
+        arr_grow_buckets(a, a->bcap);
+        b = arr_find(a, key, &slot);
+        if (b) {
+            tval_release(&a->data[b->val_off]);
+            a->data[b->val_off] = val;
+            return true;
+        }
+    }
+    b = &a->buckets[slot];
+    b->key = key;
+    tval_addref(key);
+    uint32_t di = arr_take_data_slot(a);
+    b->val_off = di;
+    a->data[di] = val;
+    a->n++;
     if (key.t == T_INT && key.u.i >= a->next_idx) a->next_idx = key.u.i + 1;
     return true;
 }

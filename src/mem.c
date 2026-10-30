@@ -66,8 +66,11 @@ static void gc_unregister(GCHead *h) {
 /* ---- string allocation (used by string.c) ---- */
 TStr *tstr_alloc_raw(uint32_t len, bool interned) {
     /* 非 interned 预留尾部余量（.=` in-place 扩容，perf-roadmap；zend
-     * zend_string rc=1 原地增长同思路）。interned 只读 cap=len。 */
-    uint32_t cap = interned ? len : (len < 64 ? 96 : len + len / 2 + 32);
+     * zend_string rc=1 原地增长同思路）。interned 只读 cap=len。
+     * 批2②（P0-16）：预留从 96B 砍到 len/4+16——短串（"k123" len4）
+     * 实占 125B→50B（PHP ~40B），内存/缓全面收紧；长 .= 增长 1.5×→1.25×，
+     * 增多 realloc 但摊销拷贝仍 O(n)，string bench 实测为准。 */
+    uint32_t cap = interned ? len : len + (len >> 2) + 16;
     TStr *s = tm_malloc(sizeof(TStr) + (size_t)cap + 1);
     s->h.rc = 1;
     s->h.color = GC_COLOR_UNMARKED;
