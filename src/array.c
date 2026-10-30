@@ -54,7 +54,8 @@ static void arr_grow_buckets(TArr *a, uint32_t new_bcap) {
  * *free_slot_out (optional) receives the first reusable slot (tombstone or
  * the empty slot that stopped the probe). */
 static ABucket *arr_find(TArr *a, TVal key, uint32_t *free_slot_out) {
-    tarr_sync_buckets(a);   /* packed append 惰性桶：查桶前先补齐 */
+    if (a->bpending) tarr_sync_buckets(a);   /* packed append 惰性桶：查桶前先补齐
+                                              * （守卫前置：非 pending 时免调用） */
     if (!a->buckets) return NULL;
     uint32_t slot = key_hash(key) & a->hmask;
     uint32_t free_slot = UINT32_MAX;
@@ -162,6 +163,16 @@ void tarr_sync_buckets(TArr *a) {
 
 bool tval_norm_key(TVal *key); /* value.c */
 
+/* norm 快路（批A kv 剖面：tarr_get 9.6 vs 手写 3.1，差值主项=跨 TU 的
+ * tval_norm_key 调用层）：interned 非数字键（tstr_intern 时已判并打
+ * GC_FLAG_NONNUM_KEY，flagged ⟹ interned ⟹ 无转换需求）直接跳过调用；
+ * 其余（int/bool/null/float/未 intern/数字串）仍走完整 norm。 */
+static inline bool key_norm_fast(TVal *k) {
+    if (k->t == T_STR && (((TStr *)k->u.p)->h.flags & GC_FLAG_NONNUM_KEY))
+        return true;
+    return tval_norm_key(k);
+}
+
 bool tarr_set(TArr *a, TVal key, TVal val) {
     /* PHP parity（批4 剖面）：$m[$i]=$v 且 $i==next_idx 就是追加——
      * zend_hash nextFreeElement 快路同构。顺序 int 键此前走全探测
@@ -178,7 +189,7 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
         a->bpending++;
         return true;
     }
-    if (!tval_norm_key(&key)) return false;
+    if (!key_norm_fast(&key)) return false;
     /* L3 键 intern（PHP zend hash 同款）：查找键比较 memcmp → 指针相等；
      * interned 串不 refcount、addref/release 为 no-op。永久驻留（CLI 单
      * 进程 ≈ PHP request 级 intern 生命周期）。 */
@@ -263,7 +274,7 @@ bool tarr_append(TArr *a, TVal val) {
 }
 
 TVal *tarr_get(TArr *a, TVal key) {
-    if (!tval_norm_key(&key)) return NULL;
+    if (!key_norm_fast(&key)) return NULL;
     /* packed 快路径（L2）：int 键直取 data[i]，跳过哈希探测 */
     if (a->packed && key.t == T_INT) {
         int64_t i = key.u.i;
@@ -325,7 +336,7 @@ void tphp_dim_ic_init(DimIC *ic) {
 }
 
 bool tarr_has(TArr *a, TVal key) {
-    if (!tval_norm_key(&key)) return false;
+    if (!key_norm_fast(&key)) return false;
     if (a->packed && key.t == T_INT) {   /* 快路同 tarr_get，免无谓 sync */
         int64_t i = key.u.i;
         return i >= 0 && (uint32_t)i < a->n;
@@ -334,7 +345,7 @@ bool tarr_has(TArr *a, TVal key) {
 }
 
 bool tarr_unset(TArr *a, TVal key) {
-    if (!tval_norm_key(&key)) return false;
+    if (!key_norm_fast(&key)) return false;
     a->packed = false;   /* 洞出现，data 不再连续 */
     ABucket *b = arr_find(a, key, NULL);
     if (!b) return false;
