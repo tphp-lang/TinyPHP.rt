@@ -170,8 +170,16 @@ static void builtin_types_init(void) {
     bt_f32   = type_new(FFI_FLOAT, 4, 4);
     bt_f64   = type_new(FFI_DOUBLE, 8, 8);
     bt_ptr   = type_new(FFI_PTR, sizeof(void *), sizeof(void *));
-    bt_long  = type_new(FFI_INT32, 4, 4);    /* Windows LLP64 */
+    /* long 宽度跟平台数据模型走：Windows LLP64=4，Linux/macOS LP64=8
+     * （对齐 PHP FFI 的 ffi_type_slong；硬编码 4 会让 POSIX cdef 的
+     * pthread_t 缓冲只分配一半 → pthread_create 8 字节写入即堆溢出） */
+#ifdef _WIN32
+    bt_long  = type_new(FFI_INT32, 4, 4);
     bt_ulong = type_new(FFI_UINT32, 4, 4);
+#else
+    bt_long  = type_new(FFI_INT64, 8, 8);
+    bt_ulong = type_new(FFI_UINT64, 8, 8);
+#endif
     bt_llong  = type_new(FFI_INT64, 8, 8);
     bt_ullong = type_new(FFI_UINT64, 8, 8);
     bt_size  = bt_u64;
