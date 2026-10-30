@@ -2369,7 +2369,7 @@ run:    ;
                 d = init_mcall_core(vm, o, *recv_sc, mname);
             } else if (o->op == OP_INIT_NEW || o->op == OP_SEND_VAL ||
                        o->op == OP_SEND_VAR || o->op == OP_DO_FCALL ||
-                       o->op == OP_NEW_USER ||
+                       o->op == OP_NEW_USER || o->op == OP_INIT_SMCALL ||
                        o->op == OP_FETCH_PROP || o->op == OP_ASSIGN_PROP ||
                        o->op == OP_ISSET_PROP || o->op == OP_UNSET_PROP ||
                        o->op == OP_FE_RESET || o->op == OP_FE_FETCH ||

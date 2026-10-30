@@ -15,6 +15,7 @@
 #include "value.h"
 #include "opcode.h"
 #include "tphp.h"
+#include "class.h"
 #include "jit.h"
 #include <stdlib.h>
 #include <string.h>
@@ -550,6 +551,56 @@ static bool jit_cfg_ok(TFunc *fn) {
     return true;                        /* 深度护栏已在 nh>=16 生效 */
 }
 
+/* 批3-3：INIT_SMCALL 编译期解析——op_init_smcall 运行期语义中**静态可判
+ * 子集**的镜像（kind 0 self::=caller->decl_cls / 1 parent::=decl->parent /
+ * 3 字面量 Cls::m；static::(LSB)/动态名/enum builtin/native/__callStatic/
+ * __construct/实例转发 全拒 = 回退解释器走完整语义）。可见性用与运行期
+ * 同一 tphp_vis_ok，from=caller->decl_cls——运行期 scope（called_cls 链）
+ * 恒为 decl 或其子类，vis_ok 链式规则下编译期判定**恒不松于**运行期，
+ * 拒掉即回解释器，无放行偏差。
+ * 成功 = callee TFunc*，同时缓存进 op->ic（op_init_smcall 不读 ic，与批2
+ * INIT_DYN 同款零读者直用；对齐指针原子写，并发同值写无撕裂面）。
+ * 只查不 autoload（tphp_class_lookup）：类未加载 → 拒，解释器路径处理。 */
+static TFunc *jit_smcallee(TFunc *caller, TOp *op, const char **rej) {
+    if (op->t1 != OPD_UNUSED) { *rej = "SMCALL dyn name"; return NULL; }
+    int kind = (int)op->a1;
+    if (kind == 2) { *rej = "SMCALL static:: LSB"; return NULL; }
+    TClass *cls;
+    TStr *mn;
+    if (kind == 0) {
+        cls = caller->decl_cls;
+        if (!cls) { *rej = "self:: outside class"; return NULL; }
+        mn = (TStr *)caller->lits[op->ar].u.p;
+    } else if (kind == 1) {
+        cls = caller->decl_cls;
+        if (!cls || !cls->parent) { *rej = "parent:: outside child"; return NULL; }
+        cls = cls->parent;
+        mn = (TStr *)caller->lits[op->ar].u.p;
+    } else {
+        const char *s = tstr_val((TStr *)caller->lits[op->ar].u.p);
+        const char *sep = NULL;
+        for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2) sep = p;
+        if (!sep) { *rej = "SMCALL malformed key"; return NULL; }
+        char clc[128];
+        size_t cl = (size_t)(sep - s);
+        if (cl >= sizeof clc) cl = sizeof clc - 1;
+        for (size_t i = 0; i < cl; i++)
+            clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+        clc[cl] = 0;
+        cls = tphp_class_lookup(clc);
+        if (!cls) { *rej = "SMCALL class not loaded"; return NULL; }
+        mn = tstr_intern(sep + 2, strlen(sep + 2));
+    }
+    tphp_class_ensure_flat(cls);
+    TMethod *m = tphp_class_find_method(cls, tstr_val(mn));
+    if (!m || !m->fn || !m->is_static || m->is_abstract)
+        { *rej = "SMCALL not user-static method"; return NULL; }
+    if (!tphp_vis_ok(m->visibility, m->decl ? m->decl : cls,
+                     caller->decl_cls))
+        { *rej = "SMCALL visibility"; return NULL; }
+    return m->fn;
+}
+
 static bool jit_eligible_inner(TFunc *fn, int depth) {
     if (depth > 16) return false;
     if (!fn || fn->is_main ||
@@ -706,6 +757,17 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
             /* P0-14 批4：isset($a[$k]) 单 op pad 执行——真 handler 用 rd
              * raw read（UNDEF 安全，isset 语义本就静默）+ wtake，零 raise */
             break;
+        case OP_INIT_SMCALL: {
+            /* 批3-3：静态方法直调——编译期解析可判子集并缓存 op->ic
+             * （emit/compile_callees 复用）；callee 需全白名单合格 */
+            const char *srej = NULL;
+            TFunc *sm = jit_smcallee(fn, op, &srej);
+            if (!sm) { rej = srej; goto out; }
+            op->ic = sm;
+            if (sm != fn && !jit_eligible_inner(sm, depth + 1))
+                { rej = "SMCALL callee ineligible"; goto out; }
+            break;
+        }
         default:
             rej = tphp_op_name(op->op);   /* 白名单外 opcode（主审计目标） */
             goto out;
@@ -769,6 +831,8 @@ typedef struct {
     uint32_t p_dyn_slot;        /* 闭包所在 CV 槽 */
     uintptr_t p_dyn_ic;         /* P0-15 批2: 该 INIT_DYN op 的 &op->ic（per-site
                                  * fn 快照槽；1=未解析哨兵，链尾存真 fn） */
+    int p_sm;                   /* 批3-3: p_callee 来自 INIT_SMCALL（静态方法，
+                                 * 帧布局 poff=1：slot0 保留/参数 1..） */
     /* P0-14 批2: 调用序回放（INIT_NEW…NEW_USER / INIT_MCALL…DO_FCALL）。
      * 1 = new 序，2 = mcall 序，值即 p_seq_pc 起点 op 下标 */
     int p_seq;
@@ -1505,10 +1569,12 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * 否则运行时 call_slots 返 0 读垃圾 ret（修复既有隐患，compile_callees
      * 只尝试不保证成功）。self 递归跳过（执行时自身 entry 必已设）。 */
     if (callee != j->fn && !callee->jit_entry) { j->fail = 1; return; }
-    /* P0-15 bug3：静态方法 TFunc（批2-2 解禁后带 jit_entry）帧布局不同
-     * （$this slot0 / 参数从 slot1，poff=1）——直调用函数布局参数错位。
-     * 保守回退解释器（与批2-2 前行为一致），方法直调布局留批3-3。 */
-    if (callee->is_method) { j->fail = 1; return; }
+    /* 批3-3：静态方法直调放行（p_sm=eligibility 已解析 user-static 且
+     * 可见性/形态全验）；其余 is_method TFunc 仍拒（批2-2 前行为）。 */
+    if (callee->is_method && !j->p_sm) { j->fail = 1; return; }
+    /* 方法帧布局：slot0 保留（$this 槽，静态不可达）、参数 1..（compile.c
+     * get_var("this") 对全部方法预留 CV0）——函数布局 poff=0。 */
+    uint32_t poff = j->p_sm ? 1u : 0u;
 
     /* v1.2 direct-slot call: pre-allocated entry-block scratch, write params
      * in place, call entry via runtime lookup — no TLS, no loop ALLOCA.
@@ -1520,13 +1586,17 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     } else {
         slots_sc = ir_ALLOCA(ir_CONST_I64((uintptr_t)nslots * TVAL_SZ));
     }
-    /* init locals/tmps to UNDEF (params get overwritten below) */
-    for (uint32_t k = callee->n_params; k < nslots; k++) {
+    /* init slot0(方法)/locals/tmps to UNDEF (params get overwritten below) */
+    if (poff) {
+        ir_ref d0 = ir_ADD_A(slots_sc, ir_CONST_ADDR(0));
+        store_imm(j, d0, (int32_t)T_UNDEF, ir_CONST_I64(0));
+    }
+    for (uint32_t k = poff + callee->n_params; k < nslots; k++) {
         ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
         store_imm(j, d, (int32_t)T_UNDEF, ir_CONST_I64(0));
     }
     for (uint32_t k = 0; k < argc; k++) {
-        ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        ir_ref d = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)(poff + k) * TVAL_SZ));
         arg_copy(j, d, k);
     }
     ir_ref ret_sc = j->r_call_ret;
@@ -1540,7 +1610,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_RETURN(ir_CONST_I32(0));
     ir_IF_FALSE(ife);
     for (uint32_t k = 0; k < argc; k++) {
-        ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
+        ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)(poff + k) * TVAL_SZ));
         ir_ref tg = ir_LOAD_I32(ir_ADD_A(a, ir_CONST_ADDR(TVAL_TAG)));
         ir_ref ift = ir_IF(ir_NE(tg, ir_CONST_I32(T_INT)));
         ir_IF_TRUE(ift);
@@ -1564,6 +1634,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
                                               ir_CONST_ADDR(TVAL_TAG))));
     }
     j->p_callee = NULL;
+    j->p_sm = 0;
 }
 
 static void lower_return(JitC *j, TOp *op) {
@@ -2023,6 +2094,19 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
+        case OP_INIT_SMCALL: {
+            /* 批3-3：静态方法直调——ic 已由 eligibility 解析缓存（TFunc*，
+             * 调用方 jit_smcallee）。p_seq 回放序列内不直调（pc 跳过，真
+             * handler 在 opseq 派发表执行）；嵌套任何调用态即 fail。 */
+            if (j->p_seq) { pc++; break; }
+            if (j->p_callee || j->p_bfn || j->p_dyn || j->p_sm || !op->ic ||
+                ((uintptr_t)op->ic & 1)) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            j->p_callee = (TFunc *)op->ic;
+            j->p_sm = 1;
+            j->p_argc = 0;
+            pc++;
+            break;
+        }
         case OP_SEND_VAL: case OP_SEND_VAR: {
             if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (j->p_seq) { pc++; break; }   /* P0-14 批2: 回放中由真 SEND handler 读槽 */
@@ -2223,7 +2307,9 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
 static void jit_compile_callees(TFunc *fn) {
     for (uint32_t i = 0; i < fn->n_ops; i++) {
         TOp *op = &fn->ops[i];
-        if (op->op != OP_INIT_FCALL) continue;
+        /* 批3-3: INIT_SMCALL 的 ic 同为 TFunc*（eligibility 已解析缓存，
+         * 无 builtin 标记位）——阈值逻辑与 INIT_FCALL 完全共用 */
+        if (op->op != OP_INIT_FCALL && op->op != OP_INIT_SMCALL) continue;
         TFunc *callee = (TFunc *)op->ic;
         if (!op->ic || ((uintptr_t)op->ic & 1)) continue;
         if (callee == fn) continue;           /* self-recursion: entry already set */
