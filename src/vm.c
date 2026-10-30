@@ -4899,6 +4899,12 @@ static void vm_seed_consts(VM *vm) {
         { "PREG_SPLIT_DELIM_CAPTURE", NULL, 2 },
         { "PREG_SPLIT_OFFSET_CAPTURE", NULL, 4 },
         { "PREG_GREP_INVERT", NULL, 1 },
+        /* sort flags（asort/arsort/ksort/krsort；P1-11） */
+        { "SORT_REGULAR", NULL, 0 },
+        { "SORT_NUMERIC", NULL, 1 },
+        { "SORT_STRING", NULL, 2 },
+        { "SORT_LOCALE_STRING", NULL, 5 },
+        { "SORT_FLAG_CASE", NULL, 8 },
     };
     for (size_t i = 0; i < sizeof seeds / sizeof seeds[0]; i++) {
         if (vm->n_consts >= 256) return;

@@ -74,7 +74,9 @@
 `gettype` `get_class` `class_exists` `is_int`/`is_integer`/`is_long` `is_float`/`is_double` `is_string` `is_array` `is_bool` `is_null` `is_numeric` `is_callable` `intval` `floatval`/`doubleval` `strval` `boolval` `defined` `define`
 
 ### 数组
-`count` `array_key_exists` `in_array` `array_push` `array_pop` `array_shift` `array_unshift` `array_keys` `array_values` `array_merge` `array_slice` `array_reverse` `array_sum` `sort` `rsort` `array_map` `array_filter` `array_reduce` `usort` `array_flip` `array_unique` `array_search` `array_key_first` `array_key_last` `array_column` `array_combine` `array_chunk` `array_fill` `range`
+`count` `array_key_exists` `in_array` `array_push` `array_pop` `array_shift` `array_unshift` `array_keys` `array_values` `array_merge` `array_slice` `array_reverse` `array_sum` `sort` `rsort` `asort` `arsort` `ksort` `krsort` `array_map` `array_filter` `array_reduce` `usort` `array_flip` `array_unique` `array_search` `array_key_first` `array_key_last` `array_column` `array_combine` `array_chunk` `array_fill` `range`
+
+排序族 flags（asort/arsort/ksort/krsort 及 sort/rsort）：`SORT_REGULAR`（默认，PHP 8 数值串感知）`SORT_NUMERIC` `SORT_STRING` `SORT_FLAG_CASE`（可组合）；`SORT_LOCALE_STRING` 无 locale 支持（归 STRING，见 PLAN/01 §10）。排序稳定（PHP 8.0+ 语义）。
 
 ### 字符串
 `strlen` `substr` `str_replace` `strpos` `stripos` `strrpos` `strripos` `trim` `ltrim` `rtrim` `strtolower` `strtoupper` `str_repeat` `str_pad` `implode`/`join` `explode` `str_split` `strrev` `strtr` `ucwords` `nl2br` `strip_tags` `htmlspecialchars` `str_contains` `str_starts_with` `str_ends_with` `sprintf` `number_format` `chr` `ord`

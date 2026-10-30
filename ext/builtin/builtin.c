@@ -945,6 +945,143 @@ static TVal bi_array_sum(VM *vm, TVal *args, int n) {
 
 static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 
+/* ---- asort/arsort/ksort/krsort（P1-11）：键保持排序 ----
+ * flags 语义对齐 PHP：REGULAR=tval_compare（PHP 8 数值串感知）、
+ * NUMERIC=转数值、STRING=字节序（FLAG_CASE=不区分大小写）；
+ * LOCALE_STRING 无 locale 支持 → 归 STRING（PLAN/01 §10 差异）。
+ * 排序核 = 自顶向下归并（稳定 O(n log n)，对齐 PHP 8.0+ 稳定语义；
+ * 既有 sort/rsort/usort 的插入排序 O(n²) 记 backlog 另批升级）。 */
+#define PHP_SORT_REGULAR       0
+#define PHP_SORT_NUMERIC       1
+#define PHP_SORT_STRING        2
+#define PHP_SORT_LOCALE_STRING 5
+#define PHP_SORT_FLAG_CASE     8
+
+typedef struct { TVal key; TVal val; } SortPair;
+
+static int sort_flags_cmp(TVal x, TVal y, int flags) {
+    bool ci = (flags & PHP_SORT_FLAG_CASE) != 0;
+    switch (flags & ~PHP_SORT_FLAG_CASE) {
+    case PHP_SORT_NUMERIC: {
+        double dx = tval_to_float(x), dy = tval_to_float(y);
+        return dx < dy ? -1 : dx > dy ? 1 : 0;
+    }
+    case PHP_SORT_STRING:
+    case PHP_SORT_LOCALE_STRING: {
+        TStr *sx = tval_to_str(x), *sy = tval_to_str(y);
+        const char *ax = tstr_val(sx), *ay = tstr_val(sy);
+        size_t lx = sx->len, ly = sy->len, m = lx < ly ? lx : ly;
+        int r = 0;
+        if (ci) {
+            for (size_t i = 0; i < m; i++) {
+                char cx = ax[i], cy = ay[i];
+                if (cx >= 'A' && cx <= 'Z') cx += 32;
+                if (cy >= 'A' && cy <= 'Z') cy += 32;
+                if (cx != cy) { r = (unsigned char)cx < (unsigned char)cy ? -1 : 1; break; }
+            }
+        } else {
+            for (size_t i = 0; i < m; i++)
+                if (ax[i] != ay[i]) { r = (unsigned char)ax[i] < (unsigned char)ay[i] ? -1 : 1; break; }
+        }
+        if (r == 0) r = lx < ly ? -1 : lx > ly ? 1 : 0;
+        TVal rx = TV_STR(sx), ry = TV_STR(sy);
+        tval_release(&rx);
+        tval_release(&ry);
+        return r;
+    }
+    default:
+        return tval_compare(x, y);
+    }
+}
+
+static void sort_pairs_merge(SortPair *a, SortPair *tmp, uint32_t lo, uint32_t hi,
+                             int flags, bool desc, bool by_key) {
+    if (hi - lo < 2) return;
+    uint32_t mid = lo + (hi - lo) / 2;
+    sort_pairs_merge(a, tmp, lo, mid, flags, desc, by_key);
+    sort_pairs_merge(a, tmp, mid, hi, flags, desc, by_key);
+    uint32_t i = lo, j = mid, t = lo;
+    while (i < mid && j < hi) {
+        int c = sort_flags_cmp(by_key ? a[i].key : a[i].val,
+                               by_key ? a[j].key : a[j].val, flags);
+        /* 稳定：相等取左（PHP 8.0+ 排序稳定） */
+        tmp[t++] = (desc ? c >= 0 : c <= 0) ? a[i++] : a[j++];
+    }
+    while (i < mid) tmp[t++] = a[i++];
+    while (j < hi)  tmp[t++] = a[j++];
+    memcpy(a + lo, tmp + lo, sizeof(SortPair) * (size_t)(hi - lo));
+}
+
+static TVal bi_keep_sort(VM *vm, TVal *args, int n, bool by_key, bool desc,
+                         const char *fn) {
+    if (n < 1 || n > 2)
+        RAISE(vm, "ArgumentCountError", "%s() expects 1 or 2 arguments", fn);
+    TArr *a = need_arr(vm, &args[0], fn, "#1 ($array)");
+    int flags = n >= 2 ? (int)tval_to_int(args[1]) : 0;
+    tarr_sync_buckets(a);
+    uint32_t cnt = a->n;
+    if (cnt <= 1) return TV_TRUE;
+    SortPair *kv = tm_malloc(sizeof(SortPair) * (size_t)cnt);
+    SortPair *tmp = tm_malloc(sizeof(SortPair) * (size_t)cnt);
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < a->dused && k < cnt; i++) {
+        if (a->data[i].t == T_UNDEF) continue;
+        kv[k].val = a->data[i];
+        tval_addref(kv[k].val);
+        TVal key = TV_NULL;
+        for (uint32_t b = 0; b < a->bcap; b++)
+            if (a->buckets[b].key.t != T_NULL && a->buckets[b].val_off == i)
+                { key = a->buckets[b].key; break; }
+        kv[k].key = key;
+        tval_addref(key);
+        k++;
+    }
+    sort_pairs_merge(kv, tmp, 0, k, flags, desc, by_key);
+    /* 清空原数组（同 bi_sort：data 值 + bucket 字符串键；interned 键
+     * release no-op，防御式保留判断） */
+    for (uint32_t i = 0; i < a->dused; i++) {
+        if (a->data[i].t != T_UNDEF)
+            tval_release(&a->data[i]);
+        a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+    }
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t == T_STR)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    a->n = 0;
+    a->next_idx = 0;
+    a->free_head = UINT32_MAX;
+    a->dused = 0;
+    /* 按 (原键, 值) 重灌——键保持；tarr_set 对字符串键 intern（收集键
+     * 已 interned → 表命中），int 键 addref no-op；val 所有权转移 */
+    for (uint32_t i = 0; i < k; i++) {
+        tarr_set(a, kv[i].key, kv[i].val);   /* set addref key、接管 val */
+        tval_release(&kv[i].key);            /* 抵消收集时 +1（值已在桶） */
+    }
+    tm_free(kv);
+    tm_free(tmp);
+    return TV_TRUE;
+}
+
+static TVal bi_asort(VM *vm, TVal *args, int n) {
+    return bi_keep_sort(vm, args, n, false, false, "asort");
+}
+
+static TVal bi_arsort(VM *vm, TVal *args, int n) {
+    return bi_keep_sort(vm, args, n, false, true, "arsort");
+}
+
+static TVal bi_ksort(VM *vm, TVal *args, int n) {
+    return bi_keep_sort(vm, args, n, true, false, "ksort");
+}
+
+static TVal bi_krsort(VM *vm, TVal *args, int n) {
+    return bi_keep_sort(vm, args, n, true, true, "krsort");
+}
+
+
 static TVal bi_sort(VM *vm, TVal *args, int n) {
     (void)n;
     TArr *a = need_arr(vm, &args[0], "sort", "#1 ($array)");
@@ -2342,6 +2479,10 @@ const Builtin tphp_builtins[] = {
     { "array_sum", bi_array_sum },
     { "sort", bi_sort },
     { "rsort", bi_rsort },
+    { "asort", bi_asort },
+    { "arsort", bi_arsort },
+    { "ksort", bi_ksort },
+    { "krsort", bi_krsort },
     /* M6-b: callable 数组 + 常用补齐 */
     { "array_map", bi_array_map },
     { "array_filter", bi_array_filter },

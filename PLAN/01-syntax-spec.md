@@ -131,6 +131,7 @@ Throwable
 | float→int 越界 cast（8.5 新增 warning） | 提示后继续 | 抛 `TypeError`（转换越界；8.5 同时覆盖显式 `(int)` 与隐式两种） |
 | NAN cast 到其他类型（8.5 新增 warning） | 提示后继续 | 抛 `TypeError` |
 | 无 `declare` 开销差异 | — | `<?php` 外的内联 HTML 允许 |
+| `asort([])` 等排序函数传字面量 | Error "could not be passed by reference" | 无引用机制：字面量/临时数组被静默排序后丢弃（需变量才有观察效果） |
 | 未初始化 typed 属性读取 | Error "must not be accessed before initialization" | 抛 `UndefinedError`（同为致命，措辞不同） |
 | 动态静态方法名 + 命名参数 `C::$v(a: 1)` | 运行期按真实签名重排 | 加载期拒绝（命名参数重排需编译期签名） |
 | `eval()` | 支持 | **不实现**（决策：注入面不安全、实际使用率低）；调用报 `Call to undefined function eval()` |
