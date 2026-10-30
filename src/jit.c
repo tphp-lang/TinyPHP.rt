@@ -1,4 +1,4 @@
-﻿/*
+/*
  * TinyPHP.rt - a small PHP runtime
  * jit.c - IR baseline JIT (PLAN/ir-jit.md v1)
  *
@@ -767,6 +767,8 @@ typedef struct {
     uint32_t cur_pc;
     int p_dyn;                  /* 1 = INIT_DYN 动态调用 */
     uint32_t p_dyn_slot;        /* 闭包所在 CV 槽 */
+    uintptr_t p_dyn_ic;         /* P0-15 批2: 该 INIT_DYN op 的 &op->ic（per-site
+                                 * fn 快照槽；1=未解析哨兵，链尾存真 fn） */
     /* P0-14 批2: 调用序回放（INIT_NEW…NEW_USER / INIT_MCALL…DO_FCALL）。
      * 1 = new 序，2 = mcall 序，值即 p_seq_pc 起点 op 下标 */
     int p_seq;
@@ -1414,23 +1416,32 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_tag(j, clo_sc, load_tag(j, ca));
         ir_ref ret_sc = j->r_call_ret;
         /* P0-15 B: closure direct-call fast path (bug1 fix: LOAD_A(clo_sc)
-         * not double-deref; bug2 fix: is_method excluded). */
+         * not double-deref; bug2 fix: is_method excluded).
+         * 批2: 门2 per-site fn 快照——clo->fn == 该 site 上次链通的 fn 即免
+         * if2..if7 全链（fn 身份蕴含 bfn==0/fn!=0/n_cap==0/entry!=0 写一次
+         * 不清/nslots/is_method，TFunc 不可变，推导见 PLAN spec）。 */
         ir_ref slow[7]; uint32_t nslow = 0;
         ir_ref if1 = ir_IF(ir_NE(load_tag(j, clo_sc), ir_CONST_I32(T_CLOSURE)));
         ir_IF_TRUE(if1); slow[nslow++] = ir_END(); ir_IF_FALSE(if1);
         ir_ref c = ir_LOAD_A(clo_sc);
+        ir_ref fn = ir_LOAD_A(ir_ADD_A(c,
+            ir_CONST_ADDR(offsetof(TClosure, fn))));
+        ir_ref snap = ir_LOAD_A(ir_CONST_ADDR(j->p_dyn_ic));
+        ir_ref ifg = ir_IF(ir_EQ(fn, snap));
+        ir_IF_TRUE(ifg);
+            ir_ref e_hit = ir_END();   /* 快照命中：免链，直用 fn->jit_entry */
+        ir_IF_FALSE(ifg);
         ir_ref if2 = ir_IF(ir_NE(ir_LOAD_I64(ir_ADD_A(c,
             ir_CONST_ADDR(offsetof(TClosure, bfn)))), ir_CONST_I64(0)));
         ir_IF_TRUE(if2); slow[nslow++] = ir_END(); ir_IF_FALSE(if2);
-        ir_ref fn = ir_LOAD_A(ir_ADD_A(c, ir_CONST_ADDR(offsetof(TClosure, fn))));
         ir_ref if3 = ir_IF(ir_EQ(fn, ir_CONST_I64(0)));
         ir_IF_TRUE(if3); slow[nslow++] = ir_END(); ir_IF_FALSE(if3);
         ir_ref if4 = ir_IF(ir_NE(ir_LOAD_U16(ir_ADD_A(c,
             ir_CONST_ADDR(offsetof(TClosure, n_cap)))), ir_CONST_I32(0)));
         ir_IF_TRUE(if4); slow[nslow++] = ir_END(); ir_IF_FALSE(if4);
-        ir_ref entry = ir_LOAD_I64(ir_ADD_A(fn,
+        ir_ref entry_chk = ir_LOAD_I64(ir_ADD_A(fn,
             ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
-        ir_ref if5 = ir_IF(ir_EQ(entry, ir_CONST_I64(0)));
+        ir_ref if5 = ir_IF(ir_EQ(entry_chk, ir_CONST_I64(0)));
         ir_IF_TRUE(if5); slow[nslow++] = ir_END(); ir_IF_FALSE(if5);
         ir_ref nsl = ir_ADD(IR_I32,
             ir_ZEXT(IR_I32, ir_LOAD_U16(ir_ADD_A(fn,
@@ -1442,6 +1453,15 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_ref if7 = ir_IF(ir_NE(ir_LOAD_U8(ir_ADD_A(fn,
             ir_CONST_ADDR(offsetof(TFunc, is_method)))), ir_CONST_I32(0)));
         ir_IF_TRUE(if7); slow[nslow++] = ir_END(); ir_IF_FALSE(if7);
+        /* 批2: 链全过 → 填 per-site 快照（单字对齐指针原子写；跨线程最坏
+         * 读到旧 fn → 门2 miss 走链，无撕裂面） */
+        ir_STORE(ir_CONST_ADDR(j->p_dyn_ic), fn);
+        ir_ref e_chain = ir_END();
+        ir_MERGE_2(e_chain, e_hit);
+        /* 命中支 fn==snap 为真 fn（ic 初值 1，链尾只存过 if5 校验的真 fn），
+         * 链支过了 if3——两支 fn 均非 NULL，entry 现读安全且恒非 0 */
+        ir_ref entry = ir_LOAD_I64(ir_ADD_A(fn,
+            ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
         ir_ref slots = j->r_call_slots;
         for (uint32_t k = 0; k < argc; k++) {
             ir_ref sa = ir_ADD_A(args_arr, ir_CONST_ADDR((uintptr_t)k * TVAL_SZ));
@@ -1476,6 +1496,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
             store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
         }
         j->p_dyn = 0;
+        j->p_dyn_ic = 0;
         return;
     }
     TFunc *callee = j->p_callee;
@@ -1868,6 +1889,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (j->p_callee || j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_dyn = 1;
             j->p_dyn_slot = op->a1;
+            /* P0-15 批2: per-site fn 快照——ic 存闭包 fn 单字（1=未解析哨兵，
+             * emit 一次性）。解释器 op_init_dyn 从不读 INIT_DYN 的 ic（勘察实证），
+             * 与 INIT_FCALL ic&1 约定互不相干（per-op 字段）。 */
+            j->p_dyn_ic = (uintptr_t)&op->ic;
+            if (!op->ic) op->ic = (void *)1;
             j->p_argc = 0;
             pc++;
             break;
