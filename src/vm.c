@@ -2945,18 +2945,33 @@ static int32_t new_user_at(VM *vm, TOp *op, TClass *cls, TStr *cname) {
 }
 
 static int32_t op_new_user(VM *vm, TOp *op) {
-    TStr *cname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
-    char lc[128];
-    { const char *s = tstr_val(cname);
-      size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
-          lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
-      lc[k] = 0; }
-    /* class_resolve_lc runs spl_autoload hooks; declared in class.c */
-    extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
-    TClass *cls = class_resolve_lc2(lc, tstr_val(cname));
-    if (!cls || cls->kind != CK_CLASS)
-        vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
-                 tstr_val(cname));
+    /* P0-20 续：per-site ic 快照（INIT_DYN 同款模式）——ic: NULL=未解析、
+     * 1=解析失败（每次重试，对齐 autoload 语义）、TClass*=成功固化（类
+     * 不可卸载）。命中免 O(len) lc 小写化 + resolve（50 字符匿名类名实测
+     * ~84ns/次，长度敏感）。emit 侧不读写 NEW_USER 的 ic（eligibility 无
+     * case、emit 走 opseq replay），handler 自治。 */
+    TClass *cls;
+    TStr *cname;
+    if (op->ic && op->ic != (void *)1) {
+        cls = (TClass *)op->ic;
+        cname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
+    } else {
+        cname = (TStr *)vm->x.frame->fn->lits[op->a1].u.p;
+        char lc[128];
+        { const char *s = tstr_val(cname);
+          size_t k = 0; for (; s[k] && k < sizeof lc - 1; k++)
+              lc[k] = (s[k] >= 'A' && s[k] <= 'Z') ? (char)(s[k] + 32) : s[k];
+          lc[k] = 0; }
+        /* class_resolve_lc runs spl_autoload hooks; declared in class.c */
+        extern TClass *class_resolve_lc2(const char *fqcn_lc, const char *orig_name);
+        cls = class_resolve_lc2(lc, tstr_val(cname));
+        if (!cls || cls->kind != CK_CLASS) {
+            op->ic = (void *)1;               /* 失败哨兵：下次重试 */
+            vm_raise(vm, ex_class("Error"), op, "Class \"%s\" not found",
+                     tstr_val(cname));
+        }
+        op->ic = cls;
+    }
     return new_user_at(vm, op, cls, cname);
 }
 
