@@ -2768,12 +2768,29 @@ static int32_t init_mcall_core(VM *vm, TOp *op, TVal objv, TStr *mname) {
         vm_raise(vm, ex_class("Error"), op,
                  "Method calls on this object type land in M3");
     TObj *o = (TObj *)h;
-    TMethod *m = tphp_class_find_method(o->cls, tstr_val(mname));
+    /* P0-20 续：per-site 方法快照（ic=TMethod*，INIT_DYN/NEW_USER 模式
+     * 第三次复用）。guard = recv 类精确匹配 m->decl（单态 site）；命中
+     * 跳过 find_method + vis_ok（同 site 的 scope 恒定，快照时已验）。
+     * 多态/继承 site guard fail 走慢路径（正确性不受影响，ic 覆盖写
+     * 无害）。fill 条件 = m->decl == o->cls（精确单态才固化）。 */
+    TMethod *m;
+    bool snap = false;
+    if (op->ic) {
+        TMethod *sm = (TMethod *)op->ic;
+        if (sm->decl == o->cls) { m = sm; snap = true; }
+        else m = tphp_class_find_method(o->cls, tstr_val(mname));
+    } else {
+        m = tphp_class_find_method(o->cls, tstr_val(mname));
+    }
     /* B3: owner = 声明类（TMethod.decl；内部类无 decl 用查找类兜底）——
-     * 关闭 M3 差异：父类 private 方法对子类 scope 不可见（对齐 PHP） */
-    bool m_hidden = m && !tphp_vis_ok(m->visibility,
-                                      m->decl ? m->decl : o->cls,
-                                      frame_scope_cls(vm));
+     * 关闭 M3 差异：父类 private 方法对子类 scope 不可见（对齐 PHP）。
+     * 快照命中跳 vis_ok：同 site 同方法同 scope，结果恒定。 */
+    bool m_hidden = (m && !snap)
+        ? !tphp_vis_ok(m->visibility, m->decl ? m->decl : o->cls,
+                       frame_scope_cls(vm))
+        : false;
+    if (m && !snap && !m_hidden && m->decl == o->cls && m->fn)
+        op->ic = m;                       /* 精确单态：固化快照 */
     if (m && !m->fn && !m->is_abstract && m->native) {
         /* internal-class native method (M4): dispatched at DO_FCALL with
          * the full argument area; the receiver rides on this_obj */
