@@ -916,6 +916,11 @@ typedef struct {
  * op 未完成语义，helper 返回 0 = 未写 dst，幂等）；函数级 = 0（deopt，
  * op_do_fcall 重跑语义不变）。 */
 #define OSR_RET_PC(j) ((j)->osr ? (int32_t)(j)->cur_pc : 0)
+/* 折叠 CALL 序（INIT_FCALL..DO_FCALL）的 deopt resume：OSR 下必须回到
+ * 序起点（j->p_seq_pc）——INIT 之后 SEND 靠 args 栈、DO 靠 rec，单独重跑
+ * DO 语义断裂；从起点重跑整序幂等（SEND_VAL/SEND_VAR 源恒为槽，args
+ * 表达式在 seq 之外求值，不在重跑范围）。函数级 = 0（整函数重跑不变）。 */
+#define OSR_SEQ_PC(j) ((j)->osr ? (int32_t)(j)->p_seq_pc : 0)
 
 static ir_ref slot_addr(JitC *j, uint32_t idx) {
     JIT_CTX();
@@ -1609,7 +1614,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
         ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
         ir_IF_TRUE(ifd);
-            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+            ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
         ir_IF_FALSE(ifd);
         ir_ref efast = ir_END();
         ir_MERGE_N((ir_ref)nslow, slow);
@@ -1619,7 +1624,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
                                ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t5);
         ir_ref ifd2 = ir_IF(ir_EQ(ok2, ir_CONST_I32(0)));
         ir_IF_TRUE(ifd2);
-            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+            ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
         ir_IF_FALSE(ifd2);
         ir_ref eslow = ir_END();
         ir_MERGE_2(eslow, efast);
@@ -1676,14 +1681,14 @@ static void lower_call_finish(JitC *j, TOp *doop) {
                                         ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
     ir_ref ife = ir_IF(ir_EQ(entry, ir_CONST_I64(0)));
     ir_IF_TRUE(ife);
-        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+        ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2: 序起点重跑 */
     ir_IF_FALSE(ife);
     for (uint32_t k = 0; k < argc; k++) {
         ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)(poff + k) * TVAL_SZ));
         ir_ref tg = ir_LOAD_I32(ir_ADD_A(a, ir_CONST_ADDR(TVAL_TAG)));
         ir_ref ift = ir_IF(ir_NE(tg, ir_CONST_I32(T_INT)));
         ir_IF_TRUE(ift);
-            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+            ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
         ir_IF_FALSE(ift);
     }
     ir_ref dir_t[3] = { j->r_vm, slots_sc, ret_sc };
@@ -1694,7 +1699,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * tphp_jit_call（dyn 路径）。 */
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
-        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+        ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
     ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
@@ -2043,6 +2048,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (j->p_callee || j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_dyn = 1;
             j->p_dyn_slot = op->a1;
+            j->p_seq_pc = pc;   /* P1-12 批2-2：OSR deopt resume=序起点 */
             /* P0-15 批2: per-site fn 快照——ic 存闭包 fn 单字（1=未解析哨兵，
              * emit 一次性）。解释器 op_init_dyn 从不读 INIT_DYN 的 ic（勘察实证），
              * 与 INIT_FCALL ic&1 约定互不相干（per-op 字段）。 */
@@ -2173,6 +2179,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             else
                 j->p_callee = (TFunc *)op->ic;
             j->p_dyn = 0;
+            j->p_seq_pc = pc;   /* P1-12 批2-2：OSR deopt resume=序起点 */
             j->p_argc = 0;
             pc++;
             break;
@@ -2534,7 +2541,41 @@ static bool osr_body_ok(TFunc *fn, uint32_t header, uint32_t backedge) {
              * emit 期单次（触发线程即执行线程，同步编译无并发执行）。 */
             if (fn->ops[i].t2 == OPD_UNUSED) return false;
             break;
+        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        case OP_ISSET_PROP: case OP_UNSET_PROP:
+            /* P1-12 批2-2a：单 op pad 执行（lower_replay→tphp_jit_opseq）。
+             * opseq 返 0 恒=exception（vm.c setjmp 唯一出口，prop handler
+             * 错误全走 raise）→ 异常传播不重跑，deopt resume=cur_pc 恒
+             * 安全；成功路径 handler 已写 dst 槽（真 handler 语义零漂移）。
+             * magic __get/__set 的用户码 raise 同门。 */
+            break;
+        case OP_INIT_FCALL: {
+            /* P1-12 批2-2b：折叠 CALL 序放行。用户 callee 准入对齐函数级
+             * （jit_eligible_inner 递归）；builtin（ic|1）bcall fail=
+             * exception。deopt 面：直调 guard fail（entry NULL/INT 契约/
+             * callee deopt 未执行）→ OSR_SEQ_PC=序起点重跑整序幂等
+             * （SEND 源恒槽、args 表达式在 seq 外）。 */
+            TFunc *callee = (TFunc *)fn->ops[i].ic;
+            if (!callee) return false;
+            if (!((uintptr_t)callee & 1) && callee != fn &&
+                !jit_eligible_inner(callee, 1))
+                return false;
+            break;
+        }
+        case OP_SEND_VAL: case OP_SEND_VAR:
+            if (fn->ops[i].t1 == OPD_CONST &&
+                !lit_scalar(fn->lits[fn->ops[i].a1]) &&
+                fn->lits[fn->ops[i].a1].t != T_STR)
+                return false;
+            break;
+        case OP_DO_FCALL: case OP_INIT_DYN:
+            /* 动态调用折叠走 opseq 深跑（fail=exception）或直调链
+             * （fail→OSR_SEQ_PC）；DO/INIT_DYN 自身无形态约束。 */
+            break;
         default:
+            if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0])
+                fprintf(stderr, "[jit] osr reject: pc=%u op=%s\n",
+                        i, tphp_op_name(fn->ops[i].op));
             return false;
         }
     }
@@ -2596,6 +2637,10 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
     ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
     memset(ctx, 0, sizeof *ctx);
     j.ctx = ctx;
+    /* FOLDING 保留（批2-3 实锤记录 PLAN/osr.md）：O1+FOLDING 在 LOOP×
+     * opseq-replay-MERGE 上 CSE 产坏码（tv_copy src=0）——MCALL/NEW 形态
+     * 已撤出白名单熔断兜底；O1 无 FOLDING 编不出（O1 拒）、O0 零收益。
+     * deps/ir 根修前该形态不进 OSR。 */
     ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING,
             IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
     ctx->ret_type = IR_I32;
@@ -2611,6 +2656,9 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
     j.r_call_args = ir_ALLOCA(ir_CONST_I64(9 * TVAL_SZ));
     j.r_call_clo  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
     j.r_call_ret  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+    /* P1-12 批2-2：B 直调链读 j->r_call_slots——漏分配则 ref 0 断链
+     * （ir_check=0 照常出码 → 崩；2026-10-31 c4 实测） */
+    j.r_call_slots = ir_ALLOCA(ir_CONST_I64(64 * TVAL_SZ));
 
     Trap t = emit_seq(&j, header, exits, ne);
     /* TR_END = 循环出口（stop/fall-through/break 跳出）；TR_RET 不可能
