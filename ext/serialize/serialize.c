@@ -34,9 +34,10 @@
 
 /* ---- 小工具 ---- */
 
+
 static bool grow(char **buf, size_t *cap, size_t need) {
     if (need <= *cap) return true;
-    size_t nc = *cap ? *cap : 64;
+    size_t nc = *cap ? *cap : 8192;
     while (nc < need) nc *= 2;
     char *nb = tm_realloc(*buf, nc);
     if (!nb) return false;
@@ -45,7 +46,7 @@ static bool grow(char **buf, size_t *cap, size_t need) {
 }
 
 static void put_bytes(char **buf, size_t *len, size_t *cap,
-                      const void *d, size_t n) {
+                    const void *d, size_t n) {
     if (!grow(buf, cap, *len + n)) return;
     memcpy(*buf + *len, d, n);
     *len += n;
@@ -70,12 +71,20 @@ static void put_f64(char **b, size_t *l, size_t *c, double v) {
 /* ---- writer ---- */
 
 typedef struct {
+    GCHead *h;          /* NULL = 空槽 */
+    uint32_t idx;
+    uint8_t state;      /* 0=done 1=progress */
+} SWSeenEnt;
+
+typedef struct {
     VM *vm;
     char *buf; size_t len, cap;
-    /* 复合值登记（DAG 去重 + 循环检测） */
-    GCHead **seen; uint32_t *seen_idx; uint8_t *seen_state; /* 0=done 1=progress */
-    uint32_t n_seen, cap_seen;
+    /* 复合值登记（DAG 去重 + 循环检测）：开地址哈希（P0-17 横向归因——
+     * 原线性扫 O(n_seen)，剖面占 serialize ~39%） */
+    SWSeenEnt *seen; uint32_t n_seen, cap_seen;   /* cap_seen = 桶数（2^n） */
     uint32_t next_idx;
+    /* off→key 逆映射缓冲（跨数组复用，免每数组 malloc/free；P0-17 横向） */
+    TVal *keys; uint32_t cap_keys;
 } SW;
 
 static void sw_put(SW *w, const void *d, size_t n) {
@@ -83,9 +92,12 @@ static void sw_put(SW *w, const void *d, size_t n) {
 }
 
 static void sw_put_str(SW *w, const char *s, uint32_t len) {
-    put_u8(&w->buf, &w->len, &w->cap, 'S');
-    put_u32(&w->buf, &w->len, &w->cap, len);
-    sw_put(w, s, len);
+    /* 三段一次 grow（头+len+内容合并检查），免 3 次独立 put 的重复检查 */
+    if (!grow(&w->buf, &w->cap, w->len + 1 + 4 + (size_t)len)) return;
+    w->buf[w->len] = 'S';
+    memcpy(w->buf + w->len + 1, &len, 4);
+    memcpy(w->buf + w->len + 5, s, len);
+    w->len += 5 + (size_t)len;
 }
 
 static void sw_put_cstr(SW *w, const char *s) {
@@ -93,38 +105,58 @@ static void sw_put_cstr(SW *w, const char *s) {
 }
 
 /* 复合值进入：-1 = 新值（先写内容后补完成），>=0 = backref 已有 */
+static uint32_t sw_seen_hash(GCHead *h) {
+    uintptr_t x = (uintptr_t)h;
+    x ^= x >> 16; x *= 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 32);
+}
+static void sw_seen_grow(SW *w) {
+    uint32_t nc = w->cap_seen ? w->cap_seen * 2 : 64;
+    SWSeenEnt *nt = tm_malloc(sizeof(SWSeenEnt) * (size_t)nc);
+    memset(nt, 0, sizeof(SWSeenEnt) * (size_t)nc);
+    for (uint32_t i = 0; i < w->cap_seen; i++) {
+        if (!w->seen[i].h) continue;
+        uint32_t m = nc - 1, j = sw_seen_hash(w->seen[i].h) & m;
+        while (nt[j].h) j = (j + 1) & m;
+        nt[j] = w->seen[i];
+    }
+    tm_free(w->seen);
+    w->seen = nt; w->cap_seen = nc;
+}
 static int sw_seen_enter(SW *w, GCHead *h) {
     for (uint32_t i = 0; i < w->n_seen; i++) {
-        if (w->seen[i] == h) {
-            if (w->seen_state[i] == 1)
+        if (w->seen[i].h == h) {
+            if (w->seen[i].state == 1)
                 tphp_raise("Error",
                            "serialize(): circular reference detected");
-            return (int)w->seen_idx[i];
+            return (int)w->seen[i].idx;
         }
     }
     if (w->n_seen == w->cap_seen) {
-        w->cap_seen = w->cap_seen ? w->cap_seen * 2 : 16;
-        w->seen = tm_realloc(w->seen, sizeof(GCHead *) * w->cap_seen);
-        w->seen_idx = tm_realloc(w->seen_idx, sizeof(uint32_t) * w->cap_seen);
-        w->seen_state = tm_realloc(w->seen_state, w->cap_seen);
+        uint32_t oc = w->cap_seen ? w->cap_seen : 16;
+        SWSeenEnt *nt = tm_malloc(sizeof(SWSeenEnt) * (size_t)(oc * 2));
+        memset(nt, 0, sizeof(SWSeenEnt) * (size_t)(oc * 2));
+        for (uint32_t i = 0; w->seen && i < oc; i++) nt[i] = w->seen[i];
+        tm_free(w->seen);
+        w->seen = nt;
+        w->cap_seen = oc * 2;
     }
-    w->seen[w->n_seen] = h;
-    w->seen_idx[w->n_seen] = w->next_idx++;  /* 预留槽位号（进入序 = reader
-                                                遇到 'A'/'O' 的登记序） */
-    w->seen_state[w->n_seen] = 1;
+    w->seen[w->n_seen] = (SWSeenEnt){ h, w->next_idx++, 1 };  /* 预留槽位号
+        （进入序 = reader 遇到 'A'/'O' 的登记序） */
     w->n_seen++;
     return -1;
 }
 
 static void sw_seen_done(SW *w, GCHead *h) {
     for (uint32_t i = 0; i < w->n_seen; i++)
-        if (w->seen[i] == h) { w->seen_state[i] = 0; return; }
+        if (w->seen[i].h == h) { w->seen[i].state = 0; return; }
 }
 
 static void sw_val(SW *w, TVal v);
 
 static void sw_array(SW *w, TArr *a) {
-    tarr_sync_buckets(a);
+    /* sync 移到 hash 分支：packed 直读不需要桶（bpending 惰性桶的复合收益
+     * ——原版每数组强制全量建桶，减法实验 V4 实测骨架占 48%） */
     int ref = sw_seen_enter(w, &a->h);
     if (ref >= 0) {
         put_u8(&w->buf, &w->len, &w->cap, 'R');
@@ -133,8 +165,26 @@ static void sw_array(SW *w, TArr *a) {
     }
     put_u8(&w->buf, &w->len, &w->cap, 'A');
     put_u32(&w->buf, &w->len, &w->cap, a->n);
-    /* data[] 插入序；off→key 逆映射（与 tval_clone_deep 同法） */
-    TVal *keys = tm_malloc(sizeof(TVal) * (size_t)(a->dused ? a->dused : 1));
+    if (a->packed && a->bpending == 0) {
+        /* packed 直读：键恒 0..n-1，免 off→key 逆映射（malloc/init/桶扫）
+         * ——serialize 场景大头（P0-17 横向归因：51/101 个数组为 packed） */
+        for (uint32_t i = 0; i < a->n; i++) {
+            sw_val(w, TV_INT((int64_t)i));
+            sw_val(w, a->data[i]);
+        }
+        sw_seen_done(w, &a->h);
+        return;
+    }
+    tarr_sync_buckets(a);
+    /* data[] 插入序；off→key 逆映射（与 tval_clone_deep 同法）。
+     * keys 缓冲挂 SW 复用（容量只增不减），免每数组 malloc/free。 */
+    if (a->dused > w->cap_keys) {
+        uint32_t nc = w->cap_keys ? w->cap_keys : 16;
+        while (nc < a->dused) nc *= 2;
+        w->keys = tm_realloc(w->keys, sizeof(TVal) * (size_t)nc);
+        w->cap_keys = nc;
+    }
+    TVal *keys = w->keys;
     for (uint32_t i = 0; i < a->dused; i++) keys[i].t = T_UNDEF;
     for (uint32_t b = 0; b < a->bcap; b++) {
         if (a->buckets[b].val_off != UINT32_MAX &&
@@ -146,7 +196,6 @@ static void sw_array(SW *w, TArr *a) {
         sw_val(w, keys[i]);
         sw_val(w, a->data[i]);
     }
-    tm_free(keys);
     sw_seen_done(w, &a->h);
 }
 
@@ -513,8 +562,7 @@ TStr *tphp_serialize_val(VM *vm, TVal v) {
     TStr *s = tstr_new(w.buf ? w.buf : "", w.len);
     tm_free(w.buf);
     tm_free(w.seen);
-    tm_free(w.seen_idx);
-    tm_free(w.seen_state);
+    tm_free(w.keys);
     return s;
 }
 
