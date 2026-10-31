@@ -139,7 +139,8 @@ static void const_eval_reset(void) { g_n_const_eval = 0; }
 TStr *tstr_alloc_raw(uint32_t len, bool interned);
 TStr *tstr_new(const char *s, size_t len);
 
-static TClosure *tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap) {
+/* P0-18①：导出（jit.c tphp_jit_closure_init 带捕获形态复用） */
+TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap) {
     TClosure *c = tm_malloc(sizeof *c);
     c->h.rc = 1; c->h.color = GC_COLOR_UNMARKED; c->h.kind = GC_KIND_CLO;
     c->h.flags = 0;
@@ -157,7 +158,7 @@ static TClosure *tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap) {
 }
 
 /* jit.c（v1.1）：无捕获闭包分配 */
-TClosure *tphp_tclo_alloc0(TFunc *fn) { return tclo_alloc(fn, NULL, 0); }
+TClosure *tphp_tclo_alloc0(TFunc *fn) { return tphp_tclo_alloc(fn, NULL, 0); }
 
 /* first-class wrapper around a builtin function */
 static TClosure *tclo_alloc_builtin(BuiltinFn bfn) {
@@ -1694,8 +1695,13 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
              * RECV 目标 CV=1..）——旧版直写 slots[0..n_params) 覆盖 $this
              * 且漏搬首参（潜伏；批2-2 prop 准入后 get/add 获 jit_entry
              * 实测暴露）。JIT→JIT 静态调用到不了方法（INIT_FCALL 不解析
-             * 方法），本路径=方法进 JIT 的唯一入口。 */
-            uint32_t poff = rec->is_method ? 1 : 0;
+             * 方法），本路径=方法进 JIT 的唯一入口。
+             * P0-18①：带捕获闭包帧布局 [captures 0..n_cap) + [CV n_cap..)，
+             * 捕获槽已由上方 rec->clo 分支预填——参数从 n_cap 起（RECV
+             * 目标槽编译期即含该偏移），旧 poff=0 直写 slots[0..n_params)
+             * 会覆盖捕获。 */
+            uint32_t poff = rec->clo ? rec->clo->n_cap
+                          : (rec->is_method ? 1u : 0u);
             bool guard_ok = true;
             for (uint16_t i = 0; i < fn->n_params; i++) {
                 if (args[i].t == T_UNDEF) { guard_ok = false; break; }
@@ -1895,7 +1901,7 @@ static int32_t op_closure_init(VM *vm, TOp *op) {
     TFunc *fn = prog->funcs[fn_idx];
     if (vm->x.n_caps < n_cap)
         vm_raise(vm, ex_class("Error"), op, "Internal: capture stack underflow");
-    TClosure *c = tclo_alloc(fn, &vm->x.caps[vm->x.n_caps - n_cap], n_cap);
+    TClosure *c = tphp_tclo_alloc(fn, &vm->x.caps[vm->x.n_caps - n_cap], n_cap);
     for (int i = 0; i < n_cap; i++)
         tval_release(&vm->x.caps[vm->x.n_caps - n_cap + i]);
     vm->x.n_caps -= n_cap;
@@ -1915,7 +1921,7 @@ static int32_t op_get_func(VM *vm, TOp *op) {
         wtake(vm, op, TV_CLO(c));
         return 1;
     }
-    TClosure *c = tclo_alloc((TFunc *)hit, NULL, 0);
+    TClosure *c = tphp_tclo_alloc((TFunc *)hit, NULL, 0);
     wtake(vm, op, TV_CLO(c));
     return 1;
 }
@@ -1939,7 +1945,7 @@ static int32_t op_fcc_dyn(VM *vm, TOp *op) {
         vm_raise(vm, ex_class("Error"), op,
                  "Cannot create first-class callable for %s()", tstr_val(name));
     TClosure *c = is_builtin ? tclo_alloc_builtin((BuiltinFn)hit)
-                             : tclo_alloc((TFunc *)hit, NULL, 0);
+                             : tphp_tclo_alloc((TFunc *)hit, NULL, 0);
     tval_release(&v);
     wtake(vm, op, TV_CLO(c));
     return 1;
@@ -2016,7 +2022,7 @@ static TClosure *clo_rebind(TClosure *src, TVal newthis, TClass *scope) {
     if (src->bfn) return src;
     int16_t ti = clo_this_capture(src);
     if (ti < 0 && !scope) return src;
-    TClosure *c = tclo_alloc(src->fn, src->captures, src->n_cap);
+    TClosure *c = tphp_tclo_alloc(src->fn, src->captures, src->n_cap);
     if (ti >= 0) {
         tval_addref(newthis);
         tval_release(&c->captures[ti]);
@@ -2055,7 +2061,7 @@ static TVal nm_closure_fromcallable(VM *vm, void *self, TVal *args, int n) {
         void *hit = resolve_fn_fb(vm, &g_magic_stub, (TStr *)cb.u.p, &is_builtin);
         if (hit) {
             TClosure *c = is_builtin ? tclo_alloc_builtin((BuiltinFn)hit)
-                                     : tclo_alloc((TFunc *)hit, NULL, 0);
+                                     : tphp_tclo_alloc((TFunc *)hit, NULL, 0);
             return TV_CLO(c);
         }
     }
@@ -4001,7 +4007,7 @@ static int32_t op_fcc_method(VM *vm, TOp *op) {
     caps[0] = ov;
     caps[1] = TV_STR(mname);
     tval_addref(caps[1]);
-    TClosure *clo = tclo_alloc(NULL, caps, 2);
+    TClosure *clo = tphp_tclo_alloc(NULL, caps, 2);
     clo->h.flags |= GC_FLAG_MFCC;
     wtake(vm, op, TV_CLO(clo));
     return 1;

@@ -25,6 +25,7 @@
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
 TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
+TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap);    /* vm.c P0-18① */
 int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
 
 #ifdef TPHP_JIT
@@ -444,14 +445,45 @@ int tphp_jit_fetch_dim_r(VM *vm, TVal *dst, TVal *base, TVal *key_in, DimIC *ic)
     return 1;
 }
 
-/* CLOSURE_INIT 无捕获形态：镜像 op_closure_init（n_cap=0 时不碰 caps 栈） */
-void tphp_jit_closure_init(VM *vm, TVal *dst, TFunc *self, uint32_t fn_idx) {
+/* CLOSURE_INIT：镜像 op_closure_init（P0-18①：n_cap>0 弹 caps 栈，配对由
+ * 编译器保证；underflow 与 fn 越界同属内部不变量 raise，记录在案边界） */
+void tphp_jit_closure_init(VM *vm, TVal *dst, TFunc *self, uint32_t fn_idx,
+                           uint16_t n_cap) {
     Program *prog = self->prog ? self->prog : vm->prog;
     if (!prog || fn_idx >= (uint32_t)prog->n_funcs)
         tphp_vm_raise(vm, "Error", "Internal: closure function missing");
-    TClosure *c = tphp_tclo_alloc0(prog->funcs[fn_idx]);
+    TFunc *fn = prog->funcs[fn_idx];
+    TClosure *c;
+    if (n_cap) {
+        if (vm->x.n_caps < n_cap)
+            tphp_vm_raise(vm, "Error", "Internal: capture stack underflow");
+        c = tphp_tclo_alloc(fn, &vm->x.caps[vm->x.n_caps - n_cap], n_cap);
+        for (uint16_t i = 0; i < n_cap; i++)
+            tval_release(&vm->x.caps[vm->x.n_caps - n_cap + i]);
+        vm->x.n_caps -= n_cap;
+    } else {
+        c = tphp_tclo_alloc0(fn);
+    }
     tval_release(dst);
     *dst = TV_CLO(c);
+}
+
+/* SEND_CAP（P0-18①）：镜像 op_send_cap——raw 读源（捕获未定义变量→null），
+ * addref 后压 vm->x.caps 栈。唯一 raise 面 = 上限 256（Too many closure
+ * captures，真实可触发的 PHP 语义）→ setjmp 守卫（P0-12 模式，longjmp
+ * 永不跨 IR 帧），检查在 addref 之前——超限零副作用，IR deopt 后
+ * op_do_fcall 层见 exception 走异常传播不重跑（无重复 push 风险）。
+ * 1 = 正常，0 = raise landed（emit 侧 IF + RETURN 0，concat 同款）。 */
+int tphp_jit_send_cap(VM *vm, TVal *src) {
+    if (vm->x.n_caps >= 256) {
+        tphp_raise_guarded(vm, "Error", "Too many closure captures");
+        return 0;
+    }
+    TVal v = *src;
+    if (v.t == T_UNDEF) v = TV_NULL;
+    tval_addref(v);
+    vm->x.caps[vm->x.n_caps++] = v;
+    return 1;
 }
 
 /* INIT_DYN..DO_FCALL 动态调用（$f(...)）：JIT'd 无捕获闭包走 trampoline，
@@ -465,10 +497,15 @@ int tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
     if (clo.t == T_CLOSURE) {
         TClosure *c = (TClosure *)clo.u.p;
         /* P0-15 C：合并 call_dyn→tphp_jit_call 两层 C 帧；entry 查表提前；
-         * 补 n==nparams 防越界（原版直接拷 nparams 个，n<nparams 读越界）。 */
-        if (c->fn && !c->bfn && c->n_cap == 0) {
+         * 补 n==nparams 防越界（原版直接拷 nparams 个，n<nparams 读越界）。
+         * P0-18①：n_cap 放开——帧布局 [captures 0..n_cap) + [CV n_cap..)，
+         * 捕获 addref 拷入（帧槽所有权，op_do_fcall 直入同构：callee wt
+         * 覆盖时引用随写随变，返回后统一 release 当前值，无双释放）；
+         * args 仍借用（真引用在调用方 scratch）。 */
+        if (c->fn && !c->bfn) {
             JitEntry e = (JitEntry)c->fn->jit_entry;
             if (e) {
+                uint32_t n_cap = c->n_cap;
                 uint32_t nparams = c->fn->n_params;
                 uint32_t nslots = (uint32_t)c->fn->n_locals + c->fn->n_tmps;
                 enum { JSIZE = 2048 };
@@ -477,12 +514,21 @@ int tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
                 if (nparams == (uint32_t)n && g_jsp + nslots <= JSIZE) {
                     TVal *slots = &g_jstack[g_jsp];
                     g_jsp += nslots;
+                    for (uint32_t i = 0; i < n_cap; i++) {
+                        tval_addref(c->captures[i]);
+                        slots[i] = c->captures[i];
+                    }
                     for (uint32_t i = 0; i < nparams; i++)
-                        slots[i] = args_in[i];
-                    for (uint32_t i = nparams; i < nslots; i++)
+                        slots[n_cap + i] = args_in[i];
+                    for (uint32_t i = n_cap + nparams; i < nslots; i++)
                         slots[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
                     int ok = e(vm, slots, ret);
                     g_jsp -= nslots;
+                    /* 捕获引用归还（含异常/未执行路径——addref 发生在 e()
+                     * 之前，无论执行与否 slots[0..n_cap) 当前值都须释放，
+                     * 否则 g_jstack 回退即泄漏） */
+                    for (uint32_t i = 0; i < n_cap; i++)
+                        tval_release(&slots[i]);
                     if (ok) return 1;
                     if (vm->x.exception)
                         return 0;
@@ -605,12 +651,17 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
     if (depth > 16) return false;
     if (!fn || fn->is_main ||
         fn->is_variadic || fn->is_generator || fn->n_ex > 0 ||
-        fn->n_cap > 0 || fn->n_params > 8)
-        return false;   /* is_closure 允许（v1.1）：n_cap>0 已在上一行拒绝。
-                         * is_method 批2-2 解禁：$this@slot0/参数 1.. 布局由
-                         * op_do_fcall 直入 poff 承接（vm.c）——方法进 JIT
-                         * 唯一入口就是该直入（INIT_FCALL 不解析方法，JIT→JIT
-                         * 到不了方法体），旧禁令=该布局债的另一半 */
+        fn->n_params > 8)
+        return false;   /* is_closure 允许；n_cap>0 放开（P0-18①）：捕获槽
+                         * [0..n_cap) 由帧建立机制预填（vm.c frame push
+                         * rec->clo 分支），闭包体内读捕获=普通槽读（emit 层
+                         * 零改动）；prologue pc0 跳 RECV 不受影响（RECV 目标
+                         * 槽=编译期 n_cap+idx）；定义点 SEND_CAP/CLOSURE_INIT
+                         * 同批放行。is_method 批2-2 解禁：$this@slot0/参数
+                         * 1.. 布局由 op_do_fcall 直入 poff 承接（vm.c）——
+                         * 方法进 JIT 唯一入口就是该直入（INIT_FCALL 不解析
+                         * 方法，JIT→JIT 到不了方法体），旧禁令=该布局债的
+                         * 另一半 */
     if (fn->param_types) {
         for (uint16_t i = 0; i < fn->n_params; i++)
             if (fn->param_types[i]) return false;
@@ -669,8 +720,16 @@ static bool jit_eligible_inner(TFunc *fn, int depth) {
         case OP_FETCH_DIM_R:
             if (op->t2 == OPD_UNUSED) { rej = "FETCH_DIM_R no key"; goto out; }
             break;
+        case OP_SEND_CAP:
+            /* P0-18①：源恒为变量 Loc（compile.c use 序列：CV 直取或
+             * FETCH_GLOBAL→TMP），raw 读语义（UNDEF→null）在 helper 内 */
+            if (op->t1 != OPD_CV && op->t1 != OPD_TMP)
+                { rej = "SEND_CAP src not slot"; goto out; }
+            break;
         case OP_CLOSURE_INIT:
-            if (op->a2 != 0) { rej = "CLOSURE_INIT captured"; goto out; }
+            /* captured（a2>0）放开（P0-18①）：SEND_CAP/CLOSURE_INIT 配对
+             * 由编译器保证（同一 uses 序列），helper 弹 caps 栈镜像
+             * op_closure_init */
             break;
         case OP_INIT_DYN:
             break;
@@ -1956,12 +2015,26 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
-        case OP_CLOSURE_INIT: {  /* 无捕获（资格判定 a2==0） */
+        case OP_SEND_CAP: {  /* P0-18①：压捕获栈（上限 raise → deopt） */
             JIT_CTX();
-            ir_ref args[4] = { j->r_vm, slot_addr(j, op->ar),
+            ir_ref sc[2] = { j->r_vm, slot_addr(j, op->a1) };
+            ir_ref okc = ir_CALL_N(IR_I32,
+                                   ir_CONST_ADDR((uintptr_t)tphp_jit_send_cap),
+                                   2, sc);
+            ir_ref ifsc = ir_IF(ir_EQ(okc, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifsc);
+                ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+            ir_IF_FALSE(ifsc);
+            pc++;
+            break;
+        }
+        case OP_CLOSURE_INIT: {  /* 带捕获放开（P0-18①）：helper 弹 caps 栈 */
+            JIT_CTX();
+            ir_ref args[5] = { j->r_vm, slot_addr(j, op->ar),
                                ir_CONST_ADDR((uintptr_t)j->fn),
-                               ir_CONST_U32(op->a1) };
-            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_closure_init), 4, args);
+                               ir_CONST_U32(op->a1),
+                               ir_CONST_I32((int32_t)op->a2) };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_closure_init), 5, args);
             pc++;
             break;
         }
