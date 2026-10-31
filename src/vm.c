@@ -620,14 +620,6 @@ static int32_t op_fetch_dim_r(VM *vm, TOp *op) {
     if (op->t2 == OPD_UNUSED)
         vm_raise(vm, ex_class("Error"), op, "Cannot use [] for reading");
     TVal key = rd(vm, op, 2);
-    /* M5.5: FFI\CData 指针/数组下标 */
-    {
-        TVal fv;
-        if (tphp_ffi_fetch_dim(vm, base, key, &fv)) {
-            wtake(vm, op, fv);
-            return 1;
-        }
-    }
     if (base.t == T_ARR) {
         TArr *a = (TArr *)base.u.p;
         if (!tval_norm_key(&key))
@@ -659,6 +651,15 @@ static int32_t op_fetch_dim_r(VM *vm, TOp *op) {
                      "Uninitialized string offset %lld", (long long)key.u.i);
         wtake(vm, op, TV_STR(tstr_new(s->c + i, 1)));
         return 1;
+    }
+    /* M5.5: FFI\CData 指针/数组下标（后置重排：FFI 只服务 T_OBJ——数组/
+     * 字符串读不再付跨 TU call+ret，kv-read 热路径每读省一次调用） */
+    {
+        TVal fv;
+        if (tphp_ffi_fetch_dim(vm, base, key, &fv)) {
+            wtake(vm, op, fv);
+            return 1;
+        }
     }
     vm_raise(vm, ex_class("TypeError"), op,
              "Cannot access offset on %s",
