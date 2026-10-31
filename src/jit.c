@@ -1335,7 +1335,7 @@ static bool dst_slot_unused(TFunc *fn, uint32_t skip_pc, uint8_t kind, uint32_t 
 
 static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
     JIT_CTX();
-    if (op->t2 != OPD_UNUSED) { j->fail = 1; do { j->fail_line = __LINE__; return; } while (0); }  /* dim 形态 $a[$i]++ 走解释器（本 lower 只镜像 var-RMW） */
+    if (op->t2 != OPD_UNUSED) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return; } while (0); }  /* dim 形态 $a[$i]++ 走解释器（本 lower 只镜像 var-RMW） */
     ir_ref aa = slot_addr(j, op->a1), da = aa;
     bool has_dst = (op->tr != OPD_UNUSED) &&
                    !dst_slot_unused(j->fn, pc, op->tr, op->ar);
@@ -1564,14 +1564,14 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         return;
     }
     TFunc *callee = j->p_callee;
-    if (!callee || argc != callee->n_params) { j->fail = 1; return; }
+    if (!callee || argc != callee->n_params) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
     /* callee 编译失败（hot=UINT16_MAX, entry NULL）→ caller 拒编走解释器：
      * 否则运行时 call_slots 返 0 读垃圾 ret（修复既有隐患，compile_callees
      * 只尝试不保证成功）。self 递归跳过（执行时自身 entry 必已设）。 */
-    if (callee != j->fn && !callee->jit_entry) { j->fail = 1; return; }
+    if (callee != j->fn && !callee->jit_entry) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
     /* 批3-3：静态方法直调放行（p_sm=eligibility 已解析 user-static 且
      * 可见性/形态全验）；其余 is_method TFunc 仍拒（批2-2 前行为）。 */
-    if (callee->is_method && !j->p_sm) { j->fail = 1; return; }
+    if (callee->is_method && !j->p_sm) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
     /* 方法帧布局：slot0 保留（$this 槽，静态不可达）、参数 1..（compile.c
      * get_var("this") 对全部方法预留 CV0）——函数布局 poff=0。 */
     uint32_t poff = j->p_sm ? 1u : 0u;
@@ -1755,15 +1755,15 @@ static ir_ref cond_addr(JitC *j, uint8_t kind, uint32_t a, ir_ref *tag_out,
 
 static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
     JIT_CTX();
-    if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+    if (j->fail) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
     for (;;) {
         j->cur_pc = pc;
-        if (pc >= j->fn->n_ops) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+        if (pc >= j->fn->n_ops) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
         if (stop_has(stops, nstops, pc)) return trap_end(ir_END(), pc);
 
         if (is_backedge_target(j->fn, pc) &&
             !(j->loop_sp > 0 && j->loop_hdr[j->loop_sp - 1] == pc)) {
-            if (j->loop_sp >= JIT_MAX_LOOPS) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            if (j->loop_sp >= JIT_MAX_LOOPS) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             ir_ref ein = ir_END();
             j->loop_ref[j->loop_sp] = ir_LOOP_BEGIN(ein);
             j->loop_hdr[j->loop_sp] = pc;
@@ -1957,7 +1957,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_INIT_DYN: {
             /* 动态调用折叠：$f(...) —— 闭包槽 a1，SEND…DO_FCALL 同静态折叠 */
-            if (j->p_callee || j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_dyn = 1;
             j->p_dyn_slot = op->a1;
             /* P0-15 批2: per-site fn 快照——ic 存闭包 fn 单字（1=未解析哨兵，
@@ -1971,7 +1971,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_INIT_NEW: {
             /* P0-14 批2：new 序起点（回放 op_init_new→SENDs→NEW_USER） */
-            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_seq = 1;
             j->p_seq_pc = pc;
             pc++;
@@ -1980,8 +1980,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_MCALL: {
             /* $o->m(...) 序起点：recv 快照进 entry scratch（实参表达式可
              * 复用接收者槽）；方法名限字面量（动态名 → fail 回退解释器） */
-            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
-            if (op->tr != OPD_CONST || (op->t1 != OPD_CV && op->t1 != OPD_TMP)) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (op->tr != OPD_CONST || (op->t1 != OPD_CV && op->t1 != OPD_TMP)) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             ir_ref ra = slot_addr(j, op->a1);
             store_pay(j, j->r_call_clo, load_pay(j, ra));
             store_tag(j, j->r_call_clo, load_tag(j, ra));
@@ -1991,7 +1991,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_NEW_USER: {
-            if (j->p_seq != 1) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_seq != 1) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_replay(j, j->p_seq_pc, pc + 1);
             pc++;
             break;
@@ -2016,7 +2016,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 族第二形态）→ fail 回退解释器，根修后放开（backlog P0-14）。 */
             if (op->op == OP_FE_RESET ? j->loop_sp != 0
                                       : !(j->loop_sp == 1 && j->loop_hdr[0] == pc)) {
-                j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
             lower_replay(j, pc, pc + 1);
             pc++;
@@ -2032,7 +2032,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_UNSET_CV: {
             /* 解释器 op_unset_cv 同款：释放槽值 + 置 UNDEF（dtor defer 于
              * mem.c，release 不进用户码不 raise → 无需 deopt 门） */
-            if (op->t1 != OPD_CV) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (op->t1 != OPD_CV) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             ir_ref da = slot_addr(j, op->a1);
             ir_ref tr1[1] = { da };
             ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr1);
@@ -2084,7 +2084,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee || j->p_bfn || j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_bfn || j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             if ((uintptr_t)op->ic & 1)
                 j->p_bfn = (void *)((uintptr_t)op->ic & ~(uintptr_t)1);
             else
@@ -2100,7 +2100,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * handler 在 opseq 派发表执行）；嵌套任何调用态即 fail。 */
             if (j->p_seq) { pc++; break; }
             if (j->p_callee || j->p_bfn || j->p_dyn || j->p_sm || !op->ic ||
-                ((uintptr_t)op->ic & 1)) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+                ((uintptr_t)op->ic & 1)) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_callee = (TFunc *)op->ic;
             j->p_sm = 1;
             j->p_argc = 0;
@@ -2108,9 +2108,9 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
-            if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (j->p_seq) { pc++; break; }   /* P0-14 批2: 回放中由真 SEND handler 读槽 */
-            if (j->p_argc >= 9) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_argc >= 9) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_arg_slot[j->p_argc++] = ((uint32_t)op->t1 << 24) | op->a1;
             pc++;
             break;
@@ -2121,9 +2121,9 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 pc++;
                 break;
             }
-            if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_call_finish(j, op);
-            if (j->fail) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            if (j->fail) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             pc++;
             break;
         }
@@ -2135,7 +2135,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_JMPZ: case OP_JMPNZ: {
             uint32_t T = op->ar;
-            if (T <= pc) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            if (T <= pc) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
 
             /* loop condition: first JMPZ at loop top level */
             if (j->loop_sp > 0 && j->loop_cond[j->loop_sp - 1]) {
@@ -2174,7 +2174,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     }
                     ir_MERGE_SET_OP(j->loop_ref[k], 2, le);
                 } else {
-                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
+                    do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
                 }
                 ir_IF_FALSE(ifx);
                 /* exit path continues at E inside the false region */
@@ -2187,7 +2187,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (op->op == OP_JMPNZ && j->loop_sp > 0)
                 j->lb_jmpnz[j->loop_sp - 1] = 1;   /* || 求值标记（挡板因子） */
             if (!find_join(j->fn, pc, T, &join, &else_start))
-                do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
 
             ir_ref ta, pa, ad;
             ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
@@ -2203,20 +2203,20 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             Trap tA;
             if (jmp_on_true) {
                 uint32_t st[11]; int ns = nstops + 1;
-                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (nstops > 10) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = join;
                 tA = emit_seq(j, T, st, ns);   /* 真跳目标体 → join */
                 if (tA.kind == TR_FAIL) return tA;
                 if (tA.kind == TR_LOOPBACK) {
-                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                     tA = trap_ret();
                 }
                 if (tA.kind == TR_END && tA.target != join)
-                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             } else {
                 uint32_t st[11]; int ns = nstops + 1;
-                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (nstops > 10) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = T;
                 tA = emit_seq(j, pc + 1, st, ns);
@@ -2224,12 +2224,12 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 if (tA.kind == TR_LOOPBACK) {
                     /* P0-14 批5: then 内 continue——分支 END 存 pending，
                      * 按终端参与既有 RET 合流（ir_END 已闭合本区） */
-                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                     tA = trap_ret();
                 }
                 if (tA.kind == TR_END && tA.target != join &&
                     !(else_start && tA.target == else_start))
-                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
             ir_IF_FALSE(ifx);
@@ -2239,36 +2239,36 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     tB = trap_end(ir_END(), T);
                 } else {
                     uint32_t st[11]; int ns = nstops + 1;
-                    if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    if (nstops > 10) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                     if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                     st[nstops] = join;
                     tB = emit_seq(j, else_start, st, ns);
                     if (tB.kind == TR_FAIL) return tB;
                     if (tB.kind == TR_LOOPBACK) {
                         /* P0-14 批5: else 内 continue——同 tA 转终端 */
-                        if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                        if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                         tB = trap_ret();
                     }
                     if (tB.kind == TR_END && tB.target != join)
-                        do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                        do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                 }
             } else {
                 /* P0-14 批5: JMPNZ 假侧 fallthrough → join（stops 含 T：
                  * 若中途落 T=else_start 则保守 END@T → 合流 fail 回退） */
                 uint32_t st[12]; int ns = nstops + 2;
-                if (nstops > 10) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                if (nstops > 10) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                 if (nstops) memcpy(st, stops, (size_t)nstops * 4);
                 st[nstops] = T;
                 st[nstops + 1] = join;
                 tB = emit_seq(j, pc + 1, st, ns);
                 if (tB.kind == TR_FAIL) return tB;
                 if (tB.kind == TR_LOOPBACK) {
-                    if (!lb_push(j, ir_END())) do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                     tB = trap_ret();
                 }
                 if (tB.kind == TR_END && tB.target != join &&
                     !(tB.target == T))
-                    do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+                    do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
             int a_end = (tA.kind == TR_END && tA.target == join);
@@ -2290,10 +2290,10 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 pc = join;
                 break;
             }
-            do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
         }
         default:
-            do { j->fail_line = __LINE__; return trap_fail(); } while (0);
+            do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
         }
     }
 }
