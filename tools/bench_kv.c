@@ -34,6 +34,44 @@ static double now_ms(void) {
 
 static volatile void *sink;
 
+/* ---- P0-16 批C 决策变体 ---- */
+
+/* MTF（move-to-front）链模拟：命中把 case 移到头。轮转访问下预期退化
+ * （每次命中移位，下一个访问键仍在尾部附近）——用数据证实/证伪。
+ * 快照层（arr/bk/bpending 门）省略：稳态同表，与 str-getic 同口径。 */
+static TVal *getic_mtf(TArr *a, TVal key, ABucket **cases, ABucket *dead) {
+    for (int i = 0; i < DIM_IC_CASES; i++) {
+        ABucket *b = cases[i];
+        if (b != dead && b->val_off != UINT32_MAX &&
+            b->key.t == key.t && b->key.u.p == key.u.p) {
+            /* interned 指针 eq（harness 字面量键同款）；move-to-front：
+             * 0..i 右移一格，hit 插头 */
+            ABucket *hit = cases[i];
+            for (int j = i; j > 0; j--) cases[j] = cases[j - 1];
+            cases[0] = hit;
+            return &a->data[b->val_off];
+        }
+    }
+    return NULL;
+}
+
+/* hash 直达快照模拟：跳 norm（emit 侧键已 norm 形态）+ 稳态跳 arr/bk
+ * 快照门（真实 IR 化时 1 load+cmp），限 4 次探测后落 helper（此处返回
+ * NULL 即 helper 等价）。这是"链改 hash 直达"方案的 C 层成本上界采样。 */
+static TVal *hashic_get(TArr *a, TVal key) {
+    TStr *ks = (TStr *)key.u.p;
+    uint32_t slot = ks->hash & a->hmask;
+    for (int p = 0; p < 4; p++) {
+        ABucket *b = &a->buckets[slot];
+        if (b->key.t == T_NULL) return NULL;
+        if (b->val_off != UINT32_MAX && b->key.t == T_STR &&
+            (TStr *)b->key.u.p == ks)
+            return &a->data[b->val_off];
+        slot = (slot + 1) & a->hmask;
+    }
+    return NULL;
+}
+
 static void report(const char *name, double t0, double t1, long n) {
     printf("%-14s %8.1f ns/read\n", name, (t1 - t0) * 1e6 / n);
 }
@@ -86,6 +124,43 @@ int main(void) {
         sink = tarr_get_ic(a, keys[i & 7], &ic);
     t1 = now_ms();
     report("str-getic", t0, t1, N);
+
+    /* ---- 批C 变体 ---- */
+    /* keys hash 预热（intern/set 已算过，保险显式触达） */
+    for (int i = 0; i < 8; i++) (void)TSTR_HASH((TStr *)keys[i].u.p);
+
+    for (int K = 2; K <= 8; K *= 2) {          /* K 阶梯：链深度 ~K/2 vs O(1) */
+        char name[16];
+        DimIC ick;
+        tphp_dim_ic_init(&ick);
+        for (int i = 0; i < K; i++) tarr_get_ic(a, keys[i], &ick);
+        t0 = now_ms();
+        for (long i = 0; i < N; i++)
+            sink = tarr_get_ic(a, keys[i % K], &ick);
+        t1 = now_ms();
+        snprintf(name, sizeof name, "getic-K%d", K);
+        report(name, t0, t1, N);
+    }
+
+    {   /* MTF：8 键轮转（预期不优——命中移位白做）。初始链 = tarr_get_ic
+         * FIFO 预热装填后的真实桶指针（与 str-getic 同起点，公平对照） */
+        DimIC icm;
+        tphp_dim_ic_init(&icm);
+        for (int i = 0; i < 8; i++) tarr_get_ic(a, keys[i], &icm);
+        t0 = now_ms();
+        for (long i = 0; i < N; i++)
+            sink = getic_mtf(a, keys[i & 7], icm.cases, &icm.dead);
+        t1 = now_ms();
+        report("getic-mtf", t0, t1, N);
+    }
+
+    {   /* hash 直达快照模拟：K 无关 O(1)，链替代方案的 C 层上界采样 */
+        t0 = now_ms();
+        for (long i = 0; i < N; i++)
+            sink = hashic_get(a, keys[i & 7]);
+        t1 = now_ms();
+        report("str-hashic", t0, t1, N);
+    }
 
     t0 = now_ms();
     for (long i = 0; i < N; i++) {

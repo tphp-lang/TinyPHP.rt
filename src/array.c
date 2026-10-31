@@ -8,6 +8,7 @@
  */
 #include "value.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 TArr *tarr_alloc_raw(void); /* mem.c */
@@ -27,6 +28,10 @@ static bool key_eq(TVal a, TVal b) {
     if (a.t == T_INT) return a.u.i == b.u.i;
     return tstr_eq((TStr *)a.u.p, (TStr *)b.u.p);
 }
+
+/* interned 同串指针 / int 同值快路（tstr_eq 首行 a==b 同款）——IC 热路径
+ * 省一次跨 TU call；不等再落 key_eq 全量比较，语义严格等价 */
+#define KEY_PTR_EQ(bk, k) ((bk).t == (k).t && (bk).u.p == (k).u.p)
 
 static void arr_grow_buckets(TArr *a, uint32_t new_bcap) {
     ABucket *nb = tm_malloc(sizeof(ABucket) * new_bcap);
@@ -286,25 +291,87 @@ TVal *tarr_get(TArr *a, TVal key) {
     return b ? &a->data[b->val_off] : NULL;
 }
 
+/* ---- P0-16 批C：IC 链统计（定义前置：tarr_get_ic 热路径引用）---- */
+DimIcStats tphp_ic_stats;
+static bool ic_on, ic_on_init;
+
+void tphp_ic_stats_dump(void) {
+    DimIcStats *s = &tphp_ic_stats;
+    if (!s->calls) return;
+    double avg = s->fast ? (double)s->scan_total / (double)s->fast : 0.0;
+    fprintf(stderr,
+            "IC-STATS calls=%llu fast=%llu (%.1f%%) avg_scan=%.2f "
+            "max_scan=%llu slow=%llu fills=%llu absent=%llu\n",
+            (unsigned long long)s->calls,
+            (unsigned long long)s->fast,
+            100.0 * (double)s->fast / (double)s->calls,
+            avg,
+            (unsigned long long)s->scan_max,
+            (unsigned long long)s->slow,
+            (unsigned long long)s->fills,
+            (unsigned long long)s->absent);
+}
+
 TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
-    /* packed int 键快路同 tarr_get（IC 无意义——IR packed 直取同款）。 */
+    /* packed int 键快路同 tarr_get（IC 无意义——IR packed 直取同款）。
+     * 不计入统计：IC 链从不服务此形态。 */
     if (a->packed && key.t == T_INT) {
         int64_t i = key.u.i;
         return (i >= 0 && (uint32_t)i < a->n) ? &a->data[i] : NULL;
     }
-    /* IC 多 case 快路径（v3）：共享 arr/bk 层 + cases[] 按序 key 比较——
-     * 全部锚定**当前 a** 的真实状态，任何非原子竞态写最坏 miss 不会错
-     * 命中（写序铁律见 value.h：cases 先于共享 arr/bk）。 */
+    /* P0-16 批C：统计 gate（TPHP_IC_STATS=1；默认关 = 一个可预测分支） */
+    if (!ic_on_init) {
+        ic_on = getenv("TPHP_IC_STATS") != NULL;
+        ic_on_init = true;
+        if (ic_on) atexit(tphp_ic_stats_dump);
+    }
+    if (ic_on) tphp_ic_stats.calls++;
+    /* 批C 两级快路（替代 8-case 线性链）：插桩实证——单态 site（tests/
+     * bench 字面量形态）avg_scan=1.00，单槽 1 步最优；多态轮转 site
+     * （bench-vs-php 变量键）avg_scan=4.48（理论 4.5），链的 O(K/2) 线
+     * 性扫换 O(1) hash 直达（C 层微基准 14.0→2.2ns）。两级都锚定快照
+     * 门（arr/bk/bpending），key_eq 全值比较，撕裂安全门不变。 */
     if (ic && !a->bpending && a == ic->arr && a->buckets == ic->bk) {
-        for (int i = 0; i < DIM_IC_CASES; i++) {
-            ABucket *b = ic->cases[i];
-            if (b != &ic->dead && b->val_off != UINT32_MAX &&
-                key_eq(b->key, key))
-                return &a->data[b->val_off];
+        /* ① 单槽（cases[0] = 最近命中桶；单态 site 一步命中） */
+        ABucket *b0 = ic->cases[0];
+        if (b0 != &ic->dead && b0->val_off != UINT32_MAX &&
+            (KEY_PTR_EQ(b0->key, key) || key_eq(b0->key, key))) {
+            if (ic_on) {
+                tphp_ic_stats.fast++;
+                tphp_ic_stats.scan_total++;
+                if (tphp_ic_stats.scan_max < 1) tphp_ic_stats.scan_max = 1;
+            }
+            return &a->data[b0->val_off];
         }
+        /* ② hash 直达（T_STR 键 hash 缓存于 TStr；限 4 次探测，超出落
+         * 慢路 arr_find 兜底——语义与原链 miss 同路） */
+        if (key.t == T_STR) {
+            TStr *ks = (TStr *)key.u.p;
+            uint32_t slot = (ks->hash ? ks->hash : tstr_hash(ks)) & a->hmask;
+            for (int p = 0; p < 4; p++) {
+                ABucket *b = &a->buckets[slot];
+                if (b->key.t == T_NULL) break;   /* 探测链终止：absent */
+                if (b->val_off != UINT32_MAX &&
+                    (KEY_PTR_EQ(b->key, key) || key_eq(b->key, key))) {
+                    ic->cases[0] = b;   /* 单槽回填（cases 序变化对 IR 链
+                                         * 安全：全值比较 + 有效桶集合语义） */
+                    if (ic_on) {
+                        tphp_ic_stats.fast++;
+                        tphp_ic_stats.scan_total += (uint64_t)(p + 2);
+                        if (p + 2 > (int)tphp_ic_stats.scan_max)
+                            tphp_ic_stats.scan_max = (uint64_t)(p + 2);
+                    }
+                    return &a->data[b->val_off];
+                }
+                slot = (slot + 1) & a->hmask;
+            }
+        }
+        if (ic_on && tphp_ic_stats.scan_max < DIM_IC_CASES)
+            tphp_ic_stats.scan_max = DIM_IC_CASES;
     }
     ABucket *b = arr_find(a, key, NULL);
     if (!b) {
+        if (ic_on) tphp_ic_stats.absent++;
         if (ic) ic->arr = NULL;   /* absent：防陈旧快照下轮假 miss 循环 */
         return NULL;
     }
@@ -318,7 +385,9 @@ TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
             ic->bk = a->buckets;
         }
         ic->cases[ic->next++ & (DIM_IC_CASES - 1)] = b;   /* FIFO 装填 */
+        if (ic_on) tphp_ic_stats.fills++;
     }
+    if (ic_on) tphp_ic_stats.slow++;
     return &a->data[b->val_off];
 }
 

@@ -349,6 +349,22 @@ typedef struct DimIC {
 } DimIC;
 TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic);
 void  tphp_dim_ic_init(DimIC *ic);   /* 懒分配后统一初始化（含哨兵） */
+
+/* ---- P0-16 批C：IC 链统计（TPHP_IC_STATS=1 开启，进程退出 dump）----
+ * 只覆盖解释器 / JIT-miss-helper 路径（JIT 内联链在机器码里，其扫描深度
+ * 由 FIFO 装填序 + 访问序数学推导，见当日日志）。默认关闭：热路径仅一个
+ * 可预测分支。 */
+typedef struct DimIcStats {
+    uint64_t calls;       /* tarr_get_ic 调用总数（packed-int 快路不计） */
+    uint64_t fast;        /* IC case 链快路命中 */
+    uint64_t scan_total;  /* 快路命中的累计扫描 case 数（avg = /fast） */
+    uint64_t scan_max;    /* 单次最大扫描深度（全扫未中也计 8） */
+    uint64_t slow;        /* 落到 arr_find 的次数（= calls - fast） */
+    uint64_t fills;       /* 慢路成功后的快照回填/装填次数 */
+    uint64_t absent;      /* 慢路且 key 不存在（返回 NULL） */
+} DimIcStats;
+extern DimIcStats tphp_ic_stats;
+void tphp_ic_stats_dump(void);       /* atexit 挂载；calls=0 时静默 */
 /* 惰性桶同步：bpending>0 时从 data[0..n) 全量重建 buckets（键全 int）；
  * 否则 no-op。所有直接遍历/写入 a->buckets 的代码入口必须先调用。 */
 void  tarr_sync_buckets(TArr *a);
