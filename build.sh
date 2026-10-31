@@ -14,6 +14,16 @@ fi
 
 OUT=build/tphp
 OBJ=build/obj
+# NO_MIMALLOC=1 ./build.sh -> CRT allocator build (mem.c #else plain malloc,
+# bins shim off), output build/tphp-crt with objects isolated in
+# build/obj-crt (shared build/obj would corrupt the main binary). purpose:
+# discriminator for the arm64-mac anomaly -- CRT fast => mimalloc Darwin
+# behavior is the tax; CRT equally slow => tphp's own layers (GC registry
+# TLS / class table) are.
+if [ "${NO_MIMALLOC:-0}" = "1" ]; then
+  OUT=build/tphp-crt
+  OBJ=build/obj-crt
+fi
 TARCH=${TARGET_ARCH:-$(uname -m)}
 TOS=$(uname -s)
 # portable lowercase (sh/dash has no ${var,,})
@@ -23,7 +33,10 @@ echo "tphp build: os=$TOS arch=$TARCH cc=$CC"
 
 # ---- flags ----
 CFLAGS="-O2 -std=c11 -g -fno-omit-frame-pointer"
-CFLAGS_US="-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE -DTPHP_USE_MIMALLOC"
+CFLAGS_US="-O2 -std=c11 -Wall -Wextra -g -fno-omit-frame-pointer -D_GNU_SOURCE"
+if [ "${NO_MIMALLOC:-0}" != "1" ]; then
+  CFLAGS_US="$CFLAGS_US -DTPHP_USE_MIMALLOC"
+fi
 # cross-compile: add -arch to clang (macOS) when TARGET_ARCH differs from host
 HOST_ARCH=$(uname -m)
 CROSS=0
@@ -132,6 +145,7 @@ for f in $UV_COMMON; do
 done
 
 # ---- [2/6] mimalloc ----
+if [ "${NO_MIMALLOC:-0}" != "1" ]; then
 echo "[2/6] compiling mimalloc..."
 MI_SRCS="alloc.c alloc-aligned.c alloc-posix.c arena.c bitmap.c heap.c init.c libc.c options.c os.c page.c page-map.c random.c sample-guarded.c sample-profile.c stats.c subproc.c theap.c threadlocal.c"
 for f in $MI_SRCS; do
@@ -140,6 +154,9 @@ done
 for f in deps/mimalloc/src/prim/*.c; do
   $CC -w $CFLAGS -DMI_STATIC_LIB $INC -c "$f" -o "$OBJ/mip_$(basename "$f" .c).o"
 done
+else
+echo "[2/6] mimalloc skipped (NO_MIMALLOC=1, CRT allocator build)"
+fi
 
 # ---- [3/6] fiber asm (per OS + arch) ----
 echo "[3/6] compiling fiber asm ($TOS $TARCH)..."

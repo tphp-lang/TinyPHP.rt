@@ -172,6 +172,27 @@ jobs:
           TPHP_NO_BINS: "1"
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php-nobins.md
 
+      # P0-19 round 2: NO_BINS showed NO ratio recovery (alloc-probe 17x ->
+      # 18x, object 25x -> 34x) -> the bins shim TLS is NOT the dominant
+      # tax, and the pure-TLS ceiling (~60ns/iter) cannot explain the
+      # ~750ns/iter gap vs aarch64-linux anyway. Two discriminators:
+      # 1) CRT-allocator build (plain malloc, mem.c #else path):
+      #    CRT fast (near Linux) -> mimalloc Darwin behavior is the tax
+      #    (purge/madvise/arena) -- dig into mimalloc options for Darwin;
+      #    CRT equally slow  -> tphp's own layers (GC registry / class
+      #    table / intern TLS) -- proceed with TLS consolidation.
+      # 2) MIMALLOC_SHOW_STATS on the main binary: shows mmap/madvise/
+      #    purge counts directly (any purge activity during a 100ms bench
+      #    = smoking gun; default purge_delay=1000ms says none should fire).
+      - name: CRT allocator discriminator (NO_MIMALLOC build)
+        run: |
+          NO_MIMALLOC=1 ./build.sh
+          ./build/tphp-crt run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (alloc-probe|object|real-logstat|serialize|json|string|array-push)" || true
+
+      - name: mimalloc stats (main binary, alloc-heavy run)
+        run: |
+          MIMALLOC_SHOW_STATS=1 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
+
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
   # Rosetta 2 - arch-mismatched, ratios not comparable. Interpreter
