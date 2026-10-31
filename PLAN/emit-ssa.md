@@ -154,6 +154,48 @@ hash 链分支**静态双活**（即使运行期单态），MERGE 值合并绕�
   data[n] 免 helper CALL（array-push 55.8→~45ns），与批 A 的 vcache 复用
   base 槽缓存。
 
+## 8. 批 C slice-1 落地与证伪记录（2026-10-31）
+
+**落地内容**（src/jit.c，tests/jit/test-fold-acc-001.php 9 场景）：
+
+1. **fold_acc_scan 守卫**：循环体严格白名单（恰一个 FETCH+ADD RMW 对 +
+   {INC,CONST} + 回边 JMP），任何嵌套结构/触碰 acc 的其他 op → 不激活。
+   守卫通过保证：fwd merge 恒达、reconcile phi 恒支配回边、无嵌套循环
+   pop 清掉激活态。
+2. **loop phi 机制**（deps/ir 官方 idiom 实证可行，examples/0002-while.c
+   + ir_check.c:198 对 loop phi 前向引用豁免）：LOOP_BEGIN 后
+   `acc_phi = ir_PHI_2(IR_I64, init_pay, IR_UNUSED)`；回边
+   `ir_PHI_SET_OP(acc_phi, 2, ...)` 补值——零 continue 时喂 fwd merge 的
+   reconcile phi（`PHI_2(fwd_ssum, slow_pay)`，0 回边 load），有 continue
+   时合并块内读槽兜底（权威值）。
+3. **fast 线 pay-only store**：`$s` tag 恒 entry 值不被 fast 线触碰 →
+   deopt/exit 槽恒 current，**无需 spill 基建**（完全去 store 的 spill
+   基建留待批 C-2）。opay 读 = loop phi（零槽 load）。
+
+**连带修 B' 潜伏 bug**：折叠 dst 槽误用 `aop->tr`（operand kind，OPD_CV=2）
+当地址——OPD_CV=2 恰与 bench 闭包 acc 槽 2 重合被掩蔽；acc 在其他槽位的
+函数会被写坏陌生 CV。修正为 `aop->ar` + kind/idx 语义全面核对（scan 配对
+条件同步修正）。回归测试场景 1/2 专测 acc@slot0 与 slot3。
+
+**实测证伪（5×5 同机交替，array-read 1e6）**：
+
+| 版本 | ms | 说明 |
+|---|---:|---|
+| base（pre-B'） | **9.7** | min-of-5 稳定 |
+| B'（骨架） | 10.8 | +1.2ns/iter 控制流税 |
+| B'+C slice-1（phi） | **11.0** | phi 再 +0.2——未兑现寄存器驻留 |
+
+**定性**：phi 值链（acc_phi→ssum→iter_phi→回边）跨循环体存活，本 RA（
+dstogov linear scan）未给驻留寄存器——寄存器压力抵消省下的 2 次内存操作
+（opay load + tag store），净 +0.2ns。**E 档（2.51→1.63ns）的前提是驻留
+兑现**，本发射器层无法达成。
+
+**处置（去留判据触发）**：折叠检测默认关断（`TPHP_FOLD_ADD=1` 重开），
+机制代码+测试全量保留；239/239。**重开前提**（二选一）：① deps/ir RA
+phi 驻留/合并增强（vendor 域，需勘察 ir_ra 的 phi 处理与 callee-saved
+偏好）；② 转 dispatch 基线（P0-4 A6：67ns/轮 vs PHP 16）——array-read
+单点已证边际递减，横向归因（§6）排序不变。
+
 ## 6. 风险清单
 
 1. **失效遗漏 = 静默错值**（最高风险）：缓解 = 全清兜底 + 写点清单化 +

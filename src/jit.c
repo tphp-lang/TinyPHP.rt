@@ -880,6 +880,20 @@ typedef struct {
     ir_ref fwd_end;
     uint32_t fwd_pc;
     uint8_t fwd_active;
+    ir_ref fwd_pay;         /* 批C slice-1: fast 线产出的 acc pay（fwd merge PHI 输入） */
+    /* P0-17③ 批C slice-1：acc（累加器 CV）loop-carried pay 寄存器化——
+     * canonical 形态守卫（fold_acc_scan）通过后，折叠 fast 线对 $s 只写
+     * pay（tag 恒 entry 值、fast 线不触碰），$s pay 经 loop phi 跨迭代
+     * 驻寄存器：fast 读 = phi（零槽 load），回边值 = fwd merge 的
+     * reconcile PHI（fast ssum / slow 槽 load 合一，零回边 load）。
+     * deopt/exit 安全性：pay 每迭代 store、tag 不被 fast 线触碰 → slot
+     * 恒 current，无需 spill 基建（完全去 store 的 spill 基建=后续批）。
+     * acc_on 激活时循环体无嵌套结构（守卫保证）→ 内层 pop 不会清掉
+     * 外层激活态。 */
+    ir_ref acc_phi;         /* loop phi（IR_I64 pay），0 = 未激活 */
+    ir_ref acc_iter;        /* fwd merge reconcile phi（回边喂入口） */
+    uint32_t acc_slot;      /* acc 槽 idx */
+    uint8_t acc_on;         /* 本层循环 acc 跟踪激活 */
     int lb_jmpnz[JIT_MAX_LOOPS];  /* 批5挡板: 本层循环体内 emit 过 JMPNZ(||)
                                    * ——||结果喂 continue 的 pending 与 MERGE_N
                                    * 组合在 O1 下值错（ms1/ms2/ms5 最小复现，
@@ -1793,6 +1807,64 @@ static int is_backedge_target(TFunc *fn, uint32_t pc) {
     return 0;
 }
 
+/* P0-17③ 批C slice-1：canonical 折叠累加形态守卫（loop phi 激活前提）。
+ * 循环体（cond JMPZ 之后 → 回边 JMP）必须严格匹配：
+ *   - 恰一个 FETCH_DIM_R+ADD 对，且 ADD 为 RMW 直写 CV（t?==OPD_CV &&
+ *     a?==tr，即 $s += $a[$i] 两 op 形态，镜像 emit 侧配对检测）；
+ *   - 其余 op 仅限 {INC, CONST}，且不得以任何操作数位触碰 acc 槽；
+ *   - 体尾存在 JMP→hdr。
+ * 任何结构外 op（嵌套 if/循环/调用/prop 等）→ 返回 0（回退 B' 全 store）。
+ * 守卫通过即保证：体无嵌套控制流 → fwd merge 恒达、reconcile phi 恒
+ * 支配回边、内层循环 pop 不会清掉本层激活态。 */
+static uint32_t fold_acc_scan(TFunc *fn, uint32_t hdr) {
+    uint32_t acc = 0, fetch_pc = 0, add_pc = 0;
+    int seen_fetch = 0;
+    uint32_t i = hdr;
+    while (i < fn->n_ops && fn->ops[i].op != OP_JMPZ &&
+           fn->ops[i].op != OP_JMPNZ) i++;
+    if (i >= fn->n_ops) return 0;
+    i++;                                    /* 体起点 = cond JMPZ + 1 */
+    for (; i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if (op->op == OP_JMP) {
+            if (op->ar == hdr) return acc;  /* 回边：守卫通过 */
+            return 0;                       /* 前跳（break/goto 形态） */
+        }
+        switch (op->op) {
+        case OP_FETCH_DIM_R:
+            if (seen_fetch || i + 1 >= fn->n_ops) return 0;
+            seen_fetch = 1; fetch_pc = i;
+            break;
+        case OP_ADD: {
+            if (!seen_fetch || add_pc) return 0;
+            TOp *f = &fn->ops[fetch_pc];
+            /* 折叠配对（镜像 emit 侧检测：kind 对 kind、idx 对 idx）
+             * + RMW 限定（dst 为 CV 且 dst==src，即 $s += 形态） */
+            int pair = (op->t2 == f->tr && op->a2 == f->ar &&
+                        op->tr == OPD_CV && op->t1 == OPD_CV &&
+                        op->a1 == op->ar) ||
+                       (op->t1 == f->tr && op->a1 == f->ar &&
+                        op->tr == OPD_CV && op->t2 == OPD_CV &&
+                        op->a2 == op->ar);
+            if (!pair) return 0;
+            add_pc = i; acc = op->ar;       /* RMW：dst(ar) 即累加器 */
+            break;
+        }
+        case OP_INC:
+        case OP_CONST:
+            break;
+        default:
+            return 0;
+        }
+        if (acc && i != add_pc) {           /* 折叠 ADD 之外触碰 acc → 不激活 */
+            if ((op->t1 == OPD_CV || op->t1 == OPD_TMP) && op->a1 == acc) return 0;
+            if ((op->t2 == OPD_CV || op->t2 == OPD_TMP) && op->a2 == acc) return 0;
+            if (op->tr == OPD_CV && op->ar == acc) return 0;
+        }
+    }
+    return 0;                               /* 体尾无回边 */
+}
+
 static Trap trap_end(ir_ref e, uint32_t t) { Trap x = { TR_END, e, t }; return x; }
 static Trap trap_ret(void)  { Trap x = { TR_RET, 0, 0 }; return x; }
 static Trap trap_fail(void) { Trap x = { TR_FAIL, 0, 0 }; return x; }
@@ -1843,7 +1915,16 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         /* P0-17③ 批B'：折叠 fast 线的前向汇合（lb_pend 同款机制）——
          * 主线推进到 fwd_pc 时把暂存的 fast 线 END 与主线 END 汇合 */
         if (j->fwd_active && j->fwd_pc == pc) {
-            ir_MERGE_2(j->fwd_end, ir_END());
+            /* 批C slice-1：回边 reconcile——fast 线 ssum 与慢线（generic
+             * ADD 已写回槽，此处 load 即权威值）合一；acc_iter 支配回边
+             * （守卫保证体无嵌套结构），喂 loop phi 零回边 load */
+            if (j->acc_on && j->acc_phi) {
+                ir_ref slow_pay = load_pay(j, slot_addr(j, j->acc_slot));
+                ir_MERGE_2(j->fwd_end, ir_END());
+                j->acc_iter = ir_PHI_2(IR_I64, j->fwd_pay, slow_pay);
+            } else {
+                ir_MERGE_2(j->fwd_end, ir_END());
+            }
             j->fwd_active = 0;
         }
         if (stop_has(stops, nstops, pc)) return trap_end(ir_END(), pc);
@@ -1851,12 +1932,25 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         if (is_backedge_target(j->fn, pc) &&
             !(j->loop_sp > 0 && j->loop_hdr[j->loop_sp - 1] == pc)) {
             if (j->loop_sp >= JIT_MAX_LOOPS) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
+            /* 批C slice-1：canonical 守卫 → acc loop phi。init_pay 必须
+             * 在 ir_END()（entry 块）前 load；phi 建在 LOOP_BEGIN 后
+             * （op1=LOOP_BEGIN 满足 _ir_PHI_SET_OP 断言），回边值在
+             * LOOP_END 后补（ir_check 对 loop phi 豁免前向引用） */
+            uint32_t acc = fold_acc_scan(j->fn, pc);
+            ir_ref init_pay = 0;
+            if (acc) init_pay = load_pay(j, slot_addr(j, acc));
             ir_ref ein = ir_END();
             j->loop_ref[j->loop_sp] = ir_LOOP_BEGIN(ein);
             j->loop_hdr[j->loop_sp] = pc;
             j->loop_cond[j->loop_sp] = 1;
             j->lb_np[j->loop_sp] = 0;          /* 批5: 层复用前清 pending/||标记 */
             j->lb_jmpnz[j->loop_sp] = 0;
+            j->acc_on = 0; j->acc_phi = j->acc_iter = 0; j->acc_slot = 0;
+            if (acc) {
+                j->acc_on = 1;
+                j->acc_slot = acc;
+                j->acc_phi = ir_PHI_2(IR_I64, init_pay, IR_UNUSED);
+            }
             j->loop_sp++;
         }
 
@@ -1965,9 +2059,18 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              *      主线 ADD 照常（语义零漂移）。 */
             uint32_t np1 = pc + 1;
             TOp *aop = (np1 < j->fn->n_ops) ? &j->fn->ops[np1] : NULL;
+            /* 批C slice-1 重测判据触发（emit-ssa.md §7 去留条款）：折叠
+             * fast 线在本发射器上净负收益——base 9.7ms vs B' 10.8 vs
+             * B'+C(phi) 11.0（array-read 1e6，5×5 交替）。机制正确
+             * （239 全绿 + PHP 对拍），但 phi 链跨循环体存活未兑现寄存
+             * 器驻留（RA 寄存器压力抵消省下的 2 次内存操作）——兑现前
+             * 默认关断，TPHP_FOLD_ADD=1 重开（A/B 与回归测试仍全量可
+             * 用）；deps/ir RA phi 驻留增强后重评（P0-17③） */
+            static int fold_en = -1;
+            if (fold_en < 0) fold_en = getenv("TPHP_FOLD_ADD") ? 1 : 0;
             bool fold_add = false;
             uint32_t other_t = 0, other_a = 0;
-            if (aop && aop->op == OP_ADD && aop->tr != OPD_UNUSED) {
+            if (fold_en && aop && aop->op == OP_ADD && aop->tr != OPD_UNUSED) {
                 if (aop->t1 == op->tr && aop->a1 == op->ar &&
                     (aop->t2 == OPD_CV || aop->t2 == OPD_TMP)) {
                     fold_add = true;
@@ -2028,16 +2131,27 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         if (!fold_add) {
                             dimic_take(&g, leaf);   /* 原样：值写 dst 槽 */
                         } else {
-                            /* fast/slow 双线（P0-17③ 批B'） */
+                            /* fast/slow 双线（P0-17③ 批B'）；批C slice-1：
+                             * RMW acc 且守卫激活 → $s pay 读 loop phi
+                             * （零槽 load）、写只 store pay（tag 恒 entry
+                             * 值不被 fast 线触碰 → slot 恒 current，
+                             * deopt/exit 安全） */
                             ir_ref vtag = ir_LOAD_I32(
                                 ir_ADD_A(leaf, ir_CONST_ADDR(TVAL_TAG)));
                             ir_ref vpay = ir_LOAD_I64(leaf);
-                            ir_ref daddr = slot_addr(j, aop->tr);
+                            /* dst 槽 = ar（tr 是 kind！原 B' 版误用 tr 当
+                             * idx——OPD_CV=2 恰与 bench acc 槽 2 重合而
+                             * 被掩蔽；acc 在其他槽位会写坏变量） */
+                            ir_ref daddr = slot_addr(j, aop->ar);
+                            int phion = j->acc_on && j->acc_phi &&
+                                        aop->tr == OPD_CV &&
+                                        aop->ar == j->acc_slot &&
+                                        aop->t1 == OPD_CV && aop->a1 == aop->ar;
                             ir_ref oaddr = (other_t == OPD_CV || other_t == OPD_TMP)
                                 ? slot_addr(j, other_a)
                                 : daddr;   /* 形态检测已保证槽；兜底指向 dst */
                             ir_ref otag = load_tag(j, oaddr);
-                            ir_ref opay = load_pay(j, oaddr);
+                            ir_ref opay = phion ? j->acc_phi : load_pay(j, oaddr);
                             ir_ref okint = ir_AND(IR_BOOL,
                                 ir_EQ(vtag, ir_CONST_I32(JT_INT)),
                                 ir_EQ(otag, ir_CONST_I32(JT_INT)));
@@ -2052,10 +2166,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                             ir_IF_TRUE(iff);
                                 /* fast：dst 直写（两 op 效果），fwd 前向汇合
                                  * ——fast 块终止于 fwd_end（脱离本链） */
-                                store_imm(j, daddr, (int32_t)JT_INT, ssum);
+                                if (phion) {
+                                    store_pay(j, daddr, ssum);
+                                } else {
+                                    store_imm(j, daddr, (int32_t)JT_INT, ssum);
+                                }
                                 j->fwd_end = ir_END();
                                 j->fwd_pc = np1 + 1;
                                 j->fwd_active = 1;
+                                j->fwd_pay = ssum;
                             ir_IF_FALSE(iff);
                                 dimic_take(&g, leaf);   /* slow：原 dst 写，
                                     活线延续（不 END，ifb-TRUE 块尾统一封） */
@@ -2319,7 +2438,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     * pos2（多回边需 3+ 输入，零 deps/ir 改动的代价是统一
                      * 汇合点：控制流等价，PHI 无涉——本发射器无 SSA phi） */
                     int k = j->loop_sp - 1;
-                    ir_ref le;
+                    ir_ref le, bepay = 0;
                     if (j->lb_np[k] > 0) {
                         ir_ref in[JIT_LB_MAX + 1];
                         int n = j->lb_np[k];
@@ -2327,17 +2446,28 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         in[n] = ir_END();          /* 体尾回跳区 */
                         j->lb_np[k] = 0;
                         ir_MERGE_N((ir_ref)(n + 1), in);
+                        /* 批C slice-1：continue 路径时 reconcile phi 不支
+                         * 配全部回边前驱 → 合并块内读槽（权威值，fast 线
+                         * 已 store pay）兜底 */
+                        if (j->acc_on && j->acc_phi)
+                            bepay = load_pay(j, slot_addr(j, j->acc_slot));
                         le = ir_LOOP_END();
                     } else {
+                        /* 批C slice-1：零 continue → reconcile phi 支配
+                         * 回边，零 load 喂 phi */
+                        if (j->acc_on && j->acc_phi) bepay = j->acc_iter;
                         le = ir_LOOP_END();
                     }
                     ir_MERGE_SET_OP(j->loop_ref[k], 2, le);
+                    if (j->acc_on && j->acc_phi)
+                        ir_PHI_SET_OP(j->acc_phi, 2, bepay);
                 } else {
                     do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
                 }
                 ir_IF_FALSE(ifx);
                 /* exit path continues at E inside the false region */
                 j->loop_sp--;
+                j->acc_on = 0; j->acc_phi = j->acc_iter = 0; j->acc_slot = 0;
                 pc = E;
                 break;
             }
