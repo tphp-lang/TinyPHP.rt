@@ -129,6 +129,21 @@ hash 链分支**静态双活**（即使运行期单态），MERGE 值合并绕�
 5. **工程量重估**：控制流重组 + 模式识别 + 双路径 emit ≈ 200 行，
    **1-1.5 天**（非顺手活，需完整双模测试矩阵：int/float/str 元素 ×
    int/float/str 累加器 × OSR/函数级）。
+
+## 7. 批 B' 骨架落地记录（2026-10-31）
+
+- **落地**：折叠检测（紧邻 ADD 消费 dst，compile.c A_VAR 实证两 op RMW
+  形态）+ packed 分支 fast/slow 双线 + fwd 前向 MERGE（lb_pend 机制复用，
+  emit_seq 主循环顶注入）。**op 形态修正**：$s += $a[$i] 是**两 op**
+  （ADD $s, mid → $s，A_VAR RMW 直写 CV 槽），非设计稿假设的三连。
+- **两次 IR 块结构修正**：①slow 分支误 END（连续 END 断链 ir_check=0）
+  → slow 活线延续由 ifb-TRUE 块尾统一封；②溢出检查用 `ir_LT`（无
+  ir_GE_BOOL/ir_LT_BOOL）。
+- **实测（诚实）**：ir_check=1、238/238、sum 验证正确——**但 12.25ms 比
+  未折叠基线 10.4ms 慢**：双线控制流 + fwd MERGE 税 > 省下的 mid 往返；
+  **主项 $s 的 loop-carried 槽写未动**（批 C 域）。
+- **结论**：批 B' 单独做负收益，**骨架保留**（结构正确），**净收益依赖
+  批 C**（$s 驻寄存器后 fast 的 store 也消）——批 C 落地后重测再定去留。
 - **批 A（基建并批 B'，顺手）**：vcache 结构随 B' 一并落（B' 的 fast 路径
   用局部 ref 即可，vcache 完整版可后置）。
 - **批 B（DimIC 单态值直达，二期）**：3.3 节改造 + 单态判据。
