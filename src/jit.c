@@ -873,6 +873,13 @@ typedef struct {
     enum { JIT_LB_MAX = 16 };
     ir_ref lb_pend[JIT_MAX_LOOPS][JIT_LB_MAX];
     int lb_np[JIT_MAX_LOOPS];
+    /* P0-17③ 批B'：折叠 fast 线的前向汇合——packed 直取分支内直出
+     * FETCH_DIM_R+ADD 两 op 效果（零 TMP 槽往返）后，fast 线 END 暂存于
+     * fwd_end，emit_seq 主循环推进到 fwd_pc 时与主线 END 做 MERGE_2 汇合。
+     * 单 pending：嵌套折叠形态保守拒编。 */
+    ir_ref fwd_end;
+    uint32_t fwd_pc;
+    uint8_t fwd_active;
     int lb_jmpnz[JIT_MAX_LOOPS];  /* 批5挡板: 本层循环体内 emit 过 JMPNZ(||)
                                    * ——||结果喂 continue 的 pending 与 MERGE_N
                                    * 组合在 O1 下值错（ms1/ms2/ms5 最小复现，
@@ -1833,6 +1840,12 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
     for (;;) {
         j->cur_pc = pc;
         if (pc >= j->fn->n_ops) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
+        /* P0-17③ 批B'：折叠 fast 线的前向汇合（lb_pend 同款机制）——
+         * 主线推进到 fwd_pc 时把暂存的 fast 线 END 与主线 END 汇合 */
+        if (j->fwd_active && j->fwd_pc == pc) {
+            ir_MERGE_2(j->fwd_end, ir_END());
+            j->fwd_active = 0;
+        }
         if (stop_has(stops, nstops, pc)) return trap_end(ir_END(), pc);
 
         if (is_backedge_target(j->fn, pc) &&
@@ -1944,6 +1957,27 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_FETCH_DIM_R: {
             JIT_CTX();
+            /* P0-17③ 批B'：折叠模式检测——紧邻 ADD 且 src 含本 op 的 dst
+             * （$s += $a[$i] 的 RMW 两连 / $x = $a[$i] + $y 的值产），
+             * 另一 src 必须是槽（CV/TMP；CONST 形态保守不折叠）。
+             * fast：packed 命中 && 双 INT && 无溢出 → 两 op 效果直出
+             *      （dst 直写，fwd 前向汇合跳过 ADD）；slow：原 dst 写，
+             *      主线 ADD 照常（语义零漂移）。 */
+            uint32_t np1 = pc + 1;
+            TOp *aop = (np1 < j->fn->n_ops) ? &j->fn->ops[np1] : NULL;
+            bool fold_add = false;
+            uint32_t other_t = 0, other_a = 0;
+            if (aop && aop->op == OP_ADD && aop->tr != OPD_UNUSED) {
+                if (aop->t1 == op->tr && aop->a1 == op->ar &&
+                    (aop->t2 == OPD_CV || aop->t2 == OPD_TMP)) {
+                    fold_add = true;
+                    other_t = aop->t2; other_a = aop->a2;
+                } else if (aop->t2 == op->tr && aop->a2 == op->ar &&
+                           (aop->t1 == OPD_CV || aop->t1 == OPD_TMP)) {
+                    fold_add = true;
+                    other_t = aop->t1; other_a = aop->a1;
+                }
+            }
             ir_ref key_addr;
             if (op->t2 == OPD_CONST) {
                 TVal kv = j->fn->lits[op->a2];
@@ -1989,8 +2023,43 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     ir_IF_TRUE(ifb);
                         ir_ref data = ir_LOAD_A(
                             ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, data))));
-                        dimic_take(&g, ir_ADD_A(data,
-                            ir_SHL_U64(ir_BITCAST_U64(g.kp), ir_CONST_U64(4))));
+                        ir_ref leaf = ir_ADD_A(data,
+                            ir_SHL_U64(ir_BITCAST_U64(g.kp), ir_CONST_U64(4)));
+                        if (!fold_add) {
+                            dimic_take(&g, leaf);   /* 原样：值写 dst 槽 */
+                        } else {
+                            /* fast/slow 双线（P0-17③ 批B'） */
+                            ir_ref vtag = ir_LOAD_I32(
+                                ir_ADD_A(leaf, ir_CONST_ADDR(TVAL_TAG)));
+                            ir_ref vpay = ir_LOAD_I64(leaf);
+                            ir_ref daddr = slot_addr(j, aop->tr);
+                            ir_ref oaddr = (other_t == OPD_CV || other_t == OPD_TMP)
+                                ? slot_addr(j, other_a)
+                                : daddr;   /* 形态检测已保证槽；兜底指向 dst */
+                            ir_ref otag = load_tag(j, oaddr);
+                            ir_ref opay = load_pay(j, oaddr);
+                            ir_ref okint = ir_AND(IR_BOOL,
+                                ir_EQ(vtag, ir_CONST_I32(JT_INT)),
+                                ir_EQ(otag, ir_CONST_I32(JT_INT)));
+                            /* 投机加法（INT 加法无陷阱）+ 溢出检查归 slow */
+                            ir_ref ssum = ir_ADD_I64(opay, vpay);
+                            ir_ref nof = ir_LT(
+                                ir_AND_I64(ir_XOR_I64(opay, ssum),
+                                           ir_XOR_I64(vpay, ssum)),
+                                ir_CONST_I64(0));
+                            ir_ref okf = ir_AND(IR_BOOL, okint, nof);
+                            ir_ref iff = ir_IF(okf);
+                            ir_IF_TRUE(iff);
+                                /* fast：dst 直写（两 op 效果），fwd 前向汇合
+                                 * ——fast 块终止于 fwd_end（脱离本链） */
+                                store_imm(j, daddr, (int32_t)JT_INT, ssum);
+                                j->fwd_end = ir_END();
+                                j->fwd_pc = np1 + 1;
+                                j->fwd_active = 1;
+                            ir_IF_FALSE(iff);
+                                dimic_take(&g, leaf);   /* slow：原 dst 写，
+                                    活线延续（不 END，ifb-TRUE 块尾统一封） */
+                        }
                         ir_ref eP1 = ir_END();
                     ir_IF_FALSE(ifb);
                         dimic_miss(&g, false);   /* packed 越界非 IC 键形态 */
