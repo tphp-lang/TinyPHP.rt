@@ -314,12 +314,12 @@ static void gc_child_release(TVal *v) {
     }
 }
 
-void tval_release(TVal *v) {
-    if (v->t < T_STR || v->t > T_CLOSURE) return;
+/* P0-8：tval_release 快路径内联进 value.h（热路径免跨 TU call）；本函
+ * 数只收 rc 归零的 switch-free 慢路。序与旧版完全一致（scalar →
+ * INTERNED → DEAD → rc>1 → 这里）。noinline：体积敏感 + 慢路本就该出
+ * 线性代码区。 */
+__attribute__((noinline)) void tphp_tval_release_slow(TVal *v) {
     GCHead *h = (GCHead *)v->u.p;
-    if (h->flags & GC_FLAG_INTERNED) return;
-    if (h->color == GC_COLOR_DEAD) { h->rc--; return; }   /* GC sweep path */
-    if (h->rc > 1) { h->rc--; return; }
     switch (h->kind) {
     case GC_KIND_STR: tstr_free((TStr *)h); break;
     case GC_KIND_ARR: tarr_free((TArr *)h); break;

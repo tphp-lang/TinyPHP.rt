@@ -44,9 +44,10 @@ static void arr_grow_buckets(TArr *a, uint32_t new_bcap) {
         for (uint32_t i = 0; i < a->bcap; i++) {
             ABucket *b = &a->buckets[i];
             if (b->val_off == UINT32_MAX || b->key.t == T_NULL) continue;
-            uint32_t slot = key_hash(b->key) & mask;
+            /* 批B：活桶 hash 有效（写入时填），免重算 key_hash */
+            uint32_t slot = b->hash & mask;
             while (nb[slot].val_off != UINT32_MAX) slot = (slot + 1) & mask;
-            nb[slot] = *b;
+            nb[slot] = *b;   /* 结构体赋值：hash 随拷贝自带 */
         }
         tm_free(a->buckets);
     }
@@ -62,7 +63,8 @@ static ABucket *arr_find(TArr *a, TVal key, uint32_t *free_slot_out) {
     if (a->bpending) tarr_sync_buckets(a);   /* packed append 惰性桶：查桶前先补齐
                                               * （守卫前置：非 pending 时免调用） */
     if (!a->buckets) return NULL;
-    uint32_t slot = key_hash(key) & a->hmask;
+    uint32_t h = key_hash(key);              /* 批B：一次计算，探测 hash 首比 */
+    uint32_t slot = h & a->hmask;
     uint32_t free_slot = UINT32_MAX;
     for (uint32_t probes = 0; probes < a->bcap; probes++) {
         ABucket *b = &a->buckets[slot];
@@ -75,7 +77,10 @@ static ABucket *arr_find(TArr *a, TVal key, uint32_t *free_slot_out) {
         }
         if (b->val_off == UINT32_MAX) {     /* tombstone: remember, keep probing */
             if (free_slot == UINT32_MAX) free_slot = slot;
-        } else if (key_eq(b->key, key)) {
+        } else if (KEY_PTR_EQ(b->key, key) ||
+                   (b->hash == h && key_eq(b->key, key))) {
+            /* 批B：hash 首比挡掉探测链上的异键（省 tstr_eq 的 len 读 +
+             * memcmp）；PTR_EQ 命中连 hash 比都免（interned 同串） */
             if (free_slot_out) *free_slot_out = free_slot;
             return b;
         }
@@ -98,7 +103,7 @@ static uint32_t arr_take_data_slot(TArr *a) {
 /* squeeze out T_UNDEF holes, keeping data[] in insertion order, and
  * rebuild the bucket table for the new slot positions */
 static void arr_compact(TArr *a) {
-    typedef struct { TVal key; uint32_t di; } Pair;
+    typedef struct { TVal key; uint32_t di; uint32_t hash; } Pair;   /* 批B：携带 hash 免重算 */
     Pair *pairs = tm_malloc(sizeof(Pair) * (size_t)(a->n ? a->n : 1));
     uint32_t np = 0;
     for (uint32_t b = 0; b < a->bcap; b++) {
@@ -106,6 +111,7 @@ static void arr_compact(TArr *a) {
         if (bk->key.t != T_NULL && bk->val_off != UINT32_MAX) {
             pairs[np].key = bk->key;
             pairs[np].di = bk->val_off;
+            pairs[np].hash = bk->hash;   /* 活桶 hash 有效（写入时填） */
             np++;
         }
     }
@@ -125,10 +131,11 @@ static void arr_compact(TArr *a) {
         a->buckets[b].val_off = UINT32_MAX;
     }
     for (uint32_t i = 0; i < np; i++) {
-        uint32_t slot = key_hash(pairs[i].key) & a->hmask;
+        uint32_t slot = pairs[i].hash & a->hmask;   /* 批B：免重算 key_hash */
         while (a->buckets[slot].val_off != UINT32_MAX) slot = (slot + 1) & a->hmask;
         a->buckets[slot].key = pairs[i].key;
         a->buckets[slot].val_off = i;
+        a->buckets[slot].hash = pairs[i].hash;
     }
     tm_free(pairs);
 }
@@ -158,11 +165,13 @@ void tarr_sync_buckets(TArr *a) {
     }
     for (uint32_t i = 0; i < a->n; i++) {     /* packed：data[i] 即键 i */
         TVal key = TV_INT((int64_t)i);
-        uint32_t slot = key_hash(key) & a->hmask;
+        uint32_t h = key_hash(key);           /* 批B：桶带 hash（读侧首比） */
+        uint32_t slot = h & a->hmask;
         while (a->buckets[slot].val_off != UINT32_MAX)
             slot = (slot + 1) & a->hmask;
         a->buckets[slot].key = key;
         a->buckets[slot].val_off = i;
+        a->buckets[slot].hash = h;
     }
 }
 
@@ -253,6 +262,7 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
     b = &a->buckets[slot];
     b->key = key;
     tval_addref(key);
+    b->hash = key_hash(key);   /* 批B：桶带 hash（读侧首比；写路径非热区） */
     uint32_t di = arr_take_data_slot(a);
     b->val_off = di;
     a->data[di] = val;
@@ -332,10 +342,14 @@ TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
      * 性扫换 O(1) hash 直达（C 层微基准 14.0→2.2ns）。两级都锚定快照
      * 门（arr/bk/bpending），key_eq 全值比较，撕裂安全门不变。 */
     if (ic && !a->bpending && a == ic->arr && a->buckets == ic->bk) {
+        /* 批B：h 一次计算（int splitmix / TStr 缓存读），单槽与 hash
+         * 直达共用——活桶 hash 首比挡异键（省 tstr_eq 的 len 读+memcmp） */
+        uint32_t h = key_hash(key);
         /* ① 单槽（cases[0] = 最近命中桶；单态 site 一步命中） */
         ABucket *b0 = ic->cases[0];
         if (b0 != &ic->dead && b0->val_off != UINT32_MAX &&
-            (KEY_PTR_EQ(b0->key, key) || key_eq(b0->key, key))) {
+            (KEY_PTR_EQ(b0->key, key) ||
+             (b0->hash == h && key_eq(b0->key, key)))) {
             if (ic_on) {
                 tphp_ic_stats.fast++;
                 tphp_ic_stats.scan_total++;
@@ -344,14 +358,14 @@ TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
             return &a->data[b0->val_off];
         }
         /* ② hash 直达（T_STR 键 hash 缓存于 TStr；限 4 次探测，超出落
-         * 慢路 arr_find 兜底——语义与原链 miss 同路） */
+         * 慢路 arr_find 兜底——语义与原链 miss 同路）。批B：桶 hash 首比 */
         if (key.t == T_STR) {
             TStr *ks = (TStr *)key.u.p;
             uint32_t slot = (ks->hash ? ks->hash : tstr_hash(ks)) & a->hmask;
             for (int p = 0; p < 4; p++) {
                 ABucket *b = &a->buckets[slot];
                 if (b->key.t == T_NULL) break;   /* 探测链终止：absent */
-                if (b->val_off != UINT32_MAX &&
+                if (b->val_off != UINT32_MAX && b->hash == h &&
                     (KEY_PTR_EQ(b->key, key) || key_eq(b->key, key))) {
                     ic->cases[0] = b;   /* 单槽回填（cases 序变化对 IR 链
                                          * 安全：全值比较 + 有效桶集合语义） */

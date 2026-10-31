@@ -108,8 +108,12 @@ typedef struct TStr { GCHead h; uint32_t len; uint32_t hash; uint32_t cap; char 
  * data[] holds values in insertion order; free slots hold T_NULL with the
  * freelist next-index in u.i. buckets[] is linear-probe open addressing:
  * key.t == T_NULL means never-used, val_off == UINT32_MAX means tombstone
- * (a valid key can never be T_NULL because null keys normalize to ""). */
-typedef struct { TVal key; uint32_t val_off; } ABucket;
+ * (a valid key can never be T_NULL because null keys normalize to "").
+ * hash（P0-16 批B）：key_hash(key) 缓存（写入时填，grow 拷贝随结构体赋
+ * 值自带）——读路径探测 hash 首比省 key_eq 全量比较（tstr_eq 读 len+
+ * memcmp）；tombstone/空桶不维护（val_off/key.t 先挡，垃圾值无害）。
+ * 结构 24B 不变（原 val_off 后 4B padding 正好被 hash 填满）。 */
+typedef struct { TVal key; uint32_t val_off; uint32_t hash; } ABucket;
 
 typedef struct TArr {
     GCHead h;
@@ -258,7 +262,20 @@ static inline bool tval_is_scalar(TVal v) {
  * T_STR / T_ARR / T_OBJ(exceptions) / T_CLOSURE carry a GCHead; everything
  * else is a raw value. Interned strings (program-literal pool) are shared
  * read-only across threads (M5) — refcount ops on them are no-ops. */
-void tval_release(TVal *v);
+/* P0-8 审计（2026-10-31）：release 原为跨 TU 函数——解释器热路径（vm.c
+ * 98 调用点，每 wtake/assign 一次）rc>1 快路径也付 call/ret+栈帧，且调
+ * 用方已 load 的字段无法 CSE。快路径内联（标量 1 分支 / heap rc>1 递减
+ * ~5 指令），switch-free 慢路留 mem.c（noinline）。序不变：scalar →
+ * INTERNED → DEAD（GC sweep 递减不 free）→ rc>1 → 慢路。 */
+void tphp_tval_release_slow(TVal *v);   /* mem.c：rc 归零的 switch-free 慢路 */
+static inline void tval_release(TVal *v) {
+    if (v->t < T_STR || v->t > T_CLOSURE) return;
+    GCHead *h = (GCHead *)v->u.p;
+    if (h->flags & GC_FLAG_INTERNED) return;
+    if (h->color == GC_COLOR_DEAD) { h->rc--; return; }   /* GC sweep path */
+    if (h->rc > 1) { h->rc--; return; }
+    tphp_tval_release_slow(v);
+}
 static inline void tval_addref(TVal v) {
     if (v.t < T_STR || v.t > T_CLOSURE) return;
     GCHead *h = (GCHead *)v.u.p;
