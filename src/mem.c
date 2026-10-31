@@ -34,17 +34,28 @@
  * TPHP_NO_BINS 可强制关。 */
 #define TM_BINS_MAX_CLASS 64            /* 16B 步进 → ≤1024B */
 static _Thread_local void *g_bins[TM_BINS_MAX_CLASS + 1];
+/* TPHP_NO_BINS 运行期开关（P0-19 arm64-mac 判别实验）：bins 头是
+ * _Thread_local，Darwin 无 ELF initial-exec 快路径——每次访问走
+ * tlv_get_addr 间接调用（mimalloc 自身用 pthread direct slot 绕开了，
+ * 见 deps/mimalloc/include/mimalloc/prim-tls.h MI_TLS_MODEL_PTHREADS）。
+ * NO_BINS=1 时全部走大块 passthrough（tag=UINT32_MAX），用于 CI 判别
+ * "bins TLS 税 vs 其他 TLS（gc_list/opool）vs 平台本身"。进程级配置，
+ * 首次分配时读一次环境变量后固化。 */
+static int g_bins_ok = -1;              /* -1 未初始化；1 可用；0 被关闭 */
 
 void *tm_malloc(size_t n) {
     uint32_t b = (uint32_t)((n + 15) >> 4);
     if (b <= TM_BINS_MAX_CLASS) {
-        if (b == 0) b = 1;
-        void *p = g_bins[b];
-        if (p) { g_bins[b] = *(void **)p; return p; }
-        char *c = (char *)mi_malloc(((size_t)b << 4) + 16);
-        if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
-        *(uint32_t *)c = b;
-        return c + 16;
+        if (g_bins_ok < 0) g_bins_ok = getenv("TPHP_NO_BINS") ? 0 : 1;
+        if (g_bins_ok) {
+            if (b == 0) b = 1;
+            void *p = g_bins[b];
+            if (p) { g_bins[b] = *(void **)p; return p; }
+            char *c = (char *)mi_malloc(((size_t)b << 4) + 16);
+            if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
+            *(uint32_t *)c = b;
+            return c + 16;
+        }
     }
     char *c = (char *)mi_malloc(n + 16);
     if (!c) { fprintf(stderr, "tphp: out of memory (%zu bytes)\n", n); exit((int)TPHP_E_NOMEM); }
