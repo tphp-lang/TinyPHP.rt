@@ -2164,6 +2164,17 @@ void tphp_closure_class_init(void) {
     g_closure_cls = cls;
 }
 
+/* P0-17 throw 快路：Windows setjmp/longjmp 对 ~790ns（tools/bench_longjmp.c
+ * 实测），占同帧 throw 全成本 ~80%（分解实测 tphp ~1000ns vs PHP ~40ns
+ * /次——PHP 的异常不走 longjmp，VM 内圈展开；Linux longjmp ~15ns 故 CI
+ * 反超 0.81×，平台分化根因即此）。当前帧 ex 表覆盖抛出点且 catch 匹配
+ * → 不 longjmp：pc 直改 handler、清帧内 call rec/args 水位（与
+ * vm_unwind_core hit 路径逐项同款），解释器内圈继续（BIND_EX 消费
+ * exception）。语义注记：trace 只在完整 unwind 构建（getTrace 未实现、
+ * uncaught 报告走 unwind，快路无消费面）；同帧嵌套 try 内层不匹配 →
+ * 返 false 落 longjmp 原路径（与 innermost-region 行为一致） */
+static bool throw_same_frame_resume(VM *vm, TExObj *ex);
+
 static int32_t op_throw(VM *vm, TOp *op) {
     TVal v = rdv(vm, op, 1);
     if (v.t == T_OBJ && ((GCHead *)v.u.p)->kind == GC_KIND_OBJ) {
@@ -2191,7 +2202,10 @@ static int32_t op_throw(VM *vm, TOp *op) {
         tval_addref(TV_OBJ(o));
         w->wrap = o;                  /* 包装器持一份用户对象引用 */
         vm->x.exception = w;
-        vm_unwind_jump(vm);
+        if (!throw_same_frame_resume(vm, w)) vm_unwind_jump(vm);
+        return 0;                     /* 快路命中：pc 已指向 handler（原路径
+            noreturn 不落此——快路后绝不能掉进下方 TExObj 判定，会把已
+            捕获的用户对象误判 "Can only throw objects"） */
     }
     if (v.t != T_OBJ || ((GCHead *)v.u.p)->kind != GC_KIND_EX)
         vm_raise(vm, ex_class("TypeError"), op,
@@ -2201,7 +2215,8 @@ static int32_t op_throw(VM *vm, TOp *op) {
     x->file = raise_file(vm);         /* 抛出点文件（同 line 归因） */
     tval_addref(v);
     vm->x.exception = x;
-    vm_unwind_jump(vm);
+    if (!throw_same_frame_resume(vm, x)) vm_unwind_jump(vm);
+    return 0;                         /* 快路命中：pc 已指向 handler */
 }
 
 static int32_t op_bind_ex(VM *vm, TOp *op) {
@@ -4273,6 +4288,45 @@ static bool catch_matches(const TExEntry *e, const TExObj *ex) {
     return false;
 }
 
+/* 帧内 handler 查找：覆盖 pc 的 region 按 end_pc 升序（innermost 优先）
+ * 逐层匹配 catch，命中即返回。对齐 PHP：同帧外层 try 在内层 catch 类型
+ * 不匹配时接住（nested_try 探针 2026-10-31 实锤：旧实现 innermost 不匹
+ * 配即判 hit=NULL 弹帧，同帧外层 try 永远收不到 → Uncaught，PHP 为
+ * outer 接住）。unwind 与 throw 快路共用，单一语义源。 */
+static TExEntry *frame_find_handler(TFunc *fn, uint32_t pc, TExObj *ex) {
+    uint32_t tried = 0;
+    for (;;) {
+        uint32_t best = UINT32_MAX;
+        for (int i = 0; i < fn->n_ex; i++) {
+            TExEntry *e = &fn->ex[i];
+            if (pc >= e->start_pc && pc < e->end_pc &&
+                e->end_pc < best && e->end_pc > tried) best = e->end_pc;
+        }
+        if (best == UINT32_MAX) return NULL;
+        tried = best;               /* end_pc 严格升序消费，逐层外扩 */
+        for (int i = 0; i < fn->n_ex; i++) {
+            TExEntry *e = &fn->ex[i];
+            if (pc >= e->start_pc && pc < e->end_pc &&
+                e->end_pc == best && catch_matches(e, ex)) return e;
+        }
+    }
+}
+
+/* P0-17 throw 快路（声明注记在 op_throw 前）：同帧 handler 探测，命中
+ * 则免 longjmp 直改 pc。复用 frame_find_handler（与 unwind 单一语义源），
+ * 命中后 f->pc=handler_pc + call rec/args 水位回卷（n_calls=
+ * n_calls_at_entry、n_args=args_base）。未命中（无 try / 全部 region 不
+ * 匹配）返 false 走原 longjmp 跨帧路径。 */
+static bool throw_same_frame_resume(VM *vm, TExObj *ex) {
+    VMFrame *f = vm->x.frame;
+    TExEntry *hit = frame_find_handler(f->fn, f->pc, ex);
+    if (!hit) return false;
+    f->pc = hit->handler_pc;
+    vm->x.n_calls = f->n_calls_at_entry;
+    vm->x.n_args = (int)f->args_base;
+    return true;
+}
+
 static void frame_destroy(VMFrame *f) {
     TFunc *fn = f->fn;
     uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
@@ -4315,26 +4369,10 @@ static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped) {
             vm->x.trace[vm->x.n_trace].line = fn->ops[pc].line;
             vm->x.n_trace++;
         }
-        /* innermost try region first; within it, catch clauses in
-         * declaration order (multiple catch blocks share the region) */
-        uint32_t best_end = UINT32_MAX;
-        for (int i = 0; i < fn->n_ex; i++) {
-            TExEntry *e = &fn->ex[i];
-            if (pc >= e->start_pc && pc < e->end_pc &&
-                e->end_pc < best_end)
-                best_end = e->end_pc;
-        }
-        TExEntry *hit = NULL;
-        if (best_end != UINT32_MAX) {
-            for (int i = 0; i < fn->n_ex; i++) {
-                TExEntry *e = &fn->ex[i];
-                if (pc >= e->start_pc && pc < e->end_pc &&
-                    e->end_pc == best_end && catch_matches(e, ex)) {
-                    hit = e;
-                    break;
-                }
-            }
-        }
+        /* innermost try region first, then outer same-frame regions on
+         * catch-type mismatch (frame_find_handler: PHP parity); within a
+         * region, catch clauses in declaration order */
+        TExEntry *hit = frame_find_handler(fn, pc, ex);
         if (hit) {
             f->pc = hit->handler_pc;   /* handler starts with BIND_EX if any */
             /* resume in the SAME frame: drop call recs opened inside it
