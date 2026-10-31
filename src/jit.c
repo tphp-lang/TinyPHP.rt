@@ -843,10 +843,20 @@ typedef struct {
     ir_ref r_call_slots;        /* P0-15 B dyn direct-call slots, 64 * TVAL_SZ */
     ir_ref r_call_clo;          /* closure TVal scratch */
     ir_ref r_call_ret;          /* return TVal scratch */
+    /* P1-12 批1（PLAN/osr.md）：1 = 循环 OSR 模式——所有 fail/deopt 点的
+     * ir_RETURN 值 = 当前 op 的解释器 pc（slots 同布局，解释器从该 pc 重跑
+     * 该 op），函数级 = 0（deopt 语义由 op_do_fcall 处理）。见 OSR_RET_PC。 */
+    int osr;
 } JitC;
 
 /* ir_builder macros expand to `ctx` — every lowering fn binds it locally */
 #define JIT_CTX() ir_ctx *ctx = j->ctx; (void)ctx
+
+/* P1-12 批1（PLAN/osr.md）：fail/deopt 点的 ir_RETURN 值。OSR 模式返回
+ * 当前 op 的解释器 pc——slots 同布局，解释器从该 pc 重跑该 op 即可（该
+ * op 未完成语义，helper 返回 0 = 未写 dst，幂等）；函数级 = 0（deopt，
+ * op_do_fcall 重跑语义不变）。 */
+#define OSR_RET_PC(j) ((j)->osr ? (int32_t)(j)->cur_pc : 0)
 
 static ir_ref slot_addr(JitC *j, uint32_t idx) {
     JIT_CTX();
@@ -895,7 +905,7 @@ static void call_slow_binop(JitC *j, int opi, ir_ref da,
     ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_binop_slow), 7, args);
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifd);
 }
 static void call_slow_cmp(JitC *j, int opi, ir_ref da,
@@ -905,7 +915,7 @@ static void call_slow_cmp(JitC *j, int opi, ir_ref da,
     ir_ref ok = ir_CALL_N(IR_I32, ir_CONST_ADDR((uintptr_t)tphp_jit_cmp_slow), 7, args);
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifd);
 }
 
@@ -963,7 +973,7 @@ static void dimic_miss(DimIcCtx *g, bool count) {
                           ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_dim_r), 5, t);
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifd);
 }
 
@@ -1429,7 +1439,7 @@ static void lower_replay(JitC *j, uint32_t pc_start, uint32_t pc_end) {
                           ir_CONST_ADDR((uintptr_t)tphp_jit_opseq), 4, t);
     ir_ref ifs = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifs);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifs);
     j->p_seq = 0;
 }
@@ -1458,7 +1468,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
          * function-tail RETURN terminates the whole chain. */
         ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
         ir_IF_TRUE(ifx);
-            ir_RETURN(ir_CONST_I32(0));   /* deopt: interpreter unwinds */
+            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));   /* deopt: interpreter unwinds */
         ir_IF_FALSE(ifx);
             if (doop->tr != OPD_UNUSED) {
                 ir_ref da = slot_addr(j, doop->ar);
@@ -1540,7 +1550,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
         ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
         ir_IF_TRUE(ifd);
-            ir_RETURN(ir_CONST_I32(0));
+            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
         ir_IF_FALSE(ifd);
         ir_ref efast = ir_END();
         ir_MERGE_N((ir_ref)nslow, slow);
@@ -1550,7 +1560,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
                                ir_CONST_ADDR((uintptr_t)tphp_jit_call_dyn), 5, t5);
         ir_ref ifd2 = ir_IF(ir_EQ(ok2, ir_CONST_I32(0)));
         ir_IF_TRUE(ifd2);
-            ir_RETURN(ir_CONST_I32(0));
+            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
         ir_IF_FALSE(ifd2);
         ir_ref eslow = ir_END();
         ir_MERGE_2(eslow, efast);
@@ -1607,14 +1617,14 @@ static void lower_call_finish(JitC *j, TOp *doop) {
                                         ir_CONST_ADDR(offsetof(TFunc, jit_entry))));
     ir_ref ife = ir_IF(ir_EQ(entry, ir_CONST_I64(0)));
     ir_IF_TRUE(ife);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ife);
     for (uint32_t k = 0; k < argc; k++) {
         ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)(poff + k) * TVAL_SZ));
         ir_ref tg = ir_LOAD_I32(ir_ADD_A(a, ir_CONST_ADDR(TVAL_TAG)));
         ir_ref ift = ir_IF(ir_NE(tg, ir_CONST_I32(T_INT)));
         ir_IF_TRUE(ift);
-            ir_RETURN(ir_CONST_I32(0));
+            ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
         ir_IF_FALSE(ift);
     }
     ir_ref dir_t[3] = { j->r_vm, slots_sc, ret_sc };
@@ -1625,7 +1635,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * tphp_jit_call（dyn 路径）。 */
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
-        ir_RETURN(ir_CONST_I32(0));
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
@@ -1820,7 +1830,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             /* raise → 0：同 assign_dim，IF_TRUE RETURN / IF_FALSE 留开 */
             ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
             ir_IF_TRUE(ifx);
-                ir_RETURN(ir_CONST_I32(0));
+                ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
             ir_IF_FALSE(ifx);
             pc++;
             break;
@@ -1863,7 +1873,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * IF_TRUE RETURN / IF_FALSE 留开继续，绝不跨 IR 帧 longjmp） */
             ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
             ir_IF_TRUE(ifx);
-                ir_RETURN(ir_CONST_I32(0));
+                ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
             ir_IF_FALSE(ifx);
             pc++;
             break;
@@ -2070,7 +2080,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                                   ir_CONST_ADDR((uintptr_t)tphp_jit_concat), 5, t);
             ir_ref ifc = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
             ir_IF_TRUE(ifc);
-                ir_RETURN(ir_CONST_I32(0));
+                ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
             ir_IF_FALSE(ifc);
             pc++;
             break;
@@ -2417,6 +2427,204 @@ void tphp_jit_compile(TFunc *fn) {
     else
         fn->hot = UINT16_MAX;
     jit_unlock();
+}
+
+/* ================================================================
+ * 循环 OSR（P1-12 批1，PLAN/osr.md）
+ * ================================================================ */
+/* 批1 白名单：封闭 int/float 域内纯计算 + 控制流。循环体子图内排除
+ * CALL/DIM/ARRAY/RETURN/FE/EXTRACT 等一切带 raise 或跨帧语义的 op（批2
+ * 经 OSR_RET_PC 的 deopt=resume_pc 语义再扩）。emit 期仍可能 fail 的
+ * 形态（如变量移位量）在 OSR 模式下安全退化为"该 op 回解释器重跑"
+ * （OSR_RET_PC），无需在此复刻函数级的形态限制。 */
+static bool osr_body_ok(TFunc *fn, uint32_t header, uint32_t backedge) {
+    for (uint32_t i = header; i <= backedge && i < fn->n_ops; i++) {
+        switch (fn->ops[i].op) {
+        case OP_CONST: case OP_COPY: case OP_ASSIGN:
+        case OP_ADD: case OP_SUB: case OP_MUL:
+        case OP_NEG: case OP_POS: case OP_INC: case OP_DEC:
+        case OP_BW_AND: case OP_BW_OR: case OP_BW_XOR: case OP_BIT_NOT:
+        case OP_SHL: case OP_SHR:
+        case OP_BOOL_NOT: case OP_BOOL_VAL: case OP_CAST:
+        case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE:
+        case OP_LT: case OP_LE: case OP_CMP:
+        case OP_ISSET_CV: case OP_UNSET_CV:
+        case OP_JMP: case OP_JMPZ: case OP_JMPNZ:
+            break;
+        case OP_FETCH_DIM_R:
+            /* P1-12 批2-1（PLAN/osr.md §7）：读操作幂等——deopt 重跑安全
+             * （IC miss → helper 返 0 → OSR_RET_PC=cur_pc → 解释器重跑
+             * op_fetch_dim_r；helper 内 raise_guarded 不穿透，异常由解释
+             * 器重跑时抛出，无重复副作用）。形态守卫对齐函数级
+             * eligibility（jit.c:669 无键形态拒）。emit 复用 emit_seq 的
+             * 函数级 case（packed 直取 + DimIC 链全内联），IC 懒分配在
+             * emit 期单次（触发线程即执行线程，同步编译无并发执行）。 */
+            if (fn->ops[i].t2 == OPD_UNUSED) return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* 收集循环出口（> backedge 的正向跳转 target + 体尾 fall-through），
+ * 全部作 emit_seq 的 stops——循环后的代码留给解释器（resume）。 */
+static int osr_collect_exits(TFunc *fn, uint32_t header, uint32_t backedge,
+                             uint32_t *exits, int cap) {
+    int ne = 0;
+    if (backedge + 1 < fn->n_ops) exits[ne++] = backedge + 1;
+    for (uint32_t i = header; i <= backedge && i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if ((op->op == OP_JMP || op->op == OP_JMPZ || op->op == OP_JMPNZ) &&
+            op->ar > backedge && op->ar < fn->n_ops) {
+            int seen = 0;
+            for (int k = 0; k < ne; k++) if (exits[k] == op->ar) seen = 1;
+            if (!seen) {
+                if (ne >= cap) return -1;      /* 出口过多：保守拒编 */
+                exits[ne++] = op->ar;
+            }
+        }
+    }
+    return ne;
+}
+
+void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
+                           uint32_t backedge_cur) {
+    if (!g_jit_on || !fn) return NULL;
+    if (header >= backedge || backedge >= fn->n_ops) return NULL;
+    /* main 允许（OSR 不走函数入口 ABI，slots 直用——顶层循环正是批1 的
+     * 核心场景）；is_global 别名槽排除（全局变量读写语义不在封闭子集）。
+     * closure 允许（n_cap>0 拒）；variadic/generator/异常表拒。 */
+    if (fn->is_variadic || fn->is_generator || fn->n_ex > 0 || fn->n_cap > 0)
+        return NULL;
+    if (fn->is_global) {
+        for (uint16_t i = 0; i < fn->n_locals; i++)
+            if (fn->is_global[i]) return NULL;
+    }
+    if (fn->param_types) {
+        for (uint16_t i = 0; i < fn->n_params; i++)
+            if (fn->param_types[i]) return NULL;
+    }
+    if (!jit_cfg_ok(fn)) return NULL;
+    if (!osr_body_ok(fn, header, backedge)) return NULL;
+
+    uint32_t exits[16];
+    int ne = osr_collect_exits(fn, header, backedge, exits, 16);
+    if (ne <= 0) return NULL;
+
+    jit_lock();
+
+    JitC j;
+    memset(&j, 0, sizeof j);
+    j.fn = fn;
+    j.osr = 1;
+    j.cur_pc = backedge_cur;
+    ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
+    memset(ctx, 0, sizeof *ctx);
+    j.ctx = ctx;
+    ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING,
+            IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
+    ctx->ret_type = IR_I32;
+
+    ir_START();
+    j.r_vm = ir_PARAM(IR_ADDR, "vm", 1);
+    /* slots = 解释器当前帧槽区（VMFrame 与 JIT 布局一致，PLAN/osr.md §2
+     * 的零拷贝红利）：OSR entry 直读直写解释器 live 状态，退出后解释器
+     * 从 resume pc 继续，无任何状态转换。 */
+    j.r_slots = ir_PARAM(IR_ADDR, "slots", 2);
+    /* call scratch 与函数级同构分配（批1 白名单无 CALL，分配仅为防
+     * lower_* 路径 NULL 解引用——批2 接入时零改动） */
+    j.r_call_args = ir_ALLOCA(ir_CONST_I64(9 * TVAL_SZ));
+    j.r_call_clo  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+    j.r_call_ret  = ir_ALLOCA(ir_CONST_I64(TVAL_SZ));
+
+    Trap t = emit_seq(&j, header, exits, ne);
+    /* TR_END = 循环出口（stop/fall-through/break 跳出）；TR_RET 不可能
+     * （白名单无 RETURN，出现即白名单漏洞 → 拒编保守回退）；TR_LOOPBACK
+     * 顶层冒泡 = 死循环形态（while(1) 无条件回边）→ 拒编。 */
+    int ok = (!j.fail && t.kind == TR_END);
+    if (ok) {
+        /* 终端 END 块收尾：TR_END 仅 OSR 出现（函数级 stops=NULL，只可能
+         * TR_RET/FAIL/LOOPBACK），此前出口块无 terminator，codegen 落出
+         * 代码缓冲（实测 = 垃圾 resume_pc → VM 跳飞挂死，ir_check 不查
+         * 尾块 terminator）。resume_pc = 出口 op 的 pc，解释器无缝续跑。 */
+        ir_BEGIN(t.end);
+        ir_RETURN(ir_CONST_I32((int32_t)t.target));
+    }
+
+    void *entry = NULL;
+    if (ok) {
+        size_t size = 0;
+        if (jit_dbg()) {
+            fprintf(stderr, "[jit] osr ir_check...\n"); fflush(stderr);
+            bool chk = ir_check(ctx);
+            fprintf(stderr, "[jit] osr ir_check=%d\n", chk); fflush(stderr);
+            if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2') {
+                fprintf(stderr, "[jit] osr ir dump:\n");
+                ir_dump(ctx, stderr);
+                fflush(stderr);
+            }
+        }
+        entry = ir_jit_compile(ctx, 1, &size);   /* O1，同函数级 */
+        if (jit_dbg())
+            fprintf(stderr, "[jit] osr compile(%s) header=%u entry=%p size=%zu\n",
+                    fn->name ? tstr_val(fn->name) : "?", header, entry, size);
+    } else if (jit_dbg()) {
+        uint32_t pc = j.cur_pc < fn->n_ops ? j.cur_pc : 0;
+        fprintf(stderr,
+                "[jit] osr compile(%s) FAILED emit (trap=%d pc=%u op=%u %s L%d)\n",
+                fn->name ? tstr_val(fn->name) : "?", (int)t.kind, j.cur_pc,
+                (unsigned)fn->ops[pc].op, tphp_op_name(fn->ops[pc].op),
+                j.fail_line);
+    }
+    ir_free(ctx);
+    tm_free(ctx);
+
+    jit_unlock();
+    return entry;          /* NULL = 拒编/发射失败（调用方熔断该位点） */
+}
+
+/* 解释器 op_jmp back-edge 的统一入口：计数 → 达阈值编译 → 进 OSR。
+ * slots 由调用方（vm.c）传 frame->slots——VM 对 jit.c 不透明。
+ *
+ * 状态编码 per-site 存 back-edge op 的 ic（JMP 类 op 无 DimIC 占用）：
+ *   0..THRESHOLD-1  = back-edge 计数器
+ *   bit63 tag       = 该位点的 OSR chunk 入口（JIT 代码分配在用户态
+ *                     低位区，bit63 恒 0，可作 tag）
+ *   UINTPTR_MAX     = 熔断（拒编/发射失败，该循环永不再试）
+ *
+ * chunk 必须循环级 per-site：曾挂函数级入口复用（osr_entry on TFunc），
+ * 同函数第二个热循环直进第一个循环的 chunk——读的是别的循环的槽，
+ * cond 常假 → 立即返第一个循环的出口 pc → 两循环间 ping-pong
+ * （实测 4000 万圈，值全对但永远走不到第二个循环）。 */
+#define OSR_IC_TAG (((uintptr_t)1) << 63)
+
+bool tphp_osr_backedge(VM *vm, TFunc *fn, void **ic_slot, uint32_t header,
+                       uint32_t backedge_cur, TVal *slots,
+                       uint32_t *resume_pc) {
+    typedef int (*OsrEntry)(VM *, TVal *);
+    uintptr_t v = (uintptr_t)*ic_slot;
+    if (v == UINTPTR_MAX) return false;        /* 熔断位点（先于 tag 判定） */
+    if (v & OSR_IC_TAG) {                      /* 已挂：直进（免计数） */
+        *resume_pc = (uint32_t)((OsrEntry)(void *)(v & ~OSR_IC_TAG))(vm, slots);
+        return true;
+    }
+    if (!tphp_jit_available()) return false;
+    /* 非原子竞态最坏计数漂移（少/多触发一次），同 P0-13 推理。 */
+    v++;
+    if (v < (uintptr_t)TPHP_JIT_OSR_THRESHOLD) {
+        *ic_slot = (void *)v;
+        return false;
+    }
+    void *entry = tphp_jit_compile_osr(fn, header, backedge_cur, backedge_cur);
+    if (!entry) {
+        *ic_slot = (void *)UINTPTR_MAX;        /* 熔断：该循环不再重试 */
+        return false;
+    }
+    *ic_slot = (void *)((uintptr_t)entry | OSR_IC_TAG);
+    *resume_pc = (uint32_t)((OsrEntry)entry)(vm, slots);
+    return true;
 }
 
 #else /* !TPHP_JIT */

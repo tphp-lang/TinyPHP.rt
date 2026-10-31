@@ -583,7 +583,19 @@ static int32_t op_cast(VM *vm, TOp *op) {
 
 /* ---- control flow ---- */
 static int32_t op_jmp(VM *vm, TOp *op) {
-    vm->x.frame->pc = op->ar;
+    VMFrame *f = vm->x.frame;
+    uint32_t cur = f->pc;
+    if (op->ar <= cur) {   /* P1-12 批1（PLAN/osr.md）：back-edge 计数/进
+                            * OSR——返回真即 OSR 已跑完循环（或失败点），
+                            * 解释器从 resume pc 继续（循环后代码/失败 op）。 */
+        uint32_t resume;
+        if (tphp_osr_backedge(vm, f->fn, &op->ic, op->ar, cur, f->slots,
+                              &resume)) {
+            f->pc = resume;
+            return 0;
+        }
+    }
+    f->pc = op->ar;
     return 0;
 }
 
