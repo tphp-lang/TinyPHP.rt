@@ -52,6 +52,7 @@
 | [PLAN/preg.md](PLAN/preg.md) | **正则（preg_*）**：vendor pcre2（php-src 8.5.7 pcre2lib）、模式语法/修饰符映射、v1 函数集语义、错误模型决策（编译=异常/运行=返回值协议）、P1–P4 分批 |
 | [PLAN/ir-jit.md](PLAN/ir-jit.md) | **IR baseline JIT v1**：函数级 lowering 规格——封闭类型世界（int/float/bool/null）、opcode 白名单、JitEntry ABI 与 prologue guard、JIT→JIT 调用折叠、slow helper 复用 tval_*、构建/线程约束、M1 验收（fib vs 追踪 JIT ≤2.5×） |
 | [PLAN/jsc-lessons.md](PLAN/jsc-lessons.md) | **JSC JIT 借鉴与准入策略升级**：Baseline 档缺口分析、per-site 单态 IC（P0-13）、profile 驱动准入（P0-14）、循环 OSR（P1-12）、异步编译（P2-13）四机制规格 + 不搬清单 + 实施批次 |
+| [PLAN/osr.md](PLAN/osr.md) | **循环 OSR 规格（P1-12）**：back-edge 计数触发、单自然循环编译单元、零拷贝 OSR entry（slots 同布局红利）、P0-12 exit 复用、编译停顿治理、三批实施与 M3 判据 |
 | [PLAN/backlog.md](PLAN/backlog.md) | **全量任务与未来规划（交接文档）**：现状快照、给新 AI 的工作协议红线、P0 性能主线（JIT v1.1 等 9 项→M2/M3）、P1 功能线 8 项、P2 工程线 16 项、远期里程碑判据、已决策不做指针、工具速查 |
 
 ## 技术栈与环境
