@@ -215,6 +215,48 @@ static void gc_run_deferred_dtors(void) {
     }
 }
 
+/* ---- P0-20 object pool（帧池 FP_POOL 同款）----
+ * TObj+props 单次变长分配（P0-4）→ **16B 对齐精确档** freelist：分配侧
+ * 就按对齐尺寸分配（多付 0-15B 对齐垫），档=精确尺寸——链内同构，复用
+ * 零越界。同类循环创建/销毁（object bench 形态）精确命中，bare 3.14×
+ * → 预期 ~1.2。freelist next 存 o->cls（释放后无意义，复用时全量重写）。
+ * 上限防长寿命泄漏；thread_local 与帧池同策略。GC 安全：gc_unregister
+ * 已在 free 前调用，池中死对象脱离 registry，mark-sweep 不可见。 */
+#define OPOOL_CLASSES 8
+#define OPOOL_MAX_PER_CLASS 1024
+static _Thread_local TObj *g_opool[OPOOL_CLASSES];
+static _Thread_local int g_opool_n[OPOOL_CLASSES];
+static const size_t g_opool_steps[OPOOL_CLASSES] =
+    { 48, 64, 80, 96, 128, 160, 192, 224 };   /* 16B 步进；>224B 直 malloc */
+static size_t obj_align16(size_t sz) { return (sz + 15) & ~(size_t)15; }
+static int obj_pool_class(size_t asz) {
+    for (int c = 0; c < OPOOL_CLASSES; c++)
+        if (asz == g_opool_steps[c]) return c;   /* 精确匹配（分配侧已对齐） */
+    return -1;
+}
+TObj *tphp_obj_pool_get(size_t sz) {
+    size_t asz = obj_align16(sz);   /* 分配侧同款对齐：池对象按 asz 分配 */
+    int c = obj_pool_class(asz);
+    if (c >= 0 && g_opool_n[c] > 0) {
+        g_opool_n[c]--;
+        TObj *o = g_opool[c];
+        g_opool[c] = *(TObj **)&o->cls;   /* freelist next 复用 cls 槽 */
+        return o;
+    }
+    return NULL;
+}
+void tphp_obj_pool_put(TObj *o, size_t sz) {
+    size_t asz = obj_align16(sz);
+    int c = obj_pool_class(asz);
+    if (c >= 0 && g_opool_n[c] < OPOOL_MAX_PER_CLASS) {
+        *(TObj **)&o->cls = g_opool[c];
+        g_opool[c] = o;
+        g_opool_n[c]++;
+        return;
+    }
+    tm_free(o);
+}
+
 void tobj_free(TObj *o) {
     if (obj_has_dtor(o) && !(o->h.flags & GC_FLAG_DTORED)) {
         o->h.flags |= GC_FLAG_DTORED;
@@ -237,7 +279,9 @@ void tobj_free(TObj *o) {
         tval_release(&o->props[i]);
     /* props 尾部紧贴（tphp_obj_alloc 单次分配，P0-4）→ 随对象一次 free */
     gc_unregister(&o->h);
-    tm_free(o);
+    size_t osz = obj_align16(sizeof(TObj) +
+        sizeof(TVal) * (size_t)(o->cls->n_props ? o->cls->n_props : 1));
+    tphp_obj_pool_put(o, osz);      /* P0-20：入池复用（档不匹配则 free） */
 }
 
 void tex_free(TExObj *x) {

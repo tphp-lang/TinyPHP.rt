@@ -995,7 +995,13 @@ bool tphp_vis_ok(uint8_t vis, TClass *owner, TClass *from) {
 TObj *tphp_obj_alloc(TClass *cls) {
     tphp_class_ensure_flat(cls);
     int np = cls->n_props;
-    TObj *o = tm_malloc(sizeof(TObj) + sizeof(TVal) * (size_t)(np ? np : 1));
+    extern TObj *tphp_obj_pool_get(size_t sz);
+    size_t osz = sizeof(TObj) + sizeof(TVal) * (size_t)(np ? np : 1);
+    TObj *o = tphp_obj_pool_get(osz);       /* P0-20：池复用（NULL=新建） */
+    if (!o) {
+        size_t asz = (osz + 15) & ~(size_t)15;   /* 与池档同款 16B 对齐 */
+        o = tm_malloc(asz);
+    }
     o->h.rc = 1; o->h.color = GC_COLOR_UNMARKED; o->h.kind = GC_KIND_OBJ;
     o->h.flags = 0;
     gc_register(&o->h);
