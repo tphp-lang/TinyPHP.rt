@@ -80,6 +80,20 @@ bench("json 2e3", function () {
     for ($i = 0; $i < 2000; $i++) { $j = json_encode($rows); $back = json_decode($j); }
 });
 
+// P0-19 arm64-mac 排查探针：分配+GC 密集（str/obj 双分配），与计算无关。
+// 五平台对照可分离"runner CPU 代差"vs"tphp 平台缺陷"：PHP 侧同机慢=CPU；
+// PHP 正常而 tphp 慢=tphp 的 TLS/allocator/平台实现问题。
+bench("alloc-probe 1e5", function () {
+    for ($r = 0; $r < 100; $r++) {
+        $a = [];
+        for ($i = 0; $i < 1000; $i++) {
+            $a[] = "s$i";
+            $o = new class($i) { public $v; };
+            $o->v = $i + 1;
+        }
+    }
+});
+
 bench("object 1e5", function () {
     // 匿名类在 PHP 8 支持；tphp 也支持（test-oop-anon）
     for ($i = 0; $i < 100000; $i++) {
