@@ -34,6 +34,38 @@ static double now_ms(void) {
 
 static volatile void *sink;
 
+/* ---- P0-19 cluster-2 probe: tphp object-alloc wrapper simulation ----
+ * Isolates what the tphp path adds over a bare mi_malloc/mi_free pair:
+ * gc_list doubly-linked registration on alloc + unlink on free.
+ * Delta vs bare bench_pair on the SAME machine = wrapper-layer cost. */
+typedef struct GCSim {
+    struct GCSim *prev, *next;
+} GCSim;
+static GCSim *gc_list_sim;
+
+static void bench_wrapper(const char *name, size_t sz, long n) {
+    double t0 = now_ms();
+    for (long i = 0; i < n; i++) {
+        char *p = (char *)mi_malloc(sz);
+        GCSim *g = (GCSim *)p;
+        g->prev = NULL;
+        g->next = gc_list_sim;
+        if (gc_list_sim) gc_list_sim->prev = g;
+        gc_list_sim = g;
+        /* unlink BEFORE touch: the touch would clobber the in-block
+         * GCSim pointers (same layout as tphp's real GCHead+user split) */
+        if (g->prev) g->prev->next = g->next; else gc_list_sim = g->next;
+        if (g->next) g->next->prev = g->prev;
+        p[0] = (char)i;
+        p[sz - 1] = (char)i;
+        sink = p;
+        mi_free(p);
+    }
+    double t1 = now_ms();
+    printf("%-14s %6zu B  %8.1f ns/pair (wrapper)\n", name, sz,
+           (t1 - t0) * 1e6 / n);
+}
+
 static void bench_pair(const char *name, size_t sz, long n) {
     double t0 = now_ms();
     for (long i = 0; i < n; i++) {
@@ -66,8 +98,11 @@ static void bench_arrlit(long n) {
 int main(void) {
     long n = 10000000;
     bench_pair("TStr-4B", 50, n);
+    bench_wrapper("TStr-4B", 50, n);
     bench_pair("TStr-16B", 64, n);
+    bench_wrapper("TStr-16B", 64, n);
     bench_pair("TArr", 64, n);
+    bench_wrapper("TArr", 64, n);
     bench_pair("data-8x16", 128, n);
     bench_pair("buckets-16", 384, n / 2);
     bench_pair("TStr-400B", 432, n / 2);
