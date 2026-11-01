@@ -210,10 +210,17 @@ jobs:
       # (no tphp TLS, no interpreter): malloc/free pair ~50ns = tphp's own
       # TLS layers are the tax (TLS consolidation); >=400ns = macOS
       # libmalloc baseline is slow (pool the hot paths instead).
-      - name: Discriminator B (pure-C alloc baseline)
+      - name: Discriminator B (pure-C alloc baseline: libc + mimalloc)
         run: |
-          clang -O2 tools/bench_alloc.c -o build/bench_alloc
-          ./build/bench_alloc || true
+          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o build/bench_alloc-libc
+          echo "== libc (macOS libmalloc baseline) =="
+          ./build/bench_alloc-libc || true
+          ls build/obj/mi_*.o >/dev/null 2>&1 && \
+            clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src \
+              tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o \
+              -o build/bench_alloc-mi && \
+            echo "== mimalloc (same objects as tphp link) ==" && \
+            ./build/bench_alloc-mi || echo "(mi objects absent, skipped)" 
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under

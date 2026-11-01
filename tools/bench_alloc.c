@@ -6,7 +6,14 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef USE_LIBC
+/* P0-19 discriminator B: pure libc baseline (macOS libmalloc vs tphp TLS) */
+#include <stdlib.h>
+#define mi_malloc(sz) malloc(sz)
+#define mi_free(p)    free(p)
+#else
 #include "mimalloc.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
