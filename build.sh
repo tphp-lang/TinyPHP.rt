@@ -26,6 +26,15 @@ if [ "${NO_MIMALLOC:-0}" = "1" ]; then
 fi
 TARCH=${TARGET_ARCH:-$(uname -m)}
 TOS=$(uname -s)
+# P0-19 cluster-1 fix (11-01): mimalloc's Darwin small-alloc fast path is
+# 2.2-3.2x slower than macOS libmalloc (bench_alloc: libc 17-21ns vs mi
+# 45-53ns per pair, reproduced across CI rounds; wrapper probe shows the
+# gc_list layer is free). Default Darwin to the CRT allocator; opt back in
+# with USE_MIMALLOC=1 if a future mimalloc release fixes Darwin.
+if [ "$TOS" = "Darwin" ] && [ "${NO_MIMALLOC:-0}" != "1" ] && [ "${USE_MIMALLOC:-0}" != "1" ]; then
+  echo "[p0-19] Darwin default: CRT allocator (mimalloc opt-in via USE_MIMALLOC=1)"
+  NO_MIMALLOC=1
+fi
 # portable lowercase (sh/dash has no ${var,,})
 TOS_LC=$(printf '%s' "$TOS" | tr 'A-Z' 'a-z')
 
