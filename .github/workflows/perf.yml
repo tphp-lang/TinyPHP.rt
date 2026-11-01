@@ -201,7 +201,7 @@ jobs:
       - name: "Discriminator A (PURGE_DELAY=0, PAGE_RESET=0, 3 rounds, drop first)"
         run: |
           for i in 1 2 3; do
-            MIMALLOC_PURGE_DELAY=0 MIMALLOC_PAGE_RESET=0 ./build/tphp run tools/bench-vs-php.php 2>/dev/null | grep -E "^BENCH (serialize|json|real-logstat|array-push)" || true
+            MIMALLOC_PURGE_DELAY=0 MIMALLOC_PAGE_RESET=0 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|json|real-logstat|array-push)" || true
             echo "-- round $i"
           done
 
