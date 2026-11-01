@@ -3,10 +3,11 @@
 > 状态：2026-10-25 建档，2026-10-27 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
 > 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。当日日志：[../memory/2026-10-27.md](../memory/2026-10-27.md)。
 
-## 0. 现状快照（截至 2026-10-27）
+## 0. 现状快照（截至 2026-11-01）
 
 - **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；spawn 入口三形态 + 子线程继承全局符号表 = P1-10 已关；协程组保留为 `Tphp\TaskGroup`）。
-- **测试基线**：`tests/run.ps1` = **224 passed / 0 failed**（Windows 本地与 CI 5 平台同绿）。
+- **测试基线**：`tests/run.ps1` = **240 passed / 0 failed**（11-01 本地 rebuild 复验；CI 5 平台同绿）。
+- **性能现状（11-01 CI 五平台）**：Windows x64 13 项几何均值 **≈1.72×**（反超带 rmw 0.96/jsonagg 0.64/string 0.6/throw 0.58；call 1.26；kv 6.79×=真实差距见 11-01 日志）；Linux x64 ≈2.1×；mac-arm 待 P0-19 判据（NO_MIMALLOC 臂已在 workflow，等 job log CRT step 输出）。**M2（≥1.0）距离 ~1.7×**。
 - **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态）：
   - fib(28)：x86_64 ≈**1.27×**（14.0ms vs 10.9ms，direct-slot ABI 后）；
   - 未持平主体 = JIT 白名单外形态：array-read 20–51×、kv-read 15–27×、call 16×、object 7–12×；
