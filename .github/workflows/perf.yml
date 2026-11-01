@@ -193,6 +193,28 @@ jobs:
         run: |
           MIMALLOC_SHOW_STATS=1 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
 
+      # P0-19 discriminator A (11-01): purge confirmed firing (53x/19MiB per
+      # run, constant across runs). If ser/json/logstat recover toward CRT
+      # levels (~65/~160/~70) with delay=0/reset=0 -> purge/page-reset tax
+      # confirmed, fix = pin mi_option at startup. Compare vs default-run
+      # mins in perf-vs-php-nobins.md. Drop first round (warmup).
+      - name: Discriminator A (PURGE_DELAY=0 PAGE_RESET=0, 3 rounds, drop first)
+        run: |
+          for i in 1 2 3; do
+            MIMALLOC_PURGE_DELAY=0 MIMALLOC_PAGE_RESET=0 ./build/tphp run tools/bench-vs-php.php 2>/dev/null | grep -E "^BENCH (serialize|json|real-logstat|array-push)" || true
+            echo "-- round $i"
+          done
+
+      # P0-19 discriminator B (11-01): alloc-probe/object are stable across
+      # 4 builds (82-91/144-163ms) = allocator-independent. Pure-C baseline
+      # (no tphp TLS, no interpreter): malloc/free pair ~50ns = tphp's own
+      # TLS layers are the tax (TLS consolidation); >=400ns = macOS
+      # libmalloc baseline is slow (pool the hot paths instead).
+      - name: Discriminator B (pure-C alloc baseline)
+        run: |
+          clang -O2 tools/bench_alloc.c -o build/bench_alloc
+          ./build/bench_alloc || true
+
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
   # Rosetta 2 - arch-mismatched, ratios not comparable. Interpreter
