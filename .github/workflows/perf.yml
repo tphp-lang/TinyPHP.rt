@@ -198,7 +198,7 @@ jobs:
       # levels (~65/~160/~70) with delay=0/reset=0 -> purge/page-reset tax
       # confirmed, fix = pin mi_option at startup. Compare vs default-run
       # mins in perf-vs-php-nobins.md. Drop first round (warmup).
-      - name: Discriminator A (PURGE_DELAY=0 PAGE_RESET=0, 3 rounds, drop first)
+      - name: "Discriminator A (PURGE_DELAY=0, PAGE_RESET=0, 3 rounds, drop first)"
         run: |
           for i in 1 2 3; do
             MIMALLOC_PURGE_DELAY=0 MIMALLOC_PAGE_RESET=0 ./build/tphp run tools/bench-vs-php.php 2>/dev/null | grep -E "^BENCH (serialize|json|real-logstat|array-push)" || true
@@ -210,7 +210,7 @@ jobs:
       # (no tphp TLS, no interpreter): malloc/free pair ~50ns = tphp's own
       # TLS layers are the tax (TLS consolidation); >=400ns = macOS
       # libmalloc baseline is slow (pool the hot paths instead).
-      - name: Discriminator B (pure-C alloc baseline: libc + mimalloc)
+      - name: "Discriminator B (pure-C alloc baseline, libc vs mimalloc)"
         run: |
           clang -O2 -DUSE_LIBC tools/bench_alloc.c -o build/bench_alloc-libc
           echo "== libc (macOS libmalloc baseline) =="
@@ -220,7 +220,7 @@ jobs:
               tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o \
               -o build/bench_alloc-mi && \
             echo "== mimalloc (same objects as tphp link) ==" && \
-            ./build/bench_alloc-mi || echo "(mi objects absent, skipped)" 
+            ./build/bench_alloc-mi || echo "(mi objects absent, skipped)"
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
