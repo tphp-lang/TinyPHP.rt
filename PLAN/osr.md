@@ -164,6 +164,22 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **验证**：Linux 本地 test-osr-005 **3 连跑 c1-c6 全绿** + 全量 EXPECT sweep **219 PASS / 5 FAIL（5 个全是 CI SKIP 的 windows-only FFI，本地 runner 未实现 SKIP 而已）**；Windows **241/241**；bench 定点复测包内（机制上 bench 零 OSR chunk、函数级 COPY 路径未动）。
 - **上游 issue 不提交（用户拍板 2026-11-02）**：dstogov/ir 作者疑似停更——**绕行转正为长期方案**（非临时），deps/ir 转为**本仓自维护**（后续上游域 bug 自行修复，vendor 时照旧对拍上游提交）。同族风险核查：CONCAT 等跨 call 实参形态**不在 osr_body_ok 白名单**（chunk 内只有 COPY，已内联）；函数级 helper 路径历史全绿。issue 草稿作废（%TEMP%\dstogov_ir_issue.md，诊断结论已全量入档本节 + memory 续7）。
 
+### f0：无帧直调 × replay 体——opseq 自框化 temp VMFrame（2026-11-02 立，11-03 落地）
+
+- **现象（HEAD 既有 bug）**：JIT→JIT 直调是裸 `entry(vm, slots, ret)`（tphp_jit_call / call_slots 不推 VMFrame），而 `tphp_jit_opseq` 以 `vm->x.frame` 为回放帧——callee 体含 replay op（new/prop/foreach pad）时，无帧入口拿**祖先帧**按 callee pc 索引 ops → 读写错误帧槽 → 乱执行/TypeError（test-frameless-replay-001：递归 fr_rec 第二层 `$q->v` 读回 unknown）。批2-4 只在 INIT_MCALL 折叠门挡了 `jit_body_frameless`；INIT_FCALL 静态直调 / p_dyn 链 / call_slots 无守卫。
+- **修复（重新实现，见批2-7 节事故）**：`tphp_jit_opseq` 加 `fn/slots` 参数（lower_replay 传 `j->fn` 编译期常量 + `j->r_slots`）；入口 `orig->fn != fn || orig->slots != slots` 即**栈上自框化** temp VMFrame（memset 0 + fn/file/pc/slots/prev=orig，`vm->x.frame=&tmp`）；escaped 与正常两个出口 `vm->x.frame = orig` 撤框。解释器/OSR 入口（帧已匹配）零成本跳过。temp 非池分配：unwind 的 floor 检查先于 frame_destroy → 永不被弹/被释放；**递归同 fn 不同 slots**（scratch）靠 slots 比对识别。
+- **验证**：test-frameless-replay-001 五场景（静态直调 / 递归 / 方法直调 / 逃逸 raise / 纯标量对照）JIT=0/1 一致；最小复现（递归 × new+prop）修复；全量 **242/242**。
+
+### 批 2-7：函数级折叠直调（2026-11-03，INIT_MCALL/NEW_USER 扩函数级 + mfail 回放）
+
+- **动机**：批2-4/2-5 折叠均限 `j->osr`（OSR chunk），函数级仍整序 p_seq replay——probe fn-mcall 262.9 / fn-new 395.3 落后，函数级热点（非循环体调用）吃不到折叠收益。
+- **核心难点 = 函数级 deopt 重启语义**：OSR 守卫失配可 RETURN OSR_SEQ_PC 从 INIT_MCALL 幂等重跑（实参表达式未求值，无双执行）；**函数级 RETURN 0 = op_do_fcall 从 pc 0 重启整函数 → 序前副作用双执行**。
+- **Route A（落地）**：函数级守卫失配不 RETURN，改收集 `j->mfail[]` → OP_DO_FCALL 处 `esucc=ir_END()` → `ir_MERGE_N(mfail)` → `lower_replay(p_seq_pc, pc+1)` **只重跑调用序**（实参已由 IR 无条件求值，opseq 跳过表达式 op 恰正确；recv 快照 r_call_clo = INIT 时接收者，PHP 本就只求值接收者一次）→ ereplay 与 esucc `ir_MERGE_2` 汇合（镜像 p_dyn slow[] 模式）。**ok==0（callee deopt/异常）保持 RETURN**——callee 已部分执行，mfail 回放会双执行 callee；异常链须直达 op_do_fcall longjmp。arg_copy 是 raw 拷贝无 addref → mfail 弃 scratch 零泄漏；$this addref 在契约检查之后，mfail 早退全在 addref 之前。
+- **落点**：INIT_MCALL fold 条件删 `j->osr &&`（函数级只设 p_callee/p_mcall/p_mcall_cls/p_argc，不发 OSR 守卫 RETURN）；三守卫 / entry==NULL / INT 契约在 `mf = p_mcall && !osr` 下改记 mfail；OP_NEW_USER nfold 删 `j->osr &&`（全静态检查零 raise 面）+ fold dbg 打印；**`op->a2 == n_params` 静态门**（省略可选参 → 缺参槽是 UNDEF 不是默认值、多传实参 → 覆写 callee 局部槽 → 直调布局不成立；不折叠走 p_seq=2 回放 RECV 补默认值 = 批2-7 前行为，否则 lower_call_finish L1873 `argc != n_params` 会 `j->fail` 拒编整函数）；`jit_compile_callees` 加 INIT_MCALL 分支（ic=TMethod* 取 sm->fn，ic 空/无 fn 跳过）；`tphp_jit_defer_ic` 挡 op_do_fcall 与 tphp_vm_call_callable 两处 eager 门（含 ic 未固化的 INIT_MCALL/NEW_USER——ic 由解释器执行该 op 填充、首调必 NULL；**只挡 eager，hot≥127 强制编译不延退**；NEW_USER ic==1 解析失败哨兵不延退）。
+- **mfail 上限**：单 site ≤ 3 守卫 + entry + 9 契约 = 13 < `mfail[16]`。
+- **实测**：probe min-of-5 **fn-mcall 262.9→193.9（1.36×）、fn-new 395.3→314.3（1.26×）**、fn-ctor 403.8-436（基线 418 噪声带）；DEBUG 实锤 `fold mcall id pc=2 [fn]` / `fold new PrPlain pc=2 [fn]`、ir_check=1、check=2000000/1999999000000/1999999000000 JIT=0/1 一致；mfail 三路径 ad-hoc（守卫3 多态 cls / 守卫1 标量接收者 / INT 契约 n=3 证明无重启双执行）JIT=0/1 一致；可选参场景输出正确无 FAILED emit；**全量 242/242**；bench-rounds 5 轮全项带内（fib 10.6 / call 6.2 / push 36.8 / read 7.3 / kv 29.5 / object 24.7 / logstat 47.5，kv/object 相对首版 +8~9% 落在 spread 22%/11% 噪声带内）。
+- **过程事故（源文件神秘还原）**：13 处编辑在 0:59:27 被同秒还原（恰为传给失败 `git stash push -- src/jit.c src/jit.h src/vm.c` 的三个路径；非仓库 stash 不可能成功，机制未明，疑 IDE/沙箱）→ 按会话上下文全部重放 + 备份 `%TEMP%\b27bak\`。**重放漏了 f0 的 opseq 自框化** → 全量 241/1（test-frameless-replay-001 fr_rec TypeError）→ 11-03 重新实现（上节 f0）。教训：编辑后、测试前校验源文件内容；本环境避免 git 命令。
+
 ### 3.1 触发：back-edge 计数（解释器侧）
 
 - 判定点：`op_jmp` 中 `target <= pc`（向后跳 = back-edge；JMPZ/JMPNZ 向后跳在 JIT 侧是 trap_fail 形态，不做计数点）；

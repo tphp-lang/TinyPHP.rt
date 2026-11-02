@@ -46,6 +46,12 @@ void tphp_jit_compile(TFunc *fn);
 /* Static eligibility probe (PLAN/ir-jit.md §5) */
 bool tphp_jit_eligible(TFunc *fn);
 
+/* 批2-7: eager 编译延退——函数含 ic 未固化的 INIT_MCALL/NEW_USER 时先让
+ * 解释器跑一次固化快照（折叠直调的前提），固化后的下一次调用才急切编译。
+ * 只挡 eager 分支；hot≥127 强制编译不延退（冷分支 ic 永不固化也不能让
+ * 小函数永远停在解释器）。NEW_USER ic==1（解析失败哨兵）不延退。 */
+bool tphp_jit_defer_ic(TFunc *fn);
+
 /* JIT→JIT call trampoline (PLAN/ir-jit.md §8) */
 int tphp_jit_call(VM *vm, TFunc *fn, TVal *args_in, TVal *ret);
 

@@ -27,13 +27,13 @@
 | 字节码形态：`FE_RESET arr→itmp`；`CONST 0→ctmp`（预留 +1 val/+2 key）；`Lstart: FE_FETCH itmp,ctmp→htmp`；`JMPZ htmp→Lend`；`COPY ctmp+1→valCV`；`COPY ctmp+2→keyCV`(可选)；体；`JMP Lstart` | src/compile.c:2341-2366 |
 | `op_fe_reset`：rdv 读操作数 → 非数组非 Generator 抛 TypeError → addref+wtake 写 itmp | src/vm.c:865-883 |
 | `op_fe_fetch`：读 itmp（rd）、游标 `opd(op,2)->u.i`（只改 payload 不改 tag）、写 `slots[a2+1]/slots[a2+2]`、wtake 写 htmp；耗尽写 FALSE | src/vm.c:885-927 |
-| raise 落 `tphp_jit_opseq` 有界 pad（setjmp 登记/escaped→返 0/重注册继续）——与 prop 同款 deopt 门 | src/vm.c:2332-2388 |
-| opseq 帧切换深跑循环已存在（承接 handler 内帧切换） | src/vm.c:2352-2363 |
-| **opseq 派发 else-if：不在真 handler 链表的 op 落 `d=1` 表达式跳过分支**——FE 必须加进链表，否则回放静默丢语义 | src/vm.c:2370-2378 |
+| raise 落 `tphp_jit_opseq` 有界 pad（setjmp 登记/escaped→返 0/重注册继续；f0 后入口带 fn/slots 自框化 temp VMFrame）——与 prop 同款 deopt 门 | src/vm.c:2398-2470 |
+| opseq 帧切换深跑循环已存在（承接 handler 内帧切换） | src/vm.c:2431-2441 |
+| **opseq 派发 else-if：不在真 handler 链表的 op 落 `d=1` 表达式跳过分支**——FE 必须加进链表，否则回放静默丢语义 | src/vm.c:2443-2459 |
 | eligibility 白名单 switch，`default:` 拒因输出（主审计目标） | src/jit.c:567-680 |
 | emit_seq：回跳目标自动建 LOOP_BEGIN + `loop_cond=1`；**首个 JMPZ 被当循环条件**；体尾回跳 → trap_lb → LOOP_END——foreach 形态零适配 | src/jit.c:1538-1546、1867-1898 |
 | emit 缺 case → default → trap_fail → 不编译回退解释器（安全） | src/jit.c:1978 |
-| `lower_replay(j, pc_start, pc_end)`：发 `tphp_jit_opseq` 调用 + IF ok==0 → RETURN 0（deopt 门），无 dst store、无 MERGE | src/jit.c:1313-1324 |
+| `lower_replay(j, pc_start, pc_end)`：发 `tphp_jit_opseq(vm, fn, slots, pc, pc_end, recv_sc)` 调用（f0 后带 fn/slots 供自框化）+ IF ok==0 → RETURN 0（deopt 门），无 dst store、无 MERGE | src/jit.c:1726-1741 |
 | prop 四 op 同形态范例（eligibility src/jit.c:673-676、emit src/jit.c:1766-1775） | 批2 已落地 47e0fa2 |
 | ctmp 游标 tag：JIT OP_CONST 存 T_INT，handler 只改 u.i → 恒 INT 读取成立 | src/jit.c:1550-1561 |
 | logstat 拒因 = FE_RESET（本批）；其 `isset($counts[$ip])` 用 OP_ISSET_DIM 不在白名单（转拒后续） | tools/real/logstat.php:36 |

@@ -1675,7 +1675,12 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
          * O1 (skip SCCP — multi-slot CALL bug in deps/ir ir_sccp). */
         if (!fn->jit_entry && fn->hot != UINT16_MAX) {
             ++fn->hot;
-            if (fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+            /* 批2-7: eager 分支延退——INIT_MCALL/NEW_USER 的 ic 未固化时
+             * 折叠判不了（编了只能回放），先让解释器跑一次固化快照；
+             * hot≥127 强制编译不延退（冷分支 ic 永不固化也不能让小函数
+             * 永远停在解释器）。 */
+            if ((fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS &&
+                 !tphp_jit_defer_ic(fn)) ||
                 fn->hot >= TPHP_JIT_HOT_THRESHOLD)
                 tphp_jit_compile(fn);
         }
@@ -2382,11 +2387,30 @@ static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped);
  * pad），dst 由真 handler 写回（= JIT 帧槽），IR 端不再 store。
  * raise 落本地 bounded pad（floor=JIT 帧）：逃逸 → exception 必已设 →
  * 返 0，IR RETURN0 沿链传播（vm.c:1701 deopt 铁律：无 exception 的返 0
- * 只许出现在入口守卫前）。catch 命中 → 重注册继续跑。 */
-int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
+ * 只许出现在入口守卫前）。catch 命中 → 重注册继续跑。
+ *
+ * f0 自框化：无帧直调链（tphp_jit_call / call_slots 裸 entry，不推帧）进入
+ * JIT 体时 vm->x.frame 仍是祖先解释器帧——按它回放会读写错误帧的槽
+ * （递归同 fn 不同 slots 同样中招，2026-11-02 test-frameless-replay-001）。
+ * fn/slots 与现帧不符即在栈上自框化 temp VMFrame（非池分配，unwind 的
+ * floor 检查先于 frame_destroy，故永不被弹/被释放）；解释器/OSR 入口
+ * （帧已匹配）零成本跳过。 */
+int tphp_jit_opseq(VM *vm, TFunc *fn, TVal *slots, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
     jmp_buf outer;
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-    VMFrame *jf = vm->x.frame;
+    VMFrame *orig = vm->x.frame;
+    VMFrame tmp;
+    VMFrame *jf = orig;
+    if (!orig || orig->fn != fn || orig->slots != slots) {
+        memset(&tmp, 0, sizeof tmp);
+        tmp.fn = fn;
+        tmp.file = fn->file;
+        tmp.pc = pc;
+        tmp.slots = slots;
+        tmp.prev = orig;
+        vm->x.frame = &tmp;
+        jf = &tmp;
+    }
     volatile uint32_t vpc = pc;
     if (TPHP_SETJMP(vm->x.unwind) == 0)
         goto run;
@@ -2396,6 +2420,7 @@ int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
         if (escaped) {
             /* rec/args 残留由后续 catch/整帧弹出的 n_calls/n_args 回卷清理
              * （vm_unwind_core 4187-88 同款；JIT 帧无 try → 必然弹帧） */
+            if (jf != orig) vm->x.frame = orig;   /* temp 帧随函数返回失效 */
             memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
             return 0;
         }
@@ -2439,6 +2464,7 @@ run:    ;
         }
         break;
     }
+    if (jf == &tmp) vm->x.frame = orig;   /* 撤自框化（temp 随返回失效） */
     memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
     return 1;
 }
@@ -5489,7 +5515,10 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
      * tphp_jit_compile 置 hot=UINT16_MAX 自动停表，无重复尝试开销。 */
     if (tphp_jit_available() && !fn->jit_entry && fn->hot != UINT16_MAX) {
         ++fn->hot;
-        if (fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+        /* 批2-7: 同 op_do_fcall——eager 分支 ic 未固化延退（折叠前提），
+         * hot≥127 强制编译不延退。 */
+        if ((fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS &&
+             !tphp_jit_defer_ic(fn)) ||
             fn->hot >= TPHP_JIT_HOT_THRESHOLD)
             tphp_jit_compile(fn);
     }

@@ -120,3 +120,10 @@
 ## 独立 Bug 记录文件索引
 - **[bug-ffi-incomplete-struct-fnptr.md](bug-ffi-incomplete-struct-fnptr.md)**（2026-10-30，**已修复**）：tphp FFI `cdef` 不支持不完整结构体指针与函数指针 typedef → teb（civetweb 封装）加载即崩。修复=parse_struct_body miss 建占位 tag + parse_named_body 复用填充 + 顶层 struct 回退路径修复（删错误回退，保留 sname）+ 前向声明登记 tag + typedef 走 parse_declarator（接 FFI_FUNC_PTR）+ 按值不完整三消费点拦截 + 顺带 CData 字符串保活（FFCData.keep，rvalue 串悬垂 UAF）。同场发现 teb 侧 3 独立 bug（char*[2] 缺 NULL 终止槽=AV 根因、request 漏 return $this——均已修；hello EXPECT 与实现不符未改）。回归 tests/ffi/test-ffi-incomplete-types.php，基线 **232/232**。教训：**FFCData 逐字段赋值无 memset——给 struct 加字段必查所有构造点**；真 PHP 对 `char*[2]` 越界"恰好活"是 zend 分配器 UB 运气，不可当行为基准。
   - **后续（同日）**：typedef alias 分支漏拷 fn_ret/fn_params/fn_n（空签名壳 → closure_create AV，见「FFI 跨线程回调」节）已修；跨线程回调 marshaling 落地（teb handler 崩溃根治），基线 **233/233**（新增 test-ffi-callback-cross-thread.php）。
+
+## 2026-11-03 批2-7 函数级折叠直调 + f0 opseq 自框化（基线 242/242）
+
+- **批2-7（详 PLAN/osr.md 批2-7 节 + memory/2026-11-03.md）**：INIT_MCALL/NEW_USER 折叠门删 `j->osr &&` 扩到函数级；核心难点=函数级 RETURN 0 会从 pc 0 重启整函数双执行序前副作用 → Route A：守卫失配不 RETURN 改收集 mfail → OP_DO_FCALL 处 MERGE_N 聚合 → lower_replay(p_seq_pc, pc+1) 只重跑调用序（实参已 IR 无条件求值）→ 与成功路径 MERGE_2 合流；ok==0 保持 RETURN（callee 已部分执行）；`a2==n_params` 静态门（可选参/多实参 → p_seq=2 兜底防整函数拒编）；`tphp_jit_defer_ic` 挡 ic 未固化的 eager 门（hot≥127 强制编译不延退）。probe min-of-5：fn-mcall 262.9→193.9ms（**1.36×**）、fn-new 395.3→314.3ms（**1.26×**）。
+- **f0（HEAD 既有 bug，曾随源还原事故丢失后重落）**：无帧直调链（tphp_jit_call/call_slots 不推帧）× replay 体 → opseq 按祖先帧回放读写错帧槽（递归同 fn 不同 slots 同样中招）→ `tphp_jit_opseq` 加 fn/slots 参数，入口不符即栈上自框化 temp VMFrame（两出口撤框；unwind floor 先于 frame_destroy 故 temp 永不被弹）。回归 tests/jit/test-frameless-replay-001.php 五场景。
+- **教训（源还原事故）**：13 处编辑被同秒整体还原（恰为失败 git stash 的三路径，非仓库 stash 不可能成功，机制未明）——**多文件批量编辑立即备份 %TEMP%，编辑后、测试前校验源内容；本环境 git 需 2>&1 才见 stderr（裸调常 128）**。
+- 基线 **242 passed / 0 failed**（tests/run.ps1 11-03 实测）；bench-rounds 5 轮全项带内。新增 tests/jit/test-frameless-replay-001.php、tools/probe_fold_fn.php。
