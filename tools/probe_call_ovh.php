@@ -24,4 +24,17 @@ $t0 = microtime(true);
 for ($i = 0; $i < 1000000; $i++) { freestanding($i); $n4++; }
 $t1 = microtime(true);
 echo "SEG free-call       " . round(($t1 - $t0) * 1000, 1) . " ms\n";
-echo "check=$n1/$n2/$n3/$n4\n";
+// subtraction anchors (P0-9 call decomposition): empty loop = dispatch
+// baseline; nop-call vs free-call isolates arg SEND/RECV machinery
+$n5 = 0;
+$t0 = microtime(true);
+for ($i = 0; $i < 1000000; $i++) { $n5++; }
+$t1 = microtime(true);
+echo "SEG empty-loop      " . round(($t1 - $t0) * 1000, 1) . " ms\n";
+function nopcall() { return 1; }
+$n6 = 0;
+$t0 = microtime(true);
+for ($i = 0; $i < 1000000; $i++) { nopcall(); $n6++; }
+$t1 = microtime(true);
+echo "SEG nop-call        " . round(($t1 - $t0) * 1000, 1) . " ms\n";
+echo "check=$n1/$n2/$n3/$n4/$n5/$n6\n";

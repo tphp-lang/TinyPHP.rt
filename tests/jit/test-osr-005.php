@@ -11,6 +11,8 @@
 // EXPECT: c1=255000
 // EXPECT: c2=135000
 // EXPECT: c3=135000
+// EXPECT: c4=270000
+// EXPECT: c5=39999
 
 // 1) method call inside the loop (INIT_MCALL fold -> replay/direct chain)
 class OsrM {
@@ -53,3 +55,37 @@ for ($i = 0; $i < 30000; $i++) {
     $s3 += $u;
 }
 echo "c3=$s3\n";
+
+// 4) batch 2-4 fold: frameless method returning $this exercises the
+//    $this addref/release balance (callee moves the ref into ret);
+//    string-arg method trips the INT contract -> seq re-run (correctness)
+class OsrR {
+    public $v = 7;
+    public function me() { return $this; }
+    public function tag($s) { return $s; }
+}
+$rr = new OsrR();
+$s4 = 0;
+for ($i = 0; $i < 30000; $i++) {
+    $x = $rr->me();
+    $s4 += $x->v;
+    $t = $rr->tag("ab");   /* standalone seq (nested-in-arg calls predate
+                            * this batch: INIT_FCALL precedes arg eval) */
+    $s4 += strlen($t);
+}
+echo "c4=$s4\n";
+
+// 5) polymorphic receiver: ic snapshot stays OsrA; after the mid-loop
+//    switch the cls guard fails every iteration -> interpreter re-run
+//    from INIT_MCALL (20001 x 1 + 9999 x 2)
+class OsrA { public function w() { return 1; } }
+class OsrB { public function w() { return 2; } }
+$oa = new OsrA();
+$ob = new OsrB();
+$pk = $oa;
+$s5 = 0;
+for ($i = 0; $i < 30000; $i++) {
+    $s5 += $pk->w();
+    if ($i == 20000) { $pk = $ob; }
+}
+echo "c5=$s5\n";

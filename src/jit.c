@@ -916,6 +916,9 @@ typedef struct {
                                  * fn 快照槽；1=未解析哨兵，链尾存真 fn） */
     int p_sm;                   /* 批3-3: p_callee 来自 INIT_SMCALL（静态方法，
                                  * 帧布局 poff=1：slot0 保留/参数 1..） */
+    int p_mcall;                /* 批2-4: p_callee 来自 INIT_MCALL 折叠直调
+                                 * （OSR 限定；poff=1 + slot0=$this，守卫失配
+                                 * → OSR_SEQ_PC 整序回解释器） */
     /* P0-14 批2: 调用序回放（INIT_NEW…NEW_USER / INIT_MCALL…DO_FCALL）。
      * 1 = new 序，2 = mcall 序，值即 p_seq_pc 起点 op 下标 */
     int p_seq;
@@ -1579,6 +1582,26 @@ static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
     }
 }
 
+/* P1-12 批2-4：callee 体是否无帧——直调链不推 VMFrame（slots 显式传参），
+ * 走 lower_replay 的真 handler 读 vm->x.frame->slots 会落进调用方帧 →
+ * 只允许无帧体走折叠直调，含 replay/pad op 的体回退 p_seq 序回放
+ * （op_do_fcall 推帧后经 opseq 执行，原路径）。 */
+static bool jit_body_frameless(TFunc *fn) {
+    for (uint32_t i = 0; i < fn->n_ops; i++) {
+        switch (fn->ops[i].op) {
+        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        case OP_ISSET_PROP: case OP_UNSET_PROP:
+        case OP_ISSET_DIM:
+        case OP_FE_RESET: case OP_FE_FETCH:
+        case OP_INIT_NEW: case OP_NEW_USER:
+        case OP_INIT_MCALL:
+            return false;
+        default: break;
+        }
+    }
+    return true;
+}
+
 /* P0-14 批2：调用序/op 回放发射（vm.c tphp_jit_opseq）——表达式已由 JIT
  * 求值；dst 由真 handler 写回 frame 槽，IR 端只做 deopt 门（P0-12 姿样：
  * IF_TRUE RETURN0 / IF_FALSE 留开；无 dst store、无 MERGE）。 */
@@ -1731,11 +1754,12 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * 只尝试不保证成功）。self 递归跳过（执行时自身 entry 必已设）。 */
     if (callee != j->fn && !callee->jit_entry) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
     /* 批3-3：静态方法直调放行（p_sm=eligibility 已解析 user-static 且
-     * 可见性/形态全验）；其余 is_method TFunc 仍拒（批2-2 前行为）。 */
-    if (callee->is_method && !j->p_sm) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
+     * 可见性/形态全验）；批2-4：p_mcall = INIT_MCALL 折叠直调（三守卫已
+     * 证实单态 user 实例方法）；其余 is_method TFunc 仍拒（批2-2 前行为）。 */
+    if (callee->is_method && !j->p_sm && !j->p_mcall) { j->fail = 1; if (!j->fail_line) j->fail_line = __LINE__; return; }
     /* 方法帧布局：slot0 保留（$this 槽，静态不可达）、参数 1..（compile.c
      * get_var("this") 对全部方法预留 CV0）——函数布局 poff=0。 */
-    uint32_t poff = j->p_sm ? 1u : 0u;
+    uint32_t poff = (j->p_sm || j->p_mcall) ? 1u : 0u;
 
     /* v1.2 direct-slot call: pre-allocated entry-block scratch, write params
      * in place, call entry via runtime lookup — no TLS, no loop ALLOCA.
@@ -1747,8 +1771,9 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     } else {
         slots_sc = ir_ALLOCA(ir_CONST_I64((uintptr_t)nslots * TVAL_SZ));
     }
-    /* init slot0(方法)/locals/tmps to UNDEF (params get overwritten below) */
-    if (poff) {
+    /* init slot0(方法)/locals/tmps to UNDEF (params get overwritten below)
+     * —— p_mcall 的 slot0=$this 在合同检查后填（addref 前无早退路径） */
+    if (poff && !j->p_mcall) {
         ir_ref d0 = ir_ADD_A(slots_sc, ir_CONST_ADDR(0));
         store_imm(j, d0, (int32_t)T_UNDEF, ir_CONST_I64(0));
     }
@@ -1778,6 +1803,19 @@ static void lower_call_finish(JitC *j, TOp *doop) {
             ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
         ir_IF_FALSE(ift);
     }
+    ir_ref mcall_d0 = IR_UNUSED;
+    if (j->p_mcall) {
+        /* 批2-4：$this@slot0 = 接收者快照 raw copy + addref（T_OBJ/kind/
+         * cls 三守卫已在 INIT 证实；合同/entry 早退均在本 addref 之前）。
+         * callee 无帧执行，调用后统一 release 归还：callee move 走
+         * （return $this → slot0 置 UNDEF）则空操作，所有权随 ret 转移；
+         * callee 复制到别处则各自 addref，此处 release 恰好配平。 */
+        mcall_d0 = ir_ADD_A(slots_sc, ir_CONST_ADDR(0));
+        store_pay(j, mcall_d0, load_pay(j, j->r_call_clo));
+        store_tag(j, mcall_d0, load_tag(j, j->r_call_clo));
+        ir_ref thiso = ir_LOAD_A(mcall_d0);
+        ir_STORE(thiso, ir_ADD_I32(ir_LOAD_I32(thiso), ir_CONST_I32(1)));
+    }
     ir_ref dir_t[3] = { j->r_vm, slots_sc, ret_sc };
     ir_ref ok = ir_CALL_N(IR_I32, entry, 3, dir_t);
     /* callee deopt（内含 raise，exception 已设）→ caller 同样立即 RETURN 0
@@ -1786,6 +1824,10 @@ static void lower_call_finish(JitC *j, TOp *doop) {
      * tphp_jit_call（dyn 路径）。 */
     ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
     ir_IF_TRUE(ifd);
+        if (j->p_mcall) {   /* 归还 $this addref（slot0 可能已被 callee 改写） */
+            ir_ref trd[1] = { mcall_d0 };
+            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, trd);
+        }
         ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
     ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
@@ -1794,8 +1836,13 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc,
                                               ir_CONST_ADDR(TVAL_TAG))));
     }
+    if (j->p_mcall) {
+        ir_ref trd2[1] = { mcall_d0 };   /* 成功路径同样配平（UNDEF 空操作） */
+        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, trd2);
+    }
     j->p_callee = NULL;
     j->p_sm = 0;
+    j->p_mcall = 0;
 }
 
 static void lower_return(JitC *j, TOp *op) {
@@ -2333,12 +2380,51 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_INIT_MCALL: {
             /* $o->m(...) 序起点：recv 快照进 entry scratch（实参表达式可
-             * 复用接收者槽）；方法名限字面量（动态名 → fail 回退解释器） */
+             * 复用接收者槽）；方法名限字面量（动态名 → fail 回退解释器）。
+             * 批2-4 折叠直调（OSR 限定）：ic 已固化精确单态 user 方法
+             * （init_mcall_core fill 规则：decl==o->cls && fn && vis 已验、
+             * 非 native/非 magic）→ 三道运行时守卫命中即走
+             * lower_call_finish 直调（同 INIT_FCALL 机械）；任一失配或
+             * 形态不支持（entry 未备/体含 replay op/函数级）→ p_seq=2
+             * 原序回放。守卫失配 RETURN OSR_SEQ_PC：OSR 下从本 op 幂等
+             * 重跑（含慢形态），函数级不折叠故不涉及重启语义。 */
             if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (op->tr != OPD_CONST || (op->t1 != OPD_CV && op->t1 != OPD_TMP)) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             ir_ref ra = slot_addr(j, op->a1);
             store_pay(j, j->r_call_clo, load_pay(j, ra));
             store_tag(j, j->r_call_clo, load_tag(j, ra));
+            TMethod *sm = (TMethod *)op->ic;
+            TFunc *mfn = sm ? sm->fn : NULL;
+            if (j->osr && mfn && sm->decl &&
+                (mfn == j->fn || mfn->jit_entry) && jit_body_frameless(mfn)) {
+                j->p_seq_pc = pc;   /* 守卫 RETURN 读此值——必须先设 */
+                ir_ref gs = j->r_call_clo;
+                /* 守卫1：接收者必须是 T_OBJ（closure/标量/异常 getter 走慢路） */
+                ir_ref ift = ir_IF(ir_NE(load_tag(j, gs), ir_CONST_I32(T_OBJ)));
+                ir_IF_TRUE(ift);
+                    ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));
+                ir_IF_FALSE(ift);
+                /* 守卫2：GC kind == OBJ（异常对象同为 T_OBJ） */
+                ir_ref ob = ir_LOAD_A(gs);
+                ir_ref ifk = ir_IF(ir_NE(
+                    ir_LOAD_U8(ir_ADD_A(ob, ir_CONST_ADDR(offsetof(GCHead, kind)))),
+                    ir_CONST_U8(GC_KIND_OBJ)));
+                ir_IF_TRUE(ifk);
+                    ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));
+                ir_IF_FALSE(ifk);
+                /* 守卫3：精确单态 cls == ic->decl（镜像解释器快照 guard） */
+                ir_ref ifc = ir_IF(ir_NE(
+                    ir_LOAD_A(ir_ADD_A(ob, ir_CONST_ADDR(offsetof(TObj, cls)))),
+                    ir_CONST_ADDR((uintptr_t)sm->decl)));
+                ir_IF_TRUE(ifc);
+                    ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));
+                ir_IF_FALSE(ifc);
+                j->p_callee = mfn;
+                j->p_mcall = 1;
+                j->p_argc = 0;
+                pc++;
+                break;
+            }
             j->p_seq = 2;
             j->p_seq_pc = pc;
             pc++;

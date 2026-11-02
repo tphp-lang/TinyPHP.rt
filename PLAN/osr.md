@@ -137,6 +137,13 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **重开条件**：deps/ir 根修 O1 FOLDING 在 LOOP 内 MERGE 链的 CSE 正确性（复现 = osr.md 本节三态矩阵 + tv_copy 诊断法：`__builtin_return_address` 对照 chunk entry 定位调用点），或 OSR chunk 换独立编译配置（FOLDING off + 可用的 O1 变体）。
 - **2026-11-02 重验落地（f97555a 后无混杂会话，阻塞证伪）**：三态矩阵的 O1+FOLDING 坏码**不复现**——与 kv 线同款"卡 deps/ir 上游"归因被后续修复证伪。白名单重加三 op（`osr_body_ok` INIT_MCALL/INIT_NEW/NEW_USER），转正 `tests/jit/test-osr-005.php` 三形态（c1 方法调用循环 / c2 new+prop+COPY / c3 三者组合）：**10 连跑全绿、osr ir_check=1、JIT=0 对拍一致、241/241、bench 全带内（kv/object 等零回退）**。**chunk 执行性实证**：阈值关断对照（`TPHP_JIT_OSR_THRESHOLD` 临时改 10 亿构建 vs 默认）——方法+对象探针 4349→3755ms（**13.6% 实益**），排除"只编译不进入"假绿。**勘误**：阈值 env 此前从未接线（jit.h 注释与本文件曾称 `TPHP_JIT_OSR`/`TPHP_JIT_OSR_THRESHOLD` 可覆盖——纯文档漂移），改阈值需动 jit.h 宏；接线 env 记为可选后续。
 
+### 批 2-4：INIT_MCALL 折叠直调（2026-11-02，P0-9 归因后的下一刀）
+
+- **动机**：批2-3 只放行白名单，mcall 仍整序 opseq replay 经 C helper（pure-call 65 = empty 6.7 + replay ~58 vs PHP 39）——P0-9 归因定位的默认配置剩余大头。
+- **机制（jit.c，`p_mcall` 态）**：INIT_MCALL 时 op->ic 已由解释器固化精确单态 user 方法（fill 规则 `decl==o->cls && fn && vis 已验`，非 native 非 magic）→ **三道运行时守卫**（接收者 T_OBJ / GCHead.kind==GC_KIND_OBJ / `TObj.cls == sm->decl`，读 recv 快照）全过 → 走 lower_call_finish 直调（poff=1，$this@slot0 = 快照 raw copy + addref，**调用后统一 release 配平**：callee move 走（`return $this` → slot0 置 UNDEF）则空操作、所有权随 ret 转移；entry/INT 合同早退均在 addref 之前无泄漏）；任一失配或形态不支持（ic 空 / entry 未备 / **callee 体含 replay op**（`jit_body_frameless` 扫描：prop4/ISSET_DIM/FE/INIT_NEW/NEW_USER/INIT_MCALL——直调链不推 VMFrame，真 handler 会读进调用方帧）/ 函数级）→ **原 p_seq=2 序回放**（语义完整兜底）。守卫失配 RETURN OSR_SEQ_PC = 从 INIT_MCALL 幂等重跑（OSR 位置安全；**函数级不折叠**，避开 deopt 重启语义）。INT 合同失配（字符串实参）同走 seq 重跑。
+- **实测**：probe **pure-call 65→12.3-12.5ms（5.2×）**，vs PHP 39.5 = **0.32×（3.2× 反超，原 1.65× 落后）**；new+noop 121-122→66.5-78（vs PHP 93.5 转反超）；free/nop/empty/JIT=0 全不动。test-osr-005 扩 c4（`return $this` 引用平衡 + 字符串实参合同回退）、c5（多态 cls 守卫失配→解释器重跑 39999），5 场景 JIT=0/1 一致、osr ir_check 全 1、**241/241**、bench 两轮 min 回带（机器噪声期，spread 27% 系统性）。
+- **过程发现（既有限制，非本批）**：参数位嵌套调用（`strlen($o->m())`——INIT_FCALL 先于实参求值）撞 p_callee 态拒编 chunk（backlog P0-16 记账同款）；c4 改独立语句绕开。
+
 ### 3.1 触发：back-edge 计数（解释器侧）
 
 - 判定点：`op_jmp` 中 `target <= pc`（向后跳 = back-edge；JMPZ/JMPNZ 向后跳在 JIT 侧是 trap_fail 形态，不做计数点）；
