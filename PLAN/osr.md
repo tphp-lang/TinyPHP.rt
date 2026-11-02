@@ -162,7 +162,7 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **根因（上游域）**：deps/ir **LSRA 把跨前置 call 活跃的实参值按 SysV hint 钉进 call 易失的 RSI 且不发回装**（ir_ra.c/ir_emit.c 与上游 HEAD b8d619a 逐字一致 = 上游同存，无现成修复可同步；cf39e5d/3470e7e 本地补丁与7个 post-vendor 上游提交逐一对拍排除）。**去 hint 试验（hints_count=0）被否决**：hint 是 call load pos 固定窗的承重结构，全局段错误——不能作为绕行。
 - **绕行（落地）**：**OSR chunk 内 OP_COPY/OP_ASSIGN 改内联**（新 `lower_tv_copy_inline`：镜像 `tphp_jit_tv_copy` 的 addref→release→16B store，块结构同 dimic_take）——chunk 内不再产生"双 slot-addr 实参跨 call"的调用形态；函数级保持 helper 调用（历史全绿，不动）。
 - **验证**：Linux 本地 test-osr-005 **3 连跑 c1-c6 全绿** + 全量 EXPECT sweep **219 PASS / 5 FAIL（5 个全是 CI SKIP 的 windows-only FFI，本地 runner 未实现 SKIP 而已）**；Windows **241/241**；bench 定点复测包内（机制上 bench 零 OSR chunk、函数级 COPY 路径未动）。
-- **上游 issue 草稿**（待人工提交 github.com/dstogov/ir）：`%TEMP%\dstogov_ir_issue.md`（含 ARGDBG/反汇编/gdb 证据与 repro IR 草图）。
+- **上游 issue 不提交（用户拍板 2026-11-02）**：dstogov/ir 作者疑似停更——**绕行转正为长期方案**（非临时），deps/ir 转为**本仓自维护**（后续上游域 bug 自行修复，vendor 时照旧对拍上游提交）。同族风险核查：CONCAT 等跨 call 实参形态**不在 osr_body_ok 白名单**（chunk 内只有 COPY，已内联）；函数级 helper 路径历史全绿。issue 草稿作废（%TEMP%\dstogov_ir_issue.md，诊断结论已全量入档本节 + memory 续7）。
 
 ### 3.1 触发：back-edge 计数（解释器侧）
 
