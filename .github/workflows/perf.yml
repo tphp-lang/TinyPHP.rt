@@ -185,6 +185,7 @@ jobs:
 
       - name: mimalloc variant build (USE_MIMALLOC=1 -> build/tphp-mi)
         run: |
+          cp build/tphp build/tphp-crt-main    # snapshot CRT: the mi build overwrites build/tphp
           USE_MIMALLOC=1 ./build.sh
           mv build/tphp build/tphp-mi
 
@@ -203,7 +204,7 @@ jobs:
 
       - name: multi-round mins (CRT vs mimalloc, drop cold first round)
         run: |
-          for b in tphp tphp-mi; do
+          for b in tphp-crt-main tphp-mi; do
             for i in 1 2 3; do
               echo "=== $b round $i ==="
               ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
