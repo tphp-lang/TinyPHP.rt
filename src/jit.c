@@ -919,6 +919,10 @@ typedef struct {
     int p_mcall;                /* 批2-4: p_callee 来自 INIT_MCALL 折叠直调
                                  * （OSR 限定；poff=1 + slot0=$this，守卫失配
                                  * → OSR_SEQ_PC 整序回解释器） */
+    int p_new;                  /* 批2-5: new 序折叠（无 ctor 直落——alloc+
+                                 * dst，零守卫零 setjmp；SEND 跳过、实参仅
+                                 * 求值副作用，不进 args 栈） */
+    TClass *p_new_cls;          /* 批2-5: 折叠固化的 TClass*（ic 快照） */
     /* P0-14 批2: 调用序回放（INIT_NEW…NEW_USER / INIT_MCALL…DO_FCALL）。
      * 1 = new 序，2 = mcall 序，值即 p_seq_pc 起点 op 下标 */
     int p_seq;
@@ -1382,14 +1386,89 @@ static void lower_cmp(JitC *j, TOp *op) {
  * 钻石 MERGE 嵌在 LOOP 区域会触发 IR codegen 崩溃（ir_check 都拦不住），
  * 值选择一律走位运算；控制流 IF 只留给 JMPZ。 */
 /* 无分支 mask：cond BOOL → i64 0/-1；i32 版 0/1 */
+/* 批2-6：tv_copy 内联（镜像 tphp_jit_tv_copy：v=*src; addref(v);
+ * release(dst); *dst=v——顺序严格同 C，先 addref 后 release 防同对象
+ * 自指归零；块结构与 dimic_take 的 addref/release 段同款）。仅 OSR chunk
+ * 走此路径：helper 调用的两个 slot-addr 实参跨前置 call 活跃，会踩
+ * deps/ir LSRA 实参 hint 窗口 bug（详见 lower_un OP_COPY 注释）。 */
+static void lower_tv_copy_inline(JitC *j, ir_ref da, ir_ref sa) {
+    JIT_CTX();
+    ir_ref vtag = ir_LOAD_I32(ir_ADD_A(sa, ir_CONST_ADDR(TVAL_TAG)));
+
+    /* --- addref v --- */
+    ir_ref ifv = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(vtag, ir_CONST_I32(T_STR)), ir_LE(vtag, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifv);
+        ir_ref gcv = ir_LOAD_A(sa);
+        ir_ref fv = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcv, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifiv = ir_IF(ir_EQ(ir_AND_I32(fv, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifiv);
+            ir_ref rcv = ir_LOAD_I32(gcv);
+            ir_STORE(gcv, ir_ADD_I32(rcv, ir_CONST_I32(1)));
+            ir_ref eV1 = ir_END();
+        ir_IF_FALSE(ifiv);
+            ir_ref eV0 = ir_END();
+        ir_MERGE_2(eV1, eV0);
+        ir_ref eRefV = ir_END();
+    ir_IF_FALSE(ifv);
+        ir_ref eScV = ir_END();
+    ir_MERGE_2(eRefV, eScV);
+
+    /* --- release dst --- */
+    ir_ref td = ir_LOAD_I32(ir_ADD_A(da, ir_CONST_ADDR(TVAL_TAG)));
+    ir_ref ifd = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(td, ir_CONST_I32(T_STR)), ir_LE(td, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifd);
+        ir_ref gcd = ir_LOAD_A(da);
+        ir_ref fd = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcd, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifid = ir_IF(ir_EQ(ir_AND_I32(fd, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifid);
+            ir_ref rcd = ir_LOAD_I32(gcd);
+            ir_ref ifrc = ir_IF(ir_GT(rcd, ir_CONST_I32(1)));
+            ir_IF_TRUE(ifrc);
+                ir_STORE(gcd, ir_SUB_I32(rcd, ir_CONST_I32(1)));
+                ir_ref eDec = ir_END();
+            ir_IF_FALSE(ifrc);
+                ir_ref tr[1] = { da };
+                ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+                ir_ref eSlow = ir_END();
+            ir_MERGE_2(eDec, eSlow);
+            ir_ref eD1 = ir_END();
+        ir_IF_FALSE(ifid);
+            ir_ref eD0 = ir_END();
+        ir_MERGE_2(eD1, eD0);
+        ir_ref eRefD = ir_END();
+    ir_IF_FALSE(ifd);
+        ir_ref eScD = ir_END();
+    ir_MERGE_2(eRefD, eScD);
+
+    /* --- 16B store（pay 先、tag 后；sa==da 自拷贝时 addref 已保活） --- */
+    ir_STORE(da, ir_LOAD_I64(sa));
+    ir_STORE(ir_ADD_A(da, ir_CONST_ADDR(TVAL_TAG)), vtag);
+}
+
 static void lower_un(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
     ir_ref ta = load_tag(j, aa), pa = load_pay(j, aa);
     switch (op->op) {
     case OP_COPY: case OP_ASSIGN:
-        /* P0-1：裸 store 对数组/串双重释放 → 走 rc helper（标量 no-op） */
-        {
+        /* P0-1：裸 store 对数组/串双重释放 → 走 rc helper（标量 no-op）。
+         * 批2-6（2026-11-02，linux CI test-osr-005 c2 段错误根因）：OSR
+         * chunk 内改内联——tv_copy 的两个 slot-addr 实参跨前置 opseq call
+         * 活跃，deps/ir LSRA 按 SysV 实参 hint 把 src 钉进 call 易失的 RSI
+         * 且不回装（ARGDBG 实锤 src==dst==RSI 而值在栈 spill；emit 按
+         * "已在寄存器"跳过装载 → 垃圾实参 → TypeError）。Win64 因 hint
+         * RDX 竞争败给 preserved r14 而侥幸未现。上游 ir_ra.c 与 HEAD
+         * 一致（无现成修复）；内联镜像 tphp_jit_tv_copy 语义（addref src
+         * → release dst → 16B store），chunk 内不再有该调用形态。 */
+        if (j->osr) {
+            lower_tv_copy_inline(j, da, aa);
+        } else {
             ir_ref t[2] = { da, aa };
             ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_tv_copy), 2, t);
         }
@@ -1600,6 +1679,35 @@ static bool jit_body_frameless(TFunc *fn) {
         }
     }
     return true;
+}
+
+/* 批2-5：无 ctor new 折叠直落（镜像 new_user_at 无构造器路径，净额等价：
+ * alloc rc=1 → dst 接管（解释器 rc++/-- 后 transfer 同净额）；无 dst =
+ * 直接 release 归零（解释器 rc-- + release 同净额）。alloc 先于 dst
+ * release = 镜像解释器顺序（GC 扫描时旧 dst 仍在槽内可达）。无 raise 面
+ * 由 INIT_NEW 的 emit 检查保证（ic 固化 + m_ctor<0 + 非 abstract/非
+ * Closure + 属性无 def_thunk）→ 零守卫零 setjmp。 */
+static void lower_new_finish(JitC *j, TOp *op) {
+    JIT_CTX();
+    ir_ref ta[1] = { ir_CONST_ADDR((uintptr_t)j->p_new_cls) };
+    ir_ref o = ir_CALL_N(IR_I64,
+                         ir_CONST_ADDR((uintptr_t)tphp_obj_alloc), 1, ta);
+    if (op->tr != OPD_UNUSED) {
+        ir_ref da = slot_addr(j, op->ar);
+        ir_ref tr[1] = { da };
+        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+        ir_STORE(da, o);
+        ir_STORE(ir_ADD_A(da, ir_CONST_ADDR(TVAL_TAG)), ir_CONST_I32(T_OBJ));
+    } else {
+        ir_ref sc = j->r_call_ret;
+        ir_STORE(sc, o);
+        ir_STORE(ir_ADD_A(sc, ir_CONST_ADDR(TVAL_TAG)), ir_CONST_I32(T_OBJ));
+        ir_ref tr[1] = { sc };
+        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+    }
+    j->p_new = 0;
+    j->p_new_cls = NULL;
+    j->p_seq = 0;   /* 序态一并清（与 lower_replay 同位） */
 }
 
 /* P0-14 批2：调用序/op 回放发射（vm.c tphp_jit_opseq）——表达式已由 JIT
@@ -2357,7 +2465,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         }
         case OP_INIT_DYN: {
             /* 动态调用折叠：$f(...) —— 闭包槽 a1，SEND…DO_FCALL 同静态折叠 */
-            if (j->p_callee || j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_seq || j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             j->p_dyn = 1;
             j->p_dyn_slot = op->a1;
             j->p_seq_pc = pc;   /* P1-12 批2-2：OSR deopt resume=序起点 */
@@ -2371,8 +2479,12 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_INIT_NEW: {
-            /* P0-14 批2：new 序起点（回放 op_init_new→SENDs→NEW_USER） */
-            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            /* P0-14 批2：new 序起点（回放 op_init_new→SENDs→NEW_USER）。
+             * 批2-5 折叠判定点在 NEW_USER——类 ic 快照挂在 NEW_USER op 上
+             * （op_new_user 自治解析填充），此处只起 p_seq 态；SEND 同样
+             * 跳过（p_seq），折叠/回放在 NEW_USER 分流，两侧 SEND 语义
+             * 完全一致（实参仅求值副作用，值留原槽由帧常规释放）。 */
+            if (j->p_seq || j->p_new || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_seq = 1;
             j->p_seq_pc = pc;
             pc++;
@@ -2388,7 +2500,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 形态不支持（entry 未备/体含 replay op/函数级）→ p_seq=2
              * 原序回放。守卫失配 RETURN OSR_SEQ_PC：OSR 下从本 op 幂等
              * 重跑（含慢形态），函数级不折叠故不涉及重启语义。 */
-            if (j->p_seq || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (j->p_seq || j->p_new || j->p_callee || j->p_dyn || j->p_bfn) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (op->tr != OPD_CONST || (op->t1 != OPD_CV && op->t1 != OPD_TMP)) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             ir_ref ra = slot_addr(j, op->a1);
             store_pay(j, j->r_call_clo, load_pay(j, ra));
@@ -2431,6 +2543,26 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_NEW_USER: {
+            /* 批2-5 折叠判定点（ic 在本 op 上）：OSR + 序态 + ic 固化解析
+             * 成功 + 无 ctor + 非 abstract/非 Closure + 属性无 def_thunk →
+             * alloc 零 raise 面直落（emit 检查保证：tm_malloc OOM=abort、
+             * GC 扫描期 dtor 就地 fatal 不外传、无 VM thunk）；raise 型
+             * site 由 threshold 前提排除（ic 由成功执行固化前的 raise 会
+             * unwind 掉循环函数够不到 back-edge 阈值）。其余 → 原回放。 */
+            TClass *ncls = (op->ic && op->ic != (void *)1) ? (TClass *)op->ic : NULL;
+            bool nfold = j->osr && j->p_seq == 1 && ncls && ncls->m_ctor < 0 &&
+                         !(ncls->flags & CLS_ABSTRACT) && ncls != g_closure_cls;
+            if (nfold) {
+                for (int pi = 0; pi < ncls->n_props; pi++)
+                    if (ncls->props[pi].def_thunk) { nfold = false; break; }
+            }
+            if (nfold) {
+                j->p_new = 1;
+                j->p_new_cls = ncls;
+                lower_new_finish(j, op);
+                pc++;
+                break;
+            }
             if (j->p_seq != 1) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             lower_replay(j, j->p_seq_pc, pc + 1);
             pc++;
@@ -2524,7 +2656,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee || j->p_bfn || j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_bfn || j->p_seq || j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
             if ((uintptr_t)op->ic & 1)
                 j->p_bfn = (void *)((uintptr_t)op->ic & ~(uintptr_t)1);
             else
@@ -2539,6 +2671,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             /* 批3-3：静态方法直调——ic 已由 eligibility 解析缓存（TFunc*，
              * 调用方 jit_smcallee）。p_seq 回放序列内不直调（pc 跳过，真
              * handler 在 opseq 派发表执行）；嵌套任何调用态即 fail。 */
+            if (j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* 批2-5: 无回放可依 */
             if (j->p_seq) { pc++; break; }
             if (j->p_callee || j->p_bfn || j->p_dyn || j->p_sm || !op->ic ||
                 ((uintptr_t)op->ic & 1)) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
@@ -2549,8 +2682,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
-            if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
+            if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq && !j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (j->p_seq) { pc++; break; }   /* P0-14 批2: 回放中由真 SEND handler 读槽 */
+            if (j->p_new) { pc++; break; }   /* 批2-5: 无 ctor 不消费实参——仅求值
+                                              * 副作用（表达式 op 照常发射），
+                                              * 值留原槽由帧常规释放 */
             if (j->p_argc >= 9) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             j->p_arg_slot[j->p_argc++] = ((uint32_t)op->t1 << 24) | op->a1;
             pc++;

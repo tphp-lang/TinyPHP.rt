@@ -50,6 +50,9 @@ void tphp_class_ensure_flat(TClass *cls);
 
 /* member lookup along the flattened table (O(n_methods), fine for now) */
 TMethod *tphp_class_find_method(TClass *cls, const char *name_lc);
+extern TClass *g_closure_cls;   /* vm.c: internal Closure class (P1-3);
+                                 * `new Closure` must keep raising — used as
+                                 * an emit-time fold belt in jit.c */
 int  tphp_class_find_prop(TClass *cls, const char *name_lc);   /* slot or -1 */
 TProp *tphp_class_find_sprop(TClass *cls, const char *name_lc);
 /* P2-B: 惰性常量表达式需要 owner/idx 供 VM 求值后回写缓存 */

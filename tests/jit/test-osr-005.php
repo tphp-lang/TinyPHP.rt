@@ -13,6 +13,7 @@
 // EXPECT: c3=135000
 // EXPECT: c4=270000
 // EXPECT: c5=39999
+// EXPECT: c6=449985000
 
 // 1) method call inside the loop (INIT_MCALL fold -> replay/direct chain)
 class OsrM {
@@ -89,3 +90,14 @@ for ($i = 0; $i < 30000; $i++) {
     if ($i == 20000) { $pk = $ob; }
 }
 echo "c5=$s5\n";
+
+// 6) batch 2-5 fold: no-ctor class -> alloc + dst landing direct in the
+//    chunk (old dst released after alloc, interpreter-identical rc net)
+class OsrPlain { public $v; }
+$sp = 0;
+for ($i = 0; $i < 30000; $i++) {
+    $q = new OsrPlain();
+    $q->v = $i;
+    $sp += $q->v;
+}
+echo "c6=$sp\n";

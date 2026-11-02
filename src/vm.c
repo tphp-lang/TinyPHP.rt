@@ -2004,7 +2004,7 @@ static int32_t op_new_ex(VM *vm, TOp *op) {
  * self 形参传 TClosure*（GC_KIND_CLO，引用计数同 GCHead）。 */
 static _Thread_local TOp g_magic_stub;   /* 前置：定义在文件尾段 */
 TVal tphp_vm_call_callable(struct VM *vm, TVal callable, TVal *args, int n);
-static TClass *g_closure_cls;
+TClass *g_closure_cls;   /* extern via class.h（jit.c new 折叠 belt 用） */
 
 static int16_t clo_this_capture(TClosure *c) {
     if (!c->fn) return -1;                     /* builtin 包装无捕获名 */

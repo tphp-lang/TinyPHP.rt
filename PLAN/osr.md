@@ -144,6 +144,26 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **实测**：probe **pure-call 65→12.3-12.5ms（5.2×）**，vs PHP 39.5 = **0.32×（3.2× 反超，原 1.65× 落后）**；new+noop 121-122→66.5-78（vs PHP 93.5 转反超）；free/nop/empty/JIT=0 全不动。test-osr-005 扩 c4（`return $this` 引用平衡 + 字符串实参合同回退）、c5（多态 cls 守卫失配→解释器重跑 39999），5 场景 JIT=0/1 一致、osr ir_check 全 1、**241/241**、bench 两轮 min 回带（机器噪声期，spread 27% 系统性）。
 - **过程发现（既有限制，非本批）**：参数位嵌套调用（`strlen($o->m())`——INIT_FCALL 先于实参求值）撞 p_callee 态拒编 chunk（backlog P0-16 记账同款）；c4 改独立语句绕开。
 
+### 批 2-5：无 ctor INIT_NEW 折叠直落（2026-11-02 续，P0-9 下一刀）
+
+- **动机**：probe new-only 60.7 / new+noop 121（vs PHP 49/85 落后）——mcall 折叠后的对象链 replay 残余。
+- **判定点在 NEW_USER（首版踩坑）**：类 ic 快照挂在 **NEW_USER op**（`op_new_user` 自治解析填充，"emit 侧不读写"是旧注释）——首版在 INIT_NEW 读 `op->ic` 恒 NULL，fold 静默不生效（probe 无改善暴露），改判定点到 NEW_USER 后生效。SEND 两侧语义一致（p_seq 跳过，实参仅求值副作用、值留原槽由帧常规释放——无 ctor 不消费实参）。
+- **fold 条件（emit 期全静态）**：`j->osr` + `p_seq==1` + ic 已固化（≠NULL≠1 哨兵）+ `m_ctor<0` + 非 `CLS_ABSTRACT` + `≠g_closure_cls`（vm.c 该符号转 extern 供 belt）+ 全部属性 `def_thunk==0`。**零 raise 面论证**：alloc（`tphp_obj_alloc`）= 池/malloc（OOM=abort）+ gc_register（扫描期 dtor 按就地 fatal 语义不外传）+ 属性默认值（无 thunk 即纯字面量 addref）；abstract/Closure 等 raise 型 site 由 threshold 前提排除（ic 固化前的 raise 会 unwind 掉循环函数够不到 back-edge 阈值——跨调用 counter 累积的极端形态由 emit belt 双拦）→ **零守卫零 setjmp**。
+- **`lower_new_finish`（镜像 new_user_at 无构造器路径，净额等价）**：`tphp_obj_alloc`（**先于** dst release——GC 扫描时旧 dst 仍在槽内可达，同解释器顺序）→ dst：release 旧值 + 16B 存 TV_OBJ（alloc rc=1 接管，等价解释器 rc++/--/transfer）；无 dst：scratch 存放后 release 归零（同解释器净额）。清 p_seq（与 lower_replay 同位）。
+- **守卫补口**：p_new 态进了 INIT_FCALL/INIT_DYN/INIT_MCALL/INIT_NEW/INIT_SMCALL/SEND 的忙闲检查（嵌套调用 → 拒编回解释器，与 p_seq 嵌套限制同款；SMCALL 在 new 序内无回放可依直接拒）。
+- **实测**：probe **new-only 60.7→26.3-26.7（2.3×，vs PHP 49.4 = 反超 1.9×）**、**new+noop 121→30.1-30.5（4×，vs PHP 85-93 = 反超 ~2.8×）**；pure-call/free/empty 不动。test-osr-005 扩 c6（无 ctor new + prop + 累加 449985000），6 场景 JIT=0/1 一致、osr ir_check 全 1、**241/241**。**bench 无回退定案**：object 曾读 +3.5%（32.7 紧 spread）→ **stash 夹替轮 A/B 反转**（BASE 31.8/med33.9 vs NEW 30.9/med31.2）+ 机制排除（bench 全函数级编译**零 OSR chunk**，nfold 需 j->osr 对 bench 惰性）= 环境负载期假信号；array-push min 回带 54.3。
+- **残余**：user-ctor 折叠（dst=对象而非 ret + ctor rc 转移 + native ctor 分支 + ctor RETURN 语义对齐，工程更大）；`new C($args)` 实参 dtor 时序微移（值留原槽至帧末释放 vs 解释器 NEW 时释放——同语句内、无 ctor 类，可接受已记账）。
+
+### 批 2-6：linux CI test-osr-005 段错误——deps/ir LSRA 实参 hint 窗口 bug，chunk 内 COPY 改内联绕行（2026-11-02）
+
+- **CI 现象**：linux x86_64 + mac x86_64 的 test-osr-005 挂在 c2（`$s2 += $u` TypeError "Unsupported operand types"），Windows 本地全绿——批2-3 放行的 new+prop+COPY chunk 形态首次在 SysV 上跑。
+- **本地复现环境（重大基建）**：`wsl --install -d Ubuntu-24.04`（与 CI 同版）+ `apt clang binutils libffi-dev` + `sh build.sh`（注意：**rsync 带 CRLF 的 build.sh 要先 `sed -i 's/\r$//'`**；`/mnt/c` 可读源码；Docker Desktop 路线两次自爆后弃用）。复现：JIT=1 挂、**JIT=0 全绿** ⇒ 纯 JIT 生成码问题。
+- **取证链**：chunk 机器码 dump（jit.c 临时 `TPHP_JIT_CODEDUMP`，已撤）→ objdump：`tv_copy` 调用点只装了 `rdi(dst)`，**rsi(src) 全程未装**；gdb 断 `tphp_jit_binop_slow`：`tb=876466986`（垃圾 tag）；gdb 断 `tphp_jit_tv_copy`：src=栈垃圾而真值 &t（slot5）正确躺在栈 spill；**ARGDBG**（dasc pass1 插针，已撤）实锤：`j=4 type=ADDR src=6(RSI) dst=6(RSI)` → emit 认定"值已在 RSI"跳过回装与拷贝。**Win64 对照反汇编**：同 IR 下 hint(RDX) 竞争败给 preserved r14，发出 `mov rdx,r14` 正确——**Win 绿纯属侥幸**。
+- **根因（上游域）**：deps/ir **LSRA 把跨前置 call 活跃的实参值按 SysV hint 钉进 call 易失的 RSI 且不发回装**（ir_ra.c/ir_emit.c 与上游 HEAD b8d619a 逐字一致 = 上游同存，无现成修复可同步；cf39e5d/3470e7e 本地补丁与7个 post-vendor 上游提交逐一对拍排除）。**去 hint 试验（hints_count=0）被否决**：hint 是 call load pos 固定窗的承重结构，全局段错误——不能作为绕行。
+- **绕行（落地）**：**OSR chunk 内 OP_COPY/OP_ASSIGN 改内联**（新 `lower_tv_copy_inline`：镜像 `tphp_jit_tv_copy` 的 addref→release→16B store，块结构同 dimic_take）——chunk 内不再产生"双 slot-addr 实参跨 call"的调用形态；函数级保持 helper 调用（历史全绿，不动）。
+- **验证**：Linux 本地 test-osr-005 **3 连跑 c1-c6 全绿** + 全量 EXPECT sweep **219 PASS / 5 FAIL（5 个全是 CI SKIP 的 windows-only FFI，本地 runner 未实现 SKIP 而已）**；Windows **241/241**；bench 定点复测包内（机制上 bench 零 OSR chunk、函数级 COPY 路径未动）。
+- **上游 issue 草稿**（待人工提交 github.com/dstogov/ir）：`%TEMP%\dstogov_ir_issue.md`（含 ARGDBG/反汇编/gdb 证据与 repro IR 草图）。
+
 ### 3.1 触发：back-edge 计数（解释器侧）
 
 - 判定点：`op_jmp` 中 `target <= pc`（向后跳 = back-edge；JMPZ/JMPNZ 向后跳在 JIT 侧是 trap_fail 形态，不做计数点）；
