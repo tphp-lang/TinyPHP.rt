@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Deterministic codegen: phpc embeds raw lib/*.php bytes into the generated
+# src/bundle_data.c. Pin generator input AND output to LF so regeneration is
+# byte-stable on every platform/checkout -- with autocrlf=true a fresh
+# checkout hands phpc a CRLF lib/std.php and every rebuild dirties the tree
+# (historical committed copy carried \r\n escapes from exactly that accident).
+lib/*.php text eol=lf
+src/bundle_data.c text eol=lf
