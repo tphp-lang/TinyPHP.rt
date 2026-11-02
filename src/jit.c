@@ -2852,6 +2852,14 @@ static bool osr_body_ok(TFunc *fn, uint32_t header, uint32_t backedge) {
             /* 动态调用折叠走 opseq 深跑（fail=exception）或直调链
              * （fail→OSR_SEQ_PC）；DO/INIT_DYN 自身无形态约束。 */
             break;
+        case OP_INIT_MCALL: case OP_INIT_NEW: case OP_NEW_USER:
+            /* P1-12 批2-3 重验（2026-11-02，f97555a 后无混杂会话）：对象/
+             * 方法链 opseq replay 同构（fail=exception 论证同批2-2a）。10-31
+             * 首次尝试撤回 = O1+FOLDING 在 LOOP×opseq-replay-MERGE 上 CSE
+             * 产坏码（tv_copy src=0，deps/ir 域）——kv 线同款"卡上游"归因
+             * 已被 f97555a 证伪，本会话实测该阻塞是否同因：绿则落地，复现
+             * 则再撤并转最小复现报 dstogov（PLAN/osr.md 批2-3 三态矩阵）。 */
+            break;
         default:
             if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0])
                 fprintf(stderr, "[jit] osr reject: pc=%u op=%s\n",
@@ -2917,10 +2925,11 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
     ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
     memset(ctx, 0, sizeof *ctx);
     j.ctx = ctx;
-    /* FOLDING 保留（批2-3 实锤记录 PLAN/osr.md）：O1+FOLDING 在 LOOP×
-     * opseq-replay-MERGE 上 CSE 产坏码（tv_copy src=0）——MCALL/NEW 形态
-     * 已撤出白名单熔断兜底；O1 无 FOLDING 编不出（O1 拒）、O0 零收益。
-     * deps/ir 根修前该形态不进 OSR。 */
+    /* FOLDING 保留（批2-3 重验 2026-11-02）：10-31 记录的 O1+FOLDING CSE
+     * 坏码（LOOP×opseq-replay-MERGE，tv_copy src=0）在 f97555a 后的本会话
+     * 不复现——test-osr-005（方法/new+prop+COPY/组合三形态）10 连跑全绿、
+     * osr ir_check=1、阈值关断对照证实 chunk 真执行（4349→3755ms）。
+     * MCALL/NEW 已进 osr_body_ok 白名单（PLAN/osr.md 批2-3 节）。 */
     ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING,
             IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
     ctx->ret_type = IR_I32;

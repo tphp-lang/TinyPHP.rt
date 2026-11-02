@@ -32,7 +32,8 @@ typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
 /* 循环 OSR（PLAN/osr.md 批1）：解释器热循环的第二个入口。back-edge 计数
  * 达阈值后编译循环体子图（header..backedge），slots 与解释器帧同布局 →
  * 零拷贝直传 frame->slots；返回 resume_pc（循环 exit 或失败点），解释器
- * 从该 pc 继续。环境变量 TPHP_JIT_OSR 覆盖阈值（默认 10000）。 */
+ * 从该 pc 继续。阈值现为硬编码 10000（11-02 勘察：本注释与 osr.md 曾称
+ * TPHP_JIT_OSR env 可覆盖——代码从未接线，改阈值需动此宏）。 */
 #define TPHP_JIT_OSR_THRESHOLD 10000
 
 /* Process-wide availability (TPHP_JIT=0 disables) */

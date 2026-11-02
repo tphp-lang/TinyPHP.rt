@@ -135,6 +135,7 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **与批 5 同族**：P0-14 批 5 的 foreach 形态同症状（tv_copy src=0、O0 全对），当时根修 = `3470e7e`（IR_BITSET_ONE LLP64 位宽）——**本次是 deps/ir 的另一处**（O1 FOLDING/CSE × LOOP×opseq-replay-MERGE 结构；批 1 注释"skip SCCP — multi-slot CALL bug in deps/ir ir_sccp"同域）；
 - **撤回决定**：三 op 撤出 osr_body_ok（MCALL/NEW 循环形态熔断走解释器 = 批 2-2 前行为），O1+FOLDING 恢复，test-osr-005 删除（形态不支持，场景记录在案）；撤回后 238/238、bench all-ok、OSR×CALL 1650ms 恢复 ✓；
 - **重开条件**：deps/ir 根修 O1 FOLDING 在 LOOP 内 MERGE 链的 CSE 正确性（复现 = osr.md 本节三态矩阵 + tv_copy 诊断法：`__builtin_return_address` 对照 chunk entry 定位调用点），或 OSR chunk 换独立编译配置（FOLDING off + 可用的 O1 变体）。
+- **2026-11-02 重验落地（f97555a 后无混杂会话，阻塞证伪）**：三态矩阵的 O1+FOLDING 坏码**不复现**——与 kv 线同款"卡 deps/ir 上游"归因被后续修复证伪。白名单重加三 op（`osr_body_ok` INIT_MCALL/INIT_NEW/NEW_USER），转正 `tests/jit/test-osr-005.php` 三形态（c1 方法调用循环 / c2 new+prop+COPY / c3 三者组合）：**10 连跑全绿、osr ir_check=1、JIT=0 对拍一致、241/241、bench 全带内（kv/object 等零回退）**。**chunk 执行性实证**：阈值关断对照（`TPHP_JIT_OSR_THRESHOLD` 临时改 10 亿构建 vs 默认）——方法+对象探针 4349→3755ms（**13.6% 实益**），排除"只编译不进入"假绿。**勘误**：阈值 env 此前从未接线（jit.h 注释与本文件曾称 `TPHP_JIT_OSR`/`TPHP_JIT_OSR_THRESHOLD` 可覆盖——纯文档漂移），改阈值需动 jit.h 宏；接线 env 记为可选后续。
 
 ### 3.1 触发：back-edge 计数（解释器侧）
 
