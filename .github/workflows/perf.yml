@@ -166,63 +166,31 @@ jobs:
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
 
-      # P0-19 arm64-mac anomaly discrimination: tphp json/object/throw/
-      # logstat 2.3-6.6x slower than SAME-arch aarch64-linux. Leading
-      # hypothesis: tphp's own _Thread_local hot vars (g_bins in mem.c)
-      # pay Darwin tlv_get_addr per access (mimalloc itself uses pthread
-      # direct slots and is NOT affected). TPHP_NO_BINS=1 disables the
-      # C bins shim -> alloc-heavy items route through mi_malloc only.
-      #   NO_BINS faster than default  -> bins TLS is the tax (fix: fast
-      #   TLS slot for g_bins, mirroring mimalloc prim-tls.h)
-      #   NO_BINS same/slower          -> tax is elsewhere (gc_list/
-      #   opool TLS, class tab, or platform) - iterate from there.
-      # alloc-probe item (bench-vs-php.php) provides the PHP-side CPU
-      # sanity check (PHP also slow -> runner generation gap, close).
-      - name: Perf vs PHP strongest (TPHP_NO_BINS=1, discrimination)
-        shell: pwsh
-        env:
-          TPHP_NO_BINS: "1"
-        run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php-nobins.md
-
-      # P0-19 round 2: NO_BINS showed NO ratio recovery (alloc-probe 17x ->
-      # 18x, object 25x -> 34x) -> the bins shim TLS is NOT the dominant
-      # tax, and the pure-TLS ceiling (~60ns/iter) cannot explain the
-      # ~750ns/iter gap vs aarch64-linux anyway. Two discriminators:
-      # 1) CRT-allocator build (plain malloc, mem.c #else path):
-      #    CRT fast (near Linux) -> mimalloc Darwin behavior is the tax
-      #    (purge/madvise/arena) -- dig into mimalloc options for Darwin;
-      #    CRT equally slow  -> tphp's own layers (GC registry / class
-      #    table / intern TLS) -- proceed with TLS consolidation.
-      # 2) MIMALLOC_SHOW_STATS on the main binary: shows mmap/madvise/
-      #    purge counts directly (any purge activity during a 100ms bench
-      #    = smoking gun; default purge_delay=1000ms says none should fire).
-      - name: CRT allocator discriminator (NO_MIMALLOC build)
-        run: |
-          NO_MIMALLOC=1 ./build.sh
-          ./build/tphp-crt run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (alloc-probe|object|real-logstat|serialize|json|string|array-push)" || true
-
-      - name: mimalloc stats (main binary, alloc-heavy run)
-        run: |
-          MIMALLOC_SHOW_STATS=1 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
-
-      # P0-19 round 4: the stats readout showed 27% KERNEL time with only
-      # 3 mmaps + 53 purges -- prime suspect is first-touch zero-fill on
-      # Darwin's 16KB pages (touched 389.8 MiB => ~24K faults; Linux 4KB
-      # pages fault 4x more but each ~10-20x cheaper). Three probes:
-      # 1) sample (macOS built-in): user-stack call tree of the bench --
-      #    heavy self-time in faulting stores / kernel leafs = smoking gun.
-      # 2) bench_alloc mi vs libc: steady-state pair health on this runner.
-      # 3) bench_growth (new): huge-32M pays first-touch EVERY round
-      #    (munmap+fresh mmap), arena-2M goes cold-then-hot -- per-round
-      #    ms + getrusage user/sys/minflt deltas split the cost domain.
-      #    Windows baseline: huge round0 33ms/32MB then 0.1ms reuse.
-      - name: kernel-time attribution (sample)
+      # P0-19 post-c6294ef framing: the MAIN mac binary is now the CRT
+      # default (cluster-1 fix). The comparison pair is CRT (build/tphp)
+      # vs mimalloc (USE_MIMALLOC=1 -> build/tphp-mi). Round-4 probes
+      # target the 27% kernel time from MIMALLOC_SHOW_STATS (prime
+      # suspect: first-touch zero-fill on Darwin 16KB pages -- faults
+      # don't care which allocator, compute benches stay healthy).
+      # Round-2/3 steps (NO_BINS pass, CRT-vs-main build) are retired:
+      # NO_BINS is a no-op on the CRT default and "CRT vs main" is now
+      # CRT vs CRT.
+      - name: kernel-time attribution (sample, CRT main binary)
         run: |
           ./build/tphp run tools/bench-vs-php.php > /dev/null 2>&1 & P=$!
           sleep 0.3
           sample $P 5 -file /tmp/tphp_sample.txt || true
           wait || true
           sed -n '1,90p' /tmp/tphp_sample.txt || true
+
+      - name: mimalloc variant build (USE_MIMALLOC=1 -> build/tphp-mi)
+        run: |
+          USE_MIMALLOC=1 ./build.sh
+          mv build/tphp build/tphp-mi
+
+      - name: mimalloc stats (mi variant)
+        run: |
+          MIMALLOC_SHOW_STATS=1 ./build/tphp-mi run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
 
       - name: bench_alloc discriminators (steady + growth, mi vs libc)
         run: |
@@ -233,9 +201,9 @@ jobs:
           echo "=== libc ==="
           /tmp/bench_alloc_libc
 
-      - name: multi-round mins (main vs CRT, drop cold first round)
+      - name: multi-round mins (CRT vs mimalloc, drop cold first round)
         run: |
-          for b in tphp tphp-crt; do
+          for b in tphp tphp-mi; do
             for i in 1 2 3; do
               echo "=== $b round $i ==="
               ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
