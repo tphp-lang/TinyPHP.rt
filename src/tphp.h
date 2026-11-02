@@ -36,6 +36,24 @@ typedef enum {
     TPHP_E_INTERNAL = 6   /* invariant violated; should never happen */
 } TPhpStatus;
 
+/* ---- P0-19 round-5: mask-less setjmp for the unwind system ----
+ * Plain setjmp() saves the signal mask on Darwin/glibc = a sigprocmask
+ * syscall PER ARM (plus sigaltstack bookkeeping) -- sampled as ~20% of VM
+ * time on the mac runner (JIT slow-path guards arm on every non-fast-path
+ * invocation; P0-19 CI readout 2026-11-02). The guarded regions never
+ * alter the signal mask, so use the mask-less flavor everywhere. Flavor
+ * consistency is MANDATORY: every arming site and every jump site in the
+ * unwind system must use this pair (a _longjmp into a plain-setjmp buffer
+ * or vice versa is UB on glibc/Darwin). _setjmp/_longjmp exist on Darwin,
+ * glibc; Windows plain setjmp is already mask-free. */
+#if defined(__APPLE__) || defined(__unix__) || defined(__unix)
+#  define TPHP_SETJMP(env)     _setjmp(env)
+#  define TPHP_LONGJMP(env, v) _longjmp((env), (v))
+#else
+#  define TPHP_SETJMP(env)     setjmp(env)
+#  define TPHP_LONGJMP(env, v) longjmp((env), (v))
+#endif
+
 const char *tphp_status_str(TPhpStatus s);
 
 /* ---- fatal errors (error.c) ----

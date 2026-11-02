@@ -132,7 +132,7 @@ int tphp_jit_binop_slow(VM *vm, int32_t opi, TVal *dst,
                         int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
     jmp_buf outer, mine;
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-    if (setjmp(mine) == 0) {
+    if (TPHP_SETJMP(mine) == 0) {
         memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
         binop_slow_body(vm, opi, dst, ta, pa, tb, pb);
         memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
@@ -146,7 +146,7 @@ int tphp_jit_cmp_slow(VM *vm, int32_t opi, TVal *dst,
                        int32_t ta, int64_t pa, int32_t tb, int64_t pb) {
     jmp_buf outer, mine;
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-    if (setjmp(mine) == 0) {
+    if (TPHP_SETJMP(mine) == 0) {
         memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
         cmp_slow_body(vm, opi, dst, ta, pa, tb, pb);
         memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
@@ -237,7 +237,7 @@ static void tphp_raise_guarded(VM *vm, const char *cls, const char *fmt, ...) {
     va_end(ap);
     jmp_buf outer, mine;
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-    if (setjmp(mine) == 0) {
+    if (TPHP_SETJMP(mine) == 0) {
         memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
         tphp_vm_raise(vm, cls, "%s", buf);   /* noreturn：longjmp 落回 mine */
     }
@@ -270,7 +270,7 @@ int tphp_jit_concat(VM *vm, TVal *dst, TVal *a, TVal *b, int inplace) {
     {
         jmp_buf outer, mine;
         memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-        if (setjmp(mine) == 0) {
+        if (TPHP_SETJMP(mine) == 0) {
             memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
             TVal r = tval_concat(av, bv);
             memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
@@ -551,7 +551,7 @@ int tphp_jit_bcall(VM *vm, void *bfn, int argc, TVal *argv, TVal *ret) {
     TVal (*bf)(VM *, TVal *, int) = (TVal (*)(VM *, TVal *, int))bfn;
     jmp_buf outer, mine;
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
-    if (setjmp(mine) == 0) {
+    if (TPHP_SETJMP(mine) == 0) {
         memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
         *ret = bf(vm, argv, argc);
         memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));

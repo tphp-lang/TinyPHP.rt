@@ -206,7 +206,7 @@ static void cont_entry(TFiber *fb) {
      * 持有会在退出时报堆损坏 */
     if (!vm->x.coro_result)
         vm->x.coro_result = &c->result;
-    if (setjmp(vm->x.unwind) == 0) {
+    if (TPHP_SETJMP(vm->x.unwind) == 0) {
         build_root_frame(vm, c);
         tval_release(&c->callable);   /* 已捕获进帧/已解析 */
         c->callable = (TVal){ .u.i = 0, .t = T_UNDEF };
@@ -432,7 +432,7 @@ static TVal nm_coro_getresult(VM *vm, void *self, TVal *args, int n) {
         TVal exv = TV_OBJ(c->exception);
         tval_addref(exv);
         vm->x.exception = (TExObj *)exv.u.p;
-        longjmp(vm->x.unwind, 1);
+        TPHP_LONGJMP(vm->x.unwind, 1);
     }
     tval_addref(c->result);
     return c->result;
@@ -682,7 +682,7 @@ static TVal await_one_coro(VM *vm, TCont *target) {
         TVal exv = TV_OBJ(target->exception);
         tval_addref(exv);
         vm->x.exception = (TExObj *)exv.u.p;
-        longjmp(vm->x.unwind, 1);
+        TPHP_LONGJMP(vm->x.unwind, 1);
     }
     tval_addref(target->result);
     return target->result;
@@ -795,7 +795,7 @@ TVal tphp_async_any(VM *vm, TVal *args, int n) {
                 tval_addref(exv);
                 tm_free(list);
                 vm->x.exception = last_ex;
-                longjmp(vm->x.unwind, 1);
+                TPHP_LONGJMP(vm->x.unwind, 1);
             }
             goto done;                        /* 空转保护（不会到达） */
         }

@@ -196,7 +196,7 @@ static TExObj *tex_alloc(const TExClass *cls, TStr *msg, int64_t code, int line,
  * unwind（try/catch 可用；逃逸 = warning+零值）。此处不再检查 cb_depth。 */
 static void vm_unwind_jump(VM *vm) __attribute__((noreturn));
 static void vm_unwind_jump(VM *vm) {
-    longjmp(vm->x.unwind, 1);
+    TPHP_LONGJMP(vm->x.unwind, 1);
 }
 
 static void vm_raise_at(VM *vm, const TExClass *cls, int line,
@@ -1747,7 +1747,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                         if (args[i].t != T_UNDEF) tval_release(&args[i]);
                         args[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
                     }
-                    longjmp(vm->x.unwind, 1);
+                    TPHP_LONGJMP(vm->x.unwind, 1);
                 }
             }
         }
@@ -2388,7 +2388,7 @@ int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
     memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
     VMFrame *jf = vm->x.frame;
     volatile uint32_t vpc = pc;
-    if (setjmp(vm->x.unwind) == 0)
+    if (TPHP_SETJMP(vm->x.unwind) == 0)
         goto run;
     for (;;) {
         bool escaped = false;
@@ -2399,7 +2399,7 @@ int tphp_jit_opseq(VM *vm, uint32_t pc, uint32_t pc_end, TVal *recv_sc) {
             memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
             return 0;
         }
-        if (setjmp(vm->x.unwind) != 0)
+        if (TPHP_SETJMP(vm->x.unwind) != 0)
             continue;               /* 恢复执行中再次 raise */
 run:    ;
         while (vpc < pc_end) {
@@ -4452,7 +4452,7 @@ bool tphp_vm_call_bounded(VM *vm, TVal callable, TVal *args, int n, TVal *out) {
     jmp_buf outer;
     memcpy(&outer, &vm->x.unwind, sizeof outer);
     VMFrame *floor = vm->x.frame;   /* C 调用点所在帧：回调帧全在其上 */
-    if (setjmp(vm->x.unwind) == 0) {
+    if (TPHP_SETJMP(vm->x.unwind) == 0) {
         TVal r = tphp_vm_call_callable(vm, callable, args, n);
         memcpy(&vm->x.unwind, &outer, sizeof outer);
         *out = r;
@@ -4467,7 +4467,7 @@ bool tphp_vm_call_bounded(VM *vm, TVal callable, TVal *args, int n, TVal *out) {
             return false;
         }
         /* catch 命中：跑到回调帧全部弹出（= floor 再次成为当前帧） */
-        if (setjmp(vm->x.unwind) != 0)
+        if (TPHP_SETJMP(vm->x.unwind) != 0)
             continue;                 /* 恢复执行中再次 raise */
         while (vm->x.frame && vm->x.frame != floor) {
             VMFrame *cf = vm->x.frame;
@@ -4875,7 +4875,7 @@ void tphp_vm_run_autoloader(TVal fn, TStr *name) {
         }
     vm->x.frame = f;
     run_frame_until_pop_deep(vm, f);
-    if (vm->x.exception) longjmp(vm->x.unwind, 1);
+    if (vm->x.exception) TPHP_LONGJMP(vm->x.unwind, 1);
 }
 
 /* __debugInfo() dispatch for var_dump: returns the method's array (+1 ref),
@@ -4930,7 +4930,7 @@ static void vm_run_until_done(VM *vm) {
     static int trace = -1;
     if (trace < 0) trace = getenv("TPHP_TRACE") ? 1 : 0;
     while (!vm->x.done) {
-        if (setjmp(vm->x.unwind) != 0) {
+        if (TPHP_SETJMP(vm->x.unwind) != 0) {
             vm_unwind(vm);        /* may resume in a handler or finish */
             continue;
         }
@@ -4951,7 +4951,7 @@ static void vm_run_until_done(VM *vm) {
  * 内圈（vm_run_until_done）的 setjmp 会覆盖这里；外圈落地只可能是
  * 协程根帧构建期的 raise，此时就地展开到底。 */
 void tphp_vm_run_current(void) {
-    if (setjmp(g_vm.x.unwind) == 0)
+    if (TPHP_SETJMP(g_vm.x.unwind) == 0)
         vm_run_until_done(&g_vm);
     else
         vm_unwind(&g_vm);
@@ -5137,7 +5137,7 @@ void tphp_obj_run_dtor(TObj *o) {
     jmp_buf saved;
     memcpy(saved, vm->x.unwind, sizeof(jmp_buf));
     memset(&g_magic_stub, 0, sizeof g_magic_stub);
-    if (setjmp(vm->x.unwind) == 0) {
+    if (TPHP_SETJMP(vm->x.unwind) == 0) {
         TVal out;
         /* 按索引直调（P0-4）：m 已在上方校验，免 vm_call_magic 按名扫表 */
         if (vm_call_magic_method(vm, &g_magic_stub, o, m, o->cls,
