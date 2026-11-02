@@ -3065,6 +3065,35 @@ static int32_t op_assign_prop(VM *vm, TOp *op) {
                  "Attempt to assign property \"%s\" on %s", tstr_val(name),
                  val_type_name(objv));
     TObj *o = (TObj *)objv.u.p;
+    /* P0-19 round-6: ic-hit fast path BEFORE the FFI probe (mirror of the
+     * fetch-side reorder) — plain public untyped no-hook non-readonly
+     * props store direct, skipping the cross-TU FFI call, the asym/vis
+     * walks, the hook branch and the type check on every hit. Soundness
+     * identical to the fetch side: FFI CData classes have n_props=0 so
+     * the name/bounds gate sends them down the miss path where the FFI
+     * probe lives; every fast-path condition re-reads the live TProp so
+     * class switching at a site stays correct. */
+    if (op->t2 == OPD_CONST && op->ic) {
+        int cached = (int)(intptr_t)op->ic - 1;
+        if (cached >= 0 && cached < o->cls->n_props
+            && o->cls->props[cached].name == name) {
+            TProp *pp = &o->cls->props[cached];
+            if (pp->visibility == CVIS_PUBLIC && !pp->set_visibility
+                && !pp->has_hooks && !pp->type && !pp->is_readonly
+                && !(o->cls->flags & CLS_READONLY)) {
+                tval_addref(val);
+                tval_release(&o->props[cached]);
+                o->props[cached] = val;
+                if (op->tr != OPD_UNUSED) {
+                    TVal *d = &vm->x.frame->slots[op->ar];
+                    tval_addref(val);
+                    tval_release(d);
+                    d[0] = val;           /* assignment is an expression */
+                }
+                return 1;
+            }
+        }
+    }
     /* M5.5: FFI\CData 结构体字段写 */
     if (tphp_ffi_assign_prop(vm, o, name, val)) {
         if (op->tr != OPD_UNUSED) {
@@ -4125,6 +4154,28 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
     GCHead *h = (GCHead *)obj.u.p;
     if (h->kind == GC_KIND_OBJ) {
         TObj *o = (TObj *)h;
+        /* P0-19 round-6: ic-hit fast path BEFORE the FFI probe — plain
+         * public no-hook props read direct, skipping the cross-TU FFI
+         * call, the visibility walk and the hook branch on every hit
+         * (same reorder rationale as the P0-16 batch-C FETCH_DIM_R FFI
+         * reposition). Soundness: the ic only fills when a real PHP prop
+         * resolved (FFI CData classes have n_props=0 → name/bounds gate
+         * fails → miss path → FFI probe unchanged there). Non-public or
+         * hooked props decline the fast path and fall to the general
+         * flow below (which re-checks ic — cheap). */
+        if (op->t2 == OPD_CONST && op->ic) {
+            int cached = (int)(intptr_t)op->ic - 1;
+            if (cached >= 0 && cached < o->cls->n_props
+                && o->cls->props[cached].name == name) {
+                TProp *pp = &o->cls->props[cached];
+                if (pp->visibility == CVIS_PUBLIC && !pp->has_hooks) {
+                    TVal out = o->props[cached];
+                    tval_addref(out);
+                    wtake(vm, op, out);
+                    return 1;
+                }
+            }
+        }
         /* M5.5: FFI\CData 结构体字段 */
         {
             TVal fv;
