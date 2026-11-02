@@ -880,6 +880,9 @@ typedef struct {
     ir_ref fwd_end;
     uint32_t fwd_pc;
     uint8_t fwd_active;
+    uint8_t fwd_is_acc;     /* 当前 fwd 挂起属于 acc 折叠（phion）——
+                             * fwd merge 据此决定是否构建 acc_iter（防
+                             * 非 RMW 折叠污染 acc 回边值） */
     ir_ref fwd_pay;         /* 批C slice-1: fast 线产出的 acc pay（fwd merge PHI 输入） */
     /* P0-17③ 批C slice-1：acc（累加器 CV）loop-carried pay 寄存器化——
      * canonical 形态守卫（fold_acc_scan）通过后，折叠 fast 线对 $s 只写
@@ -1807,6 +1810,18 @@ static int is_backedge_target(TFunc *fn, uint32_t pc) {
     return 0;
 }
 
+/* P0-19 round-5 折叠门（emit-ssa.md §7 去留条款）：折叠 fast 线在本发射
+ * 器上净负收益（base 9.7 vs B' 10.8 vs B'+C 11.0，array-read 1e6 5×5 交
+ * 替），默认关断，TPHP_FOLD_ADD=1 重开。循环头 acc phi 与折叠检测共用
+ * 本开关——acc phi 只服务折叠快线的 reconcile；fold 关断时创建 phi 只会
+ * 产生"回边补丁恒 0"的死 phi（PHI ops[3]=0 → ir_check missing reference，
+ * 11-01 的 "232" 由此而来，11-02 根因定位修正：非 deps/ir 上游缺陷）。 */
+static int fold_add_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("TPHP_FOLD_ADD") ? 1 : 0;
+    return v;
+}
+
 /* P0-17③ 批C slice-1：canonical 折叠累加形态守卫（loop phi 激活前提）。
  * 循环体（cond JMPZ 之后 → 回边 JMP）必须严格匹配：
  *   - 恰一个 FETCH_DIM_R+ADD 对，且 ADD 为 RMW 直写 CV（t?==OPD_CV &&
@@ -1917,8 +1932,10 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         if (j->fwd_active && j->fwd_pc == pc) {
             /* 批C slice-1：回边 reconcile——fast 线 ssum 与慢线（generic
              * ADD 已写回槽，此处 load 即权威值）合一；acc_iter 支配回边
-             * （守卫保证体无嵌套结构），喂 loop phi 零回边 load */
-            if (j->acc_on && j->acc_phi) {
+             * （守卫保证体无嵌套结构），喂 loop phi 零回边 load。仅当
+             * 挂起的 fwd 属于 acc 自己的折叠（fwd_is_acc）才构建——
+             * 非 RMW 折叠的 fwd_pay 是别的变量，喂进来即错值 */
+            if (j->acc_on && j->acc_phi && j->fwd_is_acc) {
                 ir_ref slow_pay = load_pay(j, slot_addr(j, j->acc_slot));
                 ir_MERGE_2(j->fwd_end, ir_END());
                 j->acc_iter = ir_PHI_2(IR_I64, j->fwd_pay, slow_pay);
@@ -1926,6 +1943,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 ir_MERGE_2(j->fwd_end, ir_END());
             }
             j->fwd_active = 0;
+            j->fwd_is_acc = 0;
         }
         if (stop_has(stops, nstops, pc)) return trap_end(ir_END(), pc);
 
@@ -1936,7 +1954,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 在 ir_END()（entry 块）前 load；phi 建在 LOOP_BEGIN 后
              * （op1=LOOP_BEGIN 满足 _ir_PHI_SET_OP 断言），回边值在
              * LOOP_END 后补（ir_check 对 loop phi 豁免前向引用） */
-            uint32_t acc = fold_acc_scan(j->fn, pc);
+            uint32_t acc = fold_add_enabled() ? fold_acc_scan(j->fn, pc) : 0;
             ir_ref init_pay = 0;
             if (acc) init_pay = load_pay(j, slot_addr(j, acc));
             ir_ref ein = ir_END();
@@ -2059,18 +2077,13 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              *      主线 ADD 照常（语义零漂移）。 */
             uint32_t np1 = pc + 1;
             TOp *aop = (np1 < j->fn->n_ops) ? &j->fn->ops[np1] : NULL;
-            /* 批C slice-1 重测判据触发（emit-ssa.md §7 去留条款）：折叠
-             * fast 线在本发射器上净负收益——base 9.7ms vs B' 10.8 vs
-             * B'+C(phi) 11.0（array-read 1e6，5×5 交替）。机制正确
-             * （239 全绿 + PHP 对拍），但 phi 链跨循环体存活未兑现寄存
-             * 器驻留（RA 寄存器压力抵消省下的 2 次内存操作）——兑现前
-             * 默认关断，TPHP_FOLD_ADD=1 重开（A/B 与回归测试仍全量可
-             * 用）；deps/ir RA phi 驻留增强后重评（P0-17③） */
-            static int fold_en = -1;
-            if (fold_en < 0) fold_en = getenv("TPHP_FOLD_ADD") ? 1 : 0;
+            /* 折叠门（fold_add_enabled，注释见上）+ 单 pending 防护：
+             * fwd 已挂起时第二个折叠会覆盖 fwd_end/fwd_pc（第一个 fast
+             * 块悬空无汇合 = CFG 破坏），保守拒编 */
             bool fold_add = false;
             uint32_t other_t = 0, other_a = 0;
-            if (fold_en && aop && aop->op == OP_ADD && aop->tr != OPD_UNUSED) {
+            if (fold_add_enabled() && !j->fwd_active &&
+                aop && aop->op == OP_ADD && aop->tr != OPD_UNUSED) {
                 if (aop->t1 == op->tr && aop->a1 == op->ar &&
                     (aop->t2 == OPD_CV || aop->t2 == OPD_TMP)) {
                     fold_add = true;
@@ -2174,6 +2187,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                                 j->fwd_end = ir_END();
                                 j->fwd_pc = np1 + 1;
                                 j->fwd_active = 1;
+                                j->fwd_is_acc = (uint8_t)phion;
                                 j->fwd_pay = ssum;
                             ir_IF_FALSE(iff);
                                 dimic_take(&g, leaf);   /* slow：原 dst 写，
@@ -2454,8 +2468,12 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         le = ir_LOOP_END();
                     } else {
                         /* 批C slice-1：零 continue → reconcile phi 支配
-                         * 回边，零 load 喂 phi */
-                        if (j->acc_on && j->acc_phi) bepay = j->acc_iter;
+                         * 回边，零 load 喂 phi；acc_iter 未构建（fold 关
+                         * 断 / 快线未发射）→ 槽 load 兜底（权威值，fast
+                         * 线每迭代 store pay；generic 路径槽恒 current） */
+                        if (j->acc_on && j->acc_phi)
+                            bepay = j->acc_iter ? j->acc_iter
+                                : load_pay(j, slot_addr(j, j->acc_slot));
                         le = ir_LOOP_END();
                     }
                     ir_MERGE_SET_OP(j->loop_ref[k], 2, le);
