@@ -1138,13 +1138,76 @@ static void dimic_take(DimIcCtx *g, ir_ref vaddr) {
     ir_STORE(ir_ADD_A(g->dst, ir_CONST_ADDR(TVAL_TAG)), vtag);
 }
 
-/* v3 多态链：lvl 0..2 = 共享层（arr/buckets/bpending，失败 = 整链 miss
- * 计数）；lvl 3..10 = cases[0..7] 按序（哨兵恒非 NULL → 每 case 归一单
- * bool，T=直接叶子取值、F=下一 case；第 8 case F 才 miss 计数）。结构
- * 仍是逐层 IF+END+MERGE_2——T/F 只有一个递归分支，线性无膨胀。 */
+/* v3 多态链（v3.2' hash 直选）：lvl 0..2 = 共享层（arr/buckets/bpending，
+ * 失败 = 整链 miss 计数）；lvl 3 = cases[0] 单槽（单态 site 一步命中，
+ * 与 v3.1 同构）；lvl 4 = STR 分派——TRUE 内 probe0 桶直取（镜像 C
+ * tarr_get_ic 两级快路：h 惰性冷填 → &hmask → bp=ic->bk+slot*24 →
+ * val_off/tag/pay 三比），命中取值、失败落 case 链兜底（轮转键不产生
+ * miss 计数 = 锁死门不错杀）；非 STR 直接落 case 链（INT 零改动）；
+ * lvl 5..4+N-1 = cases[1..N-1] 线性兜底，末 case F 才 miss 计数。
+ * 结构仍是逐层 IF+END+MERGE_2。[kp+28] 读仅在 STR 门内（INT 键的 kp
+ * 是整数值）。 */
 static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
     JitC *j = g->j;
     JIT_CTX();
+    if (lvl == 4) {
+        /* STR 分派 + probe0（v3.2'）：非短路 AND 安全——bp 经 mask 恒在
+         * 桶数组内无野读；tag+pay 指针相等即全身份（hash 比较省略，h 仅
+         * 用于 slot 计算）。 */
+        ir_ref ifstr = ir_IF(ir_EQ(g->kt, ir_CONST_I32(T_STR)));
+        ir_IF_TRUE(ifstr);
+            ir_ref ksa = ir_LOAD_A(g->key);   /* TStr*（key 槽 payload） */
+            ir_ref h0 = ir_LOAD_U32(
+                ir_ADD_A(ksa, ir_CONST_ADDR(offsetof(TStr, hash))));
+            ir_ref ifh0 = ir_IF(ir_EQ(h0, ir_CONST_U32(0)));
+            ir_IF_TRUE(ifh0);
+                /* 冷：hash 惰性未填 → tstr_hash 计算并写回（C 三元同款；
+                 * 返回值不用——合流后统一 reload） */
+                ir_ref th[1] = { ksa };
+                ir_CALL_N(IR_U32,
+                          ir_CONST_ADDR((uintptr_t)tstr_hash), 1, th);
+                ir_ref ehT = ir_END();
+            ir_IF_FALSE(ifh0);
+                ir_ref ehF = ir_END();
+            ir_MERGE_2(ehT, ehF);
+            /* 合流后统一 load：热路多一次冗余 load，免跨支 value-phi */
+            ir_ref h = ir_LOAD_U32(
+                ir_ADD_A(ksa, ir_CONST_ADDR(offsetof(TStr, hash))));
+            ir_ref hm = ir_LOAD_U32(
+                ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, hmask))));
+            ir_ref slot = ir_AND(IR_U32, h, hm);   /* U32 域纪律 */
+            ir_ref bk = ir_LOAD_A(
+                ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, bk))));
+            ir_ref zs = ir_ZEXT(IR_U64, slot);
+            ir_ref bp = ir_ADD_A(ir_ADD_A(bk, ir_SHL_U64(zs, ir_CONST_U64(4))),
+                                 ir_SHL_U64(zs, ir_CONST_U64(3)));   /* *24 */
+            ir_ref bkey = ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, key)));
+            ir_ref m = ir_AND(IR_BOOL,
+                        ir_AND(IR_BOOL,
+                               ir_EQ(g->kt, ir_LOAD_I32(
+                                   ir_ADD_A(bkey, ir_CONST_ADDR(TVAL_TAG)))),
+                               ir_EQ(g->kp, ir_LOAD_I64(bkey))),
+                        ir_NE(ir_LOAD_U32(ir_ADD_A(bp,
+                                   ir_CONST_ADDR(offsetof(ABucket, val_off)))),
+                              ir_CONST_U32(0xFFFFFFFFu)));
+            ir_ref ifm = ir_IF(m);
+            ir_IF_TRUE(ifm);
+                ir_ref voff = ir_LOAD_U32(
+                    ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
+                ir_ref data = ir_LOAD_A(
+                    ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
+                dimic_take(g, ir_ADD_A(data,
+                             ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+                ir_ref emT = ir_END();
+            ir_IF_FALSE(ifm);
+                ir_ref emF = dimic_ic_chain(g, 5);   /* probe 失败 → 兜底链 */
+            ir_MERGE_2(emT, emF);
+            ir_ref eStr = ir_END();
+        ir_IF_FALSE(ifstr);
+            ir_ref eNo = dimic_ic_chain(g, 5);       /* 非 STR → 原链零改动 */
+        ir_MERGE_2(eStr, eNo);
+        return ir_END();
+    }
     ir_ref bp = IR_UNUSED;
     ir_ref cond;
     switch (lvl) {
@@ -1160,7 +1223,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                      ir_CONST_U32(0));
         break;
     default: {
-        int ci = lvl - 3;
+        int ci = lvl == 3 ? 0 : lvl - 4;   /* lvl3=case0；lvl5..=case1.. */
         bp = ir_LOAD_A(ir_ADD_A(g->ic,
               ir_CONST_ADDR(offsetof(DimIC, cases) + (uintptr_t)ci * sizeof(ABucket *))));
         ir_ref bkey = ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, key)));
@@ -1176,7 +1239,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
     }
     }
     bool leaf_here = (lvl >= 3);   /* case 条件通过即命中取值 */
-    bool last = (lvl == 3 + DIM_IC_CASES - 1);
+    bool last = (lvl == 4 + DIM_IC_CASES - 1);   /* 末 case（lvl11 @ N=8） */
     ir_ref ifx = ir_IF(cond);
     ir_IF_TRUE(ifx);
         ir_ref ct;
