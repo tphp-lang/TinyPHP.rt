@@ -25,11 +25,27 @@ static double now_ms(void) {
 }
 #else
 #include <time.h>
+#include <sys/resource.h>
 static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
+/* P0-19 round-3: user/sys/minflt split -- the mac stats showed 27% kernel
+ * time; these lines attribute it (page zero-fill vs syscall) per section. */
+static void rusage_line(const char *tag) {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    printf("  [%s] user=%.3fs sys=%.3fs minflt=%ld majflt=%ld\n", tag,
+           (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
+           (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6,
+           ru.ru_minflt, ru.ru_majflt);
+}
+#endif
+#ifndef _WIN32
+#define RUSAGE_AVAIL 1
+#else
+static void rusage_line(const char *tag) { (void)tag; }
 #endif
 
 static volatile void *sink;
@@ -95,6 +111,40 @@ static void bench_arrlit(long n) {
     printf("%-14s %8.1f ns/cycle (3 pairs)\n", "arr-lifecycle", (t1 - t0) * 1e6 / n);
 }
 
+/* ---- P0-19 round 3: first-touch / page-fault discriminator ----
+ * The mac MIMALLOC_SHOW_STATS readout showed 27% kernel time with only
+ * 3 mmaps + 53 purges -- prime suspect is first-touch zero-fill on
+ * Darwin's 16KB pages (touched 389.8 MiB => ~24K faults; Linux 4KB pages
+ * fault 4x more often but each ~10-20x cheaper). Two shapes:
+ * - huge: fresh mmap-backed block each round -> EVERY round pays full
+ *   first-touch (munmap on free guarantees fresh pages next round).
+ * - arena: 2 MiB blocks through the arena -> slice reuse after round 1,
+ *   so cold-then-hot curve isolates first-touch from steady arena cost.
+ * Per-round ms + rusage deltas (user/sys/minflt) split the cost domain. */
+static void bench_growth(const char *name, size_t block, long rounds) {
+#ifdef RUSAGE_AVAIL
+    rusage_line("growth-before");
+#endif
+    double t0 = now_ms();
+    for (long r = 0; r < rounds; r++) {
+        double r0 = now_ms();
+        char *p = (char *)mi_malloc(block);
+        if (!p) { printf("  oom\n"); return; }
+        for (size_t i = 0; i < block; i += 4096) p[i] = (char)(i >> 12);
+        p[block - 1] = 1;
+        sink = p;
+        mi_free(p);
+        double r1 = now_ms();
+        printf("  %-16s round %2ld  %8.1f ms\n", name, r, r1 - r0);
+    }
+    double t1 = now_ms();
+    printf("%-16s %3zu MiB x %ld rounds  %8.1f ms total\n", name,
+           block >> 20, rounds, t1 - t0);
+#ifdef RUSAGE_AVAIL
+    rusage_line("growth-after");
+#endif
+}
+
 int main(void) {
     long n = 10000000;
     bench_pair("TStr-4B", 50, n);
@@ -107,5 +157,7 @@ int main(void) {
     bench_pair("buckets-16", 384, n / 2);
     bench_pair("TStr-400B", 432, n / 2);
     bench_arrlit(n / 2);
+    bench_growth("growth-huge-32M", (size_t)32 << 20, 8);
+    bench_growth("growth-arena-2M", (size_t)2 << 20, 8);
     return 0;
 }

@@ -106,6 +106,18 @@ jobs:
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
 
+      # P0-19 round 4 control: same bench_alloc probes as macos -- growth
+      # curves (huge/arena) + steady pairs + getrusage split on Linux 4KB
+      # pages give the healthy baseline the mac readings compare against.
+      - name: bench_alloc control (steady + growth)
+        run: |
+          clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
+          echo "=== mimalloc ==="
+          /tmp/bench_alloc_mi
+          echo "=== libc ==="
+          /tmp/bench_alloc_libc
+
       # P0-19 control arm: same NO_BINS pass as macos-aarch64. Linux ELF
       # TLS (initial-exec) is cheap, so this should be ~neutral vs the
       # run above - any large delta here means the toggle itself is not
@@ -193,34 +205,42 @@ jobs:
         run: |
           MIMALLOC_SHOW_STATS=1 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
 
-      # P0-19 discriminator A (11-01): purge confirmed firing (53x/19MiB per
-      # run, constant across runs). If ser/json/logstat recover toward CRT
-      # levels (~65/~160/~70) with delay=0/reset=0 -> purge/page-reset tax
-      # confirmed, fix = pin mi_option at startup. Compare vs default-run
-      # mins in perf-vs-php-nobins.md. Drop first round (warmup).
-      - name: "Discriminator A (PURGE_DELAY=0, PAGE_RESET=0, 3 rounds, drop first)"
+      # P0-19 round 4: the stats readout showed 27% KERNEL time with only
+      # 3 mmaps + 53 purges -- prime suspect is first-touch zero-fill on
+      # Darwin's 16KB pages (touched 389.8 MiB => ~24K faults; Linux 4KB
+      # pages fault 4x more but each ~10-20x cheaper). Three probes:
+      # 1) sample (macOS built-in): user-stack call tree of the bench --
+      #    heavy self-time in faulting stores / kernel leafs = smoking gun.
+      # 2) bench_alloc mi vs libc: steady-state pair health on this runner.
+      # 3) bench_growth (new): huge-32M pays first-touch EVERY round
+      #    (munmap+fresh mmap), arena-2M goes cold-then-hot -- per-round
+      #    ms + getrusage user/sys/minflt deltas split the cost domain.
+      #    Windows baseline: huge round0 33ms/32MB then 0.1ms reuse.
+      - name: kernel-time attribution (sample)
         run: |
-          for i in 1 2 3; do
-            MIMALLOC_PURGE_DELAY=0 MIMALLOC_PAGE_RESET=0 ./build/tphp run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|json|real-logstat|array-push)" || true
-            echo "-- round $i"
-          done
+          ./build/tphp run tools/bench-vs-php.php > /dev/null 2>&1 & P=$!
+          sleep 0.3
+          sample $P 5 -file /tmp/tphp_sample.txt || true
+          wait || true
+          sed -n '1,90p' /tmp/tphp_sample.txt || true
 
-      # P0-19 discriminator B (11-01): alloc-probe/object are stable across
-      # 4 builds (82-91/144-163ms) = allocator-independent. Pure-C baseline
-      # (no tphp TLS, no interpreter): malloc/free pair ~50ns = tphp's own
-      # TLS layers are the tax (TLS consolidation); >=400ns = macOS
-      # libmalloc baseline is slow (pool the hot paths instead).
-      - name: "Discriminator B (pure-C alloc baseline, libc vs mimalloc)"
+      - name: bench_alloc discriminators (steady + growth, mi vs libc)
         run: |
-          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o build/bench_alloc-libc
-          echo "== libc (macOS libmalloc baseline) =="
-          ./build/bench_alloc-libc || true
-          ls build/obj/mi_*.o >/dev/null 2>&1 && \
-            clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src \
-              tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o \
-              -o build/bench_alloc-mi && \
-            echo "== mimalloc (same objects as tphp link) ==" && \
-            ./build/bench_alloc-mi || echo "(mi objects absent, skipped)"
+          clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
+          echo "=== mimalloc ==="
+          /tmp/bench_alloc_mi
+          echo "=== libc ==="
+          /tmp/bench_alloc_libc
+
+      - name: multi-round mins (main vs CRT, drop cold first round)
+        run: |
+          for b in tphp tphp-crt; do
+            for i in 1 2 3; do
+              echo "=== $b round $i ==="
+              ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
+            done
+          done
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
