@@ -203,6 +203,17 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
         a->bpending++;
         return true;
     }
+    /* packed 原地替换（P0-13b，PHP zend 同款）：packed 不变量 data[i] 恒
+     * 为键 i（0..n-1 无洞）→ i∈[0,n) 必存在，直接覆盖并保持 packed。原先
+     * 落到下方 packed-break + 全量 arr_find：rmw 循环（$a[$i]++）首写即破
+     * packed，其后读全退 hash/helper——CI array-rmw 9.25× 的大头。 */
+    if (a->packed && key.t == T_INT && key.u.i >= 0 &&
+        (uint64_t)key.u.i < (uint64_t)a->n) {
+        uint32_t i = (uint32_t)key.u.i;
+        tval_release(&a->data[i]);
+        a->data[i] = val;
+        return true;
+    }
     if (!key_norm_fast(&key)) return false;
     /* L3 键 intern（PHP zend hash 同款）：查找键比较 memcmp → 指针相等；
      * interned 串不 refcount、addref/release 为 no-op。永久驻留（CLI 单
