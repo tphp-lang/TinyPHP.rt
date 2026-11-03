@@ -49,6 +49,31 @@ jobs:
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -MaxFibRatio ${{ inputs.fib_gate }} -Report perf-vs-php.md
 
+      # One-file handoff: bundle this job's report (+ extra logs) so the
+      # whole run can be passed to the analysis session as ONE artifact
+      # (collect-report merges everything into perf-report-all.md).
+      - name: Export perf report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## perf export: ${{ github.job }}"
+            echo "commit: $(git rev-parse --short HEAD)  time: $(date -u +%FT%TZ)"
+            for f in perf-vs-php.md perf-vs-php-nobins.md perf-extra-*.log; do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } | tee "perf-report-${{ github.job }}.md"
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.job }}
+          path: perf-report-${{ github.job }}.md
+          if-no-files-found: warn
+
   # ---------- Linux x86_64 ----------
   linux-x86_64:
     name: Linux x86_64
@@ -76,6 +101,28 @@ jobs:
       - name: Perf vs PHP strongest
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -MaxFibRatio ${{ inputs.fib_gate }} -Report perf-vs-php.md
+
+      - name: Export perf report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## perf export: ${{ github.job }}"
+            echo "commit: $(git rev-parse --short HEAD)  time: $(date -u +%FT%TZ)"
+            for f in perf-vs-php.md perf-vs-php-nobins.md perf-extra-*.log; do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } | tee "perf-report-${{ github.job }}.md"
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.job }}
+          path: perf-report-${{ github.job }}.md
+          if-no-files-found: warn
 
   # ---------- Linux aarch64 ----------
   linux-aarch64:
@@ -111,12 +158,14 @@ jobs:
       # pages give the healthy baseline the mac readings compare against.
       - name: bench_alloc control (steady + growth)
         run: |
-          clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
-          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
-          echo "=== mimalloc ==="
-          /tmp/bench_alloc_mi
-          echo "=== libc ==="
-          /tmp/bench_alloc_libc
+          {
+            clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+            clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
+            echo "=== mimalloc ==="
+            /tmp/bench_alloc_mi
+            echo "=== libc ==="
+            /tmp/bench_alloc_libc
+          } 2>&1 | tee perf-extra-alloc.log
 
       # P0-19 control arm: same NO_BINS pass as macos-aarch64. Linux ELF
       # TLS (initial-exec) is cheap, so this should be ~neutral vs the
@@ -127,6 +176,28 @@ jobs:
         env:
           TPHP_NO_BINS: "1"
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php-nobins.md
+
+      - name: Export perf report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## perf export: ${{ github.job }}"
+            echo "commit: $(git rev-parse --short HEAD)  time: $(date -u +%FT%TZ)"
+            for f in perf-vs-php.md perf-vs-php-nobins.md perf-extra-*.log; do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } | tee "perf-report-${{ github.job }}.md"
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.job }}
+          path: perf-report-${{ github.job }}.md
+          if-no-files-found: warn
 
   # ---------- macOS aarch64 (Apple Silicon, native) ----------
   macos-aarch64:
@@ -177,11 +248,13 @@ jobs:
       # CRT vs CRT.
       - name: kernel-time attribution (sample, CRT main binary)
         run: |
-          ./build/tphp run tools/bench-vs-php.php > /dev/null 2>&1 & P=$!
-          sleep 0.3
-          sample $P 5 -file /tmp/tphp_sample.txt || true
-          wait || true
-          sed -n '1,90p' /tmp/tphp_sample.txt || true
+          {
+            ./build/tphp run tools/bench-vs-php.php > /dev/null 2>&1 & P=$!
+            sleep 0.3
+            sample $P 5 -file /tmp/tphp_sample.txt || true
+            wait || true
+            sed -n '1,90p' /tmp/tphp_sample.txt || true
+          } 2>&1 | tee perf-extra-kernel.log
 
       - name: mimalloc variant build (USE_MIMALLOC=1 -> build/tphp-mi)
         run: |
@@ -191,25 +264,51 @@ jobs:
 
       - name: mimalloc stats (mi variant)
         run: |
-          MIMALLOC_SHOW_STATS=1 ./build/tphp-mi run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 || true
+          MIMALLOC_SHOW_STATS=1 ./build/tphp-mi run tools/bench-vs-php.php 2>&1 | grep -vE "^BENCH|^PASS" | tail -70 | tee perf-extra-mimalloc.log || true
 
       - name: bench_alloc discriminators (steady + growth, mi vs libc)
         run: |
-          clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
-          clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
-          echo "=== mimalloc ==="
-          /tmp/bench_alloc_mi
-          echo "=== libc ==="
-          /tmp/bench_alloc_libc
+          {
+            clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+            clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
+            echo "=== mimalloc ==="
+            /tmp/bench_alloc_mi
+            echo "=== libc ==="
+            /tmp/bench_alloc_libc
+          } 2>&1 | tee perf-extra-alloc.log
 
       - name: multi-round mins (CRT vs mimalloc, drop cold first round)
         run: |
-          for b in tphp-crt-main tphp-mi; do
-            for i in 1 2 3; do
-              echo "=== $b round $i ==="
-              ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
+          {
+            for b in tphp-crt-main tphp-mi; do
+              for i in 1 2 3; do
+                echo "=== $b round $i ==="
+                ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
+              done
             done
-          done
+          } 2>&1 | tee perf-extra-rounds.log
+
+      - name: Export perf report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## perf export: ${{ github.job }}"
+            echo "commit: $(git rev-parse --short HEAD)  time: $(date -u +%FT%TZ)"
+            for f in perf-vs-php.md perf-vs-php-nobins.md perf-extra-*.log; do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } | tee "perf-report-${{ github.job }}.md"
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.job }}
+          path: perf-report-${{ github.job }}.md
+          if-no-files-found: warn
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
   # REPORT-ONLY by design: arm64 PHP (native) vs x86_64 tphp under
@@ -254,3 +353,66 @@ jobs:
       - name: Perf vs PHP strongest
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php.md
+
+      - name: Export perf report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## perf export: ${{ github.job }}"
+            echo "commit: $(git rev-parse --short HEAD)  time: $(date -u +%FT%TZ)"
+            for f in perf-vs-php.md perf-vs-php-nobins.md perf-extra-*.log; do
+              [ -f "$f" ] || continue
+              echo; echo "### $f"; echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } | tee "perf-report-${{ github.job }}.md"
+      - name: Upload perf report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-${{ github.job }}
+          path: perf-report-${{ github.job }}.md
+          if-no-files-found: warn
+
+  # ---------- Collect: merge every job's export into ONE artifact ----------
+  # Hand the whole run to the analysis session as perf-report-all.md --
+  # no manual copy-pasting out of individual job logs.
+  collect-report:
+    name: Collect perf report (single file)
+    needs: [windows-x86_64, linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download per-job exports
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: perf-report-*
+          path: reports
+
+      - name: Merge into perf-report-all.md
+        run: |
+          {
+            echo "# TinyPHP perf report - run ${{ github.run_id }}"
+            echo "commit: ${{ github.sha }}  time: $(date -u +%FT%TZ)"
+            echo
+            if [ -d reports ]; then
+              find reports -name 'perf-report-*.md' | sort | while read -r f; do
+                echo "==================== $f"
+                cat "$f"
+                echo
+              done
+            else
+              echo "(no per-job exports found)"
+            fi
+          } > perf-report-all.md
+          cat perf-report-all.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload merged report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report-all
+          path: perf-report-all.md
+          if-no-files-found: warn
