@@ -15,7 +15,7 @@ class PrDrv {
     public function step($x) { return $this->b->id($x); }   // fn-level mcall
 }
 function wf_new($i) { $q = new PrPlain(); $q->v = $i; return $q->v; }   // fn-level no-ctor new
-function wf_ctor($i) { $q = new PrC($i); return $q->v; }                // control: user-ctor fold stays replay (batch 2-5 remainder) -- expected flat
+function wf_ctor($i) { $q = new PrC($i); return $q->v; }                // batch 2-8: user-ctor fold 直调（对照 fold 前 BASE）
 
 $w = new PrDrv();
 $s = 0;

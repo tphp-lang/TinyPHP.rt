@@ -43144,6 +43144,8 @@ static int32_t ir_emit_arguments(ir_ctx *ctx, ir_ref def, ir_insn *insn, const i
 	int vector_param = 0;
 #endif
 	int count = 0;
+	ir_reg const_dsts[IR_MAX_REG_ARGS + 3]; /* CONST->REG load targets (pass 1.5) */
+	int ncd = 0;
 	int32_t used_stack, copy_stack = 0, stack_offset = cc->shadow_store_size;
 	ir_copy *copies;
 	bool do_pass3 = 0;
@@ -43348,6 +43350,9 @@ static int32_t ir_emit_arguments(ir_ctx *ctx, ir_ref def, ir_insn *insn, const i
 			    (IR_REG_SPILLED(src_reg) && !IR_REGSET_IN(cc->preserved_regs, IR_REG_NUM(src_reg)))) {
 				/* delay CONST->REG and MEM->REG moves to third pass */
 				do_pass3 = 1;
+				if (IR_IS_CONST_REF(arg)) {
+					const_dsts[ncd++] = dst_reg;
+				}
 			} else {
 				if (IR_REG_SPILLED(src_reg)) {
 					src_reg = IR_REG_NUM(src_reg);
@@ -43382,12 +43387,43 @@ static int32_t ir_emit_arguments(ir_ctx *ctx, ir_ref def, ir_insn *insn, const i
 		}
 	}
 
+	/* 1.5 REG->REG copies whose source is a CONST load's dst must run
+	 *     BEFORE the const is materialized into that dst: linear scan ends
+	 *     the source value's interval at the call's load pos — the same
+	 *     tick the const is loaded — so the pre-load register contents ARE
+	 *     the operand (ctor PARAM2-in-%rdx case). cf39e5d's
+	 *     loads-before-shuffle order is only safe for MEM loads, which
+	 *     restore an RA register segment. CONST dsts are never copy targets
+	 *     (one mover per arg position), so the subset stays independent. */
+	if (count && ncd) {
+		ir_copy *pa = ir_mem_malloc(count * sizeof(ir_copy));
+		int k, m, in, ca = 0, cb = 0;
+
+		for (k = 0; k < count; k++) {
+			in = 0;
+			for (m = 0; m < ncd; m++) {
+				if (copies[k].from == const_dsts[m]) { in = 1; break; }
+			}
+			if (in) {
+				pa[ca++] = copies[k];
+			} else {
+				copies[cb++] = copies[k];
+			}
+		}
+		if (ca) {
+			ir_parallel_copy(ctx, pa, ca, tmp_reg, tmp_fp_reg);
+			count = cb;
+		}
+		ir_mem_free(pa);
+	}
+
 	/* 2. move the remaining memory and immediate values BEFORE the REG->REG
 	 *    shuffle: a REG->REG copy may read a register that these MEM/CONST
 	 *    loads materialize (the same value passed in two arguments, e.g.
 	 *    dst==src of an in-place concat), so loads must execute first.
 	 *    Load targets cannot clash with other copies' sources: linear scan
-	 *    reserves every arg reg by a fixed range at the call's load pos. */
+	 *    reserves every arg reg by a fixed range at the call's load pos
+	 *    (CONST dsts are the exception — their copies move in pass 1.5). */
 	if (do_pass3) {
 		int copy_stack_offset = 0;
 
