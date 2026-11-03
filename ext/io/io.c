@@ -184,7 +184,9 @@ static void fs_cb(uv_fs_t *req) {
 }
 
 /* 发起并等待一个 uv_fs_* 调用：FN(loop, req, ..., cb) 形状统一（req 第
- * 二参、cb 最后），__VA_ARGS__ 填中间参数。无调度器时退化为同步（cb=NULL），
+ * 二参、cb 最后），__VA_ARGS__ 填中间参数。无调度器、或当前无可挂起协程
+ * （FFI 回调 drain 上下文 g_cur==NULL——sched_active 仍 true，选异步会
+ * record_suspend_pos 拒绝抛 no current coroutine）时退化为同步（cb=NULL），
  * 目录项/stat 快照同步路径同样处理。 */
 #define FS_DO(op, FN, ...)                                           \
     do {                                                             \
@@ -192,7 +194,7 @@ static void fs_cb(uv_fs_t *req) {
         (op)->stat_size = 0;                                         \
         (op)->stat_mode = 0;                                         \
         (op)->req.data = (op);                                       \
-        if (tphp_sched_active()) {                                   \
+        if (tphp_sched_active() && tphp_sched_current()) {           \
             tphp_sched_event_reset(&(op)->ev);                       \
             FN(tphp_sched_loop(), &(op)->req, __VA_ARGS__, fs_cb);   \
             tphp_sched_event_wait(&(op)->ev);                        \
