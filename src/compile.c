@@ -147,6 +147,56 @@ static TStr *resolve_const_name(TStr *name, bool *fallback) {
     return ns_concat(s_cur_ns, name);
 }
 
+/* 类型声明的类名段 FQ 解析（P1-1）：类型串按 '?'/'|'/'&' 切段，
+ * builtin/self/static/parent 段原样保留（parse 已小写化），其余段过
+ * resolve_class_name（绝对 '\' 去前缀 / use 导入 / NS 前缀）。运行期
+ * tphp_type_accepts 按小写 FQCN 查类表——不解析则 use 导入/NS 前缀
+ * 的类型查表必 miss（TypeError: must be of type xxx, Yyy given）。 */
+static bool type_seg_is_builtin(const char *seg, size_t len) {
+    static const char *bw[] = {
+        "int", "float", "string", "bool", "array", "object", "mixed",
+        "null", "true", "false", "callable", "iterable", "void", "never",
+        "self", "static", "parent", "closure",
+    };
+    for (size_t i = 0; i < sizeof bw / sizeof bw[0]; i++)
+        if (strlen(bw[i]) == len && memcmp(bw[i], seg, len) == 0)
+            return true;
+    return false;
+}
+
+/* 解析整个类型串（NULL=无类型原样返回）。段未改写时 tstr_intern 回到
+ * 原串同一指针，零额外开销。 */
+static TStr *resolve_type_decl(TStr *type, const char *file, int line) {
+    if (!type) return NULL;
+    const char *s = tstr_val(type);
+    size_t n = tstr_len(type);
+    if (!n) return type;
+    char buf[1024];   /* parse 上限 511 字节 + NS/use 前缀余量 */
+    size_t o = 0, i = (s[0] == '?') ? 1 : 0;
+    if (i) buf[o++] = '?';
+    for (;;) {
+        size_t st = i;
+        while (i < n && s[i] != '|' && s[i] != '&') i++;
+        if (i > st) {
+            const char *cv = s + st;
+            size_t cl = i - st;
+            if (!type_seg_is_builtin(cv, cl)) {
+                TStr *rs = resolve_class_name(tstr_intern(cv, cl));
+                cv = tstr_val(rs); cl = tstr_len(rs);
+            }
+            if (o + cl + 2 >= sizeof buf)
+                tphp_fatal_src(file, line, "Type declaration too long");
+            memcpy(buf + o, cv, cl);
+            o += cl;
+        }
+        if (i >= n) break;
+        if (o + 2 >= sizeof buf)
+            tphp_fatal_src(file, line, "Type declaration too long");
+        buf[o++] = s[i++];   /* '|' / '&' 分隔符原样 */
+    }
+    return tstr_intern(buf, o);
+}
+
 enum { CAST_INT = 1, CAST_BOOL, CAST_FLOAT, CAST_STRING, CAST_ARRAY };
 
 static void compile_class_decl(Program *p, AClassDecl *cd, const char *file);
@@ -3241,7 +3291,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
     f->name = af->name;
     f->file = file;
     f->prog = p;
-    f->ret_type = af->ret_type;   /* P1-1 */
+    f->ret_type = resolve_type_decl(af->ret_type, file, af->line);   /* P1-1 */
     f->is_closure = is_closure;
     f->is_method = is_method;
     f->is_variadic = af->n_params > 0 && af->params[af->n_params - 1]->is_variadic;
@@ -3295,7 +3345,7 @@ static uint16_t compile_fn_like(Program *p, AFunc *af, Ctx *parent,
         for (int i = 0; i < af->n_params; i++) {
             get_var(&c, af->params[i]->name);
             f->default_thunk[i] = 0;
-            f->param_types[i] = af->params[i]->type;   /* P1-1 */
+            f->param_types[i] = resolve_type_decl(af->params[i]->type, file, af->line);   /* P1-1 */
             if (af->params[i]->default_val) {
                 bool ok = true;
                 TVal d = eval_const2(&c, af->params[i]->default_val, &ok);
@@ -3506,7 +3556,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
                     TProp prop;
                     memset(&prop, 0, sizeof prop);
                     prop.name = par->name;
-                    prop.type = par->type;        /* P1-1: 提升参数类型 → 属性校验 */
+                    prop.type = resolve_type_decl(par->type, file, mem->line);   /* P1-1: 提升参数类型 → 属性校验 */
                     prop.decl = cls;              /* P3: readonly 作用域判定 */
                     prop.visibility = (uint8_t)par->vis;
                     prop.set_visibility = (uint8_t)(par->set_vis ? par->set_vis
@@ -3566,7 +3616,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             TProp prop;
             memset(&prop, 0, sizeof prop);
             prop.name = mem->prop.name;
-            prop.type = mem->prop.type;   /* P1-1: 运行期赋值校验 */
+            prop.type = resolve_type_decl(mem->prop.type, file, mem->line);   /* P1-1: 运行期赋值校验 */
             prop.decl = cls;              /* P3: readonly 写入作用域判定 */
             prop.visibility = mem->vis;
             /* PHP 8.4 asymmetric visibility：写入可见性；未声明则同读 */
@@ -3630,7 +3680,7 @@ static void compile_class_decl(Program *p, AClassDecl *cd, const char *file) {
             cls->cthunks = tm_realloc(cls->cthunks, sizeof(uint16_t) * (size_t)(cls->n_consts + 1));
             cls->ctypes = tm_realloc(cls->ctypes, sizeof(TStr *) * (size_t)(cls->n_consts + 1));
             cls->cnames[cls->n_consts] = mem->prop.name;
-            cls->ctypes[cls->n_consts] = mem->prop.type;   /* 8.3 typed const（interned，NULL=无） */
+            cls->ctypes[cls->n_consts] = resolve_type_decl(mem->prop.type, file, mem->line);   /* 8.3 typed const（interned，NULL=无） */
             if (ok) {
                 cls->cvals[cls->n_consts] = d;
                 tval_addref(d);
