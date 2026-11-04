@@ -2335,10 +2335,12 @@ static AClassBody *parse_class_body(Parser *p, int kind, TStr *cls_name) {
     while (p->tok.kind != P_RBRACE) {
         if (p->tok.kind == L_EOF) p_error(p, "Unterminated class body");
         if (kind == CK_ENUM && p->tok.kind == KW_CASE) {
-            /* enum case: `case Name;` or `case Name = value;` */
+            /* enum case: `case Name;` or `case Name = value;`——名字位同
+             * 成员名语义（PHP 半保留字：case Default = 0; 合法） */
             int line = p->tok.line;
             advance(p);
-            if (p->tok.kind != L_IDENT) p_error(p, "Expected enum case name");
+            if (!tok_is_member_name(p->tok.kind))
+                p_error(p, "Expected enum case name");
             AClassMember *m = tm_malloc(sizeof(AClassMember));
             memset(m, 0, sizeof *m);
             m->line = line;

@@ -21,9 +21,17 @@ echo $k->match(), "\n";
 $n = null;
 var_dump($n?->fn);
 
+// enum case 名同规则（半保留字：case Default / case List 合法，PHP 对齐；
+// 2026-11-04 修：enum case 定义位改走 tok_is_member_name）
+enum KwFeat: int { case Default = 0; case List = 7; }
+echo KwFeat::Default->value, "\n";
+echo KwFeat::List->value, "\n";
+
 // EXPECT: p-fn
 // EXPECT: p-match
 // EXPECT: p-class
 // EXPECT: m-fn
 // EXPECT: m-match
 // EXPECT: NULL
+// EXPECT: 0
+// EXPECT: 7
