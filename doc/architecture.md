@@ -50,7 +50,7 @@ libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步
 - **TVal** 16 字节：`{ union u; TType t }`
 - 数组：插入序哈希（开址 + 墓碑），键边界规范化（`"8"`→int 8，`"08"` 留字符串）
 - GC：标记-清扫（环回收）；acrc 释放走 `tval_release`；interned 串不参与 rc
-- 分配：mimalloc 包装层（`tm_malloc`），与 ASAN 互斥
+- 分配：`tm_malloc` 包装层——Linux/Windows 走 mimalloc，**macOS 默认 CRT libmalloc**（P0-19 簇1，mimalloc Darwin 小分配 2.2-3.2× 慢；`USE_MIMALLOC=1` 切回）；与 ASAN 互斥
 
 ## 目录
 

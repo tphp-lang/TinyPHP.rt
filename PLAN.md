@@ -33,7 +33,7 @@
 | == 宽松比较 | **完全对齐 PHP** 全部隐式转换规则 |
 | 抛掉 &$ref | 因协程/克隆/GC 而非 AOT（见上） |
 | HTTPS/TLS | vendor mbedtls + `cacert.pem` 根证书内嵌 exe（M4；libuv 无 TLS，txiki cacert.c 同款） |
-| 分配器 | mimalloc vendor 垫在 malloc 层（默认开；与 ASAN 构建互斥，txiki 先例） |
+| 分配器 | mimalloc vendor 垫在 malloc 层（Linux/Windows 默认开；**macOS 默认 libc**——P0-19 簇1 mimalloc Darwin 小分配慢 2.2-3.2×，11-04 拍板确认，`USE_MIMALLOC=1` 可切回；与 ASAN 构建互斥，txiki 先例） |
 | 语义对拍 | 从 php-src `Zend/tests` 抽 .phpt 子集做对拍测试层（见 PLAN/04 §2） |
 | FFI | libffi vendor 进 deps（静态 .a + 头文件）；M5.5 已完成（含 dlopen/wchar/union/enum 常量） |
 
