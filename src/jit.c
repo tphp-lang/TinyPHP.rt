@@ -24,6 +24,7 @@
 
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
+int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret); /* vm.c 异常分发守卫版 */
 TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
 TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap);    /* vm.c P0-18① */
 int tphp_jit_opseq(VM *vm, TFunc *fn, TVal *slots, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
@@ -487,7 +488,7 @@ int tphp_jit_send_cap(VM *vm, TVal *src) {
 }
 
 /* INIT_DYN..DO_FCALL 动态调用（$f(...)）：JIT'd 无捕获闭包走 trampoline，
- * 其余回落 tphp_vm_call_callable（语义统一入口）。
+ * 其余回落 tphp_vm_call_guarded（语义统一入口 + 异常分发守卫，vm.c）。
  * 返回 0 = callee deopt（exception 已设）→ IR 立即 RETURN 0 沿链传播；
  * 不可落回解释器重跑（双重副作用 + exception 悬挂）。
  * tphp_jit_call 返 0 但无 exception（!entry / g_jsp 溢出，未执行）→
@@ -536,8 +537,14 @@ int tphp_jit_call_dyn(VM *vm, TVal *clo_slot, TVal *args_in, int n, TVal *ret) {
             }
         }
     }
-    *ret = tphp_vm_call_callable(vm, clo, args_in, n);
-    return 1;
+    /* 解释器 callee → guarded 调用（vm.c:5637 注详）：本地 pad +
+     * vm_unwind_core 以 floor 分发——callee 侧 handler resume 跑完返 1，
+     * 逃逸返 0（IR RETURN 上传，零跨帧展开）。两面封死：bug1（裸调的
+     * longjmp 穿无 UNWIND_INFO 的 IR 帧 → 0xC00000FF）+ bug2（缺分发
+     * 把 callee-try 异常外传 → caller JIT 已退出后 RECV 重跑 arity 误报）。 */
+    if (tphp_vm_call_guarded(vm, clo, args_in, n, ret))
+        return 1;
+    return 0;
 }
 
 /* INIT_FCALL..DO_FCALL builtin 调用（P0-1：闭包尾部校验 echo→print 等

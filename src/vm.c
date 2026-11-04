@@ -5631,6 +5631,42 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     return vm->x.thunk_ret;
 }
 
+/* JIT 内解释器调用 + 异常分发守卫（tphp_jit_opseq / FFI bounded pad 同款；
+ * tphp_jit_call_dyn 解释器 fallback 专用——longjmp 绝不跨 IR 帧）：
+ *   - 正常完成 → 返 1，*ret = 返回值；
+ *   - 执行中 raise → 落本地 pad：vm_unwind_core 以 floor（进入时 caller
+ *     帧）为界分发——handler 在 callee 侧命中 → resume 残帧逐层跑到
+ *     floor（is_thunk rec 的 RETURN 写 thunk_ret）→ 返 1；到 floor 未命中
+ *     → escaped → 返 0（vm->x.exception 保留 → 调用方 IR RETURN →
+ *     op_do_fcall 异常 deopt 从 C 帧上传，零跨帧展开）。
+ * 缺分发的裸 setjmp 版（11-04 上午）：callee 自身 try 的异常被外传给
+ * caller deopt 链 → 主分发器 resume callee 时 caller JIT 已退出（pc=0、
+ * args 被清 UNDEF）→ RECV 重跑报 ArgumentCountError 误报（bug2）。 */
+int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret) {
+    VMFrame *floor = vm->x.frame;
+    jmp_buf outer;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (TPHP_SETJMP(vm->x.unwind) == 0) {
+        *ret = tphp_vm_call_callable(vm, callable, args, n);
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+    for (;;) {
+        bool escaped = false;
+        vm_unwind_core(vm, floor, &escaped);
+        if (escaped) {
+            memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+            return 0;
+        }
+        if (TPHP_SETJMP(vm->x.unwind) != 0) continue;   /* 恢复执行中再次 raise */
+        while (vm->x.frame && vm->x.frame != floor)
+            run_frame_until_pop_deep(vm, vm->x.frame);  /* 残帧逐层跑到 floor */
+        *ret = vm->x.thunk_ret;
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+}
+
 /* 以闭包为 main 跑一个独立 runtime（M5-c：Worker 子线程入口）。
  * prog 为共享只读字节码；本线程的 thread-local runtime 必须已初始化。
  * share/n_share（P1-10）：父线程的全局 Program 快照（主 + inc_progs）。
