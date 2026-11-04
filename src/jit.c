@@ -177,6 +177,41 @@ static void cmp_slow_body(VM *vm, int32_t opi, TVal *dst,
     *dst = r;
 }
 
+/* CAST 慢路（刀2）：快叶收窄后其余形态落此——ct==1 的 FLOAT（tval_to_int
+ * 对 NAN/超范围 raise，快叶 FP2I64 裸转不查=错值）与 STR/ARR/OBJ 等、
+ * ct==3 的 STR/ARR/OBJ 等。顺序严格 compute-then-release：dst 可与源
+ * 同槽（$s=(int)$s），先转换后释放 → 别名下无 UAF；raise 落本地 mine →
+ * restore → 返 0 让 IR deopt（binop_slow 同款，绝不跨 IR 帧 longjmp）。
+ * UNDEF 源经 tval_to_* 默认支 raise TypeError——与 binop_slow 读原始
+ * UNDEF 的既存发散同族（解释器 rdv 抛 UndefinedError），记观察不扩刀。 */
+static void cast_slow_body(VM *vm, int32_t ct, TVal *dst,
+                           int32_t ta, int64_t pa) {
+    (void)vm;
+    TVal a = { .u.i = pa, .t = (TType)ta };
+    TVal r;
+    switch (ct) {
+    case 1:  r = TV_INT(tval_to_int(a)); break;
+    case 3:  r = TV_FLOAT(tval_to_float(a)); break;
+    default: r = tval_to_bool(a) ? TV_TRUE : TV_FALSE; break;
+    }
+    tval_release(dst);
+    *dst = r;
+}
+
+int tphp_jit_cast_slow(VM *vm, int32_t ct, TVal *dst,
+                       int32_t ta, int64_t pa) {
+    jmp_buf outer, mine;
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (TPHP_SETJMP(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        cast_slow_body(vm, ct, dst, ta, pa);
+        memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+        return 1;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    return 0;
+}
+
 /* Lookup jit_entry at runtime and call with pre-built slots (v1.2).
  * Needed because recursive/self calls compile before jit_entry is set. */
 int tphp_jit_call_slots(VM *vm, TFunc *fn, TVal *slots, TVal *ret) {
@@ -1046,6 +1081,20 @@ static void call_slow_cmp(JitC *j, int opi, ir_ref da,
         ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
     ir_IF_FALSE(ifd);
 }
+/* CAST 慢路调用（刀2）：helper 返 0（raise 已设）→ deopt RETURN；否则留
+ * 在 IF_FALSE 继续——调用方以 END 收 ELSE 线再 MERGE（binop 同款姿势）。
+ * 慢体自释放旧 dst → 发射器绝不在该分支前置 rel_dst_gate（防双释放）。 */
+static void call_slow_cast(JitC *j, int ct, ir_ref da,
+                           ir_ref ta, ir_ref pa) {
+    JIT_CTX();
+    ir_ref args[5] = { j->r_vm, ir_CONST_I32(ct), da, ta, pa };
+    ir_ref ok = ir_CALL_N(IR_I32,
+                          ir_CONST_ADDR((uintptr_t)tphp_jit_cast_slow), 5, args);
+    ir_ref ifd = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifd);
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+    ir_IF_FALSE(ifd);
+}
 
 static ir_ref make_truthy(JitC *j, ir_ref tag, ir_ref pay, ir_ref addr) {
     JIT_CTX();
@@ -1102,6 +1151,32 @@ static void store_bool(JitC *j, ir_ref da, ir_ref cond) {
     ir_MERGE_2(eT, eF);
 }
 
+/* 刀2（11-04 释放门）：JIT 快线裸 store 覆盖旧 dst 不释放——解释器所有
+ * 写值 op 都走 wtake（先 release 旧值再写），快线漏释即泄漏族
+ * （tools/probe_release_family.php 实证 add/cmp/not/cast/const/incsuf/
+ * call 七类 JIT on 0/300、off 300/300）。本门 = 写前释放旧 dst：
+ * - 标量/UNDEF（tag<T_STR 或 >T_CLOSURE）跳过；≥T_STR 走 tval_release
+ *   （interned/rc 递减/析构全在其内，与 wtake 同一函数）；
+ * - 慢路分支不发（slow helper 内 compute 后自释放——前置门会双释放）；
+ * - emit 判别 dst==源槽且该分支源必为标量（both_int/标量叶/fold other
+ *   ==ar）→ 免发：分支条件即证明 dst 为标量，门恒空转。
+ * 安全先例：IR 内 CALL tval_release 无 setjmp 已有三处（UNSET_CV、
+ * dimic_take rc==1 支、mcall $this 归还）；块结构与 dimic_take release
+ * 段同款（IF+END/MERGE_2）。 */
+static void rel_dst_gate(JitC *j, ir_ref da) {
+    JIT_CTX();
+    ir_ref td = load_tag(j, da);
+    ir_ref ifd = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(td, ir_CONST_I32(T_STR)), ir_LE(td, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifd);
+        ir_ref tr[1] = { da };
+        ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+        ir_ref eR = ir_END();
+    ir_IF_FALSE(ifd);
+        ir_ref eS = ir_END();
+    ir_MERGE_2(eR, eS);
+}
+
 /* ---- P0-13 v2：FETCH_DIM_R 命中路径全内联（JSC Baseline IC 形态）----
  * 两条互斥快路：packed int 直取（array-read 主形态）/ DimIC hash 快照
  * （kv-read 主形态）。IC 链序照抄 tarr_get_ic：arr→buckets→bpending→
@@ -1143,6 +1218,15 @@ static void dimic_miss(DimIcCtx *g, bool count) {
  *     与正常色 rc>1 都是 rc--，正交等价，无需查 color）；标量/interned/
  *     rc==1（= DEAD rc-- 或 switch destroy 慢路）→ call tval_release 原样
  *   misses 清零（叶子命中 = 形态稳定）随取值一并生成 */
+/* P0-17③ take 消融结论（11-04，tools/ablate_take.php）：两门动态执行≈0
+ * （INT 短路 4 指令），总税 0.070 ≈ array-read 25% 全在静态布局（冷段
+ * 横跨热 fast→MERGE ~2-3 周期/迭代）。两个修复方案已实测否决：
+ * - outline（两门移 C helper tphp_dimic_take_slow）：string 场景 CALL 税
+ *   +18.8%（kv 0.1404→0.1668）、int 无收益；
+ * - 双 INT 快路（IF 跳两门）：int 收益在噪声内（6 轮 0.307 vs 0.3117）、
+ *   str 微退（0.142 vs 0.1404），guard 自身也付 EQ×2+AND+IF。
+ * 结论：保 HEAD 内联形态；余下税 = 后端 block layout（~0.016）+ 形态
+ * guard（~0.05，需类型反馈/形态证明），记 backlog 不在本刀动。 */
 static void dimic_take(DimIcCtx *g, ir_ref vaddr) {
     JitC *j = g->j;
     JIT_CTX();
@@ -1340,6 +1424,14 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
     return ir_END();
 }
 
+/* 刀2：dst 与任一源操作数同槽判定——kind+index 双等才算（CV/TMP 下标域
+ * 经 +n_locals 互不相交；CONST 的 lit 下标可能与槽下标撞数，kind 必查）。
+ * 用于 both_int/标量叶等"分支已证源为标量"处跳过 rel_dst_gate。 */
+static bool dst_src_alias(TOp *op) {
+    return (op->t1 == op->tr && op->a1 == op->ar) ||
+           (op->t2 == op->tr && op->a2 == op->ar);
+}
+
 static void lower_binop(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
@@ -1357,6 +1449,10 @@ static void lower_binop(JitC *j, TOp *op) {
                              ir_EQ(tb, ir_CONST_I32(JT_INT)));
         ir_ref ifx = ir_IF(both);
         ir_IF_TRUE(ifx);
+            /* 刀2 释放门：快线裸存前 release 旧 dst（wtake 语义）。
+             * both_int 分支内 dst 若即源槽（$x=$x+1 形态）必为 INT →
+             * 标量免释，emit 判别跳过（慢路 binop_slow 自释放不发） */
+            if (!dst_src_alias(op)) rel_dst_gate(j, da);
             ir_ref sum = op->op == OP_ADD ? ir_ADD_I64(pa, pb)
                                           : ir_SUB_I64(pa, pb);
             ir_ref of;
@@ -1404,6 +1500,7 @@ static void lower_cmp(JitC *j, TOp *op) {
     if (op->op == OP_CMP) {
         ir_ref ifx = ir_IF(both_int);
         ir_IF_TRUE(ifx);
+            if (!dst_src_alias(op)) rel_dst_gate(j, da);   /* 刀2 释放门 */
             ir_ref lt = ir_LT(pa, pb);
             ir_ref gt = ir_LT(pb, pa);
             ir_ref iflt = ir_IF(lt);
@@ -1430,6 +1527,7 @@ static void lower_cmp(JitC *j, TOp *op) {
     }
     ir_ref ifx = ir_IF(both_int);
     ir_IF_TRUE(ifx);
+        if (!dst_src_alias(op)) rel_dst_gate(j, da);   /* 刀2 释放门 */
         ir_ref c;
         switch (op->op) {
         case OP_EQ:  case OP_SEQ: c = ir_EQ(pa, pb); break;
@@ -1529,20 +1627,25 @@ static void lower_un(JitC *j, TOp *op) {
          * RDX 竞争败给 preserved r14 而侥幸未现。上游 ir_ra.c 与 HEAD
          * 一致（无现成修复）；内联镜像 tphp_jit_tv_copy 语义（addref src
          * → release dst → 16B store），chunk 内不再有该调用形态。 */
-        if (j->osr) {
-            lower_tv_copy_inline(j, da, aa);
-        } else {
-            ir_ref t[2] = { da, aa };
-            ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_tv_copy), 2, t);
-        }
+        /* 刀2 连带修复（11-04 foreach×cmp 门崩溃）：非 OSR 形态一并内联——
+         * 实测函数级 emit 下，lower_cmp 新增释放门（IF+CALL+MERGE）扰动
+         * LSRA 后，本 CALL 两实参被 hint 进易失实参寄存器且不回装，
+         * tphp_jit_tv_copy(src=0x1) 0xC0000005（m_b/m_g/m_i 最小复现，
+         * 关门即消失）。与批2-6 OSR 内联同族根因（deps/ir LSRA 实参 hint
+         * 窗口 bug，上游 ir_ra.c 无现成修复）→ 调用形态整体撤除。 */
+        lower_tv_copy_inline(j, da, aa);
         break;
     case OP_BOOL_NOT: {
         ir_ref t = make_truthy(j, ta, pa, aa);
+        /* 刀2 释放门：结果恒标量而 dst 无约束（dst 即源槽时源可能是串，
+         * 不释放即漏）→ 恒发，不可 emit 跳过 */
+        rel_dst_gate(j, da);
         store_bool(j, da, ir_NOT_B(t));
         break;
     }
     case OP_BOOL_VAL: {
         ir_ref t = make_truthy(j, ta, pa, aa);
+        rel_dst_gate(j, da);   /* 刀2 释放门（同 BOOL_NOT：恒发） */
         store_bool(j, da, t);
         break;
     }
@@ -1555,18 +1658,34 @@ static void lower_un(JitC *j, TOp *op) {
     case OP_CAST: {
         int64_t ct = j->fn->lits[op->a2].u.i;   /* 1=int 2=bool 3=float */
         if (ct == 2) {
-            store_bool(j, da, make_truthy(j, ta, pa, aa));
+            ir_ref t = make_truthy(j, ta, pa, aa);
+            rel_dst_gate(j, da);   /* 刀2 释放门（结果标量、dst 无约束→恒发） */
+            store_bool(j, da, t);
         } else if (ct == 1) {
-            ir_ref ifi = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
-            ir_IF_TRUE(ifi);
-                store_imm(j, da, JT_INT, pa);
-                ir_ref eI = ir_END();
-            ir_IF_FALSE(ifi);
-                ir_ref iff = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_FLOAT)));
-                ir_IF_TRUE(iff);
-                    store_imm(j, da, JT_INT, ir_FP2I64(ir_LOAD_D(aa)));
-                    ir_ref eF = ir_END();
-                ir_IF_FALSE(iff);
+            /* 刀2 修复（错值+泄漏双 bug）：
+             * - 旧链 FLOAT 叶 FP2I64 裸转——NAN/超范围 tval_to_int 应
+             *   raise 却静默转垃圾；旧最终 else 对 STR/ARR 恒存 0——
+             *   (int)"5" 应得 5（probe ci 实测 JIT on 0、off 5）。
+             * - 新：快叶收窄为 INT/TRUE/NULL/FALSE（tval_to_int 不 raise
+             *   且可内联的全部形态），FLOAT/STR/ARR/UNDEF 落慢路 helper
+             *   （语义源 tval_to_int，raise 走 setjmp→deopt）。
+             * - 快叶写前释放旧 dst：别名 $s=(int)$s 时分支条件已证源为
+             *   标量 → 门空转，emit 判别跳过；慢路 helper 自释放，绝不在
+             *   ELSE 前置门（四象限：别名/非别名 × 快/慢均单次释放）。 */
+            ir_ref fast = ir_OR(IR_BOOL,
+                ir_EQ(ta, ir_CONST_I32(JT_INT)),
+                ir_OR(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_TRUE)),
+                    ir_OR(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_NULL)),
+                          ir_EQ(ta, ir_CONST_I32(JT_FALSE)))));
+            ir_ref iff = ir_IF(fast);
+            ir_IF_TRUE(iff);
+                if (!(op->t1 == op->tr && op->a1 == op->ar))
+                    rel_dst_gate(j, da);
+                ir_ref ifi = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
+                ir_IF_TRUE(ifi);
+                    store_imm(j, da, JT_INT, pa);
+                    ir_ref eI = ir_END();
+                ir_IF_FALSE(ifi);
                     ir_ref ift = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_TRUE)));
                     ir_IF_TRUE(ift);
                         store_imm(j, da, JT_INT, ir_CONST_I64(1));
@@ -1576,34 +1695,55 @@ static void lower_un(JitC *j, TOp *op) {
                         ir_ref e0 = ir_END();
                     ir_MERGE_2(eT, e0);
                     ir_ref eRest = ir_END();
-                ir_MERGE_2(eF, eRest);
-                ir_ref eNF = ir_END();
-            ir_MERGE_2(eI, eNF);
-        } else {
-            ir_ref ifl = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_FLOAT)));
-            ir_IF_TRUE(ifl);
-                store_imm(j, da, JT_FLOAT, ir_BITCAST_U64(ir_LOAD_D(aa)));
-                ir_ref eF = ir_END();
-            ir_IF_FALSE(ifl);
-                ir_ref ifi = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
-                ir_IF_TRUE(ifi);
-                    store_imm(j, da, JT_FLOAT, ir_BITCAST_U64(ir_INT2D(pa)));
-                    ir_ref eI = ir_END();
-                ir_IF_FALSE(ifi);
-                    ir_ref ift = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_TRUE)));
-                    ir_IF_TRUE(ift);
-                        store_imm(j, da, JT_FLOAT,
-                                  ir_BITCAST_U64(ir_CONST_DOUBLE(1.0)));
-                        ir_ref eT = ir_END();
-                    ir_IF_FALSE(ift);
-                        store_imm(j, da, JT_FLOAT,
-                                  ir_BITCAST_U64(ir_CONST_DOUBLE(0.0)));
-                        ir_ref e0 = ir_END();
-                    ir_MERGE_2(eT, e0);
-                    ir_ref eRest = ir_END();
                 ir_MERGE_2(eI, eRest);
-                ir_ref eNF = ir_END();
-            ir_MERGE_2(eF, eNF);
+                ir_ref eFast = ir_END();
+            ir_IF_FALSE(iff);
+                call_slow_cast(j, 1, da, ta, pa);
+                ir_ref eSlow = ir_END();
+            ir_MERGE_2(eFast, eSlow);
+        } else {
+            /* ct==3（float）：快叶 FLOAT/INT/TRUE/NULL/FALSE（tval_to_float
+             * 对其全不 raise）；STR/ARR/OBJ 等落慢路——旧链对 STR 静默给
+             * 0.0，(float)"5.5" 应得 5.5（probe cf 实测 off 得 5.5）。 */
+            ir_ref fast = ir_OR(IR_BOOL,
+                ir_EQ(ta, ir_CONST_I32(JT_FLOAT)),
+                ir_OR(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_INT)),
+                    ir_OR(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_TRUE)),
+                        ir_OR(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_NULL)),
+                              ir_EQ(ta, ir_CONST_I32(JT_FALSE))))));
+            ir_ref iff = ir_IF(fast);
+            ir_IF_TRUE(iff);
+                if (!(op->t1 == op->tr && op->a1 == op->ar))
+                    rel_dst_gate(j, da);
+                ir_ref ifl = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_FLOAT)));
+                ir_IF_TRUE(ifl);
+                    store_imm(j, da, JT_FLOAT, ir_BITCAST_U64(ir_LOAD_D(aa)));
+                    ir_ref eF = ir_END();
+                ir_IF_FALSE(ifl);
+                    ir_ref ifi = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
+                    ir_IF_TRUE(ifi);
+                        store_imm(j, da, JT_FLOAT, ir_BITCAST_U64(ir_INT2D(pa)));
+                        ir_ref eI = ir_END();
+                    ir_IF_FALSE(ifi);
+                        ir_ref ift = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_TRUE)));
+                        ir_IF_TRUE(ift);
+                            store_imm(j, da, JT_FLOAT,
+                                      ir_BITCAST_U64(ir_CONST_DOUBLE(1.0)));
+                            ir_ref eT = ir_END();
+                        ir_IF_FALSE(ift);
+                            store_imm(j, da, JT_FLOAT,
+                                      ir_BITCAST_U64(ir_CONST_DOUBLE(0.0)));
+                            ir_ref e0 = ir_END();
+                        ir_MERGE_2(eT, e0);
+                        ir_ref eRest = ir_END();
+                    ir_MERGE_2(eI, eRest);
+                    ir_ref eNF = ir_END();
+                ir_MERGE_2(eF, eNF);
+                ir_ref eFast = ir_END();
+            ir_IF_FALSE(iff);
+                call_slow_cast(j, 3, da, ta, pa);
+                ir_ref eSlow = ir_END();
+            ir_MERGE_2(eFast, eSlow);
         }
         break;
     }
@@ -1653,6 +1793,10 @@ static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
          * helper（UNDEF→NULL + addref，与 do_incdec 逐位同语义） */
         ir_ref ifs = ir_IF(ir_LT(ta, ir_CONST_I32(5)));   /* T_STR=5 起非标量 */
         ir_IF_TRUE(ifs);
+            /* 刀2 释放门：dst 即源槽（$x++ 形态）时分支已证其为标量 →
+             * 免发；dst≠源槽时 dst 旧值可能是串，裸存前必释放 */
+            if (!(op->tr == op->t1 && op->ar == op->a1))
+                rel_dst_gate(j, dstA);
             store_pay(j, dstA, pa);          /* 动态 tag/payload：store_imm 的 */
             store_tag(j, dstA, ta);          /* tag 是立即数，传 ref 会存 ref-id */
             ir_ref eS = ir_END();
@@ -1695,6 +1839,9 @@ static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
         ir_ref nt = load_tag(j, aa), np = load_pay(j, aa);
         ir_ref ifp = ir_IF(ir_LT(nt, ir_CONST_I32(5)));
         ir_IF_TRUE(ifp);
+            /* 刀2 释放门（同 suffix 标量叶）：dst==源槽免发，否则先释放 */
+            if (!(op->tr == op->t1 && op->ar == op->a1))
+                rel_dst_gate(j, dstA);
             store_pay(j, dstA, np);
             store_tag(j, dstA, nt);
             ir_ref eP = ir_END();
@@ -1927,6 +2074,8 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_IF_FALSE(ifx);
             if (doop->tr != OPD_UNUSED) {
                 ir_ref da = slot_addr(j, doop->ar);
+                rel_dst_gate(j, da);   /* 刀2 释放门：结果覆盖旧 dst，镜像
+                    * op_do_fcall 的 tval_release(d); d=r; */
                 store_pay(j, da, ir_LOAD_I64(ret_sc));
                 store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
             }
@@ -2021,6 +2170,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_MERGE_2(eslow, efast);
         if (doop->tr != OPD_UNUSED) {
             ir_ref da = slot_addr(j, doop->ar);
+            rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧 dst） */
             store_pay(j, da, ir_LOAD_I64(ret_sc));
             store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
         }
@@ -2146,6 +2296,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
+        rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧 dst） */
         store_pay(j, da, ir_LOAD_I64(ret_sc));
         store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc,
                                               ir_CONST_ADDR(TVAL_TAG))));
@@ -2697,8 +2848,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                                 ir_CONST_ADDR((uintptr_t)&j->fn->lits[op->a1]) };
                 ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_lit_set), 2, t);
             } else {
-                store_imm(j, slot_addr(j, op->ar), (int32_t)v.t,
-                          ir_CONST_I64(v.u.i));
+                /* 刀2 释放门：字面量恒不与 dst 同槽，无可证免释 → 恒发
+                 * （解释器 op_const = tval_addref + wtake，亦先释旧值） */
+                ir_ref da = slot_addr(j, op->ar);
+                rel_dst_gate(j, da);
+                store_imm(j, da, (int32_t)v.t, ir_CONST_I64(v.u.i));
             }
             pc++;
             break;
@@ -2972,6 +3126,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                             ir_IF_TRUE(iff);
                                 /* fast：dst 直写（两 op 效果），fwd 前向汇合
                                  * ——fast 块终止于 fwd_end（脱离本链） */
+                                /* 刀2 释放门：other 即 dst 槽（含 phion，
+                                 * 恒 other==ar）时 otag==daddr tag，okint
+                                 * 已证 dst 为 INT → 免发；否则 dst 旧值
+                                 * 无约束，写前释放（解释器 ADD 亦 wtake） */
+                                if (other_a != aop->ar) rel_dst_gate(j, daddr);
                                 if (phion) {
                                     store_pay(j, daddr, ssum);
                                 } else {
