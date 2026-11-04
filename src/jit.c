@@ -897,6 +897,22 @@ typedef struct {
     ir_ref acc_iter;        /* fwd merge reconcile phi（回边喂入口） */
     uint32_t acc_slot;      /* acc 槽 idx */
     uint8_t acc_on;         /* 本层循环 acc 跟踪激活 */
+    /* POC array-read preguard（memory/2026-11-04 §1 路线甲）：每层循环
+     * 的 FETCH base 不变量外提。循环头 push 时 preguard_scan 静态证明
+     * 体内（hdr..唯一回边）对 base 槽零 store、零数组变更（纯 op 白名单
+     * + 写点扫描；tphp 无引用类型 → 无别名逃逸）→ 在循环前驱块一次求值
+     * inv(tag==T_ARR)/payload/packed/n/data，体内 FETCH 只留 key 残余
+     * （$i 经 INC 可溢出变 FLOAT → key tag/ULT 不可外提），慢路 v1
+     * helper 照旧完整兜底。证明失败 → 该层 0 候选 = 原逐迭代装载，
+     * 语义零漂移。 */
+    enum { JIT_PRE_MAX = 4 };
+    int pre_n[JIT_MAX_LOOPS];          /* 本层候选数（头 push 时重置） */
+    uint32_t pre_slot[JIT_MAX_LOOPS][JIT_PRE_MAX];
+    ir_ref pre_inv[JIT_MAX_LOOPS][JIT_PRE_MAX];  /* tag==T_ARR（前驱块求值，非 phi） */
+    ir_ref pre_a[JIT_MAX_LOOPS][JIT_PRE_MAX];    /* TArr* payload phi（IR_I64） */
+    ir_ref pre_pk[JIT_MAX_LOOPS][JIT_PRE_MAX];   /* packed U8 phi */
+    ir_ref pre_n64[JIT_MAX_LOOPS][JIT_PRE_MAX];  /* (u64)n phi */
+    ir_ref pre_dt[JIT_MAX_LOOPS][JIT_PRE_MAX];   /* data 指针 phi（IR_ADDR） */
     int lb_jmpnz[JIT_MAX_LOOPS];  /* 批5挡板: 本层循环体内 emit 过 JMPNZ(||)
                                    * ——||结果喂 continue 的 pending 与 MERGE_N
                                    * 组合在 O1 下值错（ms1/ms2/ms5 最小复现，
@@ -1035,7 +1051,37 @@ static ir_ref make_truthy(JitC *j, ir_ref tag, ir_ref pay, ir_ref addr) {
     ir_ref d = ir_LOAD_D(addr);
     ir_ref flt0 = ir_AND(IR_BOOL, is_flt, ir_EQ(d, ir_CONST_DOUBLE(0.0)));
     ir_ref falsy2 = ir_OR(IR_BOOL, falsy, flt0);
-    return ir_NOT_B(falsy2);
+    /* P0-cond（11-04 实测分歧修复）：对齐 tval_to_bool 的 STR/ARR 分支——
+     * 旧链缺此两支，JIT 下 if("")/if([]) 恒真而解释器为假（探针实锤）。
+     * tag 键控菱形：只在自身 tag 为真时解引用 payload，零跨类型解引用；
+     * 假分支 phi 喂 false（恒被掩蔽）。UNDEF 不在此收口：op_bool_not 对
+     * UNDEF 走 to_bool 默认(true)，仅 JMP位显式 falsy——由调用方
+     * cond_truthy 加门，保各位语义与解释器各自一致。 */
+    ir_ref is_s = ir_EQ(tag, ir_CONST_I32(T_STR));
+    ir_ref ifs = ir_IF(is_s);
+    ir_IF_TRUE(ifs);
+        ir_ref len = ir_LOAD_U32(ir_ADD_A(pay, ir_CONST_ADDR(offsetof(TStr, len))));
+        ir_ref c0 = ir_LOAD_U8(ir_ADD_A(pay, ir_CONST_ADDR(offsetof(TStr, c))));
+        ir_ref sf = ir_OR(IR_BOOL, ir_EQ(len, ir_CONST_U32(0)),
+                   ir_AND(IR_BOOL, ir_EQ(len, ir_CONST_U32(1)),
+                          ir_EQ(c0, ir_CONST_U8('0'))));
+        ir_ref eS = ir_END();
+    ir_IF_FALSE(ifs);
+        ir_ref eSf = ir_END();
+    ir_MERGE_2(eS, eSf);
+    ir_ref strf = ir_PHI_2(IR_BOOL, sf, ir_CONST_BOOL(false));
+    ir_ref is_a = ir_EQ(tag, ir_CONST_I32(T_ARR));
+    ir_ref ifa = ir_IF(is_a);
+    ir_IF_TRUE(ifa);
+        ir_ref n = ir_LOAD_U32(ir_ADD_A(pay, ir_CONST_ADDR(offsetof(TArr, n))));
+        ir_ref af = ir_EQ(n, ir_CONST_U32(0));
+        ir_ref eA = ir_END();
+    ir_IF_FALSE(ifa);
+        ir_ref eAf = ir_END();
+    ir_MERGE_2(eA, eAf);
+    ir_ref arrf = ir_PHI_2(IR_BOOL, af, ir_CONST_BOOL(false));
+    ir_ref falsy3 = ir_OR(IR_BOOL, falsy2, ir_OR(IR_BOOL, strf, arrf));
+    return ir_NOT_B(falsy3);
 }
 static void store_bool(JitC *j, ir_ref da, ir_ref cond) {
     JIT_CTX();
@@ -2252,6 +2298,137 @@ static uint32_t fold_acc_scan(TFunc *fn, uint32_t hdr) {
     return 0;                               /* 体尾无回边 */
 }
 
+/* ==== POC array-read preguard（memory/2026-11-04 §1 路线甲） ==== */
+
+static int preguard_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_PREGUARD");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;  /* 默认开；TPHP_PREGUARD=0 关（A/B） */
+    }
+    return v;
+}
+
+/* 体内白名单：仅"读任意 + 写自身标量槽"的纯 op（emit 层语义已审计：
+ * 无调用、无数组变更、无 RETURN/THROW/FE）。白名单外任何 op → 整循环
+ * 放弃外提。tphp 无引用类型（无 T_REF/OP_REF）→ 槽写即全部可变面，
+ * 不存在别名逃逸改写 base 的路径。 */
+static int pre_pure_op(const TOp *op) {
+    switch (op->op) {
+    case OP_CONST: case OP_COPY:
+    case OP_ADD: case OP_SUB:
+    case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE:
+    case OP_LT: case OP_LE: case OP_CMP:
+    case OP_JMP: case OP_JMPZ: case OP_JMPNZ:
+    case OP_BOOL_VAL:                     /* make_truthy 纯读 + 写 tmp（循环
+                                           * cond 恒发 BOOL_VAL→JMPZ 形态）*/
+    case OP_FETCH_DIM_R:                 /* 只读 base（helper/IC 亦只读） */
+    case OP_INC: case OP_DEC:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* op 对槽 s 的写点（镜像各 lower 的写入位置；无 dst 判别的 op 按 ar
+ * 保守恒算写——只多取消候选，不会漏取消）。跳转族 ar=目标 pc，非槽写。 */
+static int pre_op_writes(const TOp *op, uint32_t s) {
+    switch (op->op) {
+    case OP_JMP: case OP_JMPZ: case OP_JMPNZ:
+        return 0;
+    case OP_INC: case OP_DEC:
+        return op->a1 == s || op->ar == s;   /* RMW 恒写 a1，有 dst 另写 ar */
+    default:
+        return op->ar == s;
+    }
+}
+
+/* 循环 [hdr..be] 不变量候选扫描：单回边、单前驱入口、区域白名单、
+ * 体内对 base 槽零 store。返回候选槽数（0 = 不做外提）。 */
+static int preguard_scan(TFunc *fn, uint32_t hdr, uint32_t *out, int nmax) {
+    const char *why = NULL;         /* 拒因（jit_dbg 常开风格同 osr reject）*/
+    uint32_t badpc = hdr;
+    if (hdr >= fn->n_ops || nmax <= 0) return 0;
+    /* 单回边：多回边形态（if 内 continue ≥2 回跳头）先不做 */
+    uint32_t be = 0;
+    int nb = 0;
+    for (uint32_t i = hdr + 1; i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if (op->op == OP_JMP && op->ar == hdr) { nb++; be = i; }
+    }
+    if (nb != 1) { why = "not single backedge"; goto out; }
+    /* 单前驱入口：fall-through + pc<hdr 跳入 hdr 合计 ≤1（多入口时
+     * 前驱块可能不经外提菱形 → 支配失败）；外部跳入体内 [hdr,be] → 放弃 */
+    int fpred = 0;
+    if (hdr > 0) {
+        TOp *pv = &fn->ops[hdr - 1];
+        if (pv->op != OP_JMP && pv->op != OP_JMPZ && pv->op != OP_JMPNZ &&
+            pv->op != OP_RETURN)
+            fpred = 1;                      /* 已知非落空的控制 op 之外一律
+                                             * 按落空计（多计只会多放弃=安全）*/
+    }
+    for (uint32_t i = 0; i < hdr; i++) {
+        TOp *op = &fn->ops[i];
+        if (op->op != OP_JMP && op->op != OP_JMPZ && op->op != OP_JMPNZ)
+            continue;
+        if (op->ar == hdr) fpred++;
+        else if (op->ar > hdr && op->ar <= be) {
+            why = "ext jump into body"; badpc = i; goto out;
+        }
+    }
+    for (uint32_t i = be + 1; i < fn->n_ops; i++) {   /* 体后跳入头/体内 */
+        TOp *op = &fn->ops[i];
+        if ((op->op == OP_JMP || op->op == OP_JMPZ || op->op == OP_JMPNZ) &&
+            op->ar >= hdr && op->ar <= be) {
+            why = "post jump into body"; badpc = i; goto out;
+        }
+    }
+    if (fpred > 1) { why = "multi forward pred"; goto out; }
+    /* 区域白名单 + 候选 base 收集 */
+    uint32_t cand[8];
+    int nc = 0;
+    for (uint32_t i = hdr; i <= be; i++) {
+        TOp *op = &fn->ops[i];
+        if (!pre_pure_op(op)) {
+            why = tphp_op_name(op->op); badpc = i; goto out;
+        }
+        if (op->op == OP_JMP || op->op == OP_JMPZ || op->op == OP_JMPNZ) {
+            if (op->ar < hdr) { why = "backward out of region"; badpc = i; goto out; }
+            /* ar==hdr=唯一回边（nb==1 已证）；ar∈(hdr,be]=内层回边头在
+             * 区域内（嵌套循环，其自身 push 时再扫）；ar>be=正向出口 */
+        }
+        if (op->op == OP_FETCH_DIM_R &&
+            (op->t1 == OPD_CV || op->t1 == OPD_TMP)) {
+            int seen = 0;
+            for (int k = 0; k < nc; k++) if (cand[k] == op->a1) seen = 1;
+            if (!seen && nc < 8) cand[nc++] = op->a1;
+        }
+    }
+    /* 写点过滤：体内对 base 槽零 store 才可外提 */
+    int out_n = 0;
+    for (int k = 0; k < nc; k++) {
+        int wr = 0;
+        for (uint32_t i = hdr; i <= be && !wr; i++)
+            if (pre_op_writes(&fn->ops[i], cand[k])) wr = 1;
+        if (!wr && out_n < nmax) out[out_n++] = cand[k];
+    }
+    return out_n;
+out:
+    if (why && jit_dbg())
+        fprintf(stderr, "[jit] preguard reject hdr=%u pc=%u: %s\n",
+                hdr, badpc, why);
+    return 0;
+}
+
+/* 体内 FETCH 查本层（最内活跃循环）候选：-1 = 无外提，走原装载 */
+static int preguard_lookup(JitC *j, uint32_t slot) {
+    if (j->loop_sp <= 0) return -1;
+    int k = j->loop_sp - 1;
+    for (int i = 0; i < j->pre_n[k]; i++)
+        if (j->pre_slot[k][i] == slot) return i;
+    return -1;
+}
+
 static Trap trap_end(ir_ref e, uint32_t t) { Trap x = { TR_END, e, t }; return x; }
 static Trap trap_ret(void)  { Trap x = { TR_RET, 0, 0 }; return x; }
 static Trap trap_fail(void) { Trap x = { TR_FAIL, 0, 0 }; return x; }
@@ -2293,6 +2470,94 @@ static ir_ref cond_addr(JitC *j, uint8_t kind, uint32_t a, ir_ref *tag_out,
     return ad;
 }
 
+/* ---- P0-cond：条件位 truthy 特化（11-04 量化：cond 段≈56% 热路径） ---- */
+
+static int is_jump_target(TFunc *fn, uint32_t pc) {
+    for (uint32_t i = 0; i < fn->n_ops; i++) {
+        TOp *op = &fn->ops[i];
+        if ((op->op == OP_JMP || op->op == OP_JMPZ || op->op == OP_JMPNZ) &&
+            op->ar == pc)
+            return 1;
+    }
+    return 0;
+}
+
+/* op 对槽 slot 的写点与产出类型三态：1=写（is_bool 出参）、0=不写、
+ * -1=不认识（可能写了 → 调用方铁律放弃）。仅列已审计写点的 op：
+ * 价值 op 恒写 ar（lower_un/lower_binop/lower_cmp/dim 系列实证），跳转族
+ * ar=目标非槽写，INC/DEC RMW 恒写 a1。 */
+static int op_slot_write_bool(const TOp *op, const TFunc *fn, uint32_t slot,
+                              int *is_bool) {
+    *is_bool = 0;
+    switch (op->op) {
+    case OP_JMP: case OP_JMPZ: case OP_JMPNZ:
+        return 0;
+    case OP_INC: case OP_DEC:
+        return (op->a1 == slot || op->ar == slot) ? 1 : 0;
+    /* 恒产 bool（dst=ar） */
+    case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE: case OP_LT: case OP_LE:
+    case OP_BOOL_VAL: case OP_BOOL_NOT:
+    case OP_ISSET_DIM: case OP_ISSET_CV: case OP_ISSET_GLOBAL:
+    case OP_ISSET_PROP: case OP_ISSET_OSPROP:
+        if (op->ar == slot) { *is_bool = 1; return 1; }
+        return 0;
+    case OP_CAST:
+        /* ct 编码在 lits[a2]：1=int 2=bool 3=float（lower_un 同读） */
+        if (op->ar == slot) { *is_bool = fn->lits[op->a2].u.i == 2; return 1; }
+        return 0;
+    /* 已知写者、非 bool（dst=ar） */
+    case OP_CONST: case OP_COPY: case OP_ASSIGN:
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_POW:
+    case OP_CONCAT: case OP_BW_AND: case OP_BW_OR: case OP_BW_XOR:
+    case OP_SHL: case OP_SHR: case OP_CMP:
+    case OP_NEG: case OP_POS: case OP_BIT_NOT:
+    case OP_FETCH_DIM_R: case OP_FETCH_GLOBAL:
+    case OP_FETCH_PROP: case OP_FETCH_OSPROP: case OP_FETCH_CCONST:
+    case OP_FETCH_CONST:
+        return op->ar == slot ? 1 : 0;
+    default:
+        return -1;
+    }
+}
+
+/* cond 槽最近写者恒产 bool？——反向直线扫描。判定次序（11-04 修正：
+ * 旧版先查跳入 → 循环头=回边目标恰好是 def 点（LT 在头）被误杀，特化
+ * 全军覆没）：
+ *   ① 首个写者命中 → 返回——其上 (k, jpc] 段已逐点验证无旁入口/无断流，
+ *      其余入口只能经 k 本身（必经 def）⇒ 声明 sound；
+ *   ② 非写者的跳入目标 → 放弃（下方 def 会被旁路）；JMP 断流 → 放弃；
+ *   ③ 不认识的 op → 放弃（可能写了槽）；扫到函数头无写者 → 放弃。
+ * jpc 自身是跳入目标 → 直接放弃（存在绕过全部下方 def 的入边）。 */
+static int cond_def_is_bool(TFunc *fn, uint32_t jpc, uint8_t kind, uint32_t a) {
+    if (kind != OPD_CV && kind != OPD_TMP) return 0;
+    if (jpc == 0 || is_jump_target(fn, jpc)) return 0;
+    for (uint32_t k = jpc; k > 0; ) {
+        k--;
+        TOp *op = &fn->ops[k];
+        int isb = 0;
+        int w = op_slot_write_bool(op, fn, a, &isb);
+        if (w < 0) return 0;
+        if (w) return isb;
+        if (op->op == OP_JMP) return 0;
+        if (is_jump_target(fn, k)) return 0;
+    }
+    return 0;
+}
+
+/* 条件位 truthy 统一出口：写者恒 bool → (tag==TRUE) 单节点（跳过全类型链；
+ * UNDEF≠TRUE 天然 falsy，与 op_jmpz 的 UNDEF 门一致）；否则全类型链 +
+ * UNDEF 门（对齐 op_jmpz/jmpnz：UNDEF=falsy——make_truthy 本体不收
+ * UNDEF，保 BOOL_NOT/BOOL_VAL 位与 op_bool_not 默认语义各自一致）。 */
+static ir_ref cond_truthy(JitC *j, uint32_t pc, TOp *op) {
+    JIT_CTX();
+    ir_ref ta, pa, ad;
+    ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
+    if (cond_def_is_bool(j->fn, pc, op->t1, op->a1))
+        return ir_EQ(ta, ir_CONST_I32(JT_TRUE));
+    ir_ref t = make_truthy(j, ta, pa, ad);
+    return ir_AND(IR_BOOL, t, ir_NOT_B(ir_EQ(ta, ir_CONST_I32((int32_t)T_UNDEF))));
+}
+
 static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
     JIT_CTX();
     if (j->fail) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
@@ -2327,6 +2592,48 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * （op1=LOOP_BEGIN 满足 _ir_PHI_SET_OP 断言），回边值在
              * LOOP_END 后补（ir_check 对 loop phi 豁免前向引用） */
             uint32_t acc = fold_add_enabled() ? fold_acc_scan(j->fn, pc) : 0;
+            /* POC preguard：先发不变量外提菱形（循环前驱块），保证 fold
+             * 的 init_pay/ein 仍落最终汇合块 → LOOP_BEGIN 单入不变 */
+            j->pre_n[j->loop_sp] = 0;
+            if (preguard_enabled()) {
+                uint32_t cand[JIT_PRE_MAX];
+                int nc = preguard_scan(j->fn, pc, cand, JIT_PRE_MAX);
+                for (int ci = 0; ci < nc; ci++) {
+                    ir_ref sa = slot_addr(j, cand[ci]);
+                    ir_ref tag = load_tag(j, sa);
+                    ir_ref inv = ir_EQ(tag, ir_CONST_I32(T_ARR));
+                    ir_ref pay = load_pay(j, sa);
+                    ir_ref ifv = ir_IF(inv);
+                    ir_IF_TRUE(ifv);
+                        /* 非数组槽 payload 不可解引用 → 字段装载只在
+                         * inv 真分支；假分支 phi 喂 0 恒不被消费（体内
+                         * FETCH 先测 inv 同一枚举） */
+                        ir_ref pk = ir_LOAD_U8(ir_ADD_A(pay,
+                            ir_CONST_ADDR(offsetof(TArr, packed))));
+                        ir_ref n32 = ir_LOAD_U32(ir_ADD_A(pay,
+                            ir_CONST_ADDR(offsetof(TArr, n))));
+                        ir_ref n64 = ir_ZEXT(IR_U64, n32);
+                        ir_ref dt = ir_LOAD_A(ir_ADD_A(pay,
+                            ir_CONST_ADDR(offsetof(TArr, data))));
+                        ir_ref eT = ir_END();
+                    ir_IF_FALSE(ifv);
+                        ir_ref eF = ir_END();
+                    ir_MERGE_2(eT, eF);
+                    j->pre_slot[j->loop_sp][ci] = cand[ci];
+                    j->pre_inv[j->loop_sp][ci] = inv;
+                    j->pre_a[j->loop_sp][ci] =
+                        ir_PHI_2(IR_I64, pay, ir_CONST_I64(0));
+                    j->pre_pk[j->loop_sp][ci] =
+                        ir_PHI_2(IR_U8, pk, ir_CONST_U8(0));
+                    j->pre_n64[j->loop_sp][ci] =
+                        ir_PHI_2(IR_U64, n64, ir_CONST_U64(0));
+                    j->pre_dt[j->loop_sp][ci] =
+                        ir_PHI_2(IR_ADDR, dt, ir_CONST_ADDR(0));
+                }
+                j->pre_n[j->loop_sp] = nc;
+                if (nc > 0 && jit_dbg())
+                    fprintf(stderr, "[jit] preguard hdr=%u n=%d\n", pc, nc);
+            }
             ir_ref init_pay = 0;
             if (acc) init_pay = load_pay(j, slot_addr(j, acc));
             ir_ref ein = ir_END();
@@ -2492,12 +2799,22 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             g.a = g.kt = g.kp = IR_UNUSED;
             g.kt = load_tag(j, g.key);
             g.kp = load_pay(j, g.key);
-            ir_ref ifa = ir_IF(ir_EQ(load_tag(j, g.base), ir_CONST_I32(T_ARR)));
+            /* POC preguard：命中本层候选 → 守卫条件与不变量字段取循环
+             * 前驱块外提值（inv/payload/packed/n/data），key 残余（kt/
+             * ULT）与慢路 v1 helper 照旧；未命中 → 原逐迭代装载 */
+            int pi = preguard_lookup(j, op->a1);
+            int lvl = j->loop_sp - 1;
+            ir_ref ifa = ir_IF(pi >= 0
+                ? j->pre_inv[lvl][pi]
+                : ir_EQ(load_tag(j, g.base), ir_CONST_I32(T_ARR)));
             ir_IF_TRUE(ifa);
-                g.a = load_pay(j, g.base);
+                g.a = (pi >= 0) ? j->pre_a[lvl][pi] : load_pay(j, g.base);
                 /* 互斥键路径：packed int 直取 vs hash 快照 */
                 ir_ref pcond = ir_AND(IR_BOOL,
-                    ir_NE(ir_LOAD_U8(ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, packed)))),
+                    ir_NE(pi >= 0
+                              ? j->pre_pk[lvl][pi]
+                              : ir_LOAD_U8(ir_ADD_A(g.a,
+                                    ir_CONST_ADDR(offsetof(TArr, packed)))),
                           ir_CONST_U8(0)),
                     ir_EQ(g.kt, ir_CONST_I32(JT_INT)));
                 ir_ref ifp = ir_IF(pcond);
@@ -2505,12 +2822,17 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     /* (u64)key < (u64)n 单条无符号比较：天然覆盖 i<0
                      * （负数 = 巨大无符号）与 i>=n，与 helper 的
                      * i>=0 && (uint32)i<n 等价 */
-                    ir_ref n64 = ir_ZEXT(IR_U64,
-                        ir_LOAD_U32(ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, n)))));
+                    ir_ref n64 = pi >= 0
+                        ? j->pre_n64[lvl][pi]
+                        : ir_ZEXT(IR_U64,
+                              ir_LOAD_U32(ir_ADD_A(g.a,
+                                  ir_CONST_ADDR(offsetof(TArr, n)))));
                     ir_ref ifb = ir_IF(ir_ULT(ir_BITCAST_U64(g.kp), n64));
                     ir_IF_TRUE(ifb);
-                        ir_ref data = ir_LOAD_A(
-                            ir_ADD_A(g.a, ir_CONST_ADDR(offsetof(TArr, data))));
+                        ir_ref data = pi >= 0
+                            ? j->pre_dt[lvl][pi]
+                            : ir_LOAD_A(ir_ADD_A(g.a,
+                                  ir_CONST_ADDR(offsetof(TArr, data))));
                         ir_ref leaf = ir_ADD_A(data,
                             ir_SHL_U64(ir_BITCAST_U64(g.kp), ir_CONST_U64(4)));
                         if (!fold_add) {
@@ -2954,9 +3276,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (j->loop_sp > 0 && j->loop_cond[j->loop_sp - 1]) {
                 j->loop_cond[j->loop_sp - 1] = 0;
                 uint32_t E = T;
-                ir_ref ta, pa, ad;
-                ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
-                ir_ref truthy = make_truthy(j, ta, pa, ad);
+                ir_ref truthy = cond_truthy(j, pc, op);
                 /* JMPZ: truthy → body; JMPNZ at header: reverse (rare) */
                 ir_ref ifx;
                 if (op->op == OP_JMPZ) ifx = ir_IF(truthy);
@@ -3017,9 +3337,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (!find_join(j->fn, pc, T, &join, &else_start))
                 do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
 
-            ir_ref ta, pa, ad;
-            ad = cond_addr(j, op->t1, op->a1, &ta, &pa);
-            ir_ref truthy = make_truthy(j, ta, pa, ad);
+            ir_ref truthy = cond_truthy(j, pc, op);
             int jmp_on_true = (op->op == OP_JMPNZ);
             /* P0-14 批5: ifx 恒 truthy。JMPNZ（||短路）原 NOT_B 极性反置
              * 且 tA=END@T 漏 emit 跳转目标体——该路径此前 100% fail 回退

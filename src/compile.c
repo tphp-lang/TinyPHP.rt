@@ -2323,9 +2323,12 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         for (int i = 0; i < ch->n; i++) {
             AIfBranch *br = &ch->branches[i];
             Loc cv = compile_expr(c, br->cond, LOC_NONE);
-            int t = tmp_new(c);
-            emit(c, OP_BOOL_VAL, cv, LOC_NONE, LOC_TMP(t), br->cond->line);
-            int jz = emit(c, OP_JMPZ, LOC_TMP(t), LOC_NONE, LOC_NONE, s->line);
+            /* P0-cond（11-04 量化）：语句条件位不发 BOOL_VAL——op_jmpz 自做
+             * tval_to_bool（含 UNDEF 门），JIT 跳转位自做 make_truthy，两侧
+             * 与 tval_to_bool(BOOL_VAL(v)) 等价（幂等）；省每分支一条全类型
+             * truthy 链（IR 实测 ≈19 节点）。值语境的 BOOL_VAL（&&/||/?:/
+             * cast）保留不动。 */
+            int jz = emit(c, OP_JMPZ, cv, LOC_NONE, LOC_NONE, s->line);
             compile_stmt_list(c, br->body);
             jends[n_ends++] = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
             patch_jump(c, jz, (uint32_t)cur_pc(c));
@@ -2341,9 +2344,8 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         uint32_t Lstart = (uint32_t)cur_pc(c);
         loop_push(c, false);
         Loc cv = compile_expr(c, s->u.wh.cond, LOC_NONE);
-        int t = tmp_new(c);
-        emit(c, OP_BOOL_VAL, cv, LOC_NONE, LOC_TMP(t), s->u.wh.cond->line);
-        int jz = emit(c, OP_JMPZ, LOC_TMP(t), LOC_NONE, LOC_NONE, s->line);
+        /* P0-cond：BOOL_VAL 冗余（两侧自 to_bool），见 S_IF 注 */
+        int jz = emit(c, OP_JMPZ, cv, LOC_NONE, LOC_NONE, s->line);
         compile_stmt_list(c, s->u.wh.body);
         int jback = emit(c, OP_JMP, LOC_NONE, LOC_NONE, LOC_NONE, s->line);
         patch_jump(c, jback, Lstart);
@@ -2358,9 +2360,8 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         compile_stmt_list(c, s->u.wh.body);
         uint32_t Lcond = (uint32_t)cur_pc(c);
         Loc cv = compile_expr(c, s->u.wh.cond, LOC_NONE);
-        int t = tmp_new(c);
-        emit(c, OP_BOOL_VAL, cv, LOC_NONE, LOC_TMP(t), s->u.wh.cond->line);
-        int jback = emit(c, OP_JMPNZ, LOC_TMP(t), LOC_NONE, LOC_NONE, s->line);
+        /* P0-cond：BOOL_VAL 冗余（两侧自 to_bool），见 S_IF 注 */
+        int jback = emit(c, OP_JMPNZ, cv, LOC_NONE, LOC_NONE, s->line);
         patch_jump(c, jback, Lbody);
         uint32_t Lend = (uint32_t)cur_pc(c);
         loop_pop(c, Lend, Lcond, true);
@@ -2374,9 +2375,8 @@ static void compile_stmt(Ctx *c, AStmt *s) {
         int jz = -1;
         if (f->cond) {
             Loc cv = compile_expr(c, f->cond, LOC_NONE);
-            int t = tmp_new(c);
-            emit(c, OP_BOOL_VAL, cv, LOC_NONE, LOC_TMP(t), f->cond->line);
-            jz = emit(c, OP_JMPZ, LOC_TMP(t), LOC_NONE, LOC_NONE, s->line);
+            /* P0-cond：BOOL_VAL 冗余（两侧自 to_bool），见 S_IF 注 */
+            jz = emit(c, OP_JMPZ, cv, LOC_NONE, LOC_NONE, s->line);
         }
         compile_stmt_list(c, f->body);
         uint32_t Lcont = (uint32_t)cur_pc(c);
