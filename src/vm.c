@@ -4564,7 +4564,14 @@ bool tphp_vm_call_bounded(VM *vm, TVal callable, TVal *args, int n, TVal *out) {
  * A zero-arg compiled function runs to completion on top of the current
  * frame; its RETURN stores into vm->x.thunk_ret (rec->is_thunk). */
 TVal tphp_call_thunk(VM *vm, uint16_t fn_idx) {
-    TFunc *fn = vm->prog->funcs[fn_idx];
+    /* default_thunk 的 idx 相对"宿主函数自己的 Program"（compile_thunk 按
+     * 编译单元表登记）——动态 require 的类（独立 Program，如 autoload 加载）
+     * 在主 prog 表里查会错位到别的 fn（2026-11-04 teb：Web ctor 默认值
+     * idx=1 → 主表 funcs[1]=autoload 闭包 → ArgumentCountError）。RECV/常量
+     * thunk 的调用帧恒为宿主 fn → 用帧 fn->prog 查；无帧才回落 vm->prog。 */
+    Program *prg = (vm->x.frame && vm->x.frame->fn && vm->x.frame->fn->prog)
+                       ? vm->x.frame->fn->prog : vm->prog;
+    TFunc *fn = prg->funcs[fn_idx];
     if (vm->x.n_calls >= VM_MAX_CALLS)
         vm_raise(vm, ex_class("Error"), NULL, "Call stack overflow");
     VMCallRec *rec = &vm->x.calls[vm->x.n_calls++];
