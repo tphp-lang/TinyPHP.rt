@@ -2240,6 +2240,17 @@ static int fold_add_enabled(void) {
     return v;
 }
 
+/* P0-append 快线开关（11-04 新地图 array-push≈3.5×=杠杆第一）：默认开，
+ * TPHP_APPEND_FAST=0 关（同二进制 A/B）。 */
+static int append_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_APPEND_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* P0-17③ 批C slice-1：canonical 折叠累加形态守卫（loop phi 激活前提）。
  * 循环体（cond JMPZ 之后 → 回边 JMP）必须严格匹配：
  *   - 恰一个 FETCH_DIM_R+ADD 对，且 ADD 为 RMW 直写 CV（t?==OPD_CV &&
@@ -2558,6 +2569,23 @@ static ir_ref cond_truthy(JitC *j, uint32_t pc, TOp *op) {
     return ir_AND(IR_BOOL, t, ir_NOT_B(ir_EQ(ta, ir_CONST_I32((int32_t)T_UNDEF))));
 }
 
+/* ASSIGN_DIM 慢路（原 emit 序，快线两分支共用各发一份——dimic miss 多份
+ * 发射同款惯例）：CALL helper + raise→deopt RETURN；IF_FALSE 留开由调用
+ * 方 END/MERGE。 */
+static void emit_assign_dim_slow(JitC *j, ir_ref base, ir_ref key, ir_ref val) {
+    JIT_CTX();
+    ir_ref t[4] = { j->r_vm, base, key, val };
+    ir_ref ok = ir_CALL_N(IR_I32,
+                          ir_CONST_ADDR((uintptr_t)tphp_jit_assign_dim),
+                          4, t);
+    /* raise → 0：IR 立即 deopt（bcall 同款，0008 因子式——
+     * IF_TRUE RETURN / IF_FALSE 留开继续，绝不跨 IR 帧 longjmp） */
+    ir_ref ifx = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+    ir_IF_TRUE(ifx);
+        ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
+    ir_IF_FALSE(ifx);
+}
+
 static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
     JIT_CTX();
     if (j->fail) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
@@ -2732,6 +2760,70 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 val = sc;
             } else {
                 val = slot_addr(j, op->ar);
+            }
+            /* P0-append 快线（11-04 新地图 array-push≈3.5×=杠杆第一）：
+             * 仅 append 形态（t2==UNUSED）。快线条件 AND——base 是数组
+             * （排除 UNDEF auto-viv/T_STR Error/TypeError）、rc<=1（tarr_cow
+             * 原地免复制）、packed、dused<dcap（免 grow 分配）、val 非 rc
+             * （tval_addref no-op）→ 镜像 tarr_append packed 分支纯内存写
+             * （data[dused]=val pay先tag后 + dused/n/next_idx/bpending 自增；
+             * packed 无洞 ⇒ dused 位恒 UNDEF/fresh，不 release 与 C 逐位同）。
+             * 零 CALL/零分配/零 raise/零槽写 → 无需 deopt 门；任一条件
+             * 不满足 → 原 tphp_jit_assign_dim 慢路两分支各发一份完整兜底
+             * （语义零漂移）。keyed 形态/开关关 → 原直通。 */
+            if (append_fast_enabled() && op->t2 == OPD_UNUSED) {
+                ir_ref ifa = ir_IF(ir_EQ(load_tag(j, base), ir_CONST_I32(T_ARR)));
+                ir_IF_TRUE(ifa);
+                    ir_ref ap = load_pay(j, base);
+                    ir_ref rc = ir_LOAD_I32(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(GCHead, rc))));
+                    ir_ref pk = ir_LOAD_U8(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, packed))));
+                    ir_ref du = ir_LOAD_I32(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, dused))));
+                    ir_ref dc = ir_LOAD_I32(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, dcap))));
+                    ir_ref vt = load_tag(j, val);
+                    ir_ref ok = ir_AND(IR_BOOL,
+                        ir_AND(IR_BOOL, ir_LE(rc, ir_CONST_I32(1)),
+                               ir_EQ(pk, ir_CONST_U8(1))),
+                        ir_AND(IR_BOOL, ir_LT(du, dc),
+                               ir_LT(vt, ir_CONST_I32(T_STR))));
+                    ir_ref ifok = ir_IF(ok);
+                    ir_IF_TRUE(ifok);
+                        ir_ref data = ir_LOAD_A(
+                            ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, data))));
+                        ir_ref leaf = ir_ADD_A(data,
+                            ir_SHL_U64(ir_ZEXT(IR_U64, du), ir_CONST_U64(4)));
+                        ir_STORE(leaf, load_pay(j, val));
+                        ir_STORE(ir_ADD_A(leaf, ir_CONST_ADDR(TVAL_TAG)), vt);
+                        ir_STORE(ir_ADD_A(ap,
+                                    ir_CONST_ADDR(offsetof(TArr, dused))),
+                                 ir_ADD_I32(du, ir_CONST_I32(1)));
+                        ir_ref an = ir_ADD_A(ap,
+                            ir_CONST_ADDR(offsetof(TArr, n)));
+                        ir_STORE(an, ir_ADD_I32(ir_LOAD_I32(an),
+                                                ir_CONST_I32(1)));
+                        ir_ref ani = ir_ADD_A(ap,
+                            ir_CONST_ADDR(offsetof(TArr, next_idx)));
+                        ir_STORE(ani, ir_ADD_I64(ir_LOAD_I64(ani),
+                                                 ir_CONST_I64(1)));
+                        ir_ref abp = ir_ADD_A(ap,
+                            ir_CONST_ADDR(offsetof(TArr, bpending)));
+                        ir_STORE(abp, ir_ADD_I32(ir_LOAD_I32(abp),
+                                                 ir_CONST_I32(1)));
+                        ir_ref eF = ir_END();
+                    ir_IF_FALSE(ifok);
+                        emit_assign_dim_slow(j, base, key, val);
+                        ir_ref eSK = ir_END();
+                    ir_MERGE_2(eF, eSK);
+                    ir_ref eArr = ir_END();
+                ir_IF_FALSE(ifa);
+                    emit_assign_dim_slow(j, base, key, val);
+                    ir_ref eNo = ir_END();
+                ir_MERGE_2(eArr, eNo);
+                pc++;
+                break;
             }
             ir_ref t[4] = { j->r_vm, base, key, val };
             ir_ref ok = ir_CALL_N(IR_I32,
