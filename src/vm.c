@@ -4381,6 +4381,21 @@ int tphp_jit_fetch_prop(VM *vm, TFunc *fn, TOp *op, uint32_t pc, TVal *slots) {
     return ok;
 }
 
+/* ---- 类型特化批1（PLAN/type-spec.md §2 preheader guard）----
+ * base 槽一体检查：T_ARR + packed + 全元素 INT。循环 preheader 每函数
+ * 调用执行一次（O(n) 扫描，1e6 迭代摊销 <0.001ns/iter）。假设的整循环
+ * 期有效性由 preguard 白名单保证：体内纯 op（无数组写）+ tphp 无引用
+ * 别名 → 元素类型进入循环后不可变。1 = 假设成立（IR 走特化循环体），
+ * 0 = guard 失败（IR RETURN 0 → 解释器从 pc0 整函数重跑，零死循环）。 */
+int tphp_jit_spec_guard(TVal *base) {
+    if (base->t != T_ARR) return 0;
+    TArr *a = (TArr *)base->u.p;
+    if (!a->packed) return 0;
+    for (uint32_t i = 0; i < a->n; i++)
+        if (a->data[i].t != T_INT) return 0;
+    return 1;
+}
+
 static int32_t op_rethrow(VM *vm, TOp *op) {
     if (!vm->x.exception)
         vm_raise(vm, ex_class("Error"), op, "Internal: rethrow without exception");
