@@ -61,6 +61,8 @@
 
 **11-05 刀5：FETCH_PROP helper 化解锁 mcall 折叠 TPHP_PROP_HELPER（未提交）**：侦察批实锤 `jit_body_frameless` 拒 getter 体（直调无帧 + FETCH_PROP 回放读 ambient 帧）→ 方法调用折叠全库从未生效、get 单价 105ns。修法 = vm.c `tphp_jit_fetch_prop` 造本地假帧（slots 零拷贝指链上槽区 + 静态 decl 作用域）**原样跑真 op_fetch_prop**（零语义重写）+ frameless 摘除 FETCH_PROP + emit 改 helper 调用（raise 局部 setjmp→返 0→op_do_fcall C 帧上传，replay 同语义）；ASSIGN_PROP/ISSET 留回放。**`fold mcall` 全库首次出现**；246/246×3 模式（默认/PROP_HELPER=0/JIT=0）全绿；A/B：**object −15.8%（30.3→25.5）**、jsonagg −4.4%、全表零回退；探针 min 26.0→19.9（JIT 收益 −15%→−35%）。CI 投影 object 3.46→~3.0。**记账**：setter 同款 helper（ASSIGN_PROP）、IR 内联 prop IC 快链（v1.5）、dtor JIT 化（5B）、嵌套调用 emit（5C：`strlen(trim())` 任一嵌套即整函数拒编，nest_probe 复现）。
 
+**11-05 刀6+刀7：编译失败闭包定位 → OSR FE 放行证伪撤回 → explode memchr 快路（未提交）**：刀6 定位（探针 FAILED 行加 `file:line n_ops`；`L`=jit.c `__LINE__` 勘正）——②=real-logstat 主闭包连坐（无害）、③=jsonagg 主闭包 FE 嵌套门，**真缺口=logstat() 主 foreach 无 OSR**（白名单拒 FE_FETCH）；实施 osr_body_ok 放行 FE/ISSET_DIM/ASSIGN_DIM（TPHP_OSR_FE）+246×3 绿，但 **A/B 证伪**：bench 单次口径编译成本>收益（logstat +3.5%、jsonagg +31.8% 触发即循环末），用户拍板撤回（chunk 稳态 −15.8% 仅多轮兑现，机制经验留档 memory/2026-11-05.md）。**成分侦察转向**：logstat 3.46× 真根因=大 explode 6.1×（逐字节 memcmp 扫 12MB）+计数循环插值 4.6×。**刀7 落地**：bi_explode 单字节分隔符 memchr 快路（TPHP_EXPLODE_FAST=0 关）——**A/B real-logstat −16.2%（40.1→33.6）全表零回退**、246×3 绿；剩余杠杆 = TStr 尾部预留 exact-alloc（big explode 仍 4.4×）、计数循环字符串插值（string 线）。
+
 **里程碑判据**：M2 = perf.yml 几何均值 ≥1.0；M3 = 敏感簇（fib/call/read/push/kv/rmw/object）全部 ≤1.0×。aarch64 门槛在 P0-5 后从"仅报告"改为硬门。
 
 ## 3. P1 · 功能线（立项类先写规格再动手）
