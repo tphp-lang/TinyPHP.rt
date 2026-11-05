@@ -1,6 +1,9 @@
 # 类型特化 / Loop Versioning（P0-17③ 最后一件：消每迭代 tag 检查）
 
-状态：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
+状态：**批1 已实施（2026-11-05，待提交）**——TPHP_TYPE_SPEC（默认开，=0 关）；
+设计稿 v1 同日拍板。批1 验收数据见 §7a。批2/批3 未动。
+
+历史：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
 上游依据：emit-ssa.md §③ 类型特化；read 减法定案（memory/2026-11-05.md 主刀轮收口）。
 
 ## 1. 目标与账本
@@ -102,3 +105,36 @@ speculation 形态：
 - A/B：TPHP_TYPE_SPEC 默认开 / =0 关，min-of-6 双口径（Windows + WSL linux）。
 - 探针：%TEMP%\tp_read_ablate.php 减法矩阵复跑（A/B/C/D 形态）。
 - DEBUG=2 机器码落盘对比：循环体 `cmp/sete` 计数前后差（直接指标）。
+
+## 7a. 批1 实测结果（2026-11-05）
+
+**实现落点**：vm.c `tphp_jit_spec_guard`（ARR+packed+全元素 INT 一体查）；
+jit.c JitC spec 字段 + `spec_scan`（结构判据复用 preguard_scan，形态=恰
+FETCH+ADD-RMW 配对+INC/DEC，身份互斥+写点约束）+ push 处 guard emit
+（IF(!g) TRUE→RETURN(0)，FALSE 线续 emit=OP_SEND_CAP 形态；OSR chunk 不特化）
++ 三检查点（lower_binop 双 tag/慢线菱形、lower_incdec isint/慢线、FETCH pcond
+kt）+ 溢出分支 RETURN(0) 化 + spec_tmp 跨 op（FETCH 尾设/ADD 消费即清）+
+pc 出体自动失效。`tests/jit/test-jit-typespec-001.php` 9 案矩阵。
+
+**验证**：247×3 全绿（默认/spec=0/JIT=0）；矩阵三模逐字一致（含 int64 溢出
+→RETURN→解释器重跑=double、guard-fail 元素 float/str/非 packed/acc 入口
+非 INT/编译后类型轮转、DEC 倒序、空数组 n=0、槽0 acc）。
+**顺带修复既有缺陷**：generic ADD/INC 溢出分支 `BITCAST_D` 位重解释得 NaN
+→ `ir_INT2D` 数值转换（矩阵溢出案首暴露；spec=0 模式原样 NAN 与解释器发散）。
+
+**A/B（min-of-6 同二进制交替，全表零回退两轮复核）**：
+
+| 口径 | array-read | 其余全表 |
+|---|---:|---|
+| Windows | 5.7→5.4（**−5.3%**，两轮一致） | ±1% 内 |
+| WSL linux（主口径） | 6.2→5.7（**−8.1%**） | ≤±1.6%（rmw 首轮 +6.7% 复轮归零=噪声） |
+
+**asm/IR 对比（DEBUG=2，read 闭包单案）**：on 6208B vs off 6256B；全文
+EQ 计数 102 vs 104——spec 消 3 个检查点 EQ + 慢线菱形（call 框架），
+动态 ×1e6 ≈ **−0.5ns/iter**。
+
+**诚实记账**：read 未达 −1ns/iter 目标（实收 −0.5）——asm 证据里"每迭代
+10-15 条检查"的其余部分（dst tag 重写、dimic 链层叠 cmp、bound 分支）
+按设计属批2（DimIC 结构消除）；检查类剩余肉记 backlog。
+批1 判据附带收益：`spec scan` 拒的形态（kv/push/rmw/外层 r 循环）零 emit
+差异=零开销（scan 纯编译期）。
