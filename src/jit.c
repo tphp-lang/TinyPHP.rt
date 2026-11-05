@@ -2443,6 +2443,19 @@ static int fold_add_enabled(void) {
     return v;
 }
 
+/* 刀A拆税子实验（2026-11-05）：TPHP_FOLD_ACC=0 只关批C acc loop-phi
+ *（2848 fold_acc_scan→0，fwd 汇合走非 phi 的普通 MERGE = B' 骨架保留），
+ * 与 TPHP_FOLD_ADD=0（纯默认）三态对照拆 1.3ns 税归属（B' 结构 vs C phi）。
+ * 默认 1 = 与 FOLD_ADD 同效（现状 B'+C）。 */
+static int fold_acc_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_FOLD_ACC");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* P0-append 快线开关（11-04 新地图 array-push≈3.5×=杠杆第一）：默认开，
  * TPHP_APPEND_FAST=0 关（同二进制 A/B）。 */
 static int append_fast_enabled(void) {
@@ -2845,7 +2858,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 在 ir_END()（entry 块）前 load；phi 建在 LOOP_BEGIN 后
              * （op1=LOOP_BEGIN 满足 _ir_PHI_SET_OP 断言），回边值在
              * LOOP_END 后补（ir_check 对 loop phi 豁免前向引用） */
-            uint32_t acc = fold_add_enabled() ? fold_acc_scan(j->fn, pc) : 0;
+            uint32_t acc = (fold_add_enabled() && fold_acc_enabled())
+                           ? fold_acc_scan(j->fn, pc) : 0;
             /* POC preguard：先发不变量外提菱形（循环前驱块），保证 fold
              * 的 init_pay/ein 仍落最终汇合块 → LOOP_BEGIN 单入不变 */
             j->pre_n[j->loop_sp] = 0;
