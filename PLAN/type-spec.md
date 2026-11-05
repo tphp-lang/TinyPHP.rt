@@ -1,7 +1,7 @@
 # 类型特化 / Loop Versioning（P0-17③ 最后一件：消每迭代 tag 检查）
 
 状态：**批1 已实施（2026-11-05，待提交）**——TPHP_TYPE_SPEC（默认开，=0 关）；
-设计稿 v1 同日拍板。批1 验收数据见 §7a。批2/批3 未动。
+设计稿 v1 同日拍板。批1 验收数据见 §7a，批2 见 §7b。批3 未动。
 
 历史：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
 上游依据：emit-ssa.md §③ 类型特化；read 减法定案（memory/2026-11-05.md 主刀轮收口）。
@@ -74,9 +74,9 @@ speculation 形态：
 |---|---|---|
 | preguard（外提 inv/pk/n/dt） | g1/g2 直接复用外提值；guard 菱形须在 preguard 菱形**之前或合并**（支配序） | 合并为单一 preheader 菱形 |
 | fold/B'（默认关） | spec 下 fold fast 线的双 INT 检查同免 | 封存态不动；spec 开时 fold 仍关 |
-| OSR | spec 循环的 OSR chunk：guard 在 chunk 外（preheader 不在 chunk 内）→ OSR 入口无法验证假设 → **OSR chunk v1 不特化**（保持现检），fn 级特化优先 | 记账批2 |
+| OSR | spec 循环的 OSR chunk：批2 已落地（§7b）——guard emit 移入 chunk entry 块（preheader 菱形后、LOOP_BEGIN 前），失败 RETURN(backedge_cur)=解释器执行回边 JMP 续跑，entry 前零副作用 | 已落地 |
 | deopt（helper raise） | 特化体的 pay-only store：resume 时槽 tag=旧 INT=真值 ✓ 与批C 同论证 | 已论证 |
-| DimIC 快照 | g3 覆盖 packed+全INT；IC 链本身仍发射（key tag 检查免但结构在——v1 只免 cmp 不动链结构，链结构消除=批2 降分支） | 分批 |
+| DimIC 快照 | g3 覆盖 packed+全INT；IC 链本身仍发射（key tag 检查免但结构在——v1 只免 cmp 不动链结构）→ 批2 已落地（§7b）：spec+guard 证下 ifa/pcond/链整段不 emit | 已落地 |
 
 ## 5. 分批计划
 
@@ -87,7 +87,7 @@ speculation 形态：
   4. 验收：read ≥−1ns（6.5→≤5.5）、246×3、全表零回退（特化错值由
      tests/jit 语义对拍矩阵兜底：int/float/str 元素 × int/float 累加器 ×
      首次调用即混合类型 × hash 数组 guard-fail 路径）。
-- **批2**：DimIC 链结构在 spec 下的消除（免 bound 分支外的层叠 cmp）、OSR chunk 入口 spec。
+- **批2**：DimIC 链结构在 spec 下的消除（免 bound 分支外的层叠 cmp）、OSR chunk 入口 spec。（已落地，实测见 §7b）
 - **批3**：all_int 观察缓存（IC 快照跳过重扫）、hash INT 键扩展。
 
 ## 6. 风险清单
@@ -138,3 +138,41 @@ EQ 计数 102 vs 104——spec 消 3 个检查点 EQ + 慢线菱形（call 框�
 按设计属批2（DimIC 结构消除）；检查类剩余肉记 backlog。
 批1 判据附带收益：`spec scan` 拒的形态（kv/push/rmw/外层 r 循环）零 emit
 差异=零开销（scan 纯编译期）。
+
+## 7b. 批2 实测结果（2026-11-05 晚）
+
+**两件（§5）均已落地**：
+
+1. **DimIC 结构消除**：spec 作用域内 FETCH 满足
+   `base == spec_base && key 恒 INT（spec_bit_int）` → guard（纯读 helper，
+   与 preguard 菱形同块、无中途写 ⇒ inv≡真、packed≡真）已证 ARR+packed+
+   全INT → `ifa` 外层、`pcond` packed 门、非 packed/非数组回退与 IC 层叠链
+   **整段不 emit**，只留 `[bound→取值 | 越界→miss 兜底]` 单菱形（idx<n 不在
+   guard 面，越界照走 v1 helper——结构消除非降级，miss/raise/deopt 语义
+   逐条不变）。`spec_base` 新字段防 cond 区异 base 候选误折（无 guard 证
+   不折）；kt 装载随之免发。未折叠形态（key 非恒 INT 等）原结构零改动。
+2. **OSR chunk 入口 spec**：去掉 `!j->osr` 闸——guard emit 在 chunk entry
+   块（preheader 菱形后、LOOP_BEGIN 前），失败 RETURN(backedge_cur) =
+   解释器执行回边 JMP 续跑；entry 前零副作用（菱形纯装载、guard 纯读），
+   chunk 未执行体代码 → resume 干净，与 fn 级 preheader 语义一致。
+
+**验证**：247×3（run1 一次 test-net-http-tls 环境挂起 0CPU——独立双模
+复跑秒过、run2/3 全绿，非本批回归）；release 族探针双模逐字一致；
+DEBUG=2 双级 guard 触发：fn 级 `osr=0`、read 基准 OSR chunk `osr=1`。
+
+**A/B（Windows min-of-6 同二进制交替，TYPE_SPEC=1 vs 0）**：
+
+| bench | spec=1 | spec=0 | 结论 |
+|---|---:|---:|---|
+| array-read | **4.0ms** | 5.5ms | **−27%**（结构消除+OSR 特化，主靶） |
+| kv-read | 18.0 | 18.1 | 平（形态不符 spec_scan，零 emit 差异） |
+| array-rmw | 14.5 | 14.5 | 平 |
+| fib | 7.5 | 7.5 | 平 |
+| call | 10.4 | 10.5 | 平 |
+
+**结构指标（DEBUG=2 OSR chunk 尺寸）**：spec=1 **865B** vs spec=0 **5640B**
+（−85%，inv/pcond/链/generic 回退全部消失）。批1 记账的"批2 剩余肉"
+（链层叠 cmp+外层菱形）即此。
+
+**观测/后续**：批3（all_int 观察缓存、hash INT 键扩展）未动；WSL/CI 口径
+待 push 后由 perf 流复核。
