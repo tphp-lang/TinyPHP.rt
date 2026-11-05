@@ -4093,7 +4093,9 @@ void tphp_jit_compile(TFunc *fn) {
     ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
     memset(ctx, 0, sizeof *ctx);
     j.ctx = ctx;
-    ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING,
+    ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING
+                 | ((getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2')
+                    ? (1u << 30) : 0),   /* IR_DEBUG_RA 位（deps/ir 需 -DIR_DEBUG 才出日志） */
             IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
     ctx->ret_type = IR_I32;
 
@@ -4139,6 +4141,10 @@ void tphp_jit_compile(TFunc *fn) {
                 fprintf(stderr, "[jit] ir dump:\n");
                 ir_dump(ctx, stderr);
                 fflush(stderr);
+                /* P0-17③ 侦察：生成码（phi 链 spill/寄存器驻留实况） */
+                fprintf(stderr, "[jit] codegen dump:\n");
+                ir_dump_codegen(ctx, stderr);
+                fflush(stderr);
             }
         }
         /* O1: skip SCCP. O2/SCCP has a multi-slot CALL bug (deps/ir
@@ -4146,6 +4152,14 @@ void tphp_jit_compile(TFunc *fn) {
          * and zeros an operand → codegen crash on chain TMP-ADD). See
          * tools/ir_bisect.c repro; restore O2 after upstream fix. */
         entry = ir_jit_compile(ctx, 1, &size);   /* O1 */
+        /* P0-17③ 侦察：落盘机器码供外部反汇编（DEBUG=2；TEMP 覆盖式） */
+        if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2' && entry) {
+            const char *tmp = getenv("TEMP");
+            char path[512];
+            snprintf(path, sizeof path, "%s\\tp_jitcode.bin", tmp ? tmp : ".");
+            FILE *bf = fopen(path, "wb");
+            if (bf) { fwrite(entry, 1, size, bf); fclose(bf); }
+        }
         if (jit_dbg())
             fprintf(stderr, "[jit] compile(%s) entry=%p size=%zu\n",
                     fn->name ? tstr_val(fn->name) : "?", entry, size);
@@ -4315,7 +4329,9 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
      * 不复现——test-osr-005（方法/new+prop+COPY/组合三形态）10 连跑全绿、
      * osr ir_check=1、阈值关断对照证实 chunk 真执行（4349→3755ms）。
      * MCALL/NEW 已进 osr_body_ok 白名单（PLAN/osr.md 批2-3 节）。 */
-    ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING,
+    ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING
+                 | ((getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0] == '2')
+                    ? (1u << 30) : 0),   /* IR_DEBUG_RA 位（deps/ir 需 -DIR_DEBUG 才出日志） */
             IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
     ctx->ret_type = IR_I32;
 
