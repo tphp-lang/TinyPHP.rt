@@ -902,6 +902,11 @@ bool tphp_jit_eligible(TFunc *fn) {
 typedef struct {
     ir_ctx *ctx;
     TFunc *fn;
+    /* 刀3（11-05）槽级标量写者分析：NULL=未分析（TPHP_SLOTGATE=0 /
+     * calloc 失败 → 全部写点保门 = HEAD 行为）；hot[s]=1 = 槽 s 可能持有
+     * refcounted（写点保 rel_dst_gate），0 = 槽恒标量/UNDEF → 写前释放
+     * 必空转 → 免发。分析见 jit_scan_slot_writers。 */
+    uint8_t *slot_hot;
     ir_ref r_vm, r_slots, r_ret;
     /* loop stack（v1.1：支持嵌套 for/while，深度8） */
     enum { JIT_MAX_LOOPS = 8 };
@@ -1175,6 +1180,18 @@ static void rel_dst_gate(JitC *j, ir_ref da) {
     ir_IF_FALSE(ifd);
         ir_ref eS = ir_END();
     ir_MERGE_2(eR, eS);
+}
+
+/* 刀3（11-05 槽级写者分析回收门税）：dst 槽恒标量/UNDEF → 免发释放门
+ * （门对标量本就空转，省下的 = load_tag+区间比+IF/CALL/MERGE 静态布局
+ * 税 = 刀2 量化的门税）。kind 必查（CONST lit 下标与槽下标撞数）；
+ * 未分析/未知 kind → 保守保门。错判方向安全：漏降级只会跳过释放=泄漏
+ * （probe_release_family 300/300 拦截），不会双释放——反向（多保门）
+ * 即 HEAD 行为。soundness 细则全在 jit_scan_slot_writers 注。 */
+static bool dst_gate_needed(JitC *j, TOp *op) {
+    if (!j->slot_hot) return 1;
+    if (op->tr != OPD_CV && op->tr != OPD_TMP) return 1;
+    return j->slot_hot[op->ar];
 }
 
 /* ---- P0-13 v2：FETCH_DIM_R 命中路径全内联（JSC Baseline IC 形态）----
@@ -1451,8 +1468,10 @@ static void lower_binop(JitC *j, TOp *op) {
         ir_IF_TRUE(ifx);
             /* 刀2 释放门：快线裸存前 release 旧 dst（wtake 语义）。
              * both_int 分支内 dst 若即源槽（$x=$x+1 形态）必为 INT →
-             * 标量免释，emit 判别跳过（慢路 binop_slow 自释放不发） */
-            if (!dst_src_alias(op)) rel_dst_gate(j, da);
+             * 标量免释，emit 判别跳过（慢路 binop_slow 自释放不发）；
+             * 刀3：dst 槽全写者标量 → 槽级免发 */
+            if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                rel_dst_gate(j, da);
             ir_ref sum = op->op == OP_ADD ? ir_ADD_I64(pa, pb)
                                           : ir_SUB_I64(pa, pb);
             ir_ref of;
@@ -1500,7 +1519,8 @@ static void lower_cmp(JitC *j, TOp *op) {
     if (op->op == OP_CMP) {
         ir_ref ifx = ir_IF(both_int);
         ir_IF_TRUE(ifx);
-            if (!dst_src_alias(op)) rel_dst_gate(j, da);   /* 刀2 释放门 */
+            if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                rel_dst_gate(j, da);   /* 刀2 释放门 + 刀3 槽级免发 */
             ir_ref lt = ir_LT(pa, pb);
             ir_ref gt = ir_LT(pb, pa);
             ir_ref iflt = ir_IF(lt);
@@ -1527,7 +1547,8 @@ static void lower_cmp(JitC *j, TOp *op) {
     }
     ir_ref ifx = ir_IF(both_int);
     ir_IF_TRUE(ifx);
-        if (!dst_src_alias(op)) rel_dst_gate(j, da);   /* 刀2 释放门 */
+        if (!dst_src_alias(op) && dst_gate_needed(j, op))
+            rel_dst_gate(j, da);   /* 刀2 释放门 + 刀3 槽级免发 */
         ir_ref c;
         switch (op->op) {
         case OP_EQ:  case OP_SEQ: c = ir_EQ(pa, pb); break;
@@ -1638,14 +1659,16 @@ static void lower_un(JitC *j, TOp *op) {
     case OP_BOOL_NOT: {
         ir_ref t = make_truthy(j, ta, pa, aa);
         /* 刀2 释放门：结果恒标量而 dst 无约束（dst 即源槽时源可能是串，
-         * 不释放即漏）→ 恒发，不可 emit 跳过 */
-        rel_dst_gate(j, da);
+         * 不释放即漏）→ 恒发，不可 emit 跳过；刀3 槽级免发除外 */
+        if (dst_gate_needed(j, op)) rel_dst_gate(j, da);
         store_bool(j, da, ir_NOT_B(t));
         break;
     }
     case OP_BOOL_VAL: {
         ir_ref t = make_truthy(j, ta, pa, aa);
-        rel_dst_gate(j, da);   /* 刀2 释放门（同 BOOL_NOT：恒发） */
+        if (dst_gate_needed(j, op))
+            rel_dst_gate(j, da);   /* 刀2 释放门（同 BOOL_NOT：恒发；刀3 除
+                                    * 外） */
         store_bool(j, da, t);
         break;
     }
@@ -1659,7 +1682,9 @@ static void lower_un(JitC *j, TOp *op) {
         int64_t ct = j->fn->lits[op->a2].u.i;   /* 1=int 2=bool 3=float */
         if (ct == 2) {
             ir_ref t = make_truthy(j, ta, pa, aa);
-            rel_dst_gate(j, da);   /* 刀2 释放门（结果标量、dst 无约束→恒发） */
+            if (dst_gate_needed(j, op))
+                rel_dst_gate(j, da);   /* 刀2 释放门（结果标量、dst 无约束→恒
+                                        * 发；刀3 槽级免发除外） */
             store_bool(j, da, t);
         } else if (ct == 1) {
             /* 刀2 修复（错值+泄漏双 bug）：
@@ -1679,7 +1704,8 @@ static void lower_un(JitC *j, TOp *op) {
                           ir_EQ(ta, ir_CONST_I32(JT_FALSE)))));
             ir_ref iff = ir_IF(fast);
             ir_IF_TRUE(iff);
-                if (!(op->t1 == op->tr && op->a1 == op->ar))
+                if (!(op->t1 == op->tr && op->a1 == op->ar) &&
+                    dst_gate_needed(j, op))
                     rel_dst_gate(j, da);
                 ir_ref ifi = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
                 ir_IF_TRUE(ifi);
@@ -1713,7 +1739,8 @@ static void lower_un(JitC *j, TOp *op) {
                               ir_EQ(ta, ir_CONST_I32(JT_FALSE))))));
             ir_ref iff = ir_IF(fast);
             ir_IF_TRUE(iff);
-                if (!(op->t1 == op->tr && op->a1 == op->ar))
+                if (!(op->t1 == op->tr && op->a1 == op->ar) &&
+                    dst_gate_needed(j, op))
                     rel_dst_gate(j, da);
                 ir_ref ifl = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_FLOAT)));
                 ir_IF_TRUE(ifl);
@@ -1794,8 +1821,10 @@ static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
         ir_ref ifs = ir_IF(ir_LT(ta, ir_CONST_I32(5)));   /* T_STR=5 起非标量 */
         ir_IF_TRUE(ifs);
             /* 刀2 释放门：dst 即源槽（$x++ 形态）时分支已证其为标量 →
-             * 免发；dst≠源槽时 dst 旧值可能是串，裸存前必释放 */
-            if (!(op->tr == op->t1 && op->ar == op->a1))
+             * 免发；dst≠源槽时 dst 旧值可能是串，裸存前必释放；刀3 槽级
+             * 免发除外（dst 槽全写者标量） */
+            if (!(op->tr == op->t1 && op->ar == op->a1) &&
+                dst_gate_needed(j, op))
                 rel_dst_gate(j, dstA);
             store_pay(j, dstA, pa);          /* 动态 tag/payload：store_imm 的 */
             store_tag(j, dstA, ta);          /* tag 是立即数，传 ref 会存 ref-id */
@@ -1839,8 +1868,10 @@ static void lower_incdec(JitC *j, TOp *op, uint32_t pc) {
         ir_ref nt = load_tag(j, aa), np = load_pay(j, aa);
         ir_ref ifp = ir_IF(ir_LT(nt, ir_CONST_I32(5)));
         ir_IF_TRUE(ifp);
-            /* 刀2 释放门（同 suffix 标量叶）：dst==源槽免发，否则先释放 */
-            if (!(op->tr == op->t1 && op->ar == op->a1))
+            /* 刀2 释放门（同 suffix 标量叶）：dst==源槽免发，否则先释放；
+             * 刀3 槽级免发除外 */
+            if (!(op->tr == op->t1 && op->ar == op->a1) &&
+                dst_gate_needed(j, op))
                 rel_dst_gate(j, dstA);
             store_pay(j, dstA, np);
             store_tag(j, dstA, nt);
@@ -2074,8 +2105,9 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_IF_FALSE(ifx);
             if (doop->tr != OPD_UNUSED) {
                 ir_ref da = slot_addr(j, doop->ar);
-                rel_dst_gate(j, da);   /* 刀2 释放门：结果覆盖旧 dst，镜像
-                    * op_do_fcall 的 tval_release(d); d=r; */
+                if (dst_gate_needed(j, doop))
+                    rel_dst_gate(j, da);   /* 刀2 释放门：结果覆盖旧 dst，
+                        * 镜像 op_do_fcall 的 tval_release(d); d=r; */
                 store_pay(j, da, ir_LOAD_I64(ret_sc));
                 store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
             }
@@ -2170,7 +2202,9 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         ir_MERGE_2(eslow, efast);
         if (doop->tr != OPD_UNUSED) {
             ir_ref da = slot_addr(j, doop->ar);
-            rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧 dst） */
+            if (dst_gate_needed(j, doop))
+                rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧
+                                        * dst；刀3 槽级免发除外） */
             store_pay(j, da, ir_LOAD_I64(ret_sc));
             store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc, ir_CONST_ADDR(TVAL_TAG))));
         }
@@ -2296,7 +2330,9 @@ static void lower_call_finish(JitC *j, TOp *doop) {
     ir_IF_FALSE(ifd);
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
-        rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧 dst） */
+        if (dst_gate_needed(j, doop))
+            rel_dst_gate(j, da);   /* 刀2 释放门（同 bcall：结果覆盖旧 dst；
+                                    * 刀3 槽级免发除外） */
         store_pay(j, da, ir_LOAD_I64(ret_sc));
         store_tag(j, da, ir_LOAD_I32(ir_ADD_A(ret_sc,
                                               ir_CONST_ADDR(TVAL_TAG))));
@@ -2849,9 +2885,10 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tphp_jit_lit_set), 2, t);
             } else {
                 /* 刀2 释放门：字面量恒不与 dst 同槽，无可证免释 → 恒发
-                 * （解释器 op_const = tval_addref + wtake，亦先释旧值） */
+                 * （解释器 op_const = tval_addref + wtake，亦先释旧值）；
+                 * 刀3 槽级免发除外（dst 槽全写者标量） */
                 ir_ref da = slot_addr(j, op->ar);
-                rel_dst_gate(j, da);
+                if (dst_gate_needed(j, op)) rel_dst_gate(j, da);
                 store_imm(j, da, (int32_t)v.t, ir_CONST_I64(v.u.i));
             }
             pc++;
@@ -3130,7 +3167,9 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                                  * 恒 other==ar）时 otag==daddr tag，okint
                                  * 已证 dst 为 INT → 免发；否则 dst 旧值
                                  * 无约束，写前释放（解释器 ADD 亦 wtake） */
-                                if (other_a != aop->ar) rel_dst_gate(j, daddr);
+                                if (other_a != aop->ar &&
+                                    dst_gate_needed(j, aop))
+                                    rel_dst_gate(j, daddr);
                                 if (phion) {
                                     store_pay(j, daddr, ssum);
                                 } else {
@@ -3762,6 +3801,153 @@ static void jit_compile_callees(TFunc *fn) {
     }
 }
 
+/* ================================================================
+ * 刀3（11-05）槽级标量写者分析 —— 回收刀2 释放门税
+ * （memory/2026-11-04 刀2 结案"回收候选"；backlog 11-04 快照）
+ * ================================================================
+ * 查询侧 dst_gate_needed：槽 s 的全部写者皆产标量/UNDEF → 写点免发
+ * rel_dst_gate。门税量化（刀2 A/B）：array-read +9.8% / fib +13.7% /
+ * call +10.6% / kv −5.8%——门对标量恒空转，成本=动态装载比较+静态
+ * 布局（刀1 教训：静态节点税独立于动态分支）。
+ *
+ * 分析 = 流不敏感全函数 fixpoint（hot 乐观起步 0、写者约束单调降级
+ * 到 1，收敛 ≤ nslots 轮）：
+ * - 无条件标量写者：tval_{add,sub,mul,div,mod,pow,band,bor,bxor,shl,
+ *   shr,neg,pos,bit_not} 全部只回 int/float（或 raise——raise 不落写），
+ *   BW_* 经 tval_to_int 亦回 int；cmp/bool 恒 bool/int；CAST ct∈{1,2,3}
+ *   （函数级白名单保证）恒 int/bool/float；ISSET_* 恒 bool；UNSET_CV
+ *   写 UNDEF。
+ * - PROP（类传播）写者：COPY/ASSIGN/INC/DEC 结果类=源类——INC 的
+ *   "标量入→标量出、串入→串出"（soundness：INC 可回写字符串，不可
+ *   无条件白名单）；suffix 结果=旧值同类。INC 原位写 a1 为恒等传播，
+ *   无需降级。
+ * - 无条件 hot 写者：RECV（参数任意值，含 thunk/默认——OSR 面）/
+ *   FETCH_DIM_R 元素/CONCAT 串/ARRAY_INIT·APPEND·ASSIGN_DIM 数组
+ *   （autoviv/COW 写基槽 a1）/CLOSURE_INIT/NEW_USER 对象/FETCH_PROP
+ *   属性任意/FE_RESET 数组·Generator/DO_FCALL 返回任意（ret_type
+ *   收紧留后续批）/OP_CONST 非标量字面量（串）。
+ * - 入口态预填：捕获 [0..n_cap) 与方法 slot0（$this/保留位由调用方
+ *   直写帧，非 op 写）置 1；参数由 RECV 写者覆盖（JIT→JIT 直写同槽
+ *   同域）；解释器帧 slots 全 UNDEF 起（vm.c frame_alloc）；tphp 无
+ *   引用类型 → 零别名逃逸。
+ * - 隐写点：FE_FETCH 的 val/key 在 slots[a2+1]/[a2+2] 不入操作数 →
+ *   显式降级（漏标 = 覆盖串不释放 → 泄漏族）；a2 游标原位裸写 payload
+ *   （CONST int 起恒 int）与 ar=bool 结果恒标量不降级。
+ * - 读操作数绝不降级：JMPZ/JMPNZ 只读 cond、SEND 源、RETURN 值、
+ *   INIT_* 状态——否则 cond TMP 被读侧污染，cmp 门白丢回收。
+ * - **is_main 全槽保门**：global_slot 直接返回 main_frame->slots[i]
+ *   （vm.c:329）——带 `global` 的函数（FETCH/ASSIGN_GLOBAL，JIT 白名单
+ *   外=纯解释器）随时写主帧槽，操作数流分析对 main 不封闭。
+ * - 未知 opcode（OSR chunk 可含函数级白名单外 op；ASSIGN_PROP/UNSET_PROP
+ *   族经 replay 执行，其 handler 有 ar 写点）→ CV/TMP 操作数保守全降级
+ *   （多保门 = HEAD 行为）。
+ * 错判方向：该 hot 未 hot = 跳过释放 → 只可能泄漏（探针拦截），不会
+ * 双释放/崩溃；反向错判 = 多付门 = HEAD。 */
+static bool slotgate_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TPHP_SLOTGATE");
+        on = (e && e[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
+static void jit_scan_slot_writers(TFunc *fn, uint8_t *hot) {
+    uint32_t nslots = (uint32_t)fn->n_locals + fn->n_tmps;
+    if (!nslots) return;
+    /* 源类：CONST 看字面量、槽看 hot、未知形态保守 hot */
+#define SLOT_SRC_HOT(kind, idx) \
+    ((kind) == OPD_CONST ? !lit_scalar(fn->lits[(idx)]) \
+     : ((kind) == OPD_CV || (kind) == OPD_TMP) ? hot[(idx)] : 1)
+#define SLOT_MARK(s) do { \
+        uint32_t _sm = (uint32_t)(s); \
+        if (_sm < nslots && !hot[_sm]) { hot[_sm] = 1; ch = 1; } \
+    } while (0)
+
+    /* 入口态预填：捕获槽由帧建立机制（vm.c frame push rec->clo 分支）
+     * 预填、方法 slot0（$this）由调用方直入 poff 写——皆非本函数 op 写 */
+    for (uint16_t i = 0; i < fn->n_cap && i < nslots; i++) hot[i] = 1;
+    if (fn->is_method) hot[0] = 1;
+    if (fn->is_main) {          /* 见函数注：全局别名随时写主帧槽 */
+        memset(hot, 1, nslots);
+        return;
+    }
+
+    for (uint32_t pass = 0; pass <= nslots + 1; pass++) {
+        int ch = 0;
+        for (uint32_t pc = 0; pc < fn->n_ops; pc++) {
+            TOp *op = &fn->ops[pc];
+            bool dsz = (op->tr == OPD_CV || op->tr == OPD_TMP);
+            switch (op->op) {
+            /* ---- 只读：绝不写槽（JMPZ/JMPNZ 只读 cond——soundness 要点） */
+            case OP_JMP: case OP_JMPZ: case OP_JMPNZ: case OP_RETURN:
+            case OP_SEND_VAL: case OP_SEND_VAR: case OP_SEND_CAP:
+            case OP_INIT_FCALL: case OP_INIT_DYN: case OP_INIT_MCALL:
+            case OP_INIT_SMCALL: case OP_INIT_NEW:
+                break;
+            /* ---- 无条件标量写者（dst=ar；a1/a2 只读） */
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+            case OP_POW: case OP_BW_AND: case OP_BW_OR: case OP_BW_XOR:
+            case OP_SHL: case OP_SHR: case OP_NEG: case OP_POS:
+            case OP_BIT_NOT: case OP_SEQ: case OP_SNE: case OP_EQ:
+            case OP_NE: case OP_CMP: case OP_LT: case OP_LE:
+            case OP_BOOL_NOT: case OP_BOOL_VAL:
+            case OP_ISSET_DIM: case OP_ISSET_PROP: case OP_ISSET_CV:
+                break;
+            case OP_UNSET_CV:
+                break;              /* 写 UNDEF（dst=a1） */
+            case OP_CAST:
+                if (op->t2 == OPD_CONST) {
+                    int64_t ct = fn->lits[op->a2].u.i;
+                    if (ct == 1 || ct == 2 || ct == 3) break;  /* int/bool/float */
+                }
+                if (dsz) SLOT_MARK(op->ar);   /* 未知 ct（串转型等）→ 串 */
+                break;
+            /* ---- PROP：结果类 = 源类（COPY 只标 dst） */
+            case OP_COPY: case OP_ASSIGN:
+            case OP_INC: case OP_DEC:
+                if (dsz && SLOT_SRC_HOT(op->t1, op->a1)) SLOT_MARK(op->ar);
+                break;
+            /* ---- 字面量：非标量（串）→ hot */
+            case OP_CONST:
+                if (dsz && !lit_scalar(fn->lits[op->a1])) SLOT_MARK(op->ar);
+                break;
+            /* ---- 无条件 hot 写者 */
+            case OP_RECV:            if (dsz) SLOT_MARK(op->ar); break;  /* 参数任意值 */
+            case OP_ARRAY_INIT:      if (dsz) SLOT_MARK(op->ar); break;  /* 数组 */
+            case OP_FETCH_DIM_R:     if (dsz) SLOT_MARK(op->ar); break;  /* 元素任意 */
+            case OP_CONCAT:          if (dsz) SLOT_MARK(op->ar); break;  /* 串 */
+            case OP_CLOSURE_INIT:    if (dsz) SLOT_MARK(op->ar); break;  /* T_CLOSURE */
+            case OP_NEW_USER:        if (dsz) SLOT_MARK(op->ar); break;  /* 对象 */
+            case OP_FETCH_PROP:      if (dsz) SLOT_MARK(op->ar); break;  /* 属性任意 */
+            case OP_FE_RESET:        if (dsz) SLOT_MARK(op->ar); break;  /* 数组/Generator */
+            case OP_DO_FCALL:        if (dsz) SLOT_MARK(op->ar); break;  /* 返回任意 */
+            case OP_ARRAY_APPEND:
+            case OP_ASSIGN_DIM:
+                /* 基槽 a1 可能 autoviv/COW 成数组；ar/t2 = val/key 只读
+                 *（do_dim_write 只写 bp，rdv 取 val） */
+                if (op->t1 == OPD_CV || op->t1 == OPD_TMP) SLOT_MARK(op->a1);
+                break;
+            case OP_FE_FETCH:
+                /* 隐写 val/key 在 slots[a2+1]/[a2+2]（vm.c op_fe_fetch，
+                 * 不入操作数）→ 显式降级；ar=bool 结果、a2 游标恒标量 */
+                SLOT_MARK(op->a2 + 1);
+                SLOT_MARK(op->a2 + 2);
+                break;
+            default:
+                /* 未知 op（OSR 白名单外 / replay 族）：CV/TMP 操作数保守降级 */
+                if (op->t1 == OPD_CV || op->t1 == OPD_TMP) SLOT_MARK(op->a1);
+                if (op->t2 == OPD_CV || op->t2 == OPD_TMP) SLOT_MARK(op->a2);
+                if (dsz) SLOT_MARK(op->ar);
+                break;
+            }
+        }
+        if (!ch) break;
+    }
+#undef SLOT_MARK
+#undef SLOT_SRC_HOT
+}
+
 void tphp_jit_compile(TFunc *fn) {
     if (!g_jit_on || !fn) return;
     if (fn->jit_entry) return;
@@ -3778,6 +3964,11 @@ void tphp_jit_compile(TFunc *fn) {
     JitC j;
     memset(&j, 0, sizeof j);
     j.fn = fn;
+    /* 刀3：槽级写者分析（TPHP_SLOTGATE=0 → slot_hot=NULL → 全保门） */
+    if (slotgate_on() && fn->n_locals + fn->n_tmps) {
+        j.slot_hot = (uint8_t *)calloc((size_t)fn->n_locals + fn->n_tmps, 1);
+        if (j.slot_hot) jit_scan_slot_writers(fn, j.slot_hot);
+    }
     ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
     memset(ctx, 0, sizeof *ctx);
     j.ctx = ctx;
@@ -3847,6 +4038,7 @@ void tphp_jit_compile(TFunc *fn) {
     }
     ir_free(ctx);
     tm_free(ctx);
+    free((void *)j.slot_hot);
 
     if (entry)
         fn->jit_entry = entry;
@@ -3988,6 +4180,11 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
     j.fn = fn;
     j.osr = 1;
     j.cur_pc = backedge_cur;
+    /* 刀3：槽级写者分析（同一 fn 全流分析，OSR chunk 写点同样受约束） */
+    if (slotgate_on() && fn->n_locals + fn->n_tmps) {
+        j.slot_hot = (uint8_t *)calloc((size_t)fn->n_locals + fn->n_tmps, 1);
+        if (j.slot_hot) jit_scan_slot_writers(fn, j.slot_hot);
+    }
     ir_ctx *ctx = tm_malloc(sizeof(ir_ctx));
     memset(ctx, 0, sizeof *ctx);
     j.ctx = ctx;
@@ -4056,6 +4253,7 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
     }
     ir_free(ctx);
     tm_free(ctx);
+    free((void *)j.slot_hot);
 
     jit_unlock();
     return entry;          /* NULL = 拒编/发射失败（调用方熔断该位点） */
