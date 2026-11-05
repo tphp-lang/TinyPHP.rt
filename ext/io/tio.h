@@ -10,6 +10,7 @@
 #define TPHP_TIO_H
 
 #include "opcode.h"
+#include "tsched.h"   /* TCont 前向声明——本头自洽依赖（导出头集单 include 可编） */
 #include <uv.h>
 
 /* TStream 内部类注册（幂等；必须在 tphp_compile 之前调用） */

@@ -59,7 +59,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tphp-windows-x86_64
-          path: build/tphp.exe
+          path: |
+            build/tphp.exe
+            build/libtphp.a
+            build/include
           if-no-files-found: error
 
   # ---------- Linux x86_64 ----------
@@ -103,7 +106,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tphp-linux-x86_64
-          path: build/tphp
+          path: |
+            build/tphp
+            build/libtphp.a
+            build/include
           if-no-files-found: error
 
   # ---------- Linux aarch64 ----------
@@ -147,7 +153,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tphp-linux-aarch64
-          path: build/tphp
+          path: |
+            build/tphp
+            build/libtphp.a
+            build/include
           if-no-files-found: error
 
   # ---------- macOS aarch64 (Apple Silicon, native) ----------
@@ -191,7 +200,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tphp-macos-aarch64
-          path: build/tphp
+          path: |
+            build/tphp
+            build/libtphp.a
+            build/include
           if-no-files-found: error
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
@@ -229,5 +241,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tphp-macos-x86_64
-          path: build/tphp
+          path: |
+            build/tphp
+            build/libtphp.a
+            build/include
           if-no-files-found: error

@@ -70,6 +70,19 @@ echo [6/6] packing lib\*.php into bundle_data.c...
 %CC% %OBJ%\*.o deps\libffi\lib\libffi.a -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 || goto :fail
 
 :done
+rem dev artifacts: single static lib (engine + vendored deps objects; libffi
+rem stays external, see build.sh parity) + flat public header set.
+rem headers: src/*.h + ext/*/*.h are flat includes (no path refs, no name
+rem clashes) + libuv uv.h/uv/ tree (tio.h pulls <uv.h> transitively).
+echo [pkg] build\libtphp.a + build\include\
+if exist build\include rmdir /s /q build\include
+mkdir build\include
+for %%f in (src\*.h) do copy /y "%%f" "build\include\" >nul || goto :fail
+for /d %%d in (ext\*) do for %%f in ("%%d\*.h") do copy /y "%%f" "build\include\" >nul || goto :fail
+xcopy /e /i /y deps\libuv\include\uv "build\include\uv" >nul || goto :fail
+copy /y deps\libuv\include\uv.h "build\include\" >nul || goto :fail
+llvm-ar rcs build\libtphp.a %OBJ%\*.o || ar rcs build\libtphp.a %OBJ%\*.o || goto :fail
+
 echo Build OK: %OUT%
 exit /b 0
 

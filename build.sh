@@ -253,4 +253,28 @@ echo "  link ffi: $FFI_LIB arch: ${ARCH_FLAG:-default}"
 # to host arch and ignores the -arch-built objects: "Undefined: _main").
 $CC $ARCH_FLAG "$OBJ"/*.o $FFI_LIB -o "$OUT" $LDLIBS
 
+# ---- dev artifacts: single static lib + flat public header set ----
+# libtphp.a = engine + vendored deps objects (uv/mbedtls/mimalloc/pcre2/
+# miniz/ir/asm). libffi stays external: system lib here, vendored .a on
+# Windows (build.cmd parity) -- consumer links -lffi alongside.
+# headers: src/*.h + ext/*/*.h are flat includes (no path refs, no name
+# clashes) + libuv uv.h/uv/ tree (tio.h pulls <uv.h> transitively).
+echo "[pkg] build/libtphp.a + build/include/"
+INC_OUT=build/include
+rm -rf "$INC_OUT"
+mkdir -p "$INC_OUT"
+cp src/*.h "$INC_OUT"/
+for d in ext/*/; do
+  for f in "$d"*.h; do
+    [ -e "$f" ] || continue
+    cp "$f" "$INC_OUT"/
+  done
+done
+cp deps/libuv/include/uv.h "$INC_OUT"/
+cp -R deps/libuv/include/uv "$INC_OUT"/
+AR_BIN=ar
+if command -v llvm-ar >/dev/null 2>&1; then AR_BIN=llvm-ar; fi
+rm -f build/libtphp.a
+"$AR_BIN" rcs build/libtphp.a "$OBJ"/*.o
+
 echo "Build OK: $OUT"
