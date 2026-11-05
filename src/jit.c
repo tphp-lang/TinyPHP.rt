@@ -28,6 +28,7 @@ int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret); /
 TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
 TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap);    /* vm.c P0-18① */
 int tphp_jit_opseq(VM *vm, TFunc *fn, TVal *slots, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
+int tphp_jit_fetch_prop(VM *vm, TFunc *fn, TOp *op, uint32_t pc, TVal *slots); /* vm.c 刀5：假帧+真 handler */
 
 #ifdef TPHP_JIT
 
@@ -1906,10 +1907,18 @@ static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
  * 走 lower_replay 的真 handler 读 vm->x.frame->slots 会落进调用方帧 →
  * 只允许无帧体走折叠直调，含 replay/pad op 的体回退 p_seq 序回放
  * （op_do_fcall 推帧后经 opseq 执行，原路径）。 */
+static int prop_helper_enabled(void);   /* 定义在开关区（刀5，晚于本用点） */
 static bool jit_body_frameless(TFunc *fn) {
     for (uint32_t i = 0; i < fn->n_ops; i++) {
         switch (fn->ops[i].op) {
-        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        /* 刀5：FETCH_PROP 摘除（helper 开关开时）——已原生发射为
+         * tphp_jit_fetch_prop helper（vm.c 造本地假帧后跑真 handler，
+         * slots 指调用链传入槽区），不依赖 ambient 帧 → getter 体可走
+         * 折叠直调（mcall fold 解锁）。开关关 → 仍拒（回放需帧）。 */
+        case OP_FETCH_PROP:
+            if (prop_helper_enabled()) break;
+            return false;
+        case OP_ASSIGN_PROP:
         case OP_ISSET_PROP: case OP_UNSET_PROP:
         case OP_ISSET_DIM:
         case OP_FE_RESET: case OP_FE_FETCH:
@@ -2451,6 +2460,18 @@ static int setdim_fast_enabled(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TPHP_SETDIM_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* 刀5（11-05 FETCH_PROP helper 化）开关：默认开，TPHP_PROP_HELPER=0 关
+ * = 回到单 op 回放 + frameless 拒 FETCH_PROP（HEAD 行为）。两处必须同开
+ * 同关——helper 关而 frameless 放开 = 无帧跑回放必错。 */
+static int prop_helper_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_PROP_HELPER");
         v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
     }
     return v;
@@ -3477,7 +3498,34 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
-        case OP_FETCH_PROP: case OP_ASSIGN_PROP:
+        case OP_FETCH_PROP: {
+            /* 刀5：helper 化（替代单 op 回放）——vm.c 造假帧跑真 handler，
+             * frameless callee/OSR/fn 级三态通用；raise → 局部 setjmp →
+             * 返 0 → IR RETURN：fn 级=0（exception 由 op_do_fcall 从 C 帧
+             * 上传，不重跑）；OSR=本 op pc（解释器见挂起异常直接传播，
+             * replay-opseq 同款"不重跑"语义）。开关关 → 单 op 回放。 */
+            if (!prop_helper_enabled()) {
+                lower_replay(j, pc, pc + 1);
+                pc++;
+                break;
+            }
+            JIT_CTX();
+            ir_ref t[5] = { j->r_vm,
+                            ir_CONST_ADDR((uintptr_t)j->fn),
+                            ir_CONST_ADDR((uintptr_t)op),
+                            ir_CONST_I32((int32_t)pc),
+                            j->r_slots };
+            ir_ref ok = ir_CALL_N(IR_I32,
+                                  ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_prop),
+                                  5, t);
+            ir_ref ifp = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+            ir_IF_TRUE(ifp);
+                ir_RETURN(ir_CONST_I32(j->osr ? (int32_t)pc : 0));
+            ir_IF_FALSE(ifp);
+            pc++;
+            break;
+        }
+        case OP_ASSIGN_PROP:
         case OP_ISSET_PROP: case OP_UNSET_PROP: {
             /* P0-14 批2-2：单 op pad 执行——真 handler 读自身操作数（动态
              * 名/槽皆活在本位）+ 写 dst 槽；magic __get/__set 与 raise 走

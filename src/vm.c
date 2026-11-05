@@ -4336,6 +4336,51 @@ static int32_t op_fetch_prop(VM *vm, TOp *op) {
              "Undefined property: %s (full objects land in M3)", n);
 }
 
+/* ---- 刀5（11-05）：FETCH_PROP 的 JIT helper ----
+ * 直调折叠不推 VMFrame，而 prop 读真 handler 依赖帧（槽访问/vis 作用域/
+ * raise 行文件）。helper 为链上造一个本地假帧：slots 指向调用链传入的
+ * callee 槽区（零拷贝），vis_scope/called_cls 取 fn 静态 decl（镜像
+ * op_do_fcall 方法直入布局 vm.c:2572），随后**原样执行真 op_fetch_prop**
+ * ——语义/IC 填充/raise 内容与解释器逐位同源，零重写风险。
+ * fn 级/OSR 入口本就有正确帧（frame->fn==fn 且 slots 同址）→ 跳过假帧
+ * （防 trace 双帧；递归同名帧因 slots 异址仍会正确补帧）。
+ * raise 用局部 setjmp 接住（bug1 家族：绝不跨 IR 帧 longjmp），
+ * exception 保留 → 返 0 → IR RETURN 沿链到 op_do_fcall 从 C 帧上传
+ * （与 replay-opseq 的"恒=exception 不重跑"同语义；fn 内 try 被
+ * jit_eligible n_ex>0 拒编排除，无同帧 handler 漏检面）。
+ * 1 = 已写 dst（真 handler wtake 落 slots[op->ar]），0 = raise landed。 */
+int tphp_jit_fetch_prop(VM *vm, TFunc *fn, TOp *op, uint32_t pc, TVal *slots) {
+    VMFrame fake;
+    int ok = 1;
+    int pushed = 0;
+    jmp_buf outer, mine;
+    if (!(vm->x.frame && vm->x.frame->fn == fn && vm->x.frame->slots == slots)) {
+        memset(&fake, 0, sizeof fake);
+        fake.fn = fn;
+        fake.file = fn->file;
+        fake.pc = pc;
+        fake.prev = vm->x.frame;
+        fake.slots = slots;
+        fake.vis_scope = (fn->is_method && fn->decl_cls)
+                       ? (TClass *)fn->decl_cls : NULL;
+        fake.called_cls = fake.vis_scope;
+        fake.args_base = (uint32_t)vm->x.n_args;
+        fake.n_calls_at_entry = vm->x.n_calls;
+        vm->x.frame = &fake;
+        pushed = 1;
+    }
+    memcpy(&outer, &vm->x.unwind, sizeof(jmp_buf));
+    if (TPHP_SETJMP(mine) == 0) {
+        memcpy(&vm->x.unwind, &mine, sizeof(jmp_buf));
+        (void)op_fetch_prop(vm, op);   /* 恒返 1；raise 不达此 */
+    } else {
+        ok = 0;
+    }
+    memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
+    if (pushed) vm->x.frame = fake.prev;
+    return ok;
+}
+
 static int32_t op_rethrow(VM *vm, TOp *op) {
     if (!vm->x.exception)
         vm_raise(vm, ex_class("Error"), op, "Internal: rethrow without exception");
