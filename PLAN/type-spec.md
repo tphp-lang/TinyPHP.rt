@@ -1,0 +1,104 @@
+# 类型特化 / Loop Versioning（P0-17③ 最后一件：消每迭代 tag 检查）
+
+状态：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
+上游依据：emit-ssa.md §③ 类型特化；read 减法定案（memory/2026-11-05.md 主刀轮收口）。
+
+## 1. 目标与账本
+
+read（array-read 1e6 闭包）现状 6.5ms ≈ 6.5ns/iter，PHP strongest 1.1ns。减法拆账：
+
+| 段 | ns/iter | 状态 |
+|---|---:|---|
+| FETCH（链/边界/装箱） | 3.5 | 结构墙（emit-ssa §5 MERGE/双活），fold 唯一解已封存 |
+| 循环控制 | 1.7 | ~0.25ns/条近硬件效率，无肉 |
+| 累加 | 0.3 | RA 已优化殆尽 |
+| **检查类（tag cmp/sete/常量物化）** | **~1-1.5** | **本立项靶子** |
+
+asm 证据（def 版 0x4d9 循环体）：`$s` tag cmp+sete、`v` tag cmp+sete、`$i` tag cmp+jne、
+DimIC key tag 检查、dst tag 每迭代重写常量——每迭代 ~10-15 条检查/物化指令。
+**PHP tracing JIT 做到 1.1 的手段即观测类型后特化消检查**——本项是与 PHP 的真实差距来源之一。
+
+预期：read 6.5 → **~5.0-5.5**（CI 比值 4.45× → ~3.5-3.8×）；对全部 preguard 白名单循环
+通用（read/rmw/push 主循环形态皆可受益）。诚实上限：边界税与 TVal 结构仍在，非 1.1 追平件。
+
+## 2. 核心机制（单版本 + preheader guard + deopt 兜底）
+
+**不做双版本代码**（emit_seq 单遍无法 emit 两份循环体）。采用 baseline JIT 惯用的
+speculation 形态：
+
+```
+（循环 preheader，LOOP_BEGIN 之前）
+  g1 = base 是 T_ARR                     ← 复用 preguard 的 inv 外提
+  g2 = packed                            ← 复用 preguard 的 pre_pk
+  g3 = all_int(base)                     ← 新 helper：O(n) 扫全元素 tag==INT（每调用一次）
+  g4 = slot($s) tag==INT && slot($i) tag==INT
+  IF (g1 && g2 && g3 && g4) {
+      LOOP_BEGIN ... 特化循环体（跳过全部 tag cmp/sete 与 dst tag 重写）
+      LOOP_END ... 出口照常
+  } ELSE {
+      ir_RETURN(resume = 循环起始 pc)     ← 解释器接管（既有 OSR_RET_PC/重启语义）
+  }
+```
+
+- **特化体 emit**：`j->spec` 上下文标志，进入循环 emit 时置位（guard TRUE 分支内），
+  emit 各检查点按标志跳过：
+  - FETCH：`g.kt == JT_INT`（key tag）、`vtag == INT`、`otag == INT` 的 cmp/sete 免；
+    dimic_take/ASSIGN **只写 pay、免 dst tag store**（恒 INT，tag 不变；批C pay-only
+    store 同款论证）。
+  - ADD/INC：$s/$i 的 tag load 与 cmp 免（值恒 INT）。
+  - 溢出检查**保留**（成本实测免费（B−C = 0.3 含它），且 float 降级是真运行时分支）。
+- **guard 失败出口** = ir_RETURN 到循环起始 pc：解释器从循环条件重进（preheader 处
+  尚未执行循环体 → 零双跑、零死循环——与 §5.2 "每迭代 deopt 死循环"警告的区别：
+  guard 每调用只评估一次，失败即整段交解释器，无"编译同版本反复进即 deopt"）。
+- **all_int 扫描成本**：1000 元素 × (load tag+cmp) ≈ 数百 ns/调用，1e6 迭代摊销
+  <0.001ns/iter；多次调用的真实负载 = 每调用 O(n)，v1 接受，v2 可做观察缓存
+  （site 记"上次数组指针 + 全INT 扫描通过"快照跳过重扫）。
+
+## 3. 适用面与安全判据（全部复用既有机制）
+
+- **循环准入 = preguard_scan 判据原文复用**：单回边、单前驱入口、无外部跳入、
+  **体内纯 op 白名单（读任意 + 写自身标量槽，无 CALL/数组写/RETURN/THROW/FE）**
+  ——体内无数组写 + tphp 无引用别名 ⇒ 进入循环后 base/元素类型不可变，
+  g3 扫描结论整个循环期有效（假设破坏不可达）。
+- 元素被改写的唯一途径是体内 store（白名单排除）或引用逃逸（不存在）；
+  UNSET/间接写同理。
+- guard 失败形态（hash 数组/混合类型/$s 非 INT）→ 每调用一次 deopt 成本 ≈
+  preheader 几条 cmp + 返回切换，可接受且**无重入**。
+
+## 4. 与既有机制交互
+
+| 机制 | 交互 | 处理 |
+|---|---|---|
+| preguard（外提 inv/pk/n/dt） | g1/g2 直接复用外提值；guard 菱形须在 preguard 菱形**之前或合并**（支配序） | 合并为单一 preheader 菱形 |
+| fold/B'（默认关） | spec 下 fold fast 线的双 INT 检查同免 | 封存态不动；spec 开时 fold 仍关 |
+| OSR | spec 循环的 OSR chunk：guard 在 chunk 外（preheader 不在 chunk 内）→ OSR 入口无法验证假设 → **OSR chunk v1 不特化**（保持现检），fn 级特化优先 | 记账批2 |
+| deopt（helper raise） | 特化体的 pay-only store：resume 时槽 tag=旧 INT=真值 ✓ 与批C 同论证 | 已论证 |
+| DimIC 快照 | g3 覆盖 packed+全INT；IC 链本身仍发射（key tag 检查免但结构在——v1 只免 cmp 不动链结构，链结构消除=批2 降分支） | 分批 |
+
+## 5. 分批计划
+
+- **批1（本立项首刀）**：fn 级 read 形态最小闭环——
+  1. preheader 菱形 emit（g1-g4 + all_int helper + FALSE→RETURN resume 循环头 pc）；
+  2. `j->spec` 标志 + FETCH/ADD/INC 三处检查点跳过 + dst tag 免写；
+  3. 判据复用 preguard_scan（spec 独立开关 TPHP_TYPE_SPEC=0 关）；
+  4. 验收：read ≥−1ns（6.5→≤5.5）、246×3、全表零回退（特化错值由
+     tests/jit 语义对拍矩阵兜底：int/float/str 元素 × int/float 累加器 ×
+     首次调用即混合类型 × hash 数组 guard-fail 路径）。
+- **批2**：DimIC 链结构在 spec 下的消除（免 bound 分支外的层叠 cmp）、OSR chunk 入口 spec。
+- **批3**：all_int 观察缓存（IC 快照跳过重扫）、hash INT 键扩展。
+
+## 6. 风险清单
+
+1. **假设破坏 = 静默错值**（最高）：体内零写白名单 + 无引用别名为证明面；每批全量
+   246 + 双模语义对拍（JIT=0 逐行）兜底。
+2. **guard-fail 高频形态**（混合数组反复调用）：每调用一次 preheader+RETURN 成本，
+   无重入；bench 矩阵含该路径。
+3. **emit 双上下文复杂度**（spec 标志漏点 = 少检查错值）：检查点清单化 + review
+   checklist（镜像 rel_dst_gate 的写点清单纪律）。
+4. **代码体积**：特化体 = 现体减检查，不膨胀。
+
+## 7. 验收与观测
+
+- A/B：TPHP_TYPE_SPEC 默认开 / =0 关，min-of-6 双口径（Windows + WSL linux）。
+- 探针：%TEMP%\tp_read_ablate.php 减法矩阵复跑（A/B/C/D 形态）。
+- DEBUG=2 机器码落盘对比：循环体 `cmp/sete` 计数前后差（直接指标）。
