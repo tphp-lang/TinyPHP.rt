@@ -50,7 +50,11 @@ rd /s /q build\obj                 # Windows
 
 ## CI
 
-`.github/workflows/ci.yml`，5 个 job：
+**拆分（11-05）**：测试自动、打包手动，只保留三个工作流——
+
+- `.github/workflows/test.yml`：**自动**（push/PR）——build → tests/run.ps1 → pack smoke → smoke，**不导出产物**
+- `.github/workflows/build.yml`：**仅手动**（workflow_dispatch）——五平台 build → Sanity(`-v`) → 导出 artifact（binary + libtphp.a + include/），不重跑测试
+- `.github/workflows/perf.yml`：**仅手动**——13 项 perf 套 + mimalloc 变体对照
 
 | Job | Runner | 构建 |
 |---|---|---|
@@ -60,7 +64,7 @@ rd /s /q build\obj                 # Windows
 | macos-aarch64 | macos-latest | build.sh |
 | macos-x86_64 | macos-latest 交叉 | `TARGET_ARCH=x86_64 build.sh` |
 
-每个 job：**build → tests/run.ps1 → pack smoke → tphp -v + tphp test tests/lib → 上传 artifact**。
+test.yml 每个 job：**build → tests/run.ps1 → pack smoke → smoke**；build.yml 每个 job：**build → Sanity → 上传 artifact**。
 
 ## ASAN 调试构建（手工，未入库）
 

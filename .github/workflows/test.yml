@@ -1,0 +1,201 @@
+name: Test
+
+# Automatic test pipeline (push / PR): build + tests on all five
+# platforms, no artifact export. Manual packaging lives in build.yml
+# (workflow_dispatch only).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- Windows x86_64 (msys2 clang64) ----------
+  windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: false
+          install: mingw-w64-clang-x86_64-clang
+
+      - name: Build (build.cmd via msys2 CLANG64)
+        shell: msys2 {0}
+        run: |
+          which clang
+          clang --version
+          cmd.exe //c build.cmd
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (PE resources)
+        shell: pwsh
+        run: |
+          # __DIR__-relative read: source_root-relative key + disk-miss fallback (T13)
+          New-Item -ItemType Directory -Path data -Force | Out-Null
+          Set-Content -Path data/asset.txt -Value "asset-data" -NoNewline
+          Set-Content -Path app.php -Value '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' -NoNewline
+          ./build/tphp.exe build app.php --with data -o app.exe
+          $out = ./app.exe
+          if (($out -split "`n") -notcontains 'asset-data') { throw "packed __DIR__ asset not readable" }
+          if (($out -split "`n").Count -lt 2) { throw "ASSET_ROOT compat path broken" }
+          if (Test-Path runtime/data) { throw "data asset must not hit disk" }
+          "asset-in-memory"
+
+      - name: Smoke
+        shell: pwsh
+        run: |
+          ./build/tphp.exe -v
+          ./build/tphp.exe test tests/lib
+
+  # ---------- Linux x86_64 ----------
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang binutils libffi-dev
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (ELF section / footer)
+        run: |
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
+          ./app > out.txt
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
+          echo "asset-in-memory"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- Linux aarch64 ----------
+  linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang binutils libffi-dev
+
+      - name: Build (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (ELF section / footer)
+        run: |
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
+          ./app > out.txt
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
+          echo "asset-in-memory"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- macOS aarch64 (Apple Silicon, native) ----------
+  macos-aarch64:
+    name: macOS aarch64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          brew install libffi || true
+          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Build native arm64 (build.sh)
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Test
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Pack smoke (footer container)
+        run: |
+          mkdir -p data
+          printf '%s' 'asset-data' > data/asset.txt
+          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
+          ./build/tphp build app.php --with data -o app
+          ./app > out.txt
+          test "$(grep -c 'asset-data' out.txt)" -eq 2
+          test ! -d runtime/data
+          echo "asset-in-memory"
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib
+
+  # ---------- macOS x86_64: cross-compile on arm64 runner ----------
+  macos-x86_64:
+    name: macOS x86_64 (cross)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          brew install libffi || true
+          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Cross-compile x86_64 (build.sh TARGET_ARCH=x86_64)
+        run: |
+          chmod +x build.sh
+          TARGET_ARCH=x86_64 ./build.sh
+
+      - name: Verify binary arch
+        run: |
+          file build/tphp
+          file build/tphp | grep -q x86_64
+
+      - name: Test (Rosetta 2)
+        shell: pwsh
+        run: ./tests/run.ps1
+
+      - name: Smoke
+        run: |
+          ./build/tphp -v
+          ./build/tphp test tests/lib

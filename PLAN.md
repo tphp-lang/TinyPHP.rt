@@ -59,7 +59,7 @@
 
 - C11 + clang（MinGW64/ucrt64 或 clang64），目标 Windows/Linux/macOS
 - 构建纯命令行脚本（不用 Make/CMake），`.cmd`/`.sh` 纯 ASCII
-- CI：GitHub Actions `.github/workflows/ci.yml`——Windows x86_64（msys2 clang64）、Linux x86_64/aarch64、macOS x86_64/arm64，build + tests/run.ps1 + smoke
+- CI：GitHub Actions，三个工作流——**自动** `test.yml`（push/PR：五平台 build + tests/run.ps1 + smoke，不导出产物）、**手动** `build.yml`（workflow_dispatch：五平台 build + 导出 binary/libtphp.a/include，不重跑测试）、**手动** `perf.yml`（13 项 perf 套 + mimalloc 对照）；平台 = Windows x86_64（msys2 clang64）、Linux x86_64/aarch64、macOS x86_64/arm64
 - vendored：libuv（I/O）、mimalloc（malloc 层）、mbedtls + cacert（HTTPS，M4）、fcontext 汇编（抄 php-src `Zend/asm/` 6 个 .S）、libffi（M5.5 FFI，静态库+头文件）
 - 仓库：`C:\project\tphp\TinyPHP.rt`，CLI 名 `tphp`
 

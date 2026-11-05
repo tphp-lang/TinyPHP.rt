@@ -1,14 +1,14 @@
-name: CI
+name: Build
 
+# Manual packaging/export (workflow_dispatch only): builds all five
+# platforms and uploads artifacts (binary + libtphp.a + include/).
+# Tests run automatically on push via test.yml — not repeated here.
 on:
-  push:
-    branches: [master, main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # ---------- Windows x86_64 (msys2 clang64) ----------
@@ -31,31 +31,11 @@ jobs:
           clang --version
           cmd.exe //c build.cmd
 
-      - name: Test
+      - name: Sanity
         shell: pwsh
-        run: ./tests/run.ps1
+        run: ./build/tphp.exe -v
 
-      - name: Pack smoke (PE resources)
-        shell: pwsh
-        run: |
-          # __DIR__-relative read: source_root-relative key + disk-miss fallback (T13)
-          New-Item -ItemType Directory -Path data -Force | Out-Null
-          Set-Content -Path data/asset.txt -Value "asset-data" -NoNewline
-          Set-Content -Path app.php -Value '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' -NoNewline
-          ./build/tphp.exe build app.php --with data -o app.exe
-          $out = ./app.exe
-          if (($out -split "`n") -notcontains 'asset-data') { throw "packed __DIR__ asset not readable" }
-          if (($out -split "`n").Count -lt 2) { throw "ASSET_ROOT compat path broken" }
-          if (Test-Path runtime/data) { throw "data asset must not hit disk" }
-          "asset-in-memory"
-
-      - name: Smoke
-        shell: pwsh
-        run: |
-          ./build/tphp.exe -v
-          ./build/tphp.exe test tests/lib
-
-      - name: Upload binary
+      - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
           name: tphp-windows-x86_64
@@ -82,27 +62,10 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
-      - name: Test
-        shell: pwsh
-        run: ./tests/run.ps1
+      - name: Sanity
+        run: ./build/tphp -v
 
-      - name: Pack smoke (ELF section / footer)
-        run: |
-          mkdir -p data
-          printf '%s' 'asset-data' > data/asset.txt
-          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with data -o app
-          ./app > out.txt
-          test "$(grep -c 'asset-data' out.txt)" -eq 2
-          test ! -d runtime/data
-          echo "asset-in-memory"
-
-      - name: Smoke
-        run: |
-          ./build/tphp -v
-          ./build/tphp test tests/lib
-
-      - name: Upload binary
+      - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
           name: tphp-linux-x86_64
@@ -129,27 +92,10 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
-      - name: Test
-        shell: pwsh
-        run: ./tests/run.ps1
+      - name: Sanity
+        run: ./build/tphp -v
 
-      - name: Pack smoke (ELF section / footer)
-        run: |
-          mkdir -p data
-          printf '%s' 'asset-data' > data/asset.txt
-          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with data -o app
-          ./app > out.txt
-          test "$(grep -c 'asset-data' out.txt)" -eq 2
-          test ! -d runtime/data
-          echo "asset-in-memory"
-
-      - name: Smoke
-        run: |
-          ./build/tphp -v
-          ./build/tphp test tests/lib
-
-      - name: Upload binary
+      - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
           name: tphp-linux-aarch64
@@ -176,27 +122,10 @@ jobs:
           chmod +x build.sh
           ./build.sh
 
-      - name: Test
-        shell: pwsh
-        run: ./tests/run.ps1
+      - name: Sanity
+        run: ./build/tphp -v
 
-      - name: Pack smoke (footer container)
-        run: |
-          mkdir -p data
-          printf '%s' 'asset-data' > data/asset.txt
-          printf '%s' '<?php echo file_get_contents(__DIR__ . "/data/asset.txt"), "\n"; echo file_get_contents(ASSET_ROOT . "/data/asset.txt"), "\n";' > app.php
-          ./build/tphp build app.php --with data -o app
-          ./app > out.txt
-          test "$(grep -c 'asset-data' out.txt)" -eq 2
-          test ! -d runtime/data
-          echo "asset-in-memory"
-
-      - name: Smoke
-        run: |
-          ./build/tphp -v
-          ./build/tphp test tests/lib
-
-      - name: Upload binary
+      - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
           name: tphp-macos-aarch64
@@ -228,16 +157,10 @@ jobs:
           file build/tphp
           file build/tphp | grep -q x86_64
 
-      - name: Test (Rosetta 2)
-        shell: pwsh
-        run: ./tests/run.ps1
+      - name: Sanity
+        run: ./build/tphp -v
 
-      - name: Smoke
-        run: |
-          ./build/tphp -v
-          ./build/tphp test tests/lib
-
-      - name: Upload binary
+      - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
           name: tphp-macos-x86_64
