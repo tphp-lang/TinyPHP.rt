@@ -1370,6 +1370,16 @@ static TVal bi_implode(VM *vm, TVal *args, int n) {
     return TV_STR(out);
 }
 
+/* 刀7（2026-11-05）explode memchr 快路开关：默认开，TPHP_EXPLODE_FAST=0 关（A/B） */
+static int explode_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_EXPLODE_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 static TVal bi_explode(VM *vm, TVal *args, int n) {
     if (n < 2) RAISE(vm, "ArgumentCountError", "explode() expects at least 2 arguments");
     TStr *delim = need_str(vm, &args[0], "explode", "#1 ($separator)");
@@ -1382,6 +1392,25 @@ static TVal bi_explode(VM *vm, TVal *args, int n) {
     const char *end = p + s->len;
     const char *d = tstr_val(delim);
     int64_t count = 0;
+    /* 刀7快路：单字节分隔符 memchr（12MB 线性 SIMD 扫 vs 通用路逐字节
+     * memcmp(q,d,1) 调用——logstat 灾样 "\n"/" " 全中；实测大 explode
+     * 6.1× 是 logstat 3.46× 最大单项根因）。语义与通用路逐位等价：
+     * p=hit+1 恒 ≤ end（命中前提 q+dlen≤end，dlen=1），p==end 时
+     * memchr 长度 0 返 NULL → break → 末段追加空串（尾分隔符语义）；
+     * limit 提前截断同款（截断后 p..end 整段作末元素，含后续分隔符）。 */
+    if (explode_fast_enabled() && delim->len == 1) {
+        char dc = d[0];
+        while (p <= end) {
+            if (limit >= 0 && count + 1 >= limit) break;
+            const char *hit = p < end ? (const char *)memchr(p, dc, (size_t)(end - p)) : NULL;
+            if (!hit) break;
+            tarr_append(a, TV_STR(tstr_new(p, (size_t)(hit - p))));
+            count++;
+            p = hit + 1;
+        }
+        tarr_append(a, TV_STR(tstr_new(p, (size_t)(end - p))));
+        return TV_ARR(a);
+    }
     while (p <= end) {
         if (limit >= 0 && count + 1 >= limit) break;
         const char *hit = NULL;

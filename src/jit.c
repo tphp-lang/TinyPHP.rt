@@ -4153,8 +4153,9 @@ void tphp_jit_compile(TFunc *fn) {
         if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0]) {
             uint32_t pc = j.cur_pc < fn->n_ops ? j.cur_pc : 0;
             fprintf(stderr,
-                    "[jit] compile(%s) FAILED emit (trap=%d pc=%u op=%u %s L%d)\n",
-                    fn->name ? tstr_val(fn->name) : "?", (int)t.kind, j.cur_pc, (unsigned)fn->ops[pc].op, tphp_op_name(fn->ops[pc].op), j.fail_line);
+                    "[jit] compile(%s) FAILED emit (trap=%d pc=%u op=%u %s L%d) at %s:%u n_ops=%u\n",
+                    fn->name ? tstr_val(fn->name) : "?", (int)t.kind, j.cur_pc, (unsigned)fn->ops[pc].op, tphp_op_name(fn->ops[pc].op), j.fail_line,
+                    fn->file ? fn->file : "?", (unsigned)fn->ops[0].line, fn->n_ops);
         }
     }
     ir_free(ctx);
