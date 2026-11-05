@@ -2445,6 +2445,17 @@ static int append_fast_enabled(void) {
     return v;
 }
 
+/* 刀4（11-05 keyed 覆盖写快路）开关：默认开，TPHP_SETDIM_FAST=0 关
+ * （同二进制 A/B，append 快路同款先例）。 */
+static int setdim_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_SETDIM_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* P0-17③ 批C slice-1：canonical 折叠累加形态守卫（loop phi 激活前提）。
  * 循环体（cond JMPZ 之后 → 回边 JMP）必须严格匹配：
  *   - 恰一个 FETCH_DIM_R+ADD 对，且 ADD 为 RMW 直写 CV（t?==OPD_CV &&
@@ -3010,6 +3021,68 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                             ir_CONST_ADDR(offsetof(TArr, bpending)));
                         ir_STORE(abp, ir_ADD_I32(ir_LOAD_I32(abp),
                                                  ir_CONST_I32(1)));
+                        ir_ref eF = ir_END();
+                    ir_IF_FALSE(ifok);
+                        emit_assign_dim_slow(j, base, key, val);
+                        ir_ref eSK = ir_END();
+                    ir_MERGE_2(eF, eSK);
+                    ir_ref eArr = ir_END();
+                ir_IF_FALSE(ifa);
+                    emit_assign_dim_slow(j, base, key, val);
+                    ir_ref eNo = ir_END();
+                ir_MERGE_2(eArr, eNo);
+                pc++;
+                break;
+            } else if (setdim_fast_enabled() && op->t2 != OPD_UNUSED) {
+                /* 刀4（11-05 keyed 覆盖写快路，目标 = CI linux-x64 rmw 4.0×）：
+                 * $a[$i]=$a[$i]+1 形态此前每迭代整链 tphp_jit_assign_dim
+                 * helper CALL（norm_key/cow/分发全付）。镜像 tarr_set packed
+                 * 原地替换支（array.c:210：packed 无洞 → release+覆盖三行，
+                 * n/next_idx/bpending 全不动、无 grow/compact）：
+                 * - base==T_ARR（排 UNDEF autoviv / T_STR Error / scalar
+                 *   TypeError）&& rc<=1（tarr_cow 原地免复制）&& packed；
+                 * - key tag==INT && (u64)key<n——单条 ULT（BITCAST 后负键
+                 *   = 巨大无符号恒假）镜像 dimic 同款，等价 C 的
+                 *   i>=0 && (uint64)i<n；
+                 * - val.tag<T_STR（tval_addref no-op）——与 helper 按值传参
+                 *   语义对齐：vp/vt 先快照再 release 旧元素（elem 内对象
+                 *   dtor 可跑用户码改 val 槽，快照后不受影响）；
+                 * - rel_dst_gate 释放旧元素（tag∈[T_STR..T_CLOSURE] 才
+                 *   CALL，UNDEF 洞/标量空转）→ pay/tag 覆盖写。
+                 * 任一条件不满足 → 慢路两分支各发完整兜底（norm/COW/grow/
+                 * compact/assoc/非法键 raise 全在其内，语义零漂移）。
+                 * append 形态走既有 APPEND 快路；TPHP_SETDIM_FAST=0 关。 */
+                ir_ref ifa = ir_IF(ir_EQ(load_tag(j, base),
+                                         ir_CONST_I32(T_ARR)));
+                ir_IF_TRUE(ifa);
+                    ir_ref ap = load_pay(j, base);
+                    ir_ref rc = ir_LOAD_I32(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(GCHead, rc))));
+                    ir_ref pk = ir_LOAD_U8(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, packed))));
+                    ir_ref n64 = ir_ZEXT(IR_U64, ir_LOAD_U32(
+                        ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, n)))));
+                    ir_ref kt = load_tag(j, key);
+                    ir_ref kp = load_pay(j, key);
+                    ir_ref vt = load_tag(j, val);
+                    ir_ref ok = ir_AND(IR_BOOL,
+                        ir_AND(IR_BOOL, ir_LE(rc, ir_CONST_I32(1)),
+                               ir_NE(pk, ir_CONST_U8(0))),
+                        ir_AND(IR_BOOL, ir_EQ(kt, ir_CONST_I32(JT_INT)),
+                               ir_ULT(ir_BITCAST_U64(kp), n64)));
+                    ok = ir_AND(IR_BOOL, ok,
+                                ir_LT(vt, ir_CONST_I32(T_STR)));
+                    ir_ref ifok = ir_IF(ok);
+                    ir_IF_TRUE(ifok);
+                        ir_ref vp = load_pay(j, val);   /* 按值快照（C 传参序） */
+                        ir_ref data = ir_LOAD_A(
+                            ir_ADD_A(ap, ir_CONST_ADDR(offsetof(TArr, data))));
+                        ir_ref leaf = ir_ADD_A(data,
+                            ir_SHL_U64(ir_BITCAST_U64(kp),
+                                       ir_CONST_U64(4)));
+                        rel_dst_gate(j, leaf);          /* release 旧元素 */
+                        ir_STORE(leaf, vp);
+                        ir_STORE(ir_ADD_A(leaf, ir_CONST_ADDR(TVAL_TAG)), vt);
                         ir_ref eF = ir_END();
                     ir_IF_FALSE(ifok);
                         emit_assign_dim_slow(j, base, key, val);
