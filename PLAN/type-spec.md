@@ -176,3 +176,13 @@ DEBUG=2 双级 guard 触发：fn 级 `osr=0`、read 基准 OSR chunk `osr=1`。
 
 **观测/后续**：批3（all_int 观察缓存、hash INT 键扩展）未动；WSL/CI 口径
 待 push 后由 perf 流复核。
+
+## 7c. 批3 实测结果（2026-11-06）
+
+**两件（§5）均已落地**：
+
+1. **all_int 观察缓存**：TArr 加 `all_int` 标志——`tphp_jit_spec_guard` 验证 packed+全INT 后置 1；写路径（set/append/unset）清除；guard 首查标志免 O(n) 重扫。tarr_alloc_raw 初始化 0、tarr_cow 深拷贝。收益场景 = 重复循环入口 / OSR chunk 同数组免重扫。
+
+2. **hash INT 键扩展**：DimIC hash 直达快路从 T_STR-only 扩展到 T_INT（splitmix via key_hash），同 4 探测上限、同快照门。kv-read 30-36→28-29ms（~5-10%）。
+
+**验证**：254/254 全绿；bench 零回退。
