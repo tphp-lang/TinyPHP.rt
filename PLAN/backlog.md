@@ -1,13 +1,14 @@
 # backlog · 全量任务与未来规划（交接文档）
 
-> 状态：2026-10-25 建档，2026-11-04 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
-> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)。当日日志：[../memory/2026-10-27.md](../memory/2026-10-27.md)。
+> 状态：2026-10-25 建档，2026-11-06 更新。**读者假设为零上下文的新 AI**：本文是"还剩什么活"的唯一清单——现状、全部未完成任务、远期规划、已决策不做的指针。细节规格一律点链接，不在此复述（防双账）。
+> 上级索引：[../PLAN.md](../PLAN.md)。性能战略：[perf-roadmap](perf-roadmap.md)；JIT 规格：[ir-jit](ir-jit.md)；类型特化：[type-spec](type-spec.md)。当日日志：[../memory/2026-11-05.md](../memory/2026-11-05.md)（含「收工交接」待办优先级）。
+> **编号警告**：11-05 存在两个"刀6"——①OSR FE 放行（已实施、A/B 证伪、用户拍板撤回）；②kv 侦察批提出的 **dimic probe0 线性探测回退（✓ 11-06 已落地，见 P0-13 行）**。详见本文 §4 刀3-刀7 记录与 memory/2026-11-05.md、memory/2026-11-06.md。
 
-## 0. 现状快照（截至 2026-11-04）
+## 0. 现状快照（截至 2026-11-06）
 
-- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；spawn 入口三形态 + 子线程继承全局符号表 = P1-10 已关；协程组保留为 `Tphp\TaskGroup`）。
-- **测试基线**：`tests/run.ps1` = **245 passed / 0 failed**（11-04 本地 rebuild 复验；CI 5 平台同绿）。
-- **性能现状（11-04 CI 五平台，run 41825774682 @ 87c6b26，13 项几何均值）**：**Windows x64 ≈1.15×**（11-01 为 1.72；反超 rmw 0.38/fib 0.31/throw 0.45/string 0.55/call 0.89/jsonagg 0.76；kv 3.76/object 3.21 是 Win 最大输家）；**linux-x64 ≈1.83×**（2.1→1.83；重灾 = 发射器损耗族 read 3.75/kv 4.11/object 3.43/rmw 4.75 + serialize 3.85 绝对差最大 +87ms）；linux-arm ≈1.38×；mac-arm ≈1.89×（P0-19 mimalloc 税拖累，libc 构建 vs mi 构建 rounds 已实锤 push 5.3 vs 28.8ms，待拍板）。**M2（≥1.0）距离 = Win 1.15 最近，主口径 linux-x64 差 1.83**。详见 memory/2026-11-04.md CI 节。
+- **完成**：M0–M6 + M5.5 FFI（回调 v1/v2）+ 包管理 A–E + 生成器 v1 + preg v1（P1–P4）+ C 批语法 + 解释器优化 L1–L5 + **IR baseline JIT v1.2（M1 达成，direct-slot ABI）** + **`Tphp\Thread` 真线程池**（spawn/wait/detach/poll；spawn 入口三形态 + 子线程继承全局符号表 = P1-10 已关；协程组保留为 `Tphp\TaskGroup`）+ **11-03~05 刀3-刀7 发射器手术**（槽级写者分析/keyed 覆盖写内联/FETCH_PROP helper/explode memchr）+ **类型特化批1+2**（`TPHP_TYPE_SPEC`，preheader guard + DimIC 结构消除 + OSR chunk 入口 spec；见 [type-spec.md](type-spec.md)）+ **CI 拆分**（test.yml 自动 / build.yml 手动导出 libtphp.a+include / perf.yml 单文件 `perf-report-all` 交接）。
+- **测试基线**：`tests/run.ps1` = **248 passed / 0 failed**（11-06 本地实测，新增 test-jit-icprobe-001；11-06 起 248×3 模式 = 默认开/`TPHP_IC_PROBE=0`/JIT=0 全绿）。
+- **性能现状（11-05 CI，13 项几何均值；比值 = tphp/PHP 最强态，≤1.0 反超）**：**linux-x64 主口径 1.28×（刀7 轮新低，含 string 异常利好）→ 1.39×（批1+2 轮）**，可比 11 项口径 vs 11-04 累计约 −24%；**windows-x64 ≈0.95× 反超保持**；linux-arm ≈0.92-0.94；mac-arm 带宽 1.6-2.3 摆动（PHP 侧镜像换代/噪声，连续两轮 ≥2.3 才立项）。**M2（≤1.0）主口径尚差 ~1.3-1.4×**；剩余重灾已均匀化（kv/object/read/fib/logstat 各 2.5-3.5×）。逐轮细节见 memory/2026-11-05.md；11-04 旧账（win 1.15 / linux 1.83）见 memory/2026-11-04.md CI 节。
 - **性能现状**（vs PHP 8.5.x opcache+tracing JIT 最强态）：
   - fib(28)：x86_64 ≈**1.27×**（14.0ms vs 10.9ms，direct-slot ABI 后）；
   - 未持平主体 = JIT 白名单外形态：array-read 20–51×、kv-read 15–27×、call 16×、object 7–12×；
@@ -64,6 +65,8 @@
 **11-05 刀8/5B：dtor JIT 直入 + ASSIGN_PROP helper（A/B 证伪全撤）**：vm_call_magic_method 加 hot 门+jit_entry 直入（镜像 op_do_fcall）+ tphp_jit_assign_prop helper（刀5 镜像）——`compile(__destruct)` 确实触发，但 **A/B 净回退**：稳态 dtor 直入 28.8 vs 解释 25.8（+30~40ns/次，helper 付 setjmp+双 memcpy > 省的 dispatch），ASSIGN helper 单独≈0；深挖上限（emit 内联直写免 setjmp）仅 −4~8% 否决。**定性：object 剩余 = dtor/free C 侧机械+alloc/ctor，JIT 线杠杆已收完**；5B 结案不再重开（除非 helper 层 setjmp 免除有全局新技术）。详见 memory/2026-11-05.md。
 
 **11-05 刀6+刀7：编译失败闭包定位 → OSR FE 放行证伪撤回 → explode memchr 快路（未提交）**：刀6 定位（探针 FAILED 行加 `file:line n_ops`；`L`=jit.c `__LINE__` 勘正）——②=real-logstat 主闭包连坐（无害）、③=jsonagg 主闭包 FE 嵌套门，**真缺口=logstat() 主 foreach 无 OSR**（白名单拒 FE_FETCH）；实施 osr_body_ok 放行 FE/ISSET_DIM/ASSIGN_DIM（TPHP_OSR_FE）+246×3 绿，但 **A/B 证伪**：bench 单次口径编译成本>收益（logstat +3.5%、jsonagg +31.8% 触发即循环末），用户拍板撤回（chunk 稳态 −15.8% 仅多轮兑现，机制经验留档 memory/2026-11-05.md）。**成分侦察转向**：logstat 3.46× 真根因=大 explode 6.1×（逐字节 memcmp 扫 12MB）+计数循环插值 4.6×。**刀7 落地**：bi_explode 单字节分隔符 memchr 快路（TPHP_EXPLODE_FAST=0 关）——**A/B real-logstat −16.2%（40.1→33.6）全表零回退**、246×3 绿；剩余杠杆 = TStr 尾部预留 exact-alloc（big explode 仍 4.4×）、计数循环字符串插值（string 线）。
+
+**11-06 刀6（真）：v3.2'' dimic probe0 线性探测回退 `TPHP_IC_PROBE`（数据见 memory/2026-11-06.md）**：kv 侦察（11-05）实锤 IR 侧 STR probe0 只搏 home bucket、8 键满表冲突 → helper 调用率 27%、+7.6ms（kv 差距 47%）。实现 = lvl4 `IF_FALSE(ifm)` 内递归展开 ≤3 步 sequential probe（`slot=(slot+1)&hmask`，镜像 array.c:376-392 的活桶+key 全身份比较；T_NULL 空桶靠 tag 不等自然不命中，超步数落 case 链 → helper → C 侧 arr_find 完整兜底；不回填 cases[0] 避免命中热路径多一次 store）。**验证**：ir_check=1；IC-STATS helper calls **180006→40006（−78%）**、avg_scan 2.76→1.00、slow/缺键次数不变；四模语义对拍（默认/`TPHP_IC_PROBE=0`/JIT=0/PHP 8.5）逐字一致（8 键轮转 / unset tombstone / grow 重建 / INT 键 / 数字串键 / refcounted 值）；**A/B min-of-6 同二进制交替：kv-read 28.8→21.7ms（−24.7%，6/6 方向一致且带完全分离）**，其余全表双向变号属本机噪声（这些形态 IR 零差异）；IR 体积 kvsum +13%。**248×3 全绿**（新增 tests/jit/test-jit-icprobe-001.php、tools/probe_ic_probe.php）。**诚实记账**：低于侦察预期 −33%（rep 水位 15.5），剩余 = 结构底 7.2 + cases FIFO 链/helper 残留；CI 口径待 push 后复核。
 
 **11-05 A 项（P0-17③）侦察批：根因挖穿 = LSRA 无循环权重**：复现 FOLD=1 现状 A/B 仍净负（array-read +22.8%，7.0 vs 5.7）；三层证据链闭环——①asm（热循环每迭代 tag/pay load+store+读回+栈 spill 四连）②RA 日志（acc phi R47 被 split at 281→挤 R43 拿 rsi）③最终布局（**循环主体 pos 320-1953 整段 SPILL**，R43/R46/R48 同形）→ **deps/ir LSRA 零循环深度权重**（freeUntilPos 贪心+3501 早退+split 竞争全无 loop 感知）；375 SHOULD→MUST 一行实验已证伪撤回（走 split 主流程不走早退）。诊断基建留 jit.c（codegen dump+机器码落盘反汇编+IR_DEBUG_RA 通路，DEBUG=2 专用）。**下一步候选 = 循环权重策略（vendor 策略级，FOLD 重开净正为验收）**，下轮拍板。详见 memory/2026-11-05.md。**→ 次日复核修正（防误投）**：三层反转——R47"整段 SPILL"系 dump 折行误读（全程有寄存器）、R46 体内段 spill 的 use_pos 为空=无害、rsp+0x530=call 保护非 RA spill；**fold 总税 1.3ns/iter ≈ 历史 B' 双线控制流税 1.2ns，phi/RA 部分仅 0.2ns → 循环权重上限 ~read −4%，降级低优**。read 真大头 = B' 控制流结构税（转正需重设计）+ 默认态槽往返（emit 值流本体）。**→ B' 税 asm 级归因 + 三态拆税定案**：两版机器码 diff（DEBUG=2 落盘+WSL objdump）——IR 静态差仅 +1IF+1MERGE+2PHI（"分支森林"不存在），每迭代净差 = **+1 taken jmp 两跳中转（$i 段被 fwd 结构挤到独立块）+ $s pay 读回+暂存链 + RA 布局扰动**；子开关 **TPHP_FOLD_ACC=0** 三态拆税：def 6.3 / B'only 7.5 / B'+C 7.6 → **B' 结构税 +1.2、C phi 税仅 +0.1**——靶点定案 = 修 B' fwd 挂起结构（fast 块提前 END→fwd_pc MERGE 开新块），acc phi 无辜不动；246×2 绿，子开关保留作诊断基建。**→ 主刀轮收口**：B'only asm 补证（读回暂存属 C、两跳属 B'）+ 结构判断（fast END 与组尾隔整段慢线 = IR 序 emit 层无解，唯尾复制/vendor layout）→ **B' 红利仅 0.3-0.6、封存**；**read 减法定案**：FETCH 段 3.5（54%）真大头、**累加仅 0.3（槽往返判断被推翻）**、控制 1.7 无肉；**F 发现**：isset(a[i]) 38.4ns = ISSET_DIM replay opseq 机械（计分面暂咬不到，记账=未来加 packed 内联链）、H 发现 = 字符串键构造 133ms（kv/string 线实证）；read 结构墙再确认（值直达撞 §5 MERGE 墙）→ **下一层 = 类型特化/loop versioning**（消每迭代 ~1ns tag 检查，PHP 1.1 真差距来源），与 P0-17 类型特化立项合并，下轮拍板。详见 memory/2026-11-05.md。**→ 用户拍板：类型特化先出设计稿 ✓ → PLAN/type-spec.md v1 已交付**（单版本+preheader guard g1-g4+all_int O(n) 扫描+FALSE→RETURN 零双跑；判据全文复用 preguard_scan 单回边/单入口/体内纯 op 白名单=假设不破坏证明面；批1=fn 级 read 形态最小闭环（TPHP_TYPE_SPEC 开关、read 6.5→≤5.5 验收），批2=链结构消除/OSR，批3=观察缓存/hash 扩展）。等设计评审后开工批1。
 
@@ -123,9 +126,10 @@
 
 ## 7. 验证与工具速查
 
-- 全量测试：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`（期望 233/0）。
-- 性能对比：本地 `pwsh tools/perf-compare.ps1 -MaxFibRatio 6.0 -Report perf.md`；CI 手动 Actions → **Perf** → Run workflow（`fib_gate` 输入可调，0=仅报告）。
-- 单 bench：`build/tphp.exe run tests/bench/test-bench-*.php`（计时走 stderr）。
+- 全量测试：`powershell -ExecutionPolicy Bypass -File tests/run.ps1`（期望 **248/0**；11-06 实测 248×3）；CI 自动测试走 `test.yml`（push/PR），手动打包导出走 `build.yml`。
+- 性能对比：本地 `pwsh tools/perf-compare.ps1 -MaxFibRatio 6.0 -Report perf.md`；CI 手动 Actions → **Perf** → Run workflow（`fib_gate` 输入可调，0=仅报告）——**跑完直接取 `perf-report-all` 单个 artifact**（5 job + extras 已由 collect-report 合并，无需逐段复制）。
+- 开关速查：`TPHP_JIT=0`（解释器）、`TPHP_TYPE_SPEC=0`（类型特化批1+2）、`TPHP_SLOTGATE=0`（刀3）、`TPHP_SETDIM_FAST=0`（刀4）、`TPHP_PROP_HELPER=0`（刀5）、`TPHP_EXPLODE_FAST=0`（刀7）、`TPHP_IC_PROBE=0`（刀6 线性探测回退）、`TPHP_APPEND_FAST=0`（append 快线）、`TPHP_PREGUARD=0`、`TPHP_FOLD_ADD=1`（折叠重开，默认关）、`TPHP_IC_STATS=1`（IC 链统计）。
+- 单 bench：`build/tphp.exe run tests/bench/test-bench-*.php`（计时走 **stderr**，grep 需 `2>&1`）；本地多轮 `tools/bench-rounds.ps1`。
 - JIT 开关 `TPHP_JIT=0`；调试 `TPHP_JIT_DEBUG=1`；执行 trace `TPHP_TRACE=1`；opcode 查看 `--dump-opcodes`。
 - **内存 bug**：ASAN 版本（`TPHP_USE_MIMALLOC` 关 + `-fsanitize=address`）——流程见 `doc/testing.md`「内存问题定位（ASAN）」。
 - 历史决策检索：`memory/MEMORY.md`（锚点）→ `memory/<date>.md`（当日细节）→ 各 PLAN（权威规格）。
