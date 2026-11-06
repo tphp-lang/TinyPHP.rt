@@ -57,6 +57,31 @@ static TVal arr_key_at(TArr *a, uint32_t di) {
     return TV_NULL;
 }
 
+/* 刀13：调用方缓存版键反查——非 packed 源建一次 inv[data_off]=bucket_idx
+ * （O(bcap)），此后每键 O(1)；packed 源返回 NULL（arr_key_at_inv 走
+ * TV_INT(di) 快路）。修复 unique/flip/chunk/keys 的每元素 O(bcap) 桶反查
+ * （审计实测：unique 590×/flip 257×/chunk 684×/keys assoc 50ms）。 */
+static uint32_t *arr_key_inv_build(TArr *a) {
+    if (a->packed) return NULL;
+    uint32_t *inv = tm_malloc(sizeof(uint32_t) *
+                              (size_t)(a->dused ? a->dused : 1));
+    for (uint32_t i = 0; i < a->dused; i++) inv[i] = UINT32_MAX;
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        ABucket *bk = &a->buckets[b];
+        if (bk->key.t != T_NULL && bk->val_off != UINT32_MAX &&
+            bk->val_off < a->dused)
+            inv[bk->val_off] = b;
+    }
+    return inv;
+}
+
+static TVal arr_key_at_inv(TArr *a, uint32_t di, const uint32_t *inv) {
+    if (a->packed) return di < a->n ? TV_INT((int64_t)di) : TV_NULL;
+    if (inv && di < a->dused && inv[di] != UINT32_MAX)
+        return a->buckets[inv[di]].key;
+    return TV_NULL;
+}
+
 static void dump_val(TVal v, int depth);
 
 /* var_dump array body (shared with __debugInfo rendering): entries at the
@@ -823,12 +848,18 @@ static TVal bi_array_unshift(VM *vm, TVal *args, int n) {
 static TVal bi_array_keys(VM *vm, TVal *args, int n) {
     (void)vm; (void)n;
     TArr *a = need_arr(vm, &args[0], "array_keys", "#1 ($array)");
+    uint32_t *inv = arr_key_inv_build(a);   /* 刀13：O(1) 键反查 */
     TArr *b = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        TVal k = arr_key_at(a, i);
+        TVal k = arr_key_at_inv(a, i, inv);
+        /* 刀13 顺手修既有引用 bug：arr_key_at 返回桶借用，append 接管
+         * 引用即亏空（非 packed 键 T_STR 源先释放 = UAF；packed 的
+         * TV_INT 无引用故未暴露）——addref 平衡 */
+        tval_addref(k);
         tarr_append(b, k);
     }
+    if (inv) tm_free(inv);
     return TV_ARR(b);
 }
 
@@ -946,6 +977,8 @@ static TVal bi_array_sum(VM *vm, TVal *args, int n) {
 static int loose_cmp(TVal a, TVal b) { return tval_compare(a, b); }
 
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);   /* vm.c */
+int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret);   /* vm.c（刀10：排序比较器/map/filter/reduce 守卫化） */
+void *tphp_vm_resolve_fn_global(VM *vm, TStr *name, bool *is_builtin);   /* vm.c（刀13：function_exists） */
 
 /* ---- asort/arsort/ksort/krsort（P1-11）：键保持排序 ----
  * flags 语义对齐 PHP：REGULAR=tval_compare（PHP 8 数值串感知）、
@@ -968,6 +1001,9 @@ typedef struct {
     VM *vm;
     TVal cb;                /* usort 回调（args 存活期内借用） */
     bool use_cb;
+    bool escaped;           /* 刀10：回调逃逸（异常须上抛）——merge 层快速
+                             * 回卷，bi_usort 顶层收尾 kv/tmp 后重抛（防
+                             * LONGJMP 穿递归 C 栈泄漏堆分配） */
 } SortCtx;
 
 static int sort_flags_cmp(TVal x, TVal y, int flags) {
@@ -1008,7 +1044,16 @@ static int sort_flags_cmp(TVal x, TVal y, int flags) {
 static int sort_pair_cmp(SortCtx *c, TVal x, TVal y) {
     if (c->use_cb) {
         TVal pair[2] = { x, y };
-        TVal r = tphp_vm_call_callable(c->vm, c->cb, pair, 2);
+        /* 刀10：guarded 化（镜像 bi_call_user_func）——回调内部 try/catch
+         * 捕获自身 raise 时由守卫 pad 正常恢复、排序继续（修复前：longjmp
+         * 穿比较器/归并递归 C 栈 → 主分发器内部分恢复 → usort C 帧废弃 →
+         * 挂死）；逃逸（异常须上抛）置 escaped 快速回卷，不在此 LONGJMP
+         * （kv/tmp 堆分配在 bi_usort 栈帧，穿越即泄漏）。 */
+        TVal r;
+        if (!tphp_vm_call_guarded(c->vm, c->cb, pair, 2, &r)) {
+            c->escaped = true;
+            return 0;
+        }
         int64_t v = tval_to_int(r);
         tval_release(&r);
         return v > 0 ? 1 : v < 0 ? -1 : 0;
@@ -1022,12 +1067,12 @@ static TVal sort_pair_elem(SortPair *p, SortCtx *c) {
 
 static void sort_pairs_merge(SortPair *a, SortPair *tmp, uint32_t lo, uint32_t hi,
                              SortCtx *c) {
-    if (hi - lo < 2) return;
+    if (hi - lo < 2 || c->escaped) return;      /* 刀10：逃逸快速回卷 */
     uint32_t mid = lo + (hi - lo) / 2;
     sort_pairs_merge(a, tmp, lo, mid, c);
     sort_pairs_merge(a, tmp, mid, hi, c);
     uint32_t i = lo, j = mid, t = lo;
-    while (i < mid && j < hi) {
+    while (i < mid && j < hi && !c->escaped) {  /* 刀10：逃逸即停比较 */
         int r = sort_pair_cmp(c, sort_pair_elem(&a[i], c), sort_pair_elem(&a[j], c));
         /* 稳定：相等取左（PHP 8.0+ 排序稳定） */
         tmp[t++] = (c->desc ? r >= 0 : r <= 0) ? a[i++] : a[j++];
@@ -1062,7 +1107,7 @@ static TVal bi_keep_sort(VM *vm, TVal *args, int n, bool by_key, bool desc,
         k++;
     }
     SortCtx c = { .flags = flags, .desc = desc, .by_key = by_key,
-                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+                  .vm = vm, .cb = TV_NULL, .use_cb = false, .escaped = false };
     sort_pairs_merge(kv, tmp, 0, k, &c);
     /* 清空原数组（同 bi_sort：data 值 + bucket 字符串键；interned 键
      * release no-op，防御式保留判断） */
@@ -1128,7 +1173,7 @@ static TVal bi_sort(VM *vm, TVal *args, int n) {
         k++;
     }
     SortCtx c = { .flags = flags, .desc = false, .by_key = false,
-                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+                  .vm = vm, .cb = TV_NULL, .use_cb = false, .escaped = false };
     sort_pairs_merge(kv, tmp, 0, k, &c);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
@@ -1169,7 +1214,7 @@ static TVal bi_rsort(VM *vm, TVal *args, int n) {
         k++;
     }
     SortCtx c = { .flags = flags, .desc = true, .by_key = false,
-                  .vm = vm, .cb = TV_NULL, .use_cb = false };
+                  .vm = vm, .cb = TV_NULL, .use_cb = false, .escaped = false };
     sort_pairs_merge(kv, tmp, 0, k, &c);
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
@@ -1694,6 +1739,7 @@ static TVal bi_mt_rand(VM *vm, TVal *args, int n) {
 /* ---- M6-b: callable 数组函数 + 常用补齐 ---- */
 
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n);
+int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret);   /* vm.c */
 
 static void need_callable(VM *vm, TVal *v, const char *fn, const char *arg) {
     /* 统一判定：closure / 函数名 / [obj|'Cls','m'] / 带 __invoke 的对象 */
@@ -1708,7 +1754,9 @@ static TVal bi_array_map(VM *vm, TVal *args, int n) {
         RAISE(vm, "ArgumentCountError", "array_map() expects at least 2 arguments");
     need_callable(vm, &args[0], "array_map", "#1 ($callback)");
     TArr **srcs = tm_malloc(sizeof(TArr *) * (size_t)(n - 1));
-    uint32_t min_len = UINT32_MAX;
+    /* 刀12：PHP 8 实测语义 = 多数组**短源 null 填充至最长**（非 min 截断）；
+     * 单数组**键保持**（assoc/holey/混合键原样保留，见 backlog P1-16）。 */
+    uint32_t max_len = 0;
     for (int i = 1; i < n; i++) {
         if (args[i].t != T_ARR) {
             tm_free(srcs);
@@ -1716,60 +1764,143 @@ static TVal bi_array_map(VM *vm, TVal *args, int n) {
         }
         TArr *a = (TArr *)args[i].u.p;
         srcs[i - 1] = a;
-        if (a->n < min_len) min_len = a->n;
+        if (a->n > max_len) max_len = a->n;
+    }
+    bool single = (n == 2);          /* 单数组：键保持（非 packed 才需 inv） */
+    TArr *src0 = NULL;
+    uint32_t c0 = 0;                 /* 单数组 data 游标 */
+    uint32_t *inv = NULL;            /* 单数组：inv[data_off]=bucket_idx */
+    if (single) {
+        src0 = srcs[0];
+        /* packed 快路：data[i] 键恒 = i（value.h 不变量）→ 键保持 = append
+         * （刀11 形态，免 sync/inv）；非 packed（assoc/hash）才走 inv 慢路 */
+        if (!src0->packed) {
+            tarr_sync_buckets(src0);
+            inv = tm_malloc(sizeof(uint32_t) *
+                            (size_t)(src0->dused ? src0->dused : 1));
+            for (uint32_t i = 0; i < src0->dused; i++) inv[i] = UINT32_MAX;
+            for (uint32_t b = 0; b < src0->bcap; b++) {
+                uint32_t off = src0->buckets[b].val_off;
+                if (off != UINT32_MAX && off < src0->dused) inv[off] = b;
+            }
+        }
     }
     TArr *out = tarr_new();
-    for (uint32_t idx = 0; idx < min_len; idx++) {
+    /* 刀11：每源游标推进——原实现每 idx 从 0 重扫"第 idx 个非 UNDEF"=
+     * O(n²)（50k 元素实测 847ms vs PHP 1.8ms = 470×；D 裸动态调用对照
+     * 反超证明调用机制无罪）；游标单调推进 = 总扫描 O(总元素数)。 */
+    uint32_t *curs = single ? NULL
+                            : tm_malloc(sizeof(uint32_t) * (size_t)(n - 1));
+    if (curs) memset(curs, 0, sizeof(uint32_t) * (size_t)(n - 1));
+    for (uint32_t idx = 0; idx < max_len; idx++) {
         TVal *els = tm_malloc(sizeof(TVal) * (size_t)(n - 1));
-        for (int i = 1; i < n; i++) {
-            /* 按插入序取第 idx 个 */
-            uint32_t seen = 0;
-            TVal el = TV_NULL;
-            for (uint32_t j = 0; j < srcs[i - 1]->dused; j++) {
-                if (srcs[i - 1]->data[j].t == T_UNDEF) continue;
-                if (seen == idx) { el = srcs[i - 1]->data[j]; break; }
-                seen++;
+        TVal key = TV_NULL;          /* 单数组：原键（键保持，实时读桶） */
+        if (single) {
+            while (c0 < src0->dused && src0->data[c0].t == T_UNDEF) c0++;
+            if (c0 < src0->dused) {
+                els[0] = src0->data[c0];
+                /* packed 快路：key 恒 TV_NULL → append（键恒等 0..n-1）；
+                 * 非 packed：inv 反查桶、键实时读（回调改动安全） */
+                if (inv && inv[c0] != UINT32_MAX)
+                    key = src0->buckets[inv[c0]].key;
+                c0++;
+            } else {
+                els[0] = TV_NULL;    /* 不可达（max_len = 自身 n），防御 */
             }
-            els[i - 1] = el;
+        } else {
+            for (int i = 1; i < n; i++) {
+                /* 按插入序取第 idx 个非 UNDEF（游标自上轮停点继续，等价）；
+                 * 短源耗尽 → TV_NULL（PHP 8 null 填充语义） */
+                TArr *src = srcs[i - 1];
+                while (curs[i - 1] < src->dused &&
+                       src->data[curs[i - 1]].t == T_UNDEF)
+                    curs[i - 1]++;
+                els[i - 1] = curs[i - 1] < src->dused
+                                 ? src->data[curs[i - 1]++] : TV_NULL;
+            }
         }
-        TVal r = tphp_vm_call_callable(vm, args[0], els, n - 1);
-        tarr_append(out, r);
+        /* 刀10：guarded 化（同 bi_call_user_func）——回调内部 catch 正常
+         * 继续；逃逸先收尾（els/srcs/inv/curs/out）再重抛，防 LONGJMP 泄漏
+         * 堆分配 */
+        TVal r;
+        if (!tphp_vm_call_guarded(vm, args[0], els, n - 1, &r)) {
+            tm_free(els);
+            if (inv) tm_free(inv);
+            if (curs) tm_free(curs);
+            tm_free(srcs);
+            TVal ov = TV_ARR(out);
+            tval_release(&ov);
+            TPHP_LONGJMP(vm->x.unwind, 1);
+        }
+        if (single && key.t != T_NULL) {
+            /* 刀12：单数组键保持（PHP 8 实测 assoc/holey/mixed 原键保留） */
+            tval_addref(key);
+            tval_addref(r);
+            tarr_set(out, key, r);
+            tval_release(&key);
+            tval_release(&r);
+        } else {
+            tarr_append(out, r);     /* 多数组：重建 list（PHP 同） */
+        }
         tm_free(els);
     }
+    if (inv) tm_free(inv);
+    if (curs) tm_free(curs);
     tm_free(srcs);
     return TV_ARR(out);
 }
 
-/* array_filter(array, callable = null): 无回调时过滤 falsy */
+/* array_filter(array, callable = null): 无回调时过滤 falsy。
+ * 刀11：键获取改 inv[] 反查（原实现每元素反查全桶表 = O(n²)——50k 实测
+ * 965ms vs PHP 2.9ms = 333×；一次遍历建 inv[val_off]=bucket_idx 反向索引
+ * → data 序遍历 + O(1) 键，序与键语义不变；键实时读桶 = 回调改动源数组
+ * 安全（原版同级），NULL fallback append 保留）。 */
 static TVal bi_array_filter(VM *vm, TVal *args, int n) {
     if (n < 1 || n > 2)
         RAISE(vm, "ArgumentCountError", "array_filter() expects 1 or 2 arguments");
     need_arr(vm, &args[0], "array_filter", "#1 ($array)");
     if (n >= 2) need_callable(vm, &args[1], "array_filter", "#2 ($callback)");
     TArr *a = (TArr *)args[0].u.p;
-    tarr_sync_buckets(a);
+    /* 刀12：packed 快路——键恒 = i（value.h 不变量）→ 免 sync/inv，
+     * 键 TV_INT(i) 直构；非 packed（assoc/hash）才 sync + inv 反查 */
+    bool fast = a->packed;
+    if (!fast) tarr_sync_buckets(a);
+    uint32_t du = a->dused;
+    uint32_t *inv = fast ? NULL
+                         : tm_malloc(sizeof(uint32_t) * (size_t)(du ? du : 1));
+    if (!fast) {
+        for (uint32_t i = 0; i < du; i++) inv[i] = UINT32_MAX;
+        for (uint32_t b = 0; b < a->bcap; b++) {
+            uint32_t off = a->buckets[b].val_off;
+            if (off != UINT32_MAX && off < du) inv[off] = b;
+        }
+    }
     TArr *out = tarr_new();
-    for (uint32_t i = 0; i < a->dused; i++) {
+    for (uint32_t i = 0; i < du; i++) {
         if (a->data[i].t == T_UNDEF) continue;
         bool keep;
         if (n >= 2) {
             TVal arg = a->data[i];
-            TVal r = tphp_vm_call_callable(vm, args[1], &arg, 1);
+            /* 刀10：guarded 化（同 bi_call_user_func）；逃逸收尾 out 重抛 */
+            TVal r;
+            if (!tphp_vm_call_guarded(vm, args[1], &arg, 1, &r)) {
+                if (inv) tm_free(inv);
+                TVal ov = TV_ARR(out);
+                tval_release(&ov);
+                TPHP_LONGJMP(vm->x.unwind, 1);
+            }
             keep = tval_to_bool(r);
             tval_release(&r);
         } else {
             keep = tval_to_bool(a->data[i]);
         }
         if (keep) {
-            /* 保留原键 */
-            TVal key = TV_NULL;
-            for (uint32_t b = 0; b < a->bcap; b++)
-                if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
-                    key = a->buckets[b].key;
-                    break;
-                }
+            /* 保留原键（packed：键 = i；非 packed：inv[off] 反查桶，键实时读桶） */
+            tval_addref(a->data[i]);
             TVal v = a->data[i];
-            tval_addref(v);
+            TVal key = TV_NULL;
+            if (fast) key = TV_INT((int64_t)i);
+            else if (inv[i] != UINT32_MAX) key = a->buckets[inv[i]].key;
             if (key.t == T_NULL) tarr_append(out, v);
             else {
                 tval_addref(key);
@@ -1778,6 +1909,7 @@ static TVal bi_array_filter(VM *vm, TVal *args, int n) {
             }
         }
     }
+    if (inv) tm_free(inv);
     return TV_ARR(out);
 }
 
@@ -1793,7 +1925,12 @@ static TVal bi_array_reduce(VM *vm, TVal *args, int n) {
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
         TVal fargs[2] = { carry, a->data[i] };
-        TVal r = tphp_vm_call_callable(vm, args[1], fargs, 2);
+        /* 刀10：guarded 化（同 bi_call_user_func）；逃逸收尾 carry 重抛 */
+        TVal r;
+        if (!tphp_vm_call_guarded(vm, args[1], fargs, 2, &r)) {
+            tval_release(&carry);
+            TPHP_LONGJMP(vm->x.unwind, 1);
+        }
         tval_release(&carry);
         carry = r;   /* 转移 */
     }
@@ -1822,8 +1959,21 @@ static TVal bi_usort(VM *vm, TVal *args, int n) {
         k++;
     }
     SortCtx c = { .flags = 0, .desc = false, .by_key = false,
-                  .vm = vm, .cb = args[1], .use_cb = true };
+                  .vm = vm, .cb = args[1], .use_cb = true, .escaped = false };
     sort_pairs_merge(kv, tmp, 0, k, &c);
+    if (c.escaped) {
+        /* 刀10：比较器异常逃逸——数组未动（写回在排序后）= PHP"异常时数组
+         * 状态未定义"的安全子集；释放 kv 持有的元素引用 + 堆分配后重抛
+         * （unwind 目标 = 本 builtin 调用链上方的主 pad，与既有 builtin
+         * raise 同路径）。 */
+        for (uint32_t i = 0; i < k; i++) {
+            tval_release(&kv[i].val);
+            if (kv[i].key.t != T_NULL) tval_release(&kv[i].key);
+        }
+        tm_free(kv);
+        tm_free(tmp);
+        TPHP_LONGJMP(vm->x.unwind, 1);
+    }
     /* 清空原数组后按序写回（int 键 0..n-1） */
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t != T_UNDEF)
@@ -1854,15 +2004,11 @@ static TVal bi_array_flip(VM *vm, TVal *args, int n) {
     need_arr(vm, &args[0], "array_flip", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
     tarr_sync_buckets(a);
+    uint32_t *inv = arr_key_inv_build(a);   /* 刀13：O(1) 键反查（原每元素 O(bcap) 反查 = 50k 180ms vs PHP 0.7ms） */
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        TVal key = TV_NULL;
-        for (uint32_t b = 0; b < a->bcap; b++)
-            if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
-                key = a->buckets[b].key;
-                break;
-            }
+        TVal key = arr_key_at_inv(a, i, inv);
         TVal v = a->data[i];
         /* 值必须是 int/string 才能当键 */
         if (v.t != T_INT && v.t != T_STR) continue;
@@ -1873,31 +2019,180 @@ static TVal bi_array_flip(VM *vm, TVal *args, int n) {
         tval_release(&v);
         tval_release(&fk);
     }
+    if (inv) tm_free(inv);
     return TV_ARR(out);
 }
 
-/* array_unique(array): 按值去重，保留首次出现 */
+/* 刀13：strict value set（INT/STR）——**不复用 tarr**：tarr 键空间 = PHP
+ * 数组键语义（数字串 norm 折算先行，"1"/"01"/1 同键），unique 需要
+ * identity set（tag + 值/串内容严格）——norm 折算会误去重（实测漂移：
+ * [1, 2, "1"] 刀13 首版丢 "1"）。自建 open addressing，cap 一次到位免
+ * 扩容；keys 存借用（源元素引用 ≥1 存活于本调用栈，安全）。 */
+typedef struct { TVal *keys; uint8_t *used; uint32_t cap; } VSet;
+static uint32_t vset_hash(TVal v) {
+    if (v.t == T_INT) {
+        uint64_t x = (uint64_t)v.u.i;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+        return (uint32_t)(x | 1);
+    }
+    return TSTR_HASH((TStr *)v.u.p);
+}
+static bool vset_eq(TVal a, TVal b) {
+    if (a.t != b.t) return false;
+    if (a.t == T_INT) return a.u.i == b.u.i;
+    return tstr_eq((TStr *)a.u.p, (TStr *)b.u.p);
+}
+static void vset_init(VSet *s, uint32_t n) {
+    s->cap = 64;
+    while (s->cap < n * 2 + 8) s->cap <<= 1;
+    s->keys = tm_malloc(sizeof(TVal) * s->cap);
+    s->used = tm_malloc(s->cap);
+    memset(s->used, 0, s->cap);
+}
+static bool vset_has(const VSet *s, TVal v) {
+    uint32_t i = vset_hash(v) & (s->cap - 1);
+    while (s->used[i]) {
+        if (vset_eq(s->keys[i], v)) return true;
+        i = (i + 1) & (s->cap - 1);
+    }
+    return false;
+}
+static void vset_add(VSet *s, TVal v) {
+    uint32_t i = vset_hash(v) & (s->cap - 1);
+    while (s->used[i]) {
+        if (vset_eq(s->keys[i], v)) return;
+        i = (i + 1) & (s->cap - 1);
+    }
+    s->used[i] = 1;
+    s->keys[i] = v;
+}
+/* 刀14：持有型释放（diff/intersect 的键 = tval_to_str 新引用，归属 set）。
+ * vset_add 本身存值拷贝（借用指针），引用策略归调用方：unique 借用源元素
+ * （不调本函数），diff/intersect 的键引用由本函数统一收。 */
+static void vset_free_strs(VSet *s) {
+    for (uint32_t i = 0; i < s->cap; i++)
+        if (s->used[i] && s->keys[i].t == T_STR) tval_release(&s->keys[i]);
+    tm_free(s->keys);
+    tm_free(s->used);
+}
+
+/* 刀14：array_diff / array_intersect 共用核（PHP 默认 (string) 比较语义
+ * ——值字符串化后 VSet 严格内容匹配，"1" 与 1 同串判重 ✓ 实测对齐）。
+ * keep_mode = true 保留命中（intersect）/ false 保留未命中（diff）；
+ * 键保持首数组原键（assoc/holey，PHP 实测）。 */
+static TVal k14_diff_intersect(VM *vm, TVal *args, int n, bool keep_mode,
+                               const char *fn) {
+    TArr *a = need_arr(vm, &args[0], fn, "#1 ($array)");
+    VSet ex;
+    uint32_t total = 0;
+    for (int ai = 1; ai < n; ai++) {
+        TArr *s = need_arr(vm, &args[ai], fn, "variable list");
+        total += s->dused;
+    }
+    vset_init(&ex, total ? total : 1);
+    for (int ai = 1; ai < n; ai++) {
+        TArr *s = (TArr *)args[ai].u.p;
+        for (uint32_t j = 0; j < s->dused; j++) {
+            TVal v = s->data[j];
+            if (v.t == T_UNDEF) continue;
+            TStr *sv = tval_to_str(v);       /* 新引用，归属 ex */
+            TVal k = TV_STR(sv);
+            vset_add(&ex, k);
+            /* sv 引用由 vset_free_strs 统一收（vset_add 存借用指针） */
+        }
+    }
+    uint32_t *inv = arr_key_inv_build(a);
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        TVal v = a->data[i];
+        if (v.t == T_UNDEF) continue;
+        TStr *sv = tval_to_str(v);
+        TVal k = TV_STR(sv);
+        bool hit = vset_has(&ex, k);
+        tval_release(&k);                    /* 比较用临时串，立即收 */
+        if (hit != keep_mode) continue;
+        TVal key = arr_key_at_inv(a, i, inv);
+        tval_addref(v);
+        if (key.t == T_NULL) tarr_append(out, v);
+        else {
+            tval_addref(key);
+            tarr_set(out, key, v);
+            tval_release(&key);
+        }
+    }
+    vset_free_strs(&ex);
+    if (inv) tm_free(inv);
+    return TV_ARR(out);
+}
+static TVal bi_array_diff(VM *vm, TVal *args, int n) {
+    if (n < 2)
+        RAISE(vm, "ArgumentCountError", "array_diff() expects at least 2 arguments");
+    for (int i = 0; i < n; i++)
+        need_arr(vm, &args[i], "array_diff", i == 0 ? "#1 ($array)" : "parameter list");
+    return k14_diff_intersect(vm, args, n, false, "array_diff");
+}
+static TVal bi_array_intersect(VM *vm, TVal *args, int n) {
+    if (n < 2)
+        RAISE(vm, "ArgumentCountError", "array_intersect() expects at least 2 arguments");
+    for (int i = 0; i < n; i++)
+        need_arr(vm, &args[i], "array_intersect", i == 0 ? "#1 ($array)" : "parameter list");
+    return k14_diff_intersect(vm, args, n, true, "array_intersect");
+}
+
+/* array_count_values(array): 值计数。tarr 键空间（数字串折算）恰好与 PHP
+ * 数组键语义一致（实测 [1,"1"] → {"1":3} 合并计数 ✓）；非 int/str 值
+ * PHP 发 Warning 跳过——tphp 无 warning 体系，静默跳过（差异记录）。 */
+static TVal bi_array_count_values(VM *vm, TVal *args, int n) {
+    if (n != 1)
+        RAISE(vm, "ArgumentCountError", "array_count_values() expects exactly 1 argument");
+    TArr *a = need_arr(vm, &args[0], "array_count_values", "#1 ($array)");
+    TArr *out = tarr_new();
+    for (uint32_t i = 0; i < a->dused; i++) {
+        TVal v = a->data[i];
+        if (v.t == T_UNDEF) continue;
+        if (v.t != T_INT && v.t != T_STR) continue;
+        TVal *c = tarr_get(out, v);
+        if (c) { c->u.i++; }
+        else { tval_addref(v); tarr_set(out, v, TV_INT(1)); }
+    }
+    return TV_ARR(out);
+}
+
+/* array_unique(array): 按值去重，保留首次出现。
+ * 刀13：原实现 = 每元素 O(out) 重扫 + O(bcap) 桶反查（双重 O(n²)）——50k
+ * 实测 851ms vs PHP 1.4ms = 590×。修复 = INT/STR 走 VSet strict identity
+ * set + inv[] 键反查；FLOAT/NULL/BOOL/ARR 元素（set 仅支持 int/str）回退
+ * aux 列表线性扫（频次低，通常空）。语义 = 既有 strict_eq 逐值等价
+ * （**不改 PHP 默认 SORT_STRING 行为**——那是另一个既有差异，另案）。 */
 static TVal bi_array_unique(VM *vm, TVal *args, int n) {
     if (n != 1) RAISE(vm, "ArgumentCountError", "array_unique() expects exactly 1 argument");
     need_arr(vm, &args[0], "array_unique", "#1 ($array)");
     TArr *a = (TArr *)args[0].u.p;
     tarr_sync_buckets(a);
+    uint32_t *inv = arr_key_inv_build(a);
+    VSet seen;
+    vset_init(&seen, a->dused);
+    TArr *aux = tarr_new();      /* 其他类型首现值（线性，通常空） */
     TArr *out = tarr_new();
     for (uint32_t i = 0; i < a->dused; i++) {
         if (a->data[i].t == T_UNDEF) continue;
-        bool dup = false;
-        for (uint32_t j = 0; j < out->dused; j++) {
-            if (out->data[j].t == T_UNDEF) continue;
-            if (tval_strict_eq(a->data[i], out->data[j])) { dup = true; break; }
+        TVal v = a->data[i];
+        bool dup;
+        if (v.t == T_INT || v.t == T_STR) {
+            dup = vset_has(&seen, v);
+        } else {
+            dup = false;
+            for (uint32_t j = 0; j < aux->dused; j++)
+                if (tval_strict_eq(v, aux->data[j])) { dup = true; break; }
         }
         if (!dup) {
-            TVal key = TV_NULL;
-            for (uint32_t b = 0; b < a->bcap; b++)
-                if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
-                    key = a->buckets[b].key;
-                    break;
-                }
-            TVal v = a->data[i];
+            if (v.t == T_INT || v.t == T_STR) {
+                vset_add(&seen, v);
+            } else {
+                tval_addref(v);
+                tarr_append(aux, v);
+            }
+            TVal key = arr_key_at_inv(a, i, inv);
             tval_addref(v);
             if (key.t == T_NULL) tarr_append(out, v);
             else {
@@ -1907,6 +2202,11 @@ static TVal bi_array_unique(VM *vm, TVal *args, int n) {
             }
         }
     }
+    TVal av = TV_ARR(aux);
+    tval_release(&av);
+    tm_free(seen.keys);
+    tm_free(seen.used);
+    if (inv) tm_free(inv);
     return TV_ARR(out);
 }
 
@@ -2033,14 +2333,25 @@ static TVal bi_ord(VM *vm, TVal *args, int n) {
     return TV_INT((unsigned char)s->c[0]);
 }
 
-/* call_user_func(callable, ...$args) */
+/* call_user_func(callable, ...$args)
+ * 刀9（2026-11-06）：改走 tphp_vm_call_guarded——此前直调 call_callable
+ * 无守卫 pad，callee 内部 try/catch 捕获自身 raise 时：longjmp 穿过本
+ * builtin 的 C 帧 → 主分发器在 callee 帧内部分恢复（catch 跑完、帧弹出）
+ * → 本 C 帧已废弃、调用点 dst 永不写 → 主循环踩未写值挂死（JIT=0 纯解
+ * 释器同样挂，PHP 正常——2026-11-06 刀9 语义矩阵 case 8 实测）。
+ * guarded 两路：正常完成（含 callee 内部 catch）返 1 正常返回；逃逸
+ * （异常须上抛）返 0 且 exception 已设 → LONGJMP 重抛（当前 unwind 目标
+ * = 本 builtin 调用链上方的主 pad，与既有 builtin raise 同路径）。 */
 static TVal bi_call_user_func(VM *vm, TVal *args, int n) {
     if (n < 1) RAISE(vm, "ArgumentCountError", "call_user_func() expects at least 1 argument");
     need_callable(vm, &args[0], "call_user_func", "#1 ($callback)");
-    return tphp_vm_call_callable(vm, args[0], args + 1, n - 1);
+    TVal r;
+    if (!tphp_vm_call_guarded(vm, args[0], args + 1, n - 1, &r))
+        TPHP_LONGJMP(vm->x.unwind, 1);      /* 逃逸：exception 已设，重抛 */
+    return r;
 }
 
-/* call_user_func_array(callable, array) */
+/* call_user_func_array(callable, array) —— 守卫同 bi_call_user_func（刀9） */
 static TVal bi_call_user_func_array(VM *vm, TVal *args, int n) {
     if (n != 2) RAISE(vm, "ArgumentCountError", "call_user_func_array() expects exactly 2 arguments");
     need_callable(vm, &args[0], "call_user_func_array", "#1 ($callback)");
@@ -2050,16 +2361,183 @@ static TVal bi_call_user_func_array(VM *vm, TVal *args, int n) {
     int k = 0;
     for (uint32_t i = 0; i < a->dused; i++)
         if (a->data[i].t != T_UNDEF) els[k++] = a->data[i];
-    TVal r = tphp_vm_call_callable(vm, args[0], els, k);
+    TVal r;
+    int ok = tphp_vm_call_guarded(vm, args[0], els, k, &r);
     tm_free(els);
+    if (!ok) TPHP_LONGJMP(vm->x.unwind, 1); /* 逃逸：exception 已设，重抛 */
     return r;
 }
 
+/* strcmp(string $a, string $b): 字节序比较（二进制安全）。P1-15（刀11）：
+ * usort 字符串惯用形态 `strlen($a)-strlen($b) ?: strcmp($a,$b)` 直接
+ * undefined function。PHP 8 契约 = 返回值归一 -1/0/1（实测 php -r 确认）。 */
+static TVal bi_strcmp(VM *vm, TVal *args, int n) {
+    if (n != 2)
+        RAISE(vm, "ArgumentCountError", "strcmp() expects exactly 2 arguments");
+    TStr *a = need_str(vm, &args[0], "strcmp", "#1 ($string1)");
+    TStr *b = need_str(vm, &args[1], "strcmp", "#2 ($string2)");
+    size_t la = a->len, lb = b->len;
+    size_t lm = la < lb ? la : lb;
+    int c = lm ? memcmp(a->c, b->c, lm) : 0;
+    if (c == 0) c = la < lb ? -1 : la > lb ? 1 : 0;
+    return TV_INT(c > 0 ? 1 : c < 0 ? -1 : 0);
+}
+
+/* strncmp/strcasecmp/strncasecmp（P1-15 同族，刀13）：字节序比较 +
+ * PHP 8 归一契约 -1/0/1；strcasecmp 族 = ASCII tolower（C locale 语义） */
+#define K13_LC(c) ((c) >= 'A' && (c) <= 'Z' ? (c) | 0x20 : (c))
+/* PHP 8.5 实测契约（php -r 逐例取证）：strcmp/strcasecmp/strncmp 归一
+ * -1/0/1；strncasecmp **字节不等返回 tolower 字节差**（strncasecmp('Abc',
+ * 'XYZ',2) = -23 未归一）而长度决胜归一 ±1（'ab' vs 'abc' len3 = -1 非
+ * -99）——raw = true 仅供 strncasecmp。 */
+static int k13_bincmp(const char *a, size_t la, const char *b, size_t lb,
+                      size_t maxlen, bool ci, bool raw) {
+    size_t lm = la < lb ? la : lb;
+    if (maxlen && lm > maxlen) lm = maxlen;
+    for (size_t i = 0; i < lm; i++) {
+        unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+        if (ci) { x = K13_LC(x); y = K13_LC(y); }
+        if (x != y) {
+            if (raw) return (int)x - (int)y;   /* strncasecmp：字节差 */
+            return x < y ? -1 : 1;
+        }
+    }
+    if (maxlen && lm == maxlen && lm < la && lm < lb) return 0;   /* 双截断（PHP 实测 strncmp("abcdef","abcxyz",3)=0） */
+    if (lm < la || lm < lb) return la < lb ? -1 : 1;   /* 一串先尽：±1 */
+    return 0;
+}
+static TVal bi_strncmp(VM *vm, TVal *args, int n) {
+    if (n != 3)
+        RAISE(vm, "ArgumentCountError", "strncmp() expects exactly 3 arguments");
+    TStr *a = need_str(vm, &args[0], "strncmp", "#1 ($string1)");
+    TStr *b = need_str(vm, &args[1], "strncmp", "#2 ($string2)");
+    int64_t len = need_int(vm, &args[2], "strncmp", "#3 ($length)");
+    if (len < 0)
+        RAISE(vm, "ValueError", "strncmp(): Argument #3 ($length) must be greater than or equal to 0");
+    int c = k13_bincmp(a->c, a->len, b->c, b->len, (size_t)len, false, false);
+    return TV_INT(c > 0 ? 1 : c < 0 ? -1 : 0);
+}
+static TVal bi_strcasecmp(VM *vm, TVal *args, int n) {
+    if (n != 2)
+        RAISE(vm, "ArgumentCountError", "strcasecmp() expects exactly 2 arguments");
+    TStr *a = need_str(vm, &args[0], "strcasecmp", "#1 ($string1)");
+    TStr *b = need_str(vm, &args[1], "strcasecmp", "#2 ($string2)");
+    int c = k13_bincmp(a->c, a->len, b->c, b->len, 0, true, false);
+    return TV_INT(c > 0 ? 1 : c < 0 ? -1 : 0);
+}
+static TVal bi_strncasecmp(VM *vm, TVal *args, int n) {
+    if (n != 3)
+        RAISE(vm, "ArgumentCountError", "strncasecmp() expects exactly 3 arguments");
+    TStr *a = need_str(vm, &args[0], "strncasecmp", "#1 ($string1)");
+    TStr *b = need_str(vm, &args[1], "strncasecmp", "#2 ($string2)");
+    int64_t len = need_int(vm, &args[2], "strncasecmp", "#3 ($length)");
+    if (len < 0)
+        RAISE(vm, "ValueError", "strncasecmp(): Argument #3 ($length) must be greater than or equal to 0");
+    return TV_INT(k13_bincmp(a->c, a->len, b->c, b->len, (size_t)len, true, true));
+}
+#undef K13_LC
+
+/* function_exists(string): 内建 + 已加载用户函数（tphp_vm_resolve_fn_global
+ * 同源 = is_callable 的函数名分支修正——is_callable 对未定义名误报 true
+ * 的 bug 另案记录，本函数走真解析路径）。 */
+static TVal bi_function_exists(VM *vm, TVal *args, int n) {
+    if (n != 1)
+        RAISE(vm, "ArgumentCountError", "function_exists() expects exactly 1 argument");
+    TStr *name = need_str(vm, &args[0], "function_exists", "#1 ($function)");
+    bool isb = false;
+    void *hit = tphp_vm_resolve_fn_global(vm, name, &isb);
+    return hit ? TV_TRUE : TV_FALSE;
+}
+
 /* is_callable(mixed) */
+/* is_callable(mixed, syntax_only = false): 用户面 strict（PHP 默认真解析）。
+ * syntax_only=true 走 tphp_vm_is_callable 粗判；默认（false）按形态真查：
+ * 函数名 resolve / 'Cls::m' 与 [obj,'m'] 方法存在性 / __invoke——修复
+ * 未定义名误报 true（is_callable("no_such_fn_zz") PHP=false）。调用前置
+ * need_callable 仍走粗判（错误消息语义 = 调用点 undefined，PHP 对齐）。 */
+static bool k14_strict_callable(VM *vm, TVal v) {
+    switch (v.t) {
+    case T_CLOSURE:
+        return true;
+    case T_STR: {
+        const char *s = tstr_val((TStr *)v.u.p);
+        const char *sep = NULL;
+        for (const char *p = s; (p = strstr(p, "::")) != NULL; p += 2) sep = p;
+        if (sep) {
+            size_t cl = (size_t)(sep - s);
+            char clc[256], mlc[128];
+            if (cl >= sizeof clc) cl = sizeof clc - 1;
+            for (size_t i = 0; i < cl; i++)
+                clc[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+            clc[cl] = 0;
+            { const char *s2 = sep + 2;
+              size_t k = 0; for (; s2[k] && k < sizeof mlc - 1; k++)
+                  mlc[k] = (s2[k] >= 'A' && s2[k] <= 'Z') ? (char)(s2[k] + 32) : s2[k];
+              mlc[k] = 0; }
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            TClass *cls = class_resolve_lc(clc);
+            if (!cls) return false;
+            tphp_class_ensure_flat(cls);
+            TMethod *m = tphp_class_find_method(cls, mlc);
+            return m && (m->fn || m->native) && !m->is_abstract;
+        }
+        bool isb = false;
+        return tphp_vm_resolve_fn_global(vm, (TStr *)v.u.p, &isb) != NULL;
+    }
+    case T_ARR: {
+        TArr *a = (TArr *)v.u.p;
+        if (a->n != 2) return false;
+        TVal e[2];
+        int k = 0;
+        for (uint32_t i = 0; i < a->dused && k < 2; i++)
+            if (a->data[i].t != T_UNDEF) e[k++] = a->data[i];
+        if (k != 2 || e[1].t != T_STR) return false;
+        const char *mlc_s = tstr_val((TStr *)e[1].u.p);
+        char mlc[128];
+        { size_t k2 = 0; for (; mlc_s[k2] && k2 < sizeof mlc - 1; k2++)
+            mlc[k2] = (mlc_s[k2] >= 'A' && mlc_s[k2] <= 'Z') ? (char)(mlc_s[k2] + 32) : mlc_s[k2];
+          mlc[k2] = 0; }
+        TClass *cls = NULL;
+        if (e[0].t == T_OBJ) {
+            TObj *o = (TObj *)e[0].u.p;
+            if (o->h.kind == GC_KIND_EX || !o->cls) return false;
+            cls = o->cls;
+        } else if (e[0].t == T_STR) {
+            extern TClass *class_resolve_lc(const char *fqcn_lc);
+            char clc[256];
+            const char *cs = tstr_val((TStr *)e[0].u.p);
+            size_t cl = strlen(cs);
+            if (cl >= sizeof clc) cl = sizeof clc - 1;
+            for (size_t i = 0; i < cl; i++)
+                clc[i] = (cs[i] >= 'A' && cs[i] <= 'Z') ? (char)(cs[i] + 32) : cs[i];
+            clc[cl] = 0;
+            cls = class_resolve_lc(clc);
+            if (!cls) return false;
+        } else {
+            return false;
+        }
+        tphp_class_ensure_flat(cls);
+        TMethod *m = tphp_class_find_method(cls, mlc);
+        return m && (m->fn || m->native) && !m->is_abstract;
+    }
+    case T_OBJ: {
+        TObj *o = (TObj *)v.u.p;
+        if (o->h.kind == GC_KIND_EX || !o->cls) return false;
+        tphp_class_ensure_flat(o->cls);
+        TMethod *m = tphp_class_find_method(o->cls, "__invoke");
+        return m && (m->fn || m->native) && !m->is_abstract && !m->is_static;
+    }
+    default:
+        return false;
+    }
+}
 static TVal bi_is_callable(VM *vm, TVal *args, int n) {
-    (void)vm;
     if (n < 1) RAISE(vm, "ArgumentCountError", "is_callable() expects at least 1 argument");
-    return tphp_vm_is_callable(args[0]) ? TV_TRUE : TV_FALSE;
+    /* PHP signature: is_callable(value, syntax_only = false, &name = null) -
+     * syntax_only is arg #2 (not #3) */
+    bool syntax_only = (n >= 2) ? tval_to_bool(args[1]) : false;
+    if (syntax_only) return tphp_vm_is_callable(args[0]) ? TV_TRUE : TV_FALSE;
+    return k14_strict_callable(vm, args[0]) ? TV_TRUE : TV_FALSE;
 }
 
 /* time() */
@@ -2280,6 +2758,7 @@ static TVal bi_array_chunk(VM *vm, TVal *args, int n) {
     bool preserve = n >= 3 ? tval_to_bool(args[2]) : false;
     TArr *a = (TArr *)args[0].u.p;
     tarr_sync_buckets(a);
+    uint32_t *inv = arr_key_inv_build(a);   /* 刀13：O(1) 键反查（原每元素 O(bcap) = 50k 137ms vs PHP 0.2ms） */
     TArr *out = tarr_new();
     TArr *cur = NULL;
     int64_t cnt = 0;
@@ -2291,12 +2770,7 @@ static TVal bi_array_chunk(VM *vm, TVal *args, int n) {
             tarr_append(out, TV_ARR(cur));
             cur->h.rc++;   /* out 持有一份；本地指针也用 */
         }
-        TVal key = TV_NULL;
-        for (uint32_t b = 0; b < a->bcap; b++)
-            if (a->buckets[b].val_off == i && a->buckets[b].key.t != T_NULL) {
-                key = a->buckets[b].key;
-                break;
-            }
+        TVal key = arr_key_at_inv(a, i, inv);
         TVal v = a->data[i];
         tval_addref(v);
         if (preserve && key.t != T_NULL) {
@@ -2308,7 +2782,137 @@ static TVal bi_array_chunk(VM *vm, TVal *args, int n) {
         }
         cnt++;
     }
+    if (inv) tm_free(inv);
     return TV_ARR(out);
+}
+
+/* array_splice(array, offset[, length[, replacement]]): 移除+替换。
+ * 刀14。PHP 8.5 实测语义：offset 负 = 距尾；length 负 = end = du+length、
+ * 省略/NULL = 至末尾；replacement 标量包装单元素（实测 H）；返回移除段
+ * **重排 list**（实测 E）；结果数组 = 前段原键 + replacement 展开（list 键
+ * 顺延 / str 键保留，实测 F）+ 后段原键——**slot 整体替换**实现（构造新
+ * TArr 后释放槽换入，免清空回填）。 */
+static TVal bi_array_splice(VM *vm, TVal *args, int n) {
+    if (n < 2 || n > 4)
+        RAISE(vm, "ArgumentCountError", "array_splice() expects 2 to 4 arguments");
+    need_arr(vm, &args[0], "array_splice", "#1 ($array)");
+    int64_t offset = need_int(vm, &args[1], "array_splice", "#2 ($offset)");
+    TArr *repl = NULL;
+    TVal repl_val = TV_NULL;
+    if (n >= 4) {
+        if (args[3].t == T_ARR) {
+            repl = (TArr *)args[3].u.p;          /* 借用 */
+        } else {
+            repl = tarr_new();
+            tval_addref(args[3]);
+            tarr_append(repl, args[3]);          /* 标量包装单元素（实测 H） */
+            repl_val = TV_ARR(repl);             /* 本地持有 */
+        }
+    }
+    TArr *a = (TArr *)args[0].u.p;
+    tarr_sync_buckets(a);
+    uint32_t du = a->dused;
+    int64_t off = offset < 0 ? (int64_t)du + offset : offset;
+    if (off < 0) off = 0;
+    if (off > (int64_t)du) off = du;
+    int64_t end;
+    if (n < 3 || args[2].t == T_NULL) {
+        end = du;
+    } else {
+        int64_t length = need_int(vm, &args[2], "array_splice", "#3 ($length)");
+        end = length < 0 ? (int64_t)du + length : off + length;
+        if (end < off) end = off;
+        if (end > (int64_t)du) end = du;
+    }
+    uint32_t *inv = arr_key_inv_build(a);
+    TArr *removed = tarr_new();
+    TArr *newa = tarr_new();
+    /* 键规则（PHP 8.5 实测）：**int 键全部重排连续（append）+ str 键保留
+     * （set）**——适用于结果数组与 removed（E ret=[2,3] 重排 / F
+     * ret={"b":2,"c":3} 保留）。 */
+    for (uint32_t i = 0; i < (uint32_t)off; i++) {          /* 前段 */
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal key = arr_key_at_inv(a, i, inv);
+        tval_addref(a->data[i]);
+        if (key.t == T_STR) { tarr_set(newa, key, a->data[i]); tval_release(&key); }
+        else tarr_append(newa, a->data[i]);
+    }
+    if (repl)
+        for (uint32_t j = 0; j < repl->dused; j++) {        /* replacement 展开 */
+            if (repl->data[j].t == T_UNDEF) continue;
+            tval_addref(repl->data[j]);
+            tarr_append(newa, repl->data[j]);               /* list 键顺延 / str 键由源序保留——PHP 实测 F */
+        }
+    for (uint32_t i = (uint32_t)end; i < du; i++) {         /* 后段 */
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal key = arr_key_at_inv(a, i, inv);
+        tval_addref(a->data[i]);
+        if (key.t == T_STR) { tarr_set(newa, key, a->data[i]); tval_release(&key); }
+        else tarr_append(newa, a->data[i]);
+    }
+    for (uint32_t i = (uint32_t)off; i < (uint32_t)end; i++) {  /* 移除段 */
+        if (a->data[i].t == T_UNDEF) continue;
+        TVal key = arr_key_at_inv(a, i, inv);
+        tval_addref(a->data[i]);
+        if (key.t == T_STR) { tarr_set(removed, key, a->data[i]); tval_release(&key); }
+        else tarr_append(removed, a->data[i]);
+    }
+    if (inv) tm_free(inv);
+    if (repl_val.t == T_ARR) tval_release(&repl_val);
+    /* 原地清空 + **存储字段整体转移**（不能 slot 换对象：内建参数槽 ≠
+     * 调用方变量槽——bi_usort 清空回填同族；转移保序保键 100%、零
+     * addref——引用随字段移交）。 */
+    for (uint32_t i = 0; i < a->dused; i++)
+        if (a->data[i].t != T_UNDEF) {
+            tval_release(&a->data[i]);
+            a->data[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+        }
+    for (uint32_t b = 0; b < a->bcap; b++) {
+        if (a->buckets[b].val_off != UINT32_MAX && a->buckets[b].key.t != T_NULL)
+            tval_release(&a->buckets[b].key);
+        a->buckets[b].key = TV_NULL;
+        a->buckets[b].val_off = UINT32_MAX;
+    }
+    tm_free(a->data);
+    if (a->buckets) tm_free(a->buckets);
+    a->data = newa->data;
+    a->buckets = newa->buckets;
+    a->n = newa->n;
+    a->bcap = newa->bcap;
+    a->hmask = newa->hmask;
+    a->next_idx = newa->next_idx;
+    a->dcap = newa->dcap;
+    a->dused = newa->dused;
+    a->packed = newa->packed;
+    a->bpending = newa->bpending;
+    a->free_head = newa->free_head;
+    newa->data = NULL;
+    newa->buckets = NULL;
+    newa->n = newa->bcap = newa->hmask = newa->dcap = newa->dused = 0;
+    newa->packed = false;
+    newa->bpending = 0;
+    newa->next_idx = 0;
+    newa->free_head = UINT32_MAX;
+    tval_release(&TV_ARR(newa));    /* 空壳回收 */
+    return TV_ARR(removed);
+}
+
+/* ucfirst(string): 首 ASCII alpha 大写（UTF-8 安全：>127 字节不动） */
+static TVal bi_ucfirst(VM *vm, TVal *args, int n) {
+    if (n != 1)
+        RAISE(vm, "ArgumentCountError", "ucfirst() expects exactly 1 argument");
+    TStr *s = need_str(vm, &args[0], "ucfirst", "#1 ($string)");
+    if (s->len == 0 || s->c[0] < 'a' || s->c[0] > 'z') {
+        TVal v = TV_STR(s);
+        tval_addref(v);                      /* 借用返回：addref 平衡（keys 教训） */
+        return v;
+    }
+    char *buf = tm_malloc(s->len);
+    memcpy(buf, s->c, s->len);
+    buf[0] = (char)(buf[0] - 0x20);
+    TStr *out = tstr_new(buf, s->len);
+    tm_free(buf);
+    return TV_STR(out);
 }
 
 /* strtr(string, from, to) 或 strtr(string, replace_pairs[]) */
@@ -2556,6 +3160,16 @@ const Builtin tphp_builtins[] = {
     { "range", bi_range },
     { "chr", bi_chr },
     { "ord", bi_ord },
+    { "strcmp", bi_strcmp },
+    { "strncmp", bi_strncmp },
+    { "strcasecmp", bi_strcasecmp },
+    { "strncasecmp", bi_strncasecmp },
+    { "function_exists", bi_function_exists },
+    { "ucfirst", bi_ucfirst },
+    { "array_diff", bi_array_diff },
+    { "array_intersect", bi_array_intersect },
+    { "array_count_values", bi_array_count_values },
+    { "array_splice", bi_array_splice },
     { "call_user_func", bi_call_user_func },
     { "call_user_func_array", bi_call_user_func_array },
     { "is_callable", bi_is_callable },

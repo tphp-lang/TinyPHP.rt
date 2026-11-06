@@ -35,4 +35,4 @@ var_dump(is_callable([new Plain(), 'nope'])); // 数组但方法不存在（粗�
 // EXPECT: bool(false)
 // EXPECT: bool(true)
 // EXPECT: bool(true)
-// EXPECT: bool(true)
+// EXPECT: bool(false)
