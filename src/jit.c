@@ -2660,20 +2660,17 @@ static int prop_helper_enabled(void) {
     return v;
 }
 
-/* 刀5C（11-06）嵌套调用 emit 开关：**默认关**，TPHP_NEST_CALL=1 显式开。
- * 默认关的理由（A/B 实测证伪，勿翻案）：放行后 bench() 计时壳 JIT 化，
- * JIT'd caller 的 call_dyn 路径使被测闭包未在函数级预编译 → 循环中途
- * 触发 OSR 编译（DEBUG=1 多 4 条 osr compile），编译开销落进计时区 →
- * 全表前段项虚高（array-push 2.19×/rmw 5.8×/string 2.9×/kv 1.23×），
- * 而单项隔离 on/off 持平 = 被测代码本身没变慢。与 11-05 刀6（OSR FE）
- * "单次口径编译成本>收益"同族。待计时壳隔离或 call_dyn 的 callee eager
- * 门补齐后再评估默认开。功能本身有效：=1 时 n1/n2/n3 不再 FAILED、
- * 长循环+嵌套调用专项 −14.8%、四模语义一致。 */
+/* 刀5C（11-06）嵌套调用 emit 开关：**默认开**（11-06 用户拍板）。
+ * 历史：曾默认关——A/B 实测 bench() 计时壳 JIT 化后 call_dyn 使被测
+ * 闭包未预编译 → 循环中途 OSR 编译开销落进计时区 → 全表前段虚高。
+ * 刀9 补齐 callee eager 门后重开条件②满足，用户拍板默认开。
+ * TPHP_NEST_CALL=0 可关。功能本身：n1/n2/n3 不再 FAILED、长循环+嵌套
+ * 调用专项 −14.8%、四模语义一致。 */
 static int nest_call_enabled(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TPHP_NEST_CALL");
-        v = (e && e[0] && e[0] == '1') ? 1 : 0;
+        v = (e && e[0] == '0') ? 0 : 1;   /* 默认开，=0 关 */
     }
     return v;
 }
