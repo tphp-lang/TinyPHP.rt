@@ -4408,8 +4408,11 @@ int tphp_jit_spec_guard(TVal *base) {
     if (base->t != T_ARR) return 0;
     TArr *a = (TArr *)base->u.p;
     if (!a->packed) return 0;
+    /* all_int 缓存（type-spec 批3）：已验证则免 O(n) 重扫 */
+    if (a->all_int) return 1;
     for (uint32_t i = 0; i < a->n; i++)
         if (a->data[i].t != T_INT) return 0;
+    a->all_int = 1;
     return 1;
 }
 

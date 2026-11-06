@@ -192,6 +192,7 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
      * zend_hash nextFreeElement 快路同构。顺序 int 键此前走全探测
      * （kv-comp 剖面：+105ns vs append 地板，PHP 仅 +2ns）。packed
      * 不变量保证 key 必不存在（0..next_idx-1 已在），纯插入零探测。 */
+    a->all_int = 0;   /* type-spec 批3：任何写清除 all_int 缓存 */
     if (a->packed && key.t == T_INT && key.u.i == a->next_idx) {
         if (a->dused == a->dcap) {
             a->dcap = a->dcap ? a->dcap * 2 : 8;
@@ -285,6 +286,7 @@ bool tarr_set(TArr *a, TVal key, TVal val) {
 bool tarr_append(TArr *a, TVal val) {
     /* packed 快路（L5）：直接 data[n]=val，桶惰性补齐（bpending）——
      * 跳过 norm/find/grow/双查/桶写。非 packed 走全套 tarr_set。 */
+    a->all_int = 0;   /* type-spec 批3：任何写清除 all_int 缓存 */
     if (a->packed) {
         if (a->dused == a->dcap) {
             a->dcap = a->dcap ? a->dcap * 2 : 8;
@@ -441,6 +443,7 @@ bool tarr_has(TArr *a, TVal key) {
 bool tarr_unset(TArr *a, TVal key) {
     if (!key_norm_fast(&key)) return false;
     a->packed = false;   /* 洞出现，data 不再连续 */
+    a->all_int = 0;      /* type-spec 批3：布局破坏，缓存失效 */
     ABucket *b = arr_find(a, key, NULL);
     if (!b) return false;
     uint32_t di = b->val_off;
@@ -460,6 +463,7 @@ TArr *tarr_cow(TArr *a) {
     b->dcap = a->dcap;
     b->dused = a->dused;
     b->packed = a->packed;   /* L2：布局不变时快路径同样成立 */
+    b->all_int = a->all_int; /* type-spec 批3：深拷贝后语义不变 */
     b->bpending = a->bpending;   /* 桶同样落后，复制方自行 sync */
     if (a->dcap) {
         b->data = tm_malloc(sizeof(TVal) * a->dcap);
