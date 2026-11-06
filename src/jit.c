@@ -997,6 +997,13 @@ typedef struct {
                                  * fn 快照槽；1=未解析哨兵，链尾存真 fn） */
     int p_sm;                   /* 批3-3: p_callee 来自 INIT_SMCALL（静态方法，
                                  * 帧布局 poff=1：slot0 保留/参数 1..） */
+    /* 刀5C（11-06）：参数位置嵌套调用的 opseq 回放态。外层折叠序
+     * （p_callee/p_bfn）进行中遇到内层 INIT_FCALL 时不再整函数 fail，
+     * 而是把内层 INIT..DO 交给真 handler 回放（lower_replay），结果写
+     * 回内层 dst 槽供外层 SEND 使用。单层兄弟嵌套可多次；多层嵌套
+     * 与 OSR 态保守拒编（见 INIT_FCALL case 的保守门）。 */
+    uint8_t nest_active;
+    uint32_t nest_start;
     int p_mcall;                /* 批2-4: p_callee 来自 INIT_MCALL 折叠直调
                                  * （poff=1 + slot0=$this；OSR 守卫在 INIT
                                  * 失配 → OSR_SEQ_PC 整序回解释器，批2-7） */
@@ -2653,6 +2660,24 @@ static int prop_helper_enabled(void) {
     return v;
 }
 
+/* 刀5C（11-06）嵌套调用 emit 开关：**默认关**，TPHP_NEST_CALL=1 显式开。
+ * 默认关的理由（A/B 实测证伪，勿翻案）：放行后 bench() 计时壳 JIT 化，
+ * JIT'd caller 的 call_dyn 路径使被测闭包未在函数级预编译 → 循环中途
+ * 触发 OSR 编译（DEBUG=1 多 4 条 osr compile），编译开销落进计时区 →
+ * 全表前段项虚高（array-push 2.19×/rmw 5.8×/string 2.9×/kv 1.23×），
+ * 而单项隔离 on/off 持平 = 被测代码本身没变慢。与 11-05 刀6（OSR FE）
+ * "单次口径编译成本>收益"同族。待计时壳隔离或 call_dyn 的 callee eager
+ * 门补齐后再评估默认开。功能本身有效：=1 时 n1/n2/n3 不再 FAILED、
+ * 长循环+嵌套调用专项 −14.8%、四模语义一致。 */
+static int nest_call_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_NEST_CALL");
+        v = (e && e[0] && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* P0-17③ 批C slice-1：canonical 折叠累加形态守卫（loop phi 激活前提）。
  * 循环体（cond JMPZ 之后 → 回边 JMP）必须严格匹配：
  *   - 恰一个 FETCH_DIM_R+ADD 对，且 ADD 为 RMW 直写 CV（t?==OPD_CV &&
@@ -3977,7 +4002,29 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
         case OP_INIT_FCALL: {
             /* start folded call; arg expressions run as normal ops until
              * SEND_vals then DO_FCALL (PLAN/ir-jit.md section 6) */
-            if (j->p_callee || j->p_bfn || j->p_seq || j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }  /* nested */
+            if (j->p_callee || j->p_bfn || j->p_seq || j->p_new || j->p_dyn) {
+                /* 刀5C：嵌套调用（外层折叠序的参数表达式内含内层调用）。
+                 * 保守门（防双执行/状态错乱）：
+                 *  ①仅函数级（OSR chunk 的 resume pc 语义不覆盖内层序）
+                 *  ②外层须为普通静态/内建折叠序（p_seq/p_new/p_dyn 回放
+                 *    或动态调用态不放行）
+                 *  ③内层必须是已解析的 builtin（ic&1）——用户函数内层调用
+                 *    可能带副作用，raise→函数级 deopt 整函数重跑会双执行
+                 *  ④多层嵌套（nest_active 已置位）拒编
+                 * 命中即记 nest_start，内层 INIT/SEND/DO 交给 opseq 真
+                 * handler 回放（vm.c 派发表已加 OP_INIT_FCALL），表达式 op
+                 * 照常 IR emit（opseq 跳过表达式 op，零双跑）。 */
+                if (nest_call_enabled() && !j->osr && !j->nest_active
+                    && !j->p_seq && !j->p_new && !j->p_dyn
+                    && (j->p_callee || j->p_bfn)
+                    && op->ic && ((uintptr_t)op->ic & 1)) {
+                    j->nest_active = 1;
+                    j->nest_start = pc;
+                    pc++;
+                    break;
+                }
+                j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);  /* nested */
+            }
             if ((uintptr_t)op->ic & 1)
                 j->p_bfn = (void *)((uintptr_t)op->ic & ~(uintptr_t)1);
             else
@@ -4003,6 +4050,9 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_SEND_VAL: case OP_SEND_VAR: {
+            if (j->nest_active) { pc++; break; }   /* 刀5C：内层回放态——实参由
+                                                     * 真 handler 读槽，编译期不记
+                                                     * 外层 p_arg_slot（防污染） */
             if (!j->p_callee && !j->p_dyn && !j->p_bfn && !j->p_seq && !j->p_new) { j->fail = 1; do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0); }
             if (j->p_seq) {
                 /* 批2-8: NEW 序（==1）同时记槽——ctor 折叠在 NEW_USER 才知
@@ -4020,6 +4070,16 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_DO_FCALL: {
+            if (j->nest_active) {
+                /* 刀5C：回放内层 INIT..DO（真 handler 完整语义，含
+                 * builtin raise/deopt 上传）；结果写内层 dst 槽，外层折叠
+                 * 序后续 SEND 引用该槽。lower_replay 内 p_seq=0 对本态
+                 * 无影响（本态从不设 p_seq）。 */
+                lower_replay(j, j->nest_start, pc + 1);
+                j->nest_active = 0;
+                pc++;
+                break;
+            }
             if (j->p_seq == 2) {   /* P0-14 批2: mcall 序回放 */
                 lower_replay(j, j->p_seq_pc, pc + 1);
                 pc++;
