@@ -370,11 +370,11 @@ TVal *tarr_get_ic(TArr *a, TVal key, DimIC *ic) {
             }
             return &a->data[b0->val_off];
         }
-        /* ② hash 直达（T_STR 键 hash 缓存于 TStr；限 4 次探测，超出落
-         * 慢路 arr_find 兜底——语义与原链 miss 同路）。批B：桶 hash 首比 */
-        if (key.t == T_STR) {
-            TStr *ks = (TStr *)key.u.p;
-            uint32_t slot = (ks->hash ? ks->hash : tstr_hash(ks)) & a->hmask;
+        /* ② hash 直达（T_STR 键 hash 缓存于 TStr；INT 键 splitmix 由
+         * key_hash 算；限 4 次探测，超出落慢路 arr_find 兜底——语义与
+         * 原链 miss 同路）。批B：桶 hash 首比。批3：INT 键扩展。 */
+        if (key.t == T_STR || key.t == T_INT) {
+            uint32_t slot = h & a->hmask;
             for (int p = 0; p < 4; p++) {
                 ABucket *b = &a->buckets[slot];
                 if (b->key.t == T_NULL) break;   /* 探测链终止：absent */
