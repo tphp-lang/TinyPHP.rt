@@ -40,11 +40,11 @@
 
 ## 2026-11-06 锚点刷新（11-03~11-05 四天进展；开工前必读 memory/2026-11-05.md「收工交接」）
 
-- **基线**：HEAD=8a6a4e5（11-05 交接）→ 11-06 工作区含刀6 实现 + 文档同步（未提交）；`tests/run.ps1` **248/0**（11-06 实测 248×3）。当日日志锚点：`memory/2026-11-05.md`（最长，含刀3-7/类型特化/CI 交接）、`memory/2026-11-06.md`（刀6 落地）、11-04、11-03。
+- **基线**：HEAD=a3e8796（11-05 交接）→ 11-06 工作区含刀6 提交 + 刀7B 实现与文档同步（未提交）；`tests/run.ps1` **249/0**（11-06 实测 249×3）。当日日志锚点：`memory/2026-11-05.md`（最长，含刀3-7/类型特化/CI 交接）、`memory/2026-11-06.md`（刀6 落地 + CI 判读 + 刀7B）、11-04、11-03。
 - **CI 三分**：`test.yml`（push/PR 自动测试）、`build.yml`（手动导出 binary + libtphp.a + include/ 19 头）、`perf.yml`（手动对比，`collect-report` 合并成**单文件 `perf-report-all`** artifact）。
 - **性能主线（11-05）**：刀3 槽级写者分析（回收门税 read −10.9%）、刀4 keyed ASSIGN_DIM 内联（rmw −34.8%）、刀5 FETCH_PROP helper 解锁 mcall 折叠（object −15.8%）、刀7 explode memchr（logstat −16.2%）；刀6-OSR-FE / 刀8 / 5B 全部 A/B 证伪撤回。**类型特化批1+2**（[PLAN/type-spec.md](../PLAN/type-spec.md)，`TPHP_TYPE_SPEC`）：本地 read −27%、OSR chunk −85%，CI 可比口径持平无回退。CI 几何均值：linux-x64 **1.28-1.39×**（主口径，M2 尚差 1.3-1.4×）、win ≈0.95× 反超、arm ≈0.92-0.94。
 - **刀6（11-06 已落地）= dimic probe0 线性探测回退**（`TPHP_IC_PROBE=0` 关）：jit.c lvl4 `IF_FALSE(ifm)` 内 ≤3 步 sequential probe 镜像 array.c:376-392；IR 健康 ir_check=1、IC-STATS helper −78%、四模语义逐字一致、A/B min-of-6 kv-read 28.8→21.7ms（−24.7%，6/6 分离）、248×3 全绿，详见 memory/2026-11-06.md。**编号歧义警告**：11-05 另有一个"刀6=OSR FE 放行"（已做但证伪撤回），勿混。剩余 = 结构底 7.2 + cases FIFO 链/helper 残留；CI 口径待复核。当前候选：type-spec 批3 / 刀5C 嵌套调用 emit 覆盖率。
-- **规矩**：开工先 git fetch + 读当日日志尾部分析更新（用户明确要求）；早前误荐"刀3（已完成）"是教训实例。文档记账曾滞后（backlog 245→248、MEMORY 242→248、§7 233→248 已于 11-06 同步）。
+- **规矩**：开工先 git fetch + 读当日日志尾部分析更新（用户明确要求）；早前误荐"刀3（已完成）"是教训实例。文档记账曾滞后（backlog 245→249、MEMORY 242→249、§7 233→249 已于 11-06 同步）。**刀7B（11-06）= explode 元素 exact-alloc**（`TPHP_EXACT_ALLOC=0` 关，`tstr_alloc_exact` cap=0 + `tstr_new_exact`）：12MB 灾样 −21.5%（6/6 分离）、四模逐字一致、249×3 全绿；全表 logstat 噪声内、CI 待复核。**存量差异另案**：`explode(...,-1)` 负 limit 与 PHP 不一致（P1 功能线）。详见 memory/2026-11-06.md。
 
 ## 2026-10-15 OOP 审计修复（P0+P1 全闭环，116/116）
 - P0-1 跨帧异常：S_TRY 三处 end_pc=end+1（缩进不一，replace_all 曾漏一处）
