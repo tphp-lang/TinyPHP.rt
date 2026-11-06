@@ -1625,7 +1625,15 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
     if (!fn->is_variadic)
         for (uint16_t i = fn->n_params; i < rec->n_args; i++)
             if (args[i].t != T_UNDEF) tval_release(&args[i]);
-    vm->x.n_args = (int)rec->args_base;
+    /* 刀10（P1-14）：此处不再复位 args 水位（原 vm->x.n_args = rec->args_base）。
+     * 复位后直调 JIT entry，callee 内 opseq replay 的 SEND 按 n_args++ 写队列、
+     * 踩掉 [args_base, args_base+n_params) 的原始 arg 引用 = **引用泄漏**
+     * （2026-11-06 插桩实证：每 deopt 泄 1 ref；值错误形态不成立——踩源
+     * replay 同时把 f->pc 推过 RECV，deopt resume 在序起点、队列不再被读，
+     * 两条件互斥；本修同时封死未来 emit 演进出 pc-0 resume 形态时的值错误
+     * 面）。e() 期间保持高位（args_base + rec->n_args），replay 排队恒在
+     * 本调队列上方；复位移至各出口（成功分支 / 下方 fall-through 前），
+     * 异常分支由 vm_unwind_core 逐帧复位接管。 */
     VMFrame *f = frame_alloc();
     memset(f, 0, sizeof *f);   /* zero gen/… — new fields default safely */
     /* 可见性 scope（PHP EG(scope)）优先级：
@@ -1724,6 +1732,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                         tval_release(&args[i]);
                         args[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
                     }
+                    vm->x.n_args = (int)rec->args_base;   /* 刀10 P1-14 */
                     VMCallRec *jr = &vm->x.calls[vm->x.n_calls - 1];
                     vm->x.n_calls--;
                     if (jr->dst_kind != OPD_UNUSED) {
@@ -1741,12 +1750,16 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
                      * path line ~1633) — must NOT advance again (d=0) */
                     return 0;
                 }
-                /* deopt: interpreter re-runs RECV from pc 0 (slot copies get
-                 * released there, arg refs moved). builtin-raise deopt
-                 * (tphp_jit_bcall failed): IR frame already returned — raise
-                 * from this C frame, RtlUnwind never crosses an IR frame (no
-                 * UNWIND_INFO). 异常路径帧会被弹掉、RECV 永远不跑——arg
-                 * 引用若不在此释放即泄漏（slot 副本由 frame_destroy 收）。 */
+                /* deopt: interpreter re-runs from f->pc（**实测 = 调用序起点
+                 * 而非 pc 0**——体含 opseq replay 时归因循环已把 f->pc 推进
+                 * 到序内各点，2026-11-06 刀10 插桩实证 fpc=9/RECV 零重跑；
+                 * 体无 replay 则 f->pc=0=RECV 重跑。slot copies get
+                 * released there, arg refs moved（RECV 重跑形态））。
+                 * builtin-raise deopt (tphp_jit_bcall failed): IR frame
+                 * already returned — raise from this C frame, RtlUnwind
+                 * never crosses an IR frame (no UNWIND_INFO). 异常路径帧会
+                 * 被弹掉、RECV 永远不跑——arg 引用若不在此释放即泄漏
+                 * （slot 副本由 frame_destroy 收）。 */
                 if (vm->x.exception) {
                     for (uint16_t i = 0; i < fn->n_params; i++) {
                         if (args[i].t != T_UNDEF) tval_release(&args[i]);
@@ -1758,6 +1771,9 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
         }
     }
 #endif
+    vm->x.n_args = (int)rec->args_base;   /* 刀10 P1-14：解释器路径出口复位
+                                           * （guard fail / deopt fall-through
+                                           * / 无 JIT）——语义与 HEAD 逐位一致 */
     return 0;                     /* pc managed (new frame starts at 0) */
 }
 
@@ -2446,7 +2462,8 @@ run:    ;
             if (o->op == OP_INIT_MCALL) {
                 TStr *mname = op_member_name(vm, o, 3);  /* emit 已限 CONST */
                 d = init_mcall_core(vm, o, *recv_sc, mname);
-            } else if (o->op == OP_INIT_NEW || o->op == OP_SEND_VAL ||
+            } else if (o->op == OP_INIT_NEW || o->op == OP_INIT_FCALL ||
+                       o->op == OP_SEND_VAL ||
                        o->op == OP_SEND_VAR || o->op == OP_DO_FCALL ||
                        o->op == OP_NEW_USER || o->op == OP_INIT_SMCALL ||
                        o->op == OP_FETCH_PROP || o->op == OP_ASSIGN_PROP ||
@@ -5425,6 +5442,19 @@ bool tphp_vm_is_callable(TVal v) {
     }
 }
 
+#ifdef TPHP_JIT
+/* 刀9（2026-11-06）：动态调用兜底 JIT 分发开关。TPHP_DYN_JIT=0 关（默认开）
+ * = 回到"hot 门编译 + 帧纯解释器"的 HEAD 行为。 */
+static int dyn_jit_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_DYN_JIT");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+#endif
+
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
     TClosure *clo = NULL;
     BuiltinFn bfn = NULL;
@@ -5681,10 +5711,70 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
             tval_addref(clo->captures[i]);
             f->slots[i] = clo->captures[i];
         }
+    vm->x.frame = f;
+#ifdef TPHP_JIT
+    /* 刀9（2026-11-06）：动态调用兜底路径的 JIT 分发（镜像 op_do_fcall
+     * ~1687 的 hot 门 + 直调）。缺口：上方 ~5584 的 hot++/eager 门编译出
+     * jit_entry 后，帧仍走 run_frame_until_pop_deep 纯解释器——首调的
+     * 长循环闭包整段解释执行、中途 OSR（编译开销落进 JIT'd 调用方的计时
+     * 区：TPHP_NEST_CALL=1 全表 A/B 实证，每个被测闭包多 1 条 osr
+     * compile）；usort 族/call_user_func/FFI 回调/trampoline 兜底同走此
+     * 缺口——被动态调用的 callee 即使已编译也永不以 JIT 执行。
+     * 仅放行闭包/普通函数（!is_method：静态方法经字符串可调用的槽布局
+     * poff 有歧义且不在受益面；实例方法走上方 recv 路径本就不经此）。
+     * 与 op_do_fcall 的有意差异：e() 期间不复位 args 水位（保持 base+nq）
+     * ——op_do_fcall 先复位（~1628）再直调，callee 内 opseq replay 的
+     * SEND 按 n_args 写队列、会踩掉本调用的原始 arg 引用（clean deopt
+     * 后 RECV 读到 UNDEF 走默认值/arity 误报的暴露面，op_do_fcall 侧
+     * 既有、另案）；保水位则 replay 排队恒在本调队列上方，成功/deopt
+     * 分支内再复位。deopt（返 0 无 exception）→ 落下方解释器：RECV 先
+     * release 槽副本再 move 队列引用（op_do_fcall:1744 同协议）；异常 →
+     * 释放队列引用后 LONGJMP 上传（JIT'd 帧无内部 try/catch——emit 白
+     * 名单拒绝——不存在 JIT'd 帧内 resume 面；槽副本/捕获由
+     * frame_destroy 收）。TPHP_DYN_JIT=0 关（默认开）。 */
+    if (tphp_jit_available() && dyn_jit_enabled() &&
+        !fn->is_method && fn->jit_entry && n >= fn->n_params) {
+        TVal *qargs = &vm->x.args[base];
+        bool guard_ok = true;
+        for (uint16_t i = 0; i < fn->n_params; i++)
+            if (qargs[i].t == T_UNDEF) { guard_ok = false; break; }
+        if (guard_ok) {
+            uint32_t poff = clo ? (uint32_t)clo->n_cap : 0u;
+            for (uint16_t i = 0; i < fn->n_params; i++) {
+                f->slots[poff + i] = qargs[i];
+                tval_addref(qargs[i]);
+            }
+            TVal jret = { .u.i = 0, .t = T_NULL };
+            int jok = ((JitEntry)fn->jit_entry)(vm, f->slots, &jret);
+            if (jok) {
+                for (uint16_t i = 0; i < fn->n_params; i++) {
+                    tval_release(&qargs[i]);
+                    qargs[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                }
+                vm->x.n_args = (int)base;
+                vm->x.n_calls--;
+                VMFrame *jprev = f->prev;
+                frame_destroy(f);
+                vm->x.frame = jprev;
+                if (!jprev) vm->x.done = true;
+                return jret;
+            }
+            if (vm->x.exception) {
+                for (uint16_t i = 0; i < fn->n_params; i++) {
+                    if (qargs[i].t != T_UNDEF) tval_release(&qargs[i]);
+                    qargs[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                }
+                TPHP_LONGJMP(vm->x.unwind, 1);
+            }
+            /* jok==0 且无 exception = deopt：队列引用不释放不清（解释器
+             * RECV 接管——release 槽副本 + move 队列引用），水位复位交给
+             * 下方既有行 */
+        }
+    }
+#endif
     /* 形参/默认值/variadic 全部交给函数体首部的 RECV/RECV_VARIADIC（与
      * op_do_fcall 主路径一致），此处只恢复 args 区水位 */
     vm->x.n_args = (int)base;
-    vm->x.frame = f;
     /* 同上：普通闭包体内的用户函数子帧必须在本循环内执行完 */
     run_frame_until_pop_deep(vm, f);
     if (vm->x.exception) vm_unwind_jump(vm);
