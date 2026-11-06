@@ -127,14 +127,9 @@ static void gc_unregister(GCHead *h) {
     h->gc_prev = h->gc_next = NULL;
 }
 
-/* ---- string allocation (used by string.c) ---- */
-TStr *tstr_alloc_raw(uint32_t len, bool interned) {
-    /* 非 interned 预留尾部余量（.=` in-place 扩容，perf-roadmap；zend
-     * zend_string rc=1 原地增长同思路）。interned 只读 cap=len。
-     * 批2②（P0-16）：预留从 96B 砍到 len/4+16——短串（"k123" len4）
-     * 实占 125B→50B（PHP ~40B），内存/缓全面收紧；长 .= 增长 1.5×→1.25×，
-     * 增多 realloc 但摊销拷贝仍 O(n)，string bench 实测为准。 */
-    uint32_t cap = interned ? len : len + (len >> 2) + 16;
+/* ---- string allocation (used by string.c) ----
+ * impl 共用：cap=0 表示精确分配（无 .= 预留；见 value.h 注释）。 */
+static TStr *tstr_alloc_impl(uint32_t len, uint32_t cap, bool interned) {
     TStr *s = tm_malloc(sizeof(TStr) + (size_t)cap + 1);
     s->h.rc = 1;
     s->h.color = GC_COLOR_UNMARKED;
@@ -145,6 +140,28 @@ TStr *tstr_alloc_raw(uint32_t len, bool interned) {
     s->cap = cap;
     s->c[len] = 0;
     if (!interned) gc_register(&s->h);
+    return s;
+}
+
+TStr *tstr_alloc_raw(uint32_t len, bool interned) {
+    /* 非 interned 预留尾部余量（.=` in-place 扩容，perf-roadmap；zend
+     * zend_string rc=1 原地增长同思路）。interned 只读 cap=len。
+     * 批2②（P0-16）：预留从 96B 砍到 len/4+16——短串（"k123" len4）
+     * 实占 125B→50B（PHP ~40B），内存/缓全面收紧；长 .= 增长 1.5×→1.25×，
+     * 增多 realloc 但摊销拷贝仍 O(n)，string bench 实测为准。 */
+    uint32_t cap = interned ? len : len + (len >> 2) + 16;
+    return tstr_alloc_impl(len, cap, interned);
+}
+
+/* 刀7B（11-06）：explode/str_split 等"短命只读元素"专用精确分配——
+ * 这些串永不 .=，len/4+16 预留纯浪费（big explode 2 万元素 × 平均
+ * ~21B 尾空间 + 缓存行污染，日志记账 big explode 仍 4.4×）。
+ * cap=0 → tstr_append_inplace 的 `len+n > cap` 恒真 → 后续若真被 .=
+ * 自动落慢路（tval_concat 新串），语义与预留版完全一致。 */
+TStr *tstr_alloc_exact(uint32_t len) {
+    /* 分配尺寸仍 = len+1（c[len]=0 必须可写）；cap 字段置 0 = 无 .= 预留 */
+    TStr *s = tstr_alloc_impl(len, len, false);
+    s->cap = 0;
     return s;
 }
 

@@ -30,6 +30,15 @@ TStr *tstr_new(const char *s, size_t len) {
     return str;
 }
 
+/* 刀7B：与 tstr_new 逐位同款，仅分配走 cap=0 精确容量（无 .= 预留）。
+ * 用于 explode/str_split 的短命只读元素；后续 .= 自动落慢路，语义不变。 */
+TStr *tstr_new_exact(const char *s, size_t len) {
+    if (len > UINT32_MAX - 1) { fprintf(stderr, "tphp: string too long\n"); exit((int)TPHP_E_NOMEM); }
+    TStr *str = tstr_alloc_exact((uint32_t)len);
+    memcpy(str->c, s, len);
+    return str;
+}
+
 /* intern table: program-lifetime strings (keywords, names, literals).
  * M5: per-OS-thread tables — compile-time literals are shared via prog
  * pointers (INTERNED strings never refcount), runtime interning in worker

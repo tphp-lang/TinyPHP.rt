@@ -1380,6 +1380,20 @@ static int explode_fast_enabled(void) {
     return v;
 }
 
+/* 刀7B（11-06）：explode 元素精确分配开关，默认开，TPHP_EXACT_ALLOC=0 关
+ *（同二进制 A/B）。元素短命只读、永不 .=，len/4+16 预留全浪费。 */
+static int explode_exact_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_EXACT_ALLOC");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+static TStr *explode_str(const char *s, size_t len) {
+    return explode_exact_enabled() ? tstr_new_exact(s, len) : tstr_new(s, len);
+}
+
 static TVal bi_explode(VM *vm, TVal *args, int n) {
     if (n < 2) RAISE(vm, "ArgumentCountError", "explode() expects at least 2 arguments");
     TStr *delim = need_str(vm, &args[0], "explode", "#1 ($separator)");
@@ -1404,11 +1418,11 @@ static TVal bi_explode(VM *vm, TVal *args, int n) {
             if (limit >= 0 && count + 1 >= limit) break;
             const char *hit = p < end ? (const char *)memchr(p, dc, (size_t)(end - p)) : NULL;
             if (!hit) break;
-            tarr_append(a, TV_STR(tstr_new(p, (size_t)(hit - p))));
+            tarr_append(a, TV_STR(explode_str(p, (size_t)(hit - p))));
             count++;
             p = hit + 1;
         }
-        tarr_append(a, TV_STR(tstr_new(p, (size_t)(end - p))));
+        tarr_append(a, TV_STR(explode_str(p, (size_t)(end - p))));
         return TV_ARR(a);
     }
     while (p <= end) {
@@ -1419,12 +1433,12 @@ static TVal bi_explode(VM *vm, TVal *args, int n) {
                 if (memcmp(q, d, delim->len) == 0) { hit = q; break; }
         }
         if (!hit) break;
-        tarr_append(a, TV_STR(tstr_new(p, (size_t)(hit - p))));
+        tarr_append(a, TV_STR(explode_str(p, (size_t)(hit - p))));
         count++;
         p = hit + delim->len;
         if (p > end) break;
     }
-    tarr_append(a, TV_STR(tstr_new(p, (size_t)(end - p))));
+    tarr_append(a, TV_STR(explode_str(p, (size_t)(end - p))));
     return TV_ARR(a);
 }
 

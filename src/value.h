@@ -294,6 +294,7 @@ void gc_register(GCHead *h);
 
 /* ---- heap allocation (mem.c) ---- */
 TStr *tstr_alloc_raw(uint32_t len, bool interned);
+TStr *tstr_alloc_exact(uint32_t len);   /* cap=0：短命只读串，免 .= 预留 */
 TArr *tarr_alloc_raw(void);
 void  tstr_free(TStr *s);
 /* mark-sweep pass reclaiming reference cycles; returns objects freed */
@@ -301,6 +302,7 @@ int64_t gc_collect(void);
 
 /* ---- strings (string.c) ---- */
 TStr  *tstr_new(const char *s, size_t len);        /* heap string */
+TStr  *tstr_new_exact(const char *s, size_t len);  /* heap string, cap=0（无 .= 预留） */
 TStr  *tstr_intern(const char *s, size_t len);     /* program-lifetime string */
 TStr  *tstr_concat(TStr *a, TStr *b);              /* new heap string */
 /* `.=` in-place：dst 唯一引用且 cap 够时原地追加（perf-roadmap）；成功 true */
