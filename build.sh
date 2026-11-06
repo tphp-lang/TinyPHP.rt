@@ -35,6 +35,13 @@ if [ "$TOS" = "Darwin" ] && [ "${NO_MIMALLOC:-0}" != "1" ] && [ "${USE_MIMALLOC:
   echo "[p0-19] Darwin default: CRT allocator (mimalloc opt-in via USE_MIMALLOC=1)"
   NO_MIMALLOC=1
 fi
+# P0-19 cluster-2 (11-06 CI): mimalloc aarch64 small-alloc also 3-4x slower
+# than libc (bench_alloc: libc 10ns vs mi 38-41ns/pair on Linux aarch64).
+# Same Darwin default; opt back in with USE_MIMALLOC=1.
+if [ "$TARCH" = "aarch64" ] && [ "${NO_MIMALLOC:-0}" != "1" ] && [ "${USE_MIMALLOC:-0}" != "1" ]; then
+  echo "[p0-19] aarch64 default: CRT allocator (mimalloc opt-in via USE_MIMALLOC=1)"
+  NO_MIMALLOC=1
+fi
 # portable lowercase (sh/dash has no ${var,,})
 TOS_LC=$(printf '%s' "$TOS" | tr 'A-Z' 'a-z')
 
