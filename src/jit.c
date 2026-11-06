@@ -1339,6 +1339,67 @@ static void dimic_take(DimIcCtx *g, ir_ref vaddr) {
     ir_STORE(ir_ADD_A(g->dst, ir_CONST_ADDR(TVAL_TAG)), vtag);
 }
 
+/* 刀6（11-06，kv 形态侦察批）：STR probe0 失败后的 sequential probe 回退。
+ * 镜像 C 侧 tarr_get_ic ② hash 直达的 ≤4 步开放寻址（array.c:376-392；
+ * IR 侧 probe0 已是 p=0，这里补 p=1..3）。kv 侦察实锤：8 键满表哈希
+ * 冲突下 probe0 恒 miss → cases[1..7] 全死哨兵 → 每轮 helper CALL
+ * （27% 调用率 ≈ +7.6ms = kv 差距 47%，memory/2026-11-05.md §kv 侦察）。
+ * 语义安全：
+ *  - 匹配 = 活桶（val_off != UINT32_MAX）+ key tag/pay 全身份（与
+ *    probe0/case 链同款；interned 串指针相等即全身份，是 C 侧
+ *    KEY_PTR_EQ||hash+key_eq 的保守子集，miss 一律有兜底）；
+ *  - C 侧以 T_NULL 空桶终止探测链：IR 侧空桶 tag 与 STR key 不等自然
+ *    不命中，继续探测最多 N 步后落 case 链（开放寻址保证空桶后无目标
+ *    键、全身份比较杜绝误命中）；
+ *  - 命中复用 dimic_take（与 case 链叶同款）；超步数/不命中一律落
+ *    dimic_ic_chain(g,5) → helper → C 侧 arr_find 完整兜底，零语义漂移；
+ *  - 不回填 ic->cases[0]（缓存非语义；C 侧 helper 命中时仍会回填），
+ *    避免命中热路径多一次 store。
+ * 开关 TPHP_IC_PROBE=0 关（同二进制 A/B，回到 probe0 直落 case 链）。 */
+#define IC_PROBE_STEPS 3
+static int ic_probe_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_IC_PROBE");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl);
+
+static ir_ref dimic_linear_probe(DimIcCtx *g, ir_ref slot, ir_ref hm,
+                                 ir_ref bk, int p) {
+    JitC *j = g->j;
+    JIT_CTX();
+    if (p > IC_PROBE_STEPS) return dimic_ic_chain(g, 5);
+    ir_ref s = ir_AND(IR_U32, ir_ADD_U32(slot, ir_CONST_U32(1)), hm);
+    ir_ref zs = ir_ZEXT(IR_U64, s);
+    ir_ref bp = ir_ADD_A(ir_ADD_A(bk, ir_SHL_U64(zs, ir_CONST_U64(4))),
+                         ir_SHL_U64(zs, ir_CONST_U64(3)));   /* *24 */
+    ir_ref bkey = ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, key)));
+    ir_ref m = ir_AND(IR_BOOL,
+                ir_AND(IR_BOOL,
+                       ir_EQ(g->kt, ir_LOAD_I32(
+                           ir_ADD_A(bkey, ir_CONST_ADDR(TVAL_TAG)))),
+                       ir_EQ(g->kp, ir_LOAD_I64(bkey))),
+                ir_NE(ir_LOAD_U32(ir_ADD_A(bp,
+                           ir_CONST_ADDR(offsetof(ABucket, val_off)))),
+                      ir_CONST_U32(0xFFFFFFFFu)));
+    ir_ref ifp = ir_IF(m);
+    ir_IF_TRUE(ifp);
+        ir_ref voff = ir_LOAD_U32(
+            ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
+        ir_ref data = ir_LOAD_A(
+            ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
+        dimic_take(g, ir_ADD_A(data,
+                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+        ir_ref epT = ir_END();
+    ir_IF_FALSE(ifp);
+        ir_ref epF = dimic_linear_probe(g, s, hm, bk, p + 1);
+    ir_MERGE_2(epT, epF);
+    return ir_END();
+}
+
 /* v3 多态链（v3.2' hash 直选）：lvl 0..2 = 共享层（arr/buckets/bpending，
  * 失败 = 整链 miss 计数）；lvl 3 = cases[0] 单槽（单态 site 一步命中，
  * 与 v3.1 同构）；lvl 4 = STR 分派——TRUE 内 probe0 桶直取（镜像 C
@@ -1401,7 +1462,11 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                              ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
                 ir_ref emT = ir_END();
             ir_IF_FALSE(ifm);
-                ir_ref emF = dimic_ic_chain(g, 5);   /* probe 失败 → 兜底链 */
+                /* 刀6：probe0 miss → sequential probe 回退（同二进制 A/B
+                 * 开关；关 = v3.2' 原行为直落 case 链） */
+                ir_ref emF = ic_probe_enabled()
+                    ? dimic_linear_probe(g, slot, hm, bk, 1)
+                    : dimic_ic_chain(g, 5);
             ir_MERGE_2(emT, emF);
             ir_ref eStr = ir_END();
         ir_IF_FALSE(ifstr);
