@@ -187,3 +187,38 @@ DEBUG=2 双级 guard 触发：fn 级 `osr=0`、read 基准 OSR chunk `osr=1`。
 2. **hash INT 键扩展**：DimIC hash 直达快路从 T_STR-only 扩展到 T_INT（splitmix via key_hash），同 4 探测上限、同快照门。kv-read 30-36→28-29ms（~5-10%）。
 
 **验证**：254/254 全绿；bench 零回退。
+
+## 7d. 刀15 take 瘦身实测结果（2026-11-09）——11-04 刀1 余税兑现
+
+**切面**：spec_c 折叠路径的 `dimic_take` 三免（`TPHP_TAKE_THIN` 默认开，=0 关）：
+
+1. **免 misses 清零 store**——spec site 该字段零读者：generic 门批2 不 emit、
+   miss 计数 `dimic_miss(false)` 不计、C 侧仅 init（array.c:426）。
+2. **免 addref 菱形 + vtag load**——元素恒 INT（guard g3 + 体内零写）→
+   [STR,CLOSURE] 区间恒假，尾部 tag 直落 CONST INT。
+3. **免 release dst 菱形**——**preheader 消灭**：guard 通过线对体内 FETCH dst
+   槽（`spec_body_tmp`，spec_scan 输出恒等身份）恒发 `rel_dst_gate` + 置 UNDEF
+   （每函数调用一次摊销），此后每迭代 dst=take 写入的元素值恒 INT；越界
+   UndefinedError raise 不写 dst → deopt 重跑——dst 全程恒标量。
+   thin 判定 = `spec_c && spec_body_tmp && op->ar == spec_body_tmp`（身份
+   单一真源：字段非零 ⟺ preheader 已消灭 ⟺ 可 thin；cond 区 FETCH 的 dst
+   不经消灭 → 保守原样三门，read 形态 cond 无 FETCH 零损失）。
+
+**验证**：255×4（默认 / THIN=0 / TYPE_SPEC=0 / JIT=0——TYPE_SPEC=0 为超集
+关闭，零影响）；新 `tests/jit/test-jit-takethin-001.php` 5 案三模逐字一致
+（thin 主路径 / 越界异常与 thin 共存 / 异常后复跑 / guard-fail 轮转 /
+STR 遗留 rc 稳定）；DEBUG=2 双级 ir_check=1、编译 size 1880→1744（−136B）、
+IR −51 行（≈三门菱形量）。
+
+**A/B（min-of-6 交替，双口径双轮）**：
+
+| 口径 | array-read | 备注 |
+|---|---:|---|
+| Windows | 4.1→2.9（**−29.3%**）、复轮 4.2→2.9（**−31.0%**） | rmw +6.2% 复轮归零=噪声 |
+| WSL linux | 4.0→2.8（**−30.0%**） | jsonagg/logstat 超带项专项 8 交替均为 on 带下移=噪声 |
+
+**兑现链**：11-04 刀1 消融定案"两门动态≈0、税在静态布局（0.070 ≈ read 25%，
+归因 block layout + 形态 guard）"——type-spec guard 提供形态证明后三门连同
+冷段菱形整体消失，布局税回收。本机 read 自批1 起累计 6.5→5.7→4.1→**2.8**。
+type-spec 系列（批1/2/3+刀15）全部落地；剩余 = FETCH 结构墙（MERGE/双活
+旧案，spec 下路径可重估）。

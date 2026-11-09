@@ -974,7 +974,11 @@ typedef struct {
     uint32_t spec_lo, spec_hi; /* 作用域 [hdr, be] */
     uint32_t spec_acc;         /* 累加器 CV（$s） */
     uint32_t spec_idx;         /* 索引 CV（$i = FETCH key 槽 = INC a1） */
-    uint32_t spec_tmp;         /* FETCH dst（元素值 TMP） */
+    uint32_t spec_tmp;         /* FETCH dst（元素值 TMP，ADD tb 消费用） */
+    uint32_t spec_body_tmp;    /* 刀15：体内 FETCH dst 恒等身份（spec_scan
+                                * 输出）。非零 ⟺ preheader 已 gate+UNDEF
+                                * 消灭该槽 ⟺ dimic_take 可免 release。
+                                * 不受 FETCH 尾 spec_tmp 覆盖影响。 */
     uint32_t spec_base;        /* 批2：guard 证过的 base CV（FETCH 结构折叠
                                 * 只对本 base 生效——cond 区异 base 的
                                 * preguard 候选无 guard 证，不得折叠） */
@@ -1281,7 +1285,30 @@ static void dimic_miss(DimIcCtx *g, bool count) {
  *   str 微退（0.142 vs 0.1404），guard 自身也付 EQ×2+AND+IF。
  * 结论：保 HEAD 内联形态；余下税 = 后端 block layout（~0.016）+ 形态
  * guard（~0.05，需类型反馈/形态证明），记 backlog 不在本刀动。 */
-static void dimic_take(DimIcCtx *g, ir_ref vaddr) {
+static void dimic_take(DimIcCtx *g, ir_ref vaddr, int thin) {
+    /* 刀15 thin 版（type-spec spec_c 折叠路径专用）：三免 + 16B store。
+     * - 免 misses 清零：spec site 的 generic 门批2 不 emit、miss 计数
+     *   dimic_miss(false) 不计、C 侧仅 init（array.c:426）→ 该字段
+     *   零读者零写者；
+     * - 免 addref 菱形 + vtag load：元素恒 INT（guard g3 全元素扫描 +
+     *   体内零数组写白名单）→ [STR,CLOSURE] 区间恒假，tag 直落
+     *   CONST INT；
+     * - 免 release dst 菱形：dst=体内 FETCH dst——preheader 已恒发
+     *   gate+UNDEF 消灭槽遗留（spec_body_tmp 非零=已消灭），此后每
+     *   迭代 dst=take 写入的元素值（恒 INT）；miss 路径 helper 取值
+     *   成功同样写元素（恒 INT）、越界则 UndefinedError raise 不写
+     *   dst（deopt 重跑，test-jit-takethin-001 b2 实证）——dst 全程
+     *   恒标量。首迭代依据来自 preheader 一次性 gate，每调用一次摊销。
+     * 语义等价：值写 dst（pay 先、tag 后）逐条与慢版一致，仅省去
+     * 必空转的三门（11-04 消融"动态≈0、税在静态布局"的残余主体）。 */
+    if (thin) {
+        JitC *j = g->j;
+        JIT_CTX();
+        ir_STORE(g->dst, ir_LOAD_I64(vaddr));
+        ir_STORE(ir_ADD_A(g->dst, ir_CONST_ADDR(TVAL_TAG)),
+                 ir_CONST_I32(JT_INT));
+        return;
+    }
     JitC *j = g->j;
     JIT_CTX();
     ir_STORE(ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, misses))),
@@ -1399,7 +1426,7 @@ static ir_ref dimic_linear_probe(DimIcCtx *g, ir_ref slot, ir_ref hm,
         ir_ref data = ir_LOAD_A(
             ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
         dimic_take(g, ir_ADD_A(data,
-                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
         ir_ref epT = ir_END();
     ir_IF_FALSE(ifp);
         ir_ref epF = dimic_linear_probe(g, s, hm, bk, p + 1);
@@ -1466,7 +1493,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                 ir_ref data = ir_LOAD_A(
                     ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
                 dimic_take(g, ir_ADD_A(data,
-                             ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+                             ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
                 ir_ref emT = ir_END();
             ir_IF_FALSE(ifm);
                 /* 刀6：probe0 miss → sequential probe 回退（同二进制 A/B
@@ -1521,7 +1548,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                 ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
             ir_ref data = ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
             dimic_take(g, ir_ADD_A(data,
-                         ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))));
+                         ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
             ct = ir_END();
         } else {
             ct = dimic_ic_chain(g, lvl + 1);
@@ -2648,6 +2675,19 @@ static int type_spec_enabled(void) {
     return v;
 }
 
+/* 刀15（11-09 take 瘦身）开关：默认开，TPHP_TAKE_THIN=0 关（同二进制
+ * A/B）。关 = dimic_take 原三门 + 无 preheader 消灭 = HEAD 行为。
+ * 开关同时控制 preheader 消灭与 take thin 判定（spec_body_tmp 非零
+ * 仅在开时）——两者互为依据，单一真源防错配。 */
+static int take_thin_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_TAKE_THIN");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* 刀5（11-05 FETCH_PROP helper 化）开关：默认开，TPHP_PROP_HELPER=0 关
  * = 回到单 op 回放 + frameless 拒 FETCH_PROP（HEAD 行为）。两处必须同开
  * 同关——helper 关而 frameless 放开 = 无帧跑回放必错。 */
@@ -3123,6 +3163,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->spec_lo = j->spec_hi = 0;
             j->spec_tmp_valid = 0;
             j->spec_base = 0;
+            j->spec_body_tmp = 0;
         }
         /* P0-17③ 批B'：折叠 fast 线的前向汇合（lb_pend 同款机制）——
          * 主线推进到 fwd_pc 时把暂存的 fast 线 END 与主线 END 汇合 */
@@ -3229,9 +3270,21 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
                     ir_IF_FALSE(ifbad);
                     /* FALSE 线 = 活线（无 MERGE，镜像 OP_SEND_CAP） */
+                    /* 刀15：preheader 消灭体内 FETCH dst 的槽遗留——恒发
+                     * gate（旧值任意形态正确释放，每调用一次摊销）+
+                     * 置 UNDEF，作为循环内 thin take 免 release 的首迭代
+                     * 依据（之后每迭代 dst=take 写入的元素值恒 INT；
+                     * 越界 raise 不写 dst → deopt 重跑）。TPHP_TAKE_THIN=0
+                     * 不发。 */
+                    if (take_thin_enabled()) {
+                        ir_ref tsa = slot_addr(j, s_tmp);
+                        rel_dst_gate(j, tsa);
+                        store_imm(j, tsa, (int32_t)T_UNDEF, ir_CONST_I64(0));
+                    }
                     j->spec_acc = s_acc;
                     j->spec_idx = s_idx;
                     j->spec_tmp = s_tmp;
+                    j->spec_body_tmp = take_thin_enabled() ? s_tmp : 0;
                     j->spec_base = s_base;
                     j->spec_lo = pc;
                     j->spec_hi = s_be;
@@ -3247,6 +3300,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec_lo = j->spec_hi = 0;
                     j->spec_tmp_valid = 0;
                     j->spec_base = 0;
+                    j->spec_body_tmp = 0;
                 }
             } else if (jit_dbg()) {
                 fprintf(stderr, "[jit] spec skip hdr=%u osr=%d\n", pc, j->osr);
@@ -3600,7 +3654,13 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         ir_ref leaf = ir_ADD_A(data,
                             ir_SHL_U64(ir_BITCAST_U64(g.kp), ir_CONST_U64(4)));
                         if (!fold_add) {
-                            dimic_take(&g, leaf);   /* 原样：值写 dst 槽 */
+                            /* 刀15 thin：spec_c（元素恒 INT 证）+ 体内
+                             * FETCH 身份（preheader 已 gate+UNDEF 消灭
+                             * spec_body_tmp 槽）双满足才瘦身；cond 区
+                             * FETCH/未消灭槽一律原样三门。 */
+                            dimic_take(&g, leaf,
+                                spec_c && j->spec_body_tmp &&
+                                op->ar == j->spec_body_tmp);
                         } else {
                             /* fast/slow 双线（P0-17③ 批B'）；批C slice-1：
                              * RMW acc 且守卫激活 → $s pay 读 loop phi
@@ -3655,7 +3715,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                                 j->fwd_is_acc = (uint8_t)phion;
                                 j->fwd_pay = ssum;
                             ir_IF_FALSE(iff);
-                                dimic_take(&g, leaf);   /* slow：原 dst 写，
+                                dimic_take(&g, leaf, 0);   /* slow：原 dst 写，
                                     活线延续（不 END，ifb-TRUE 块尾统一封） */
                         }
                         ir_ref eP1 = ir_END();
