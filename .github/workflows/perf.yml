@@ -156,10 +156,22 @@ jobs:
       # P0-19 round 4 control: same bench_alloc probes as macos -- growth
       # curves (huge/arena) + steady pairs + getrusage split on Linux 4KB
       # pages give the healthy baseline the mac readings compare against.
+      # P0-19 cluster-2 (11-06): aarch64 build.sh defaults to the CRT
+      # allocator -> build/obj/mi_*.o absent and the mimalloc arm died
+      # (taking the libc arm with it, three runs). Fall back to compiling
+      # the mimalloc sources directly (same list as build.sh [2/6]).
       - name: bench_alloc control (steady + growth)
         run: |
           {
-            clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+            if compgen -G 'build/obj/mi_*.o' > /dev/null; then
+              clang -O2 -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c build/obj/mi_*.o build/obj/mip_*.o -o /tmp/bench_alloc_mi
+            else
+              MI_SRCS="alloc.c alloc-aligned.c alloc-posix.c arena.c bitmap.c heap.c init.c libc.c options.c os.c page.c page-map.c random.c sample-guarded.c sample-profile.c stats.c subproc.c theap.c threadlocal.c"
+              MI_ARGS=""
+              for f in $MI_SRCS; do MI_ARGS="$MI_ARGS deps/mimalloc/src/$f"; done
+              for f in deps/mimalloc/src/prim/*.c; do MI_ARGS="$MI_ARGS $f"; done
+              clang -O2 -w -DMI_STATIC_LIB -Ideps/mimalloc/include -Ideps/mimalloc/src tools/bench_alloc.c $MI_ARGS -o /tmp/bench_alloc_mi
+            fi
             clang -O2 -DUSE_LIBC tools/bench_alloc.c -o /tmp/bench_alloc_libc
             echo "=== mimalloc ==="
             /tmp/bench_alloc_mi
