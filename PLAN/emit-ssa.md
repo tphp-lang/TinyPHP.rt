@@ -1,6 +1,6 @@
 # P0-17③ 发射器值流手术（emitter value-flow / SSA-ization）
 
-状态：**设计稿 v1（2026-10-31）**——立项依据、方案、失效规则、分批计划。
+状态：**设计稿 v1（2026-10-31）+ 批B'/批C slice-1 证伪记录 + 刀16 落地（2026-11-09）**。
 预估：数天级。主攻目标 = Linux x64 CI 四重灾项（array-rmw 8.86× / object 6.38× /
 kv-read 6.21× / array-read 6×）与 array-push 2.29×/object 的公共根因。
 
@@ -195,6 +195,49 @@ dstogov linear scan）未给驻留寄存器——寄存器压力抵消省下的 
 phi 驻留/合并增强（vendor 域，需勘察 ir_ra 的 phi 处理与 callee-saved
 偏好）；② 转 dispatch 基线（P0-4 A6：67ns/轮 vs PHP 16）——array-read
 单点已证边际递减，横向归因（§6）排序不变。
+
+## 9. 刀16 FETCH 值直达落地（2026-11-09，TPHP_FETCH_FWD 默认开）
+
+**切面（A 模式：phi 桥接，不动控制流）**——10-31"纯值流撞 MERGE 墙"的否决在 type-spec
+批1-3 + 刀15 后重估成立：spec_c 下 FETCH→ADD 之间只剩 [bound→take | 越界→miss] 单菱形，
+fwd 绑定 thin 证明（spec_body_tmp 身份 ⟺ preheader gate+UNDEF 已消灭 dst 槽），miss 线
+helper 恒写 dst（越界 raise 为实死线），两侧各取 pay ref 作 phi 输入结构完备：
+
+1. **emit 期 gate**（jit.c FETCH case）：`fetch_fwd_enabled() && !fold_add && 配对 ADD
+   （镜像 spec_scan RMW 判据：dst CV 直写 + 另一 src == FETCH dst）&& !stop_has(pc+1) &&
+   !is_jump_target(pc+1)（防 ADD 由续块/跳入发射，fwd 跨块失准）&& thin 三条件`。
+2. **hit 线**：只 `LOAD element pay`（免 take 16B store）；**miss 线**：`load dst` 作 phi
+   输入占位（spec 下 helper 越界恒 raise → 该线实死，值亦真）；**MERGE 处
+   `PHI I64(hit, miss)`** 桥出 → JitC `spec_fwd_pay/valid/kind/idx`。
+3. **消费（lower_binop）**：kind+idx 双等（防 CONST lit 撞数）→ pa/pb 直取 phi，免槽
+   load；**消费即清**，与 spec_tmp_valid 同生命周期（FETCH 尾置/清、spec 出体清、
+   guard 激活/失败清——五处同步）。
+4. **deopt 物化**：spec 双 INT 快线溢出 RETURN 前补写 tmp 槽（2 store 冷路）——OSR 从
+   ADD pc 重跑读槽；槽恒 UNDEF（preheader 消灭 + 直达不写）→ 裸存安全。慢线
+   call_slow_binop 的 deopt 不可达（fwd_gate ⊂ spec 快线双证）。
+
+**与既有机制交互**：fold_add（批B'）互斥（gate 含 !fold_add）；TAKE_THIN=0 →
+spec_body_tmp=0 → gate 空（超集关）；TYPE_SPEC=0 → spec_c=0 → gate 空；miss/raise/
+deopt 语义零改动（dimic_miss 原样）。
+
+**IR 实证**（DEBUG=2 read 循环，ir_check=1）：热路 take 2 store + ADD dst load 消失，
+换 phi+miss 冷 load——**每迭代净省 3 内存操作**；code size 655→663（+8B = 溢出物化
+冷路 2 store，热路净减）。
+
+**A/B（同二进制 min-of-6 交替，双口径）**：
+| 口径 | array-read | 复轮 | 超带专项 |
+|---|---|---|---|
+| Windows ×2 轮 | **2.9→2.3（−20.7%）** | −20.7% 稳 | array-push 首轮 +2.0% → 复轮 −0.4% 归零 |
+| WSL | **−20.7%** | — | array-push +13.4% / string +144% → 8 交替归零（−0.7% / 0.0%）|
+
+其余全表 ≤±3.4%（噪声带内）。**测试 256×5**（默认/FETCH_FWD=0/TAKE_THIN=0/TYPE_SPEC=0/
+JIT=0）+ 专项 tests/jit/test-jit-fetchfwd-001.php 七案（溢出物化函数级+OSR 热循环、
+OOB deopt、guard 轮转、rc 稳定）三模逐字一致。
+
+**批B' 教训对照**：B'（双线控制流+fwd 汇合）单独负收益的根因是控制流税——刀16 不动
+控制流（菱形原样），只在既有 MERGE 上加 phi + 免槽往返，−20.7% 兑现"净收益依赖结构
+简化后再动值流"的重估判断。**余量**：批C（$s loop-carried 寄存器化，E 档 2.51→1.63ns）
+仍是 RA 域死结，不在本刀。
 
 ## 6. 风险清单
 
