@@ -979,6 +979,13 @@ typedef struct {
                                 * 输出）。非零 ⟺ preheader 已 gate+UNDEF
                                 * 消灭该槽 ⟺ dimic_take 可免 release。
                                 * 不受 FETCH 尾 spec_tmp 覆盖影响。 */
+    uint8_t spec_fwd_valid;    /* 刀16：FETCH 值直达挂起——pay 经 MERGE phi
+                                * 桥出，紧邻 ADD 免槽往返（dst 槽不写）。 */
+    uint8_t spec_fwd_kind;     /* 直达目标操作数身份（FETCH dst 的 kind，
+                                * 消费判别用：kind+idx 双等才算） */
+    uint32_t spec_fwd_idx;
+    ir_ref spec_fwd_pay;       /* phi 结果（hit=IF_TRUE 内 element load /
+                                * miss=helper 写 dst 后 load） */
     uint32_t spec_base;        /* 批2：guard 证过的 base CV（FETCH 结构折叠
                                 * 只对本 base 生效——cond 区异 base 的
                                 * preguard 候选无 guard 证，不得折叠） */
@@ -1585,8 +1592,14 @@ static void lower_binop(JitC *j, TOp *op) {
      * spec_tmp=全元素 INT 证）。ta 兼供慢线——const tag 即真值，恒正确。 */
     int spec_ta = spec_bit_int(j, op->t1, op->a1);
     ir_ref ta = spec_ta ? ir_CONST_I32(JT_INT) : load_tag(j, aa);
-    ir_ref pa = load_pay(j, aa);
-    ir_ref tb, pb;
+    ir_ref pa, tb, pb;
+    /* 刀16：值直达消费（kind+idx 双等，防 CONST lit 撞数；消费即清，
+     * 与 spec_tmp_valid 同生命周期——emit 期已证 pc+1 即本 ADD）。 */
+    int fwd1 = j->spec_fwd_valid && op->t1 == j->spec_fwd_kind &&
+               op->a1 == j->spec_fwd_idx;
+    ir_ref fwd_val = 0;
+    if (fwd1) { pa = j->spec_fwd_pay; fwd_val = pa; j->spec_fwd_valid = 0; }
+    else pa = load_pay(j, aa);
     int spec_tb = 0;
     if (op->t2 == OPD_CONST) {
         tb = ir_CONST_I32((int32_t)j->fn->lits[op->a2].t);
@@ -1595,7 +1608,10 @@ static void lower_binop(JitC *j, TOp *op) {
         ir_ref ba = slot_addr(j, op->a2);
         spec_tb = spec_bit_int(j, op->t2, op->a2);
         tb = spec_tb ? ir_CONST_I32(JT_INT) : load_tag(j, ba);
-        pb = load_pay(j, ba);
+        int fwd2 = j->spec_fwd_valid && op->t2 == j->spec_fwd_kind &&
+                   op->a2 == j->spec_fwd_idx;
+        if (fwd2) { pb = j->spec_fwd_pay; fwd_val = pb; j->spec_fwd_valid = 0; }
+        else pb = load_pay(j, ba);
         if (spec_tb) j->spec_tmp_valid = 0;   /* 消费即清（时效见 spec_bit_int） */
     }
     if (op->op == OP_ADD || op->op == OP_SUB) {
@@ -1619,6 +1635,12 @@ static void lower_binop(JitC *j, TOp *op) {
                            ir_CONST_I64(0));
             ir_ref ifof = ir_IF(of);
             ir_IF_TRUE(ifof);
+                /* 刀16：deopt 物化——OSR 从本 ADD pc 重跑读 tmp 槽，
+                 * 值直达下槽恒 UNDEF → RETURN 前补写（冷路 2 store）。
+                 * 槽恒 UNDEF（preheader 消灭 + 直达不写）→ 裸存安全。 */
+                if (fwd_val)
+                    store_imm(j, slot_addr(j, j->spec_fwd_idx),
+                              (int32_t)JT_INT, fwd_val);
                 ir_RETURN(ir_CONST_I32(OSR_RET_PC(j)));
             ir_IF_FALSE(ifof);
                 store_imm(j, da, JT_INT, sum);
@@ -2688,6 +2710,18 @@ static int take_thin_enabled(void) {
     return v;
 }
 
+/* 刀16（11-09 FETCH 值直达）开关：默认开，TPHP_FETCH_FWD=0 关（同二进制
+ * A/B）。关 = 回刀15 thin（take 16B store + ADD 槽 load 照旧）。
+ * 仅在 thin 条件（spec_c+spec_body_tmp 身份）之上叠加生效。 */
+static int fetch_fwd_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_FETCH_FWD");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* 刀5（11-05 FETCH_PROP helper 化）开关：默认开，TPHP_PROP_HELPER=0 关
  * = 回到单 op 回放 + frameless 拒 FETCH_PROP（HEAD 行为）。两处必须同开
  * 同关——helper 关而 frameless 放开 = 无帧跑回放必错。 */
@@ -3162,6 +3196,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->spec = 0;
             j->spec_lo = j->spec_hi = 0;
             j->spec_tmp_valid = 0;
+            j->spec_fwd_valid = 0;
             j->spec_base = 0;
             j->spec_body_tmp = 0;
         }
@@ -3290,6 +3325,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec_hi = s_be;
                     j->spec = 1;
                     j->spec_tmp_valid = 0;
+                    j->spec_fwd_valid = 0;
                     if (jit_dbg())
                         fprintf(stderr, "[jit] spec guard hdr=%u acc=%u idx=%u base=%u osr=%d\n",
                                 pc, s_acc, s_idx, s_base, j->osr);
@@ -3299,6 +3335,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec = 0;
                     j->spec_lo = j->spec_hi = 0;
                     j->spec_tmp_valid = 0;
+                    j->spec_fwd_valid = 0;
                     j->spec_base = 0;
                     j->spec_body_tmp = 0;
                 }
@@ -3645,6 +3682,26 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         : ir_ZEXT(IR_U64,
                               ir_LOAD_U32(ir_ADD_A(g.a,
                                   ir_CONST_ADDR(offsetof(TArr, n)))));
+                    /* 刀16（FETCH 值直达）：thin 条件 + emit 期证明
+                     * [pc+1 恰为配对 ADD（镜像 spec_scan RMW 判据）且
+                     * 非 stop 点（否则 ADD 由续块发射，fwd 跨块失准）]
+                     * → hit 线只 LOAD 元素 pay 不落 dst 槽，miss 线
+                     * load dst（helper 成功写值，spec 下越界恒 raise
+                     * 即该线实死，load 仅作 phi 输入保结构正确），
+                     * MERGE 处 phi 桥给紧邻 ADD——免 take 2 store +
+                     * ADD 1 load 的槽往返。 */
+                    int fwd_on = 0;
+                    if (!fold_add && fetch_fwd_enabled() && aop &&
+                        aop->op == OP_ADD && aop->tr == OPD_CV &&
+                        ((aop->t1 == OPD_CV && aop->a1 == aop->ar &&
+                          aop->t2 == op->tr && aop->a2 == op->ar) ||
+                         (aop->t2 == OPD_CV && aop->a2 == aop->ar &&
+                          aop->t1 == op->tr && aop->a1 == op->ar)) &&
+                        !stop_has(stops, nstops, np1) &&
+                        !is_jump_target(j->fn, np1))
+                        fwd_on = spec_c && j->spec_body_tmp &&
+                                 op->ar == j->spec_body_tmp;
+                    ir_ref fwd_hit = 0, fwd_miss = 0;
                     ir_ref ifb = ir_IF(ir_ULT(ir_BITCAST_U64(g.kp), n64));
                     ir_IF_TRUE(ifb);
                         ir_ref data = pi >= 0
@@ -3657,10 +3714,14 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                             /* 刀15 thin：spec_c（元素恒 INT 证）+ 体内
                              * FETCH 身份（preheader 已 gate+UNDEF 消灭
                              * spec_body_tmp 槽）双满足才瘦身；cond 区
-                             * FETCH/未消灭槽一律原样三门。 */
-                            dimic_take(&g, leaf,
-                                spec_c && j->spec_body_tmp &&
-                                op->ar == j->spec_body_tmp);
+                             * FETCH/未消灭槽一律原样三门。刀16：fwd_on
+                             * 时连 16B store 一并免（值走 phi）。 */
+                            if (fwd_on)
+                                fwd_hit = ir_LOAD_I64(leaf);
+                            else
+                                dimic_take(&g, leaf,
+                                    spec_c && j->spec_body_tmp &&
+                                    op->ar == j->spec_body_tmp);
                         } else {
                             /* fast/slow 双线（P0-17③ 批B'）；批C slice-1：
                              * RMW acc 且守卫激活 → $s pay 读 loop phi
@@ -3721,8 +3782,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         ir_ref eP1 = ir_END();
                     ir_IF_FALSE(ifb);
                         dimic_miss(&g, false);   /* packed 越界非 IC 键形态 */
+                        /* 刀16 phi 输入：helper 成功线写 dst 后取 pay。
+                         * spec 下越界恒 raise（packed+INT key 证）→ 该线
+                         * 实死，load 仅为 phi 结构占位（若可达则值亦真）。 */
+                        if (fwd_on)
+                            fwd_miss = load_pay(j, g.dst);
                         ir_ref eP0 = ir_END();
                     ir_MERGE_2(eP1, eP0);
+                    if (fwd_on)
+                        j->spec_fwd_pay = ir_PHI_2(IR_I64, fwd_hit, fwd_miss);
             if (!spec_c) {
                     ir_ref ePack = ir_END();
                 ir_IF_FALSE(ifp);
@@ -3750,6 +3818,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 传给 lower_binop 的 tb 检查点（消费即清，见 spec_bit_int）。
              * spec 作用域外/非配对情形不设。 */
             if (j->spec) { j->spec_tmp = op->ar; j->spec_tmp_valid = 1; }
+            /* 刀16：值直达挂起（emit 期已证 pc+1 配对 + 非 stop）——
+             * lower_binop 按 kind+idx 双等消费，消费即清；FETCH 尾若
+             * 未挂起则清位防上一次残留串用。 */
+            j->spec_fwd_valid = fwd_on ? 1 : 0;
+            if (fwd_on) { j->spec_fwd_kind = op->tr; j->spec_fwd_idx = op->ar; }
             pc++;
             break;
         }
