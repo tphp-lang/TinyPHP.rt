@@ -1687,7 +1687,7 @@ static int32_t op_do_fcall(VM *vm, TOp *op) {
              * 折叠判不了（编了只能回放），先让解释器跑一次固化快照；
              * hot≥127 强制编译不延退（冷分支 ic 永不固化也不能让小函数
              * 永远停在解释器）。 */
-            if ((fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS &&
+            if ((fn->n_ops <= tphp_jit_eager_max_ops() &&
                  !tphp_jit_defer_ic(fn)) ||
                 fn->hot >= TPHP_JIT_HOT_THRESHOLD)
                 tphp_jit_compile(fn);
@@ -5617,7 +5617,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
         ++fn->hot;
         /* 批2-7: 同 op_do_fcall——eager 分支 ic 未固化延退（折叠前提），
          * hot≥127 强制编译不延退。 */
-        if ((fn->n_ops <= TPHP_JIT_EAGER_MAX_OPS &&
+        if ((fn->n_ops <= tphp_jit_eager_max_ops() &&
              !tphp_jit_defer_ic(fn)) ||
             fn->hot >= TPHP_JIT_HOT_THRESHOLD)
             tphp_jit_compile(fn);
@@ -5723,8 +5723,10 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
      * 区：TPHP_NEST_CALL=1 全表 A/B 实证，每个被测闭包多 1 条 osr
      * compile）；usort 族/call_user_func/FFI 回调/trampoline 兜底同走此
      * 缺口——被动态调用的 callee 即使已编译也永不以 JIT 执行。
-     * 仅放行闭包/普通函数（!is_method：静态方法经字符串可调用的槽布局
-     * poff 有歧义且不在受益面；实例方法走上方 recv 路径本就不经此）。
+     * 放行条件：闭包/普通函数（!is_method）恒放行；方法仅当 clo 在场
+     * （刀20：poff=clo->n_cap 即无歧义——合成垫闭包 n_cap=1 对位静态方法
+     * slot1.. 布局；字符串/数组可调用 clo=NULL 仍排除——无实例无法判 recv，
+     * 走下方解释器 RECV 布局天然正确；实例方法走上方 recv 路径本就不经此）。
      * 与 op_do_fcall 的有意差异：e() 期间不复位 args 水位（保持 base+nq）
      * ——op_do_fcall 先复位（~1628）再直调，callee 内 opseq replay 的
      * SEND 按 n_args 写队列、会踩掉本调用的原始 arg 引用（clean deopt
@@ -5736,7 +5738,7 @@ TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n) {
      * 名单拒绝——不存在 JIT'd 帧内 resume 面；槽副本/捕获由
      * frame_destroy 收）。TPHP_DYN_JIT=0 关（默认开）。 */
     if (tphp_jit_available() && dyn_jit_enabled() &&
-        !fn->is_method && fn->jit_entry && n >= fn->n_params) {
+        (!fn->is_method || clo) && fn->jit_entry && n >= fn->n_params) {
         TVal *qargs = &vm->x.args[base];
         bool guard_ok = true;
         for (uint16_t i = 0; i < fn->n_params; i++)
@@ -5818,6 +5820,33 @@ int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret) {
         memcpy(&vm->x.unwind, &outer, sizeof(jmp_buf));
         return 1;
     }
+}
+
+/* 刀19（11-09）：静态直调慢路——JIT'd caller 折叠调用普通函数且实参含
+ * 非 INT（STR/ARR/...）时，替代 lower_call_finish 的 INT 契约 deopt。
+ * 旧行为：契约失配 RETURN(0) → 函数级从 pc0 全量重跑 → 序前副作用双执行
+ * （实证：echo "A"; helper("hello") → tphp "AAB5" vs PHP "AB5"；同时是
+ * 刀18 real-logstat +47% 的真凶——闭包序前 make 全量跑两遍）。
+ * 本 helper 合成捕获闭包走 tphp_vm_call_guarded（= op_do_fcall C 侧
+ * 同一套已证协议：args addref 进队、任意参数类型、e() 直入或解释器回退、
+ * 异常 floor 分发）→ callee 单次执行、调用方序前状态零重跑。
+ * arg 由 IR 侧 raw 借用传入（slots scratch），addref 配平在 callable 内。
+ * 刀20（同日）：p_sm 静态方法同款失配（emit poff=1、实参在 slot1..）——
+ * 合成 n_cap=1 空垫闭包占位 CV0（get_var("this") 对全部方法预留、静态体
+ * 不可达），调用侧 poff=clo->n_cap=1 自动对位 op_do_fcall 直入协议（刀9
+ * 门同步放宽 `!is_method || clo`：合法闭包 fn 恒非方法，两真仅本合成源）。 */
+int tphp_jit_call_userfn(VM *vm, TFunc *fn, TVal *args, int argc, TVal *ret) {
+    TClosure *c;
+    if (fn->is_method) {
+        TVal pad = { .u.i = 0, .t = T_NULL };
+        c = tphp_tclo_alloc(fn, &pad, 1);
+    } else {
+        c = tphp_tclo_alloc0(fn);
+    }
+    TVal clo = TV_CLO(c);
+    int ok = tphp_vm_call_guarded(vm, clo, args, argc, ret);
+    tval_release(&clo);
+    return ok;
 }
 
 /* 以闭包为 main 跑一个独立 runtime（M5-c：Worker 子线程入口）。

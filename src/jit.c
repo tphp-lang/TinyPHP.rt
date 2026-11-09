@@ -21,11 +21,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <uv.h>            /* uv_hrtime → compile 成本诊断（TPHP_JIT_DEBUG） */
 
 void tphp_vm_frame_destroy(VMFrame *f);   /* vm.c */
 TVal tphp_vm_call_callable(VM *vm, TVal callable, TVal *args, int n); /* vm.c */
 int tphp_vm_call_guarded(VM *vm, TVal callable, TVal *args, int n, TVal *ret); /* vm.c 异常分发守卫版 */
 TClosure *tphp_tclo_alloc0(TFunc *fn);                               /* vm.c */
+int tphp_jit_call_userfn(VM *vm, TFunc *fn, TVal *args, int argc, TVal *ret); /* vm.c 刀19 慢路 */
 TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap);    /* vm.c P0-18① */
 int tphp_jit_opseq(VM *vm, TFunc *fn, TVal *slots, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
 int tphp_jit_fetch_prop(VM *vm, TFunc *fn, TOp *op, uint32_t pc, TVal *slots); /* vm.c 刀5：假帧+真 handler */
@@ -893,8 +895,8 @@ bool tphp_jit_eligible(TFunc *fn) {
     static int dbg;
     if (!dbg) { const char *e = getenv("TPHP_JIT_DEBUG"); dbg = e && e[0] ? 2 : 1; }
     if (dbg == 2 && fn)
-        fprintf(stderr, "[jit] eligible(%s)=%d\n",
-                fn->name ? tstr_val(fn->name) : "?", ok);
+        fprintf(stderr, "[jit] eligible(%s)=%d n_ops=%u\n",
+                fn->name ? tstr_val(fn->name) : "?", ok, fn->n_ops);
     return ok;
 }
 
@@ -2115,6 +2117,7 @@ static void arg_copy(JitC *j, ir_ref dst, uint32_t k) {
  * 只允许无帧体走折叠直调，含 replay/pad op 的体回退 p_seq 序回放
  * （op_do_fcall 推帧后经 opseq 执行，原路径）。 */
 static int prop_helper_enabled(void);   /* 定义在开关区（刀5，晚于本用点） */
+static int call_str_slow_enabled(void); /* 定义在开关区（刀19，晚于本用点） */
 static bool jit_body_frameless(TFunc *fn) {
     for (uint32_t i = 0; i < fn->n_ops; i++) {
         switch (fn->ops[i].op) {
@@ -2505,6 +2508,17 @@ static void lower_call_finish(JitC *j, TOp *doop) {
         if (mf) j->mfail[j->mfail_n++] = ir_END();
         else ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));
     ir_IF_FALSE(ife);
+    /* 刀19（11-09）+刀20：非 INT 实参慢路收集——普通函数与 p_sm 静态方法
+     * （契约失配不再 RETURN0 = 函数级 pc0 全量重跑 → 序前副作用双执行，
+     * 实证 AAB5≠AB5 与 SMK::len 双写；刀18 real-logstat +47% 真凶），改走
+     * tphp_jit_call_userfn 慢路（合成捕获闭包 → guarded = op_do_fcall C 侧
+     * 同协议，callee 单次执行；p_sm 侧 helper 自判 is_method 合成 n_cap=1
+     * 垫闭包对位 slot1..，emit 传参基址同步 +TVAL_SZ）。
+     * p_mcall（实例方法直调，mf=mfail 回放）保持既有路径；TPHP_CALL_STR_SLOW=0
+     * 关（HEAD 行为，ncslow 恒 0 → IR 与 HEAD 逐位同）。argc≤32 防御。 */
+    ir_ref cslow[32];
+    uint32_t ncslow = 0;
+    int str_slow = call_str_slow_enabled() && !mf && !j->p_mcall;
     for (uint32_t k = 0; k < argc; k++) {
         ir_ref a = ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)(poff + k) * TVAL_SZ));
         ir_ref tg = ir_LOAD_I32(ir_ADD_A(a, ir_CONST_ADDR(TVAL_TAG)));
@@ -2513,6 +2527,7 @@ static void lower_call_finish(JitC *j, TOp *doop) {
             /* 批2-7: 函数级 mcall → mfail（非 INT 契约失配，callee 未执行；
              * arg_copy 是 raw 拷贝无 addref，弃 scratch 零泄漏） */
             if (mf) j->mfail[j->mfail_n++] = ir_END();
+            else if (str_slow && ncslow < 32) cslow[ncslow++] = ir_END();
             else ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
         ir_IF_FALSE(ift);
     }
@@ -2543,7 +2558,30 @@ static void lower_call_finish(JitC *j, TOp *doop) {
             ir_CALL_N(IR_VOID, ir_CONST_ADDR((uintptr_t)tval_release), 1, trd);
         }
         ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* P1-12 批2-2 */
+    ir_ref efast = IR_UNUSED;
     ir_IF_FALSE(ifd);
+    if (ncslow) efast = ir_END();   /* 刀19: 有慢路边 → 快路止步，dst store 移至 MERGE 后 */
+    if (ncslow) {
+        /* 刀19/20 慢路：非 INT 实参 → tphp_jit_call_userfn（合成捕获闭包走
+         * guarded）。args = slots_sc raw 借用（arg_copy 已填 [poff..poff+argc)，
+         * helper 内 addref 进队配平由既有协议负责；p_sm 参数在 slot1.. →
+         * 基址 +TVAL_SZ，slot0 垫片由 helper n_cap=1 闭包自补）；
+         * 释放只针对本函数合成的 clo 引用（tclo rc=1）。 */
+        ir_MERGE_N((ir_ref)ncslow, cslow);
+        ir_ref args_pa = j->p_sm
+            ? ir_ADD_A(slots_sc, ir_CONST_ADDR((uintptr_t)TVAL_SZ))
+            : slots_sc;
+        ir_ref ut[5] = { j->r_vm, ir_CONST_ADDR((uintptr_t)callee), args_pa,
+                         ir_CONST_I32((int32_t)argc), ret_sc };
+        ir_ref ok2 = ir_CALL_N(IR_I32,
+                               ir_CONST_ADDR((uintptr_t)tphp_jit_call_userfn), 5, ut);
+        ir_ref ifd2 = ir_IF(ir_EQ(ok2, ir_CONST_I32(0)));
+        ir_IF_TRUE(ifd2);
+            ir_RETURN(ir_CONST_I32(OSR_SEQ_PC(j)));   /* 逃逸异常上传（同既有 RETURN 语义） */
+        ir_IF_FALSE(ifd2);
+        ir_ref eslow = ir_END();
+        ir_MERGE_2(eslow, efast);
+    }
     if (doop->tr != OPD_UNUSED) {
         ir_ref da = slot_addr(j, doop->ar);
         if (dst_gate_needed(j, doop))
@@ -2718,6 +2756,29 @@ static int fetch_fwd_enabled(void) {
     if (v < 0) {
         const char *e = getenv("TPHP_FETCH_FWD");
         v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* 刀19（11-09 静态直调非 INT 慢路）开关：默认开，TPHP_CALL_STR_SLOW=0 关
+ * （同二进制 A/B）= HEAD 行为（INT 契约失配 RETURN0 → pc0 全量重跑）。 */
+static int call_str_slow_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_CALL_STR_SLOW");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* 刀18（11-09 logstat 勘察）：有效急切 ops 门，env 单次解析（jit.h 注释
+ * 有结论：默认 96=HEAD，扩容实测反亏不改默认）。0 = 关急切（仅 hot127）。 */
+int tphp_jit_eager_max_ops(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_JIT_EAGER_OPS");
+        if (e && e[0]) { v = atoi(e); if (v < 0) v = 0; }
+        else v = TPHP_JIT_EAGER_DEFAULT_OPS;
     }
     return v;
 }
@@ -4469,7 +4530,7 @@ static void jit_compile_callees(TFunc *fn) {
          * `!callee->jit_entry → fail` 让 caller 回退解释器（既有兜底）；
          * callee 被解释器调热(hot≥127)后自然编译，caller 随后可编。 */
         if (!callee->jit_entry && callee->hot != UINT16_MAX &&
-            (callee->n_ops <= TPHP_JIT_EAGER_MAX_OPS ||
+            (callee->n_ops <= tphp_jit_eager_max_ops() ||
              callee->hot >= TPHP_JIT_HOT_THRESHOLD))
             tphp_jit_compile(callee);         /* recursive; lock is re-entry safe
                                                * via the jit_entry check below */
@@ -4626,6 +4687,9 @@ static void jit_scan_slot_writers(TFunc *fn, uint8_t *hot) {
 void tphp_jit_compile(TFunc *fn) {
     if (!g_jit_on || !fn) return;
     if (fn->jit_entry) return;
+    /* 刀18 诊断：编译成本计时（含 compile_callees 连带；DEBUG 门）——
+     * 急切门扩容 A/B 需要把"成本 vs 收益"拆开判（刀6 教训） */
+    uint64_t ct0 = jit_dbg() ? uv_hrtime() : 0;
     if (!tphp_jit_eligible(fn)) {
         fn->hot = UINT16_MAX;
         return;
@@ -4734,6 +4798,9 @@ void tphp_jit_compile(TFunc *fn) {
         fn->jit_entry = entry;
     else
         fn->hot = UINT16_MAX;
+    if (jit_dbg())
+        fprintf(stderr, "[jit] compile_cost(%s) %.2f ms\n",
+                fn->name ? tstr_val(fn->name) : "?", (uv_hrtime() - ct0) / 1e6);
     jit_unlock();
 }
 

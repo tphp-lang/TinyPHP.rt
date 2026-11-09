@@ -26,8 +26,21 @@ typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
 /* Hotness threshold for the first compile attempt (zend jit_hot_func default) */
 #define TPHP_JIT_HOT_THRESHOLD 127
 /* 急切编译（v1.1）：体小的合格函数首调即编译——函数粒度热度对
- * "只调一次的大循环"（bench 闭包形态）永不触发；小体编译成本 ≪ 循环收益 */
-#define TPHP_JIT_EAGER_MAX_OPS 96
+ * "只调一次的大循环"（bench 闭包形态）永不触发；小体编译成本 ≪ 循环收益。
+ *
+ * 刀18（11-09 logstat 勘察）结论：logstat（n_ops=102）等 >96 的单次调用
+ * 大循环函数三门全绕开（急切96 / hot127 单次调不达 / OSR FE_FETCH 拒）
+ * → 主循环全程解释，是实证单点。但门扩容（默认 512）实测反亏：单发口径
+ * 下闭包编译链 7.1ms + 首入隐性成本 ~13.6ms 落进 bench 计时，远超编译后
+ * 循环净收益（stat 段仅 -2.5ms）——real-logstat +16.6ms/+47%（min-of-6
+ * 交替，warm 全 bench 拆段稳定复现）。与刀6（OSR FE 放行）同款结论：
+ * 单发测量无法摊销首调成本，扩容需先切掉首调成本才可重估。
+ * 故默认保持 96（=HEAD 行为零漂移）；TPHP_JIT_EAGER_OPS 显式覆盖
+ * （如 512 复测，0 = 关急切只留 hot127）供后续重估。 */
+#define TPHP_JIT_EAGER_DEFAULT_OPS 96
+/* 有效急切门（env 单次解析），三处门（op_do_fcall / 动态调用 /
+ * compile_callees 连带）共用同一真源 */
+int tphp_jit_eager_max_ops(void);
 
 /* 循环 OSR（PLAN/osr.md 批1）：解释器热循环的第二个入口。back-edge 计数
  * 达阈值后编译循环体子图（header..backedge），slots 与解释器帧同布局 →
