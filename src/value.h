@@ -128,8 +128,9 @@ typedef struct TArr {
     /* packed（perf-roadmap L2）：仅追加连续 int 键且无 unset 洞时 true；
      * 此时 data[i] 恒为键 i 的值（i=0..n-1），tarr_get int 键直取。 */
     bool packed;
-    /* all_int（type-spec 批3）：packed 且全元素 INT 已验证——spec guard
-     * 快路免 O(n) 重扫。写路径（set/append/unset）清除，下次 guard 重建。 */
+    /* all_int（type-spec 批3；批4a 语义扩为布局无关）：packed 全元素 /
+     * hash 全活跃桶值 INT 已验证——spec guard 快路免重扫。写路径
+     * （set/append/unset）与布局破坏清除，下次 guard 重建。 */
     bool all_int;
     /* 惰性桶同步（L5 写路径）：bpending = 尚未写入 buckets 的 append 数。
      * 不变量：bpending>0 ⇒ packed（全部键为 int 0..n-1，dused==n 无洞），

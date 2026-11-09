@@ -32,6 +32,7 @@ TClosure *tphp_tclo_alloc(TFunc *fn, TVal *caps, uint16_t n_cap);    /* vm.c P0-
 int tphp_jit_opseq(VM *vm, TFunc *fn, TVal *slots, uint32_t pc, uint32_t pc_end, TVal *recv_sc); /* vm.c */
 int tphp_jit_fetch_prop(VM *vm, TFunc *fn, TOp *op, uint32_t pc, TVal *slots); /* vm.c 刀5：假帧+真 handler */
 int tphp_jit_spec_guard(TVal *base); /* vm.c 类型特化批1：preheader ARR+packed+全INT 一体查 */
+int tphp_jit_spec_guard_ht(TVal *base); /* vm.c 类型特化批4a：ARR+hash+全活跃桶值 INT 一体查 */
 
 #ifdef TPHP_JIT
 
@@ -991,6 +992,12 @@ typedef struct {
     uint32_t spec_base;        /* 批2：guard 证过的 base CV（FETCH 结构折叠
                                 * 只对本 base 生效——cond 区异 base 的
                                 * preguard 候选无 guard 证，不得折叠） */
+    uint8_t spec_ht;           /* 批4a（§8.3）：本作用域 guard 走 ht 形态
+                                * （tphp_jit_spec_guard_ht：hash 基+全活跃
+                                * 桶值 INT）——spec_c（packed 结构证）须
+                                * 排除本态；键 TMP 的 INT 证在本态无效
+                                * （键来自 F1 取值=STR，spec_tmp 在 F1 尾
+                                * 置位的窗口为假证，由相邻约束+本闸兜住） */
     int lb_jmpnz[JIT_MAX_LOOPS];  /* 批5挡板: 本层循环体内 emit 过 JMPNZ(||)
                                    * ——||结果喂 continue 的 pending 与 MERGE_N
                                    * 组合在 O1 下值错（ms1/ms2/ms5 最小复现，
@@ -1256,6 +1263,10 @@ static bool dst_gate_needed(JitC *j, TOp *op) {
 typedef struct DimIcCtx {
     JitC *j;
     ir_ref dst, base, key, ic, a, kt, kp;
+    int thin;   /* 批4a：链叶 take 瘦身透传（spec_ht+body_tmp 恒等双证；
+                 * 非 spec 点恒 0——g 在 DimIcCtx 初始化处清零） */
+    int fwd;    /* 批4a-ii：ht 直探值汇流开关（hit=LOAD pay 免 16B store、
+                 * miss=helper 写 dst 后 load）——仅 emit_ht_fetch 填 */
 } DimIcCtx;
 
 /* miss：整链落 v1 helper + deopt（线留开供 MERGE；RETURN 线不参与）。
@@ -1435,7 +1446,7 @@ static ir_ref dimic_linear_probe(DimIcCtx *g, ir_ref slot, ir_ref hm,
         ir_ref data = ir_LOAD_A(
             ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
         dimic_take(g, ir_ADD_A(data,
-                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
+                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), g->thin);
         ir_ref epT = ir_END();
     ir_IF_FALSE(ifp);
         ir_ref epF = dimic_linear_probe(g, s, hm, bk, p + 1);
@@ -1502,7 +1513,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                 ir_ref data = ir_LOAD_A(
                     ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
                 dimic_take(g, ir_ADD_A(data,
-                             ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
+                             ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), g->thin);
                 ir_ref emT = ir_END();
             ir_IF_FALSE(ifm);
                 /* 刀6：probe0 miss → sequential probe 回退（同二进制 A/B
@@ -1557,7 +1568,7 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
                 ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
             ir_ref data = ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
             dimic_take(g, ir_ADD_A(data,
-                         ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), 0);
+                         ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4))), g->thin);
             ct = ir_END();
         } else {
             ct = dimic_ic_chain(g, lvl + 1);
@@ -1577,6 +1588,101 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
         }
     ir_MERGE_2(ct, cf);
     return ir_END();
+}
+
+/* ---- 批4a-ii（PLAN/type-spec.md §8.3-3/4）：spec_ht 直探 ----
+ * 免 inv 外层（guard 已证 ARR）、IC 快照门（arr/bk/bpending）、case0、
+ * case1-7 链与 generic 8-fail 门：guard_ht + 体内零写 ⇒ buckets/hmask/
+ * bpending 循环期不变，直探直接读 g->a（无需 IC 快照）。结构 = STR 分派
+ * + hash 惰性 + ≤4 步开放寻址（镜像 array.c 快路② + 刀6 的 tombstone/
+ * absent 判据），步尽/非 STR 键/absent 全落 dimic_miss helper（norm/IC
+ * fill/raise 语义逐条不变 = 结构消除非降级）。
+ * fwd（值汇流）：逐层 MERGE+PHI（hit=LOAD pay 免 take 16B store、
+ * base 步 miss=helper 成功写 dst 后 load）——与刀16 packed 单菱形同构，
+ * 只是命中点从 1 变 ≤4 → 值沿层上传。fwd 关时恒 take thin（元素恒 INT
+ * 由 guard_ht 证、槽遗留由 preheader 消灭证 = g->thin 双证）。 */
+
+/* 递归直探步：p=0 用 home slot，1..3 为 (home+p)&hmask；步尽落 helper。
+ * 返回 fwd phi 输入值（fwd 关 = 0，调用方不挂 phi）；返回后当前块 =
+ * 本层 MERGE 合流块（父层自行 ir_END 收支）。 */
+static ir_ref ht_probe_rec(DimIcCtx *g, ir_ref slot, ir_ref hm, ir_ref bk, int p) {
+    JitC *j = g->j;
+    JIT_CTX();
+    if (p > IC_PROBE_STEPS) {
+        dimic_miss(g, false);   /* IF_TRUE RETURN；FALSE 线留开 */
+        return g->fwd ? load_pay(j, g->dst) : (ir_ref)0;
+    }
+    ir_ref st = p ? ir_AND(IR_U32, ir_ADD_U32(slot, ir_CONST_U32(p)), hm)
+                  : slot;
+    ir_ref zs = ir_ZEXT(IR_U64, st);
+    ir_ref bp = ir_ADD_A(ir_ADD_A(bk, ir_SHL_U64(zs, ir_CONST_U64(4))),
+                         ir_SHL_U64(zs, ir_CONST_U64(3)));   /* *24 */
+    ir_ref bkey = ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, key)));
+    /* 匹配 = 活桶 + key tag/pay 全身份（interned 串指针等 = C 侧
+     * KEY_PTR_EQ||key_eq 的保守子集，miss 一律有 helper 兜底）；STR 分派
+     * 已在外层，tag 恒比 g->kt（=T_STR）防混型桶误命中 */
+    ir_ref m = ir_AND(IR_BOOL,
+                ir_AND(IR_BOOL,
+                       ir_EQ(g->kt, ir_LOAD_I32(
+                           ir_ADD_A(bkey, ir_CONST_ADDR(TVAL_TAG)))),
+                       ir_EQ(g->kp, ir_LOAD_I64(bkey))),
+                ir_NE(ir_LOAD_U32(ir_ADD_A(bp,
+                           ir_CONST_ADDR(offsetof(ABucket, val_off)))),
+                      ir_CONST_U32(0xFFFFFFFFu)));
+    ir_ref vh = 0, vsub = 0;
+    ir_ref ifh = ir_IF(m);
+    ir_IF_TRUE(ifh);
+        ir_ref voff = ir_LOAD_U32(
+            ir_ADD_A(bp, ir_CONST_ADDR(offsetof(ABucket, val_off))));
+        ir_ref data = ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
+        ir_ref leaf = ir_ADD_A(data,
+                     ir_SHL_U64(ir_ZEXT(IR_U64, voff), ir_CONST_U64(4)));
+        if (g->fwd) vh = ir_LOAD_I64(leaf);
+        else dimic_take(g, leaf, g->thin);
+        ir_ref epT = ir_END();
+    ir_IF_FALSE(ifh);
+        vsub = ht_probe_rec(g, slot, hm, bk, p + 1);
+        ir_ref epF = ir_END();
+    ir_MERGE_2(epT, epF);
+    if (g->fwd) return ir_PHI_2(IR_I64, vh, vsub);
+    return 0;
+}
+
+/* spec_ht 点的 FETCH 发射（完整替代 inv/pcond/bound/链结构）。
+ * fwd_on 由调用方（FETCH case）按刀16 同款形状门算好传入——is_jump_target
+ * 等在 case 作用域。返回后当前块 = STR/非STR 合流块，fwd phi 已挂
+ * j->spec_fwd_pay（fwd_on=1 时）。 */
+static void emit_ht_fetch(JitC *j, DimIcCtx *g, int pi, int lvl, int fwd_on) {
+    JIT_CTX();
+    g->fwd = fwd_on;
+    g->kt = load_tag(j, g->key);
+    g->a = j->pre_a[lvl][pi];
+    ir_ref v_str = 0, v_no = 0;
+    ir_ref ifstr = ir_IF(ir_EQ(g->kt, ir_CONST_I32(T_STR)));
+    ir_IF_TRUE(ifstr);
+        /* hash 惰性（lvl4 同款）：h==0 → tstr_hash 冷填写回，合流 reload */
+        ir_ref ksa = ir_LOAD_A(g->key);
+        ir_ref h0 = ir_LOAD_U32(ir_ADD_A(ksa, ir_CONST_ADDR(offsetof(TStr, hash))));
+        ir_ref ifh0 = ir_IF(ir_EQ(h0, ir_CONST_U32(0)));
+        ir_IF_TRUE(ifh0);
+            ir_ref th[1] = { g->key };
+            ir_CALL_N(IR_U32, ir_CONST_ADDR((uintptr_t)tstr_hash), 1, th);
+            ir_ref ehT = ir_END();
+        ir_IF_FALSE(ifh0);
+            ir_ref ehF = ir_END();
+        ir_MERGE_2(ehT, ehF);
+        ir_ref h = ir_LOAD_U32(ir_ADD_A(ksa, ir_CONST_ADDR(offsetof(TStr, hash))));
+        ir_ref hm = ir_LOAD_U32(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, hmask))));
+        ir_ref slot = ir_AND(IR_U32, h, hm);
+        ir_ref bk = ir_LOAD_A(ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, buckets))));
+        v_str = ht_probe_rec(g, slot, hm, bk, 0);
+        ir_ref eStrT = ir_END();
+    ir_IF_FALSE(ifstr);
+        dimic_miss(g, false);   /* 非 STR 键 → C 侧 norm/全语义兜底 */
+        if (fwd_on) v_no = load_pay(j, g->dst);
+        ir_ref eStrF = ir_END();
+    ir_MERGE_2(eStrT, eStrF);
+    if (fwd_on) j->spec_fwd_pay = ir_PHI_2(IR_I64, v_str, v_no);
 }
 
 /* 刀2：dst 与任一源操作数同槽判定——kind+index 双等才算（CV/TMP 下标域
@@ -1693,14 +1799,20 @@ static void lower_binop(JitC *j, TOp *op) {
 static void lower_cmp(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
-    ir_ref ta = load_tag(j, aa), pa = load_pay(j, aa);
+    /* 类型特化批4a §8.3-5：cond 区恒 INT 位免 tag 装载（acc/idx=guard 证、
+     * spec_tmp=元素证——proof 下 ta/tb 恒真值，慢线分发不受影响） */
+    ir_ref ta = spec_bit_int(j, op->t1, op->a1)
+              ? ir_CONST_I32(JT_INT) : load_tag(j, aa);
+    ir_ref pa = load_pay(j, aa);
     ir_ref tb, pb;
     if (op->t2 == OPD_CONST) {
         tb = ir_CONST_I32((int32_t)j->fn->lits[op->a2].t);
         pb = ir_CONST_I64(j->fn->lits[op->a2].u.i);
     } else {
         ir_ref ba = slot_addr(j, op->a2);
-        tb = load_tag(j, ba); pb = load_pay(j, ba);
+        tb = spec_bit_int(j, op->t2, op->a2)
+           ? ir_CONST_I32(JT_INT) : load_tag(j, ba);
+        pb = load_pay(j, ba);
     }
     ir_ref both_int = ir_AND(IR_BOOL, ir_EQ(ta, ir_CONST_I32(JT_INT)),
                              ir_EQ(tb, ir_CONST_I32(JT_INT)));
@@ -3010,10 +3122,17 @@ static int preguard_lookup(JitC *j, uint32_t slot) {
  *   不得写 acc/idx；任何 op 不得写 base（preguard 已证，双保险）。
  * 输出 acc（返回 0 = 不特化）/ idx / tmp / base / be。
  * 返回 1 = 特化；acc 经出参——槽号 0 合法（无参闭包首 CV），不可兼作
- * 成功标志。 */
+ * 成功标志。
+ * 批4a（§8.3-1，kv 形态）：恰 2 个 FETCH 放行——F1（键取值，key=CV idx、
+ * dst=键 TMP）紧邻 F2（值查表，base=CV、key=F1 dst）、ADD 紧邻 F2；
+ * INC 对 F1 的 key 槽（ix）。身份扩键 TMP/键 base 两元，写点约束扩
+ * key_base。form：nfetch==2 ⇒ ht（guard 走 tphp_jit_spec_guard_ht，
+ * $m 为 hash 键基；packed 基的 2-fetch 形态 guard 失败交解释器=设计
+ * 记账的回退面）。 */
 static int spec_scan(TFunc *fn, uint32_t hdr, uint32_t *acc_out,
                      uint32_t *idx, uint32_t *tmp,
-                     uint32_t *base, uint32_t *be_out) {
+                     uint32_t *base, uint32_t *be_out,
+                     uint32_t *kt_out, uint32_t *kb_out, int *ht_out) {
     const char *why = NULL;
     uint32_t badpc = hdr;
     uint32_t cand[JIT_PRE_MAX];
@@ -3030,14 +3149,29 @@ static int spec_scan(TFunc *fn, uint32_t hdr, uint32_t *acc_out,
     if (!be || be <= jz) { why = "no backedge/be<=jz"; goto out; }
     uint32_t fetch_pc = 0, add_pc = 0, inc_pc = 0;
     uint32_t acc = 0, ix = 0, tp = 0, bs = 0;
+    uint32_t f1_pc = 0, ktp = 0, kb = 0;   /* 批4a：F1 身份（键槽 base/dst） */
     int nfetch = 0, nadd = 0, ninc = 0;
     for (uint32_t k = jz + 1; k < be; k++) {
         TOp *op = &fn->ops[k];
         switch (op->op) {
         case OP_FETCH_DIM_R:
-            if (++nfetch > 1) { why = "2nd fetch"; badpc = k; goto out; }
             if (op->t2 == OPD_CONST) { why = "const key"; badpc = k; goto out; }
-            fetch_pc = k; bs = op->a1; tp = op->ar; ix = op->a2;
+            if (nfetch == 0) {
+                f1_pc = k; kb = op->a1; ktp = op->ar; ix = op->a2;
+                bs = op->a1; tp = op->ar;   /* 1-fetch 形态的 base/dst；
+                                             * 2-fetch 形态由 F2 分支覆盖 */
+                nfetch = 1;
+            } else if (nfetch == 1) {
+                /* 批4a：F2 = 值查表，键恰为 F1 dst 且严格相邻——相邻是
+                 * spec_tmp 时序前提（F1 尾置的键 dst 证明被 F2 紧随覆盖，
+                 * 中间不得有 op 消费 spec_bit_int 把 STR 键当 INT 证） */
+                if (k != f1_pc + 1) { why = "fetch not adjacent"; badpc = k; goto out; }
+                if (op->t1 != OPD_CV) { why = "fetch2 base not CV"; badpc = k; goto out; }
+                if (op->t2 != OPD_TMP || op->a2 != ktp) { why = "fetch2 key != f1 dst"; badpc = k; goto out; }
+                bs = op->a1; tp = op->ar;
+                nfetch = 2;
+            } else { why = "3rd fetch"; badpc = k; goto out; }
+            fetch_pc = k;
             break;
         case OP_ADD: {
             if (++nadd > 1 || !nfetch) { why = "add pos"; badpc = k; goto out; }
@@ -3057,7 +3191,10 @@ static int spec_scan(TFunc *fn, uint32_t hdr, uint32_t *acc_out,
         }
         case OP_INC: case OP_DEC:
             if (++ninc > 1 || !nfetch) { why = "inc pos"; badpc = k; goto out; }
-            if (op->a1 != fn->ops[fetch_pc].a2) { why = "inc idx != key"; badpc = k; goto out; }
+            /* 批4a：对 F1 的 key 槽（ix 由 F1 捕获；1-fetch 形态与原
+             * fetch.a2 同值）——2-fetch 形态 F2.a2 是键 TMP，INC 必对
+             * 循环变量 CV（$k++） */
+            if (op->a1 != ix) { why = "inc idx != key"; badpc = k; goto out; }
             if (op->t2 != OPD_UNUSED) { why = "inc dim form"; badpc = k; goto out; }
             /* res 位不设形态判据：编译器常给语句级 $i++ 分配丢弃 res
              * （tr 非 UNUSED）。res 的安全性由下方写点约束兜住——res==acc
@@ -3070,28 +3207,44 @@ static int spec_scan(TFunc *fn, uint32_t hdr, uint32_t *acc_out,
         }
     }
     /* acc 槽号 0 合法（无参闭包首 CV）→ 用 add_pc 作配对成功标志 */
-    if (nfetch != 1 || nadd != 1 || ninc != 1 || !add_pc) {
+    if ((nfetch != 1 && nfetch != 2) || nadd != 1 || ninc != 1 || !add_pc) {
         if (jit_dbg())
             fprintf(stderr, "[jit] spec reject hdr=%u: count fetch=%d add=%d inc=%d acc=%u jz=%u be=%u\n",
                     hdr, nfetch, nadd, ninc, acc, jz, be);
         return 0;
     }
     if (fetch_pc + 1 != add_pc) { why = "fetch/add not adjacent"; badpc = add_pc; goto out; }
-    if (acc == ix || acc == bs || ix == bs ||
-        tp == acc || tp == ix || tp == bs) { why = "identity alias"; goto out; }
     {
-        int in = 0;
-        for (int c = 0; c < nc; c++) if (cand[c] == bs) in = 1;
+        /* 身份两两互斥（批4a 扩键 TMP/键 base 至六元；1-fetch 与原四元
+         * 同式——F1 的 key 槽 ix 即原 fetch.a2） */
+        uint32_t id[6]; int n = 0;
+        id[n++] = acc; id[n++] = ix; id[n++] = bs; id[n++] = tp;
+        if (nfetch == 2) { id[n++] = ktp; id[n++] = kb; }
+        for (int a = 0; a < n; a++)
+            for (int b2 = a + 1; b2 < n; b2++)
+                if (id[a] == id[b2]) { why = "identity alias"; goto out; }
+    }
+    {
+        int in = 0, in2 = (nfetch != 2);   /* 1-fetch 无键 base，免查 */
+        for (int c = 0; c < nc; c++) {
+            if (cand[c] == bs) in = 1;
+            if (nfetch == 2 && cand[c] == kb) in2 = 1;
+        }
         if (!in) { why = "base not cand"; goto out; }
+        if (!in2) { why = "key_base not cand"; goto out; }
     }
     for (uint32_t k = jz + 1; k < be; k++) { /* 写点约束 */
         TOp *op = &fn->ops[k];
         if (k != add_pc && pre_op_writes(op, acc)) { why = "body writes acc"; badpc = k; goto out; }
         if (k != inc_pc && pre_op_writes(op, ix)) { why = "body writes idx"; badpc = k; goto out; }
         if (pre_op_writes(op, bs)) { why = "body writes base"; badpc = k; goto out; }
+        if (nfetch == 2 && pre_op_writes(op, kb)) { why = "body writes key_base"; badpc = k; goto out; }
     }
     *acc_out = acc;
     *idx = ix; *tmp = tp; *base = bs; *be_out = be;
+    *kt_out = (nfetch == 2) ? ktp : 0;
+    *kb_out = (nfetch == 2) ? kb : 0;
+    *ht_out = (nfetch == 2);
     return 1;
 out:
     if (why && jit_dbg())
@@ -3259,6 +3412,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->spec_tmp_valid = 0;
             j->spec_fwd_valid = 0;
             j->spec_base = 0;
+            j->spec_ht = 0;
             j->spec_body_tmp = 0;
         }
         /* P0-17③ 批B'：折叠 fast 线的前向汇合（lb_pend 同款机制）——
@@ -3346,15 +3500,21 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * preheader 一致；chunk 尚未执行任何体代码 → resume 干净。 */
             if (type_spec_enabled()) {
                 uint32_t s_idx = 0, s_tmp = 0, s_base = 0, s_be = 0;
-                uint32_t s_acc = 0;
+                uint32_t s_acc = 0, s_ktmp = 0, s_kbase = 0;
+                int s_ht = 0;
                 int s_ok = spec_scan(j->fn, pc, &s_acc, &s_idx, &s_tmp,
-                                     &s_base, &s_be);
+                                     &s_base, &s_be, &s_ktmp, &s_kbase, &s_ht);
                 if (jit_dbg())
-                    fprintf(stderr, "[jit] spec scan hdr=%u -> ok=%d acc=%u\n", pc, s_ok, s_acc);
+                    fprintf(stderr, "[jit] spec scan hdr=%u -> ok=%d acc=%u ht=%d\n",
+                            pc, s_ok, s_acc, s_ht);
                 if (s_ok) {
                     ir_ref gargs[1] = { slot_addr(j, s_base) };
+                    /* 批4a：form 选 helper——ht（2-fetch，hash 键基）走
+                     * tphp_jit_spec_guard_ht；packed 形态原 helper 不变 */
                     ir_ref gchk = ir_CALL_N(IR_I32,
-                        ir_CONST_ADDR((uintptr_t)tphp_jit_spec_guard), 1, gargs);
+                        ir_CONST_ADDR((uintptr_t)(s_ht ? tphp_jit_spec_guard_ht
+                                                       : tphp_jit_spec_guard)),
+                        1, gargs);
                     ir_ref gok = ir_EQ(gchk, ir_CONST_I32(1));
                     ir_ref gts = load_tag(j, slot_addr(j, s_acc));
                     ir_ref gti = load_tag(j, slot_addr(j, s_idx));
@@ -3382,14 +3542,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec_tmp = s_tmp;
                     j->spec_body_tmp = take_thin_enabled() ? s_tmp : 0;
                     j->spec_base = s_base;
+                    j->spec_ht = (uint8_t)s_ht;
                     j->spec_lo = pc;
                     j->spec_hi = s_be;
                     j->spec = 1;
                     j->spec_tmp_valid = 0;
                     j->spec_fwd_valid = 0;
                     if (jit_dbg())
-                        fprintf(stderr, "[jit] spec guard hdr=%u acc=%u idx=%u base=%u osr=%d\n",
-                                pc, s_acc, s_idx, s_base, j->osr);
+                        fprintf(stderr, "[jit] spec guard hdr=%u acc=%u idx=%u base=%u osr=%d ht=%d\n",
+                                pc, s_acc, s_idx, s_base, j->osr, s_ht);
                 } else {
                     /* 本循环不特化 → 清上下文（防上一循环残留；spec 激活
                      * 的体内按白名单不可能出现新循环头，此为纵深保险） */
@@ -3398,6 +3559,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec_tmp_valid = 0;
                     j->spec_fwd_valid = 0;
                     j->spec_base = 0;
+                    j->spec_ht = 0;
                     j->spec_body_tmp = 0;
                 }
             } else if (jit_dbg()) {
@@ -3695,6 +3857,11 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             g.ic = ir_CONST_ADDR((uintptr_t)op->ic);
             g.a = g.kt = g.kp = IR_UNUSED;
             g.kp = load_pay(j, g.key);
+            /* 批4a：链叶 thin 透传（ht 作用域 + body_tmp 身份恒等；
+             * 元素恒 INT 由 guard_ht 证、槽遗留由 preheader 消灭证——
+             * 与 spec_c 路径 3783 处的 thin 同一证明面） */
+            g.thin = (j->spec && j->spec_ht && j->spec_body_tmp &&
+                      op->ar == j->spec_body_tmp) ? 1 : 0;
             int pi = preguard_lookup(j, op->a1);
             int lvl = j->loop_sp - 1;
             /* POC preguard：命中本层候选 → 守卫条件与不变量字段取循环
@@ -3711,9 +3878,35 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * guard 面，越界照走 v1 helper）。结构消除非降级：miss/raise/
              * deopt 语义与原结构一致。kt 装载随之免发。未折叠 → 原结构
              * 零改动（含批1 key tag 门）。 */
-            int spec_c = j->spec && pi >= 0 && op->a1 == j->spec_base
-                         && spec_bit_int(j, op->t2, op->a2);
+            /* 批4a：键 TMP 的 INT 证在 ht 作用域无效（键=F1 取值=STR，
+             * spec_tmp 在 F1 尾置位的窗口是假证——相邻约束保证 F2 紧随
+             * 覆盖，此处按 kind 显式排除）。spec_c（批2 packed 结构证）
+             * 随之对 ht 排除：guard_ht 已证 !packed，走 bound-only 折叠
+             * 必错（hash 无 bound 语义）。 */
+            int key_int_ok = spec_bit_int(j, op->t2, op->a2)
+                             && !(j->spec_ht && op->t2 == OPD_TMP);
+            int spec_c = j->spec && !j->spec_ht && pi >= 0 && op->a1 == j->spec_base
+                         && key_int_ok;
+            /* 批4a-ii：spec_ht 直探分支（与批2 spec_c 并列互斥）——ht 点
+             * 整段绕过 inv/pcond/bound/链，直探+fwd 由 emit_ht_fetch 内发。
+             * fwd 形状门（刀16 同款配对/stop/jump 判据）在此层算——
+             * is_jump_target 等仅 case 作用域可见；身份条件由 g.thin 承载
+             * （spec_ht+body_tmp+恒等）。 */
+            int spec_ht_ok = j->spec && j->spec_ht && pi >= 0 && op->a1 == j->spec_base;
+            int fwd_pair = !fold_add && fetch_fwd_enabled() && aop &&
+                aop->op == OP_ADD && aop->tr == OPD_CV &&
+                ((aop->t1 == OPD_CV && aop->a1 == aop->ar &&
+                  aop->t2 == op->tr && aop->a2 == op->ar) ||
+                 (aop->t2 == OPD_CV && aop->a2 == op->ar &&
+                  aop->t1 == op->tr && aop->a1 == op->ar)) &&
+                !stop_has(stops, nstops, np1) &&
+                !is_jump_target(j->fn, np1);
+            int fwd_on = 0;
             ir_ref ifa = 0, ifp = 0;
+            if (spec_ht_ok) {
+                fwd_on = fwd_pair && g.thin;
+                emit_ht_fetch(j, &g, pi, lvl, fwd_on);
+            } else {
             if (!spec_c) {
                 g.kt = load_tag(j, g.key);
                 ifa = ir_IF(pi >= 0
@@ -3728,7 +3921,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     ? j->pre_pk[lvl][pi]
                     : ir_LOAD_U8(ir_ADD_A(g.a,
                           ir_CONST_ADDR(offsetof(TArr, packed))));
-                ir_ref pcond = spec_bit_int(j, op->t2, op->a2)
+                ir_ref pcond = key_int_ok
                     ? ir_NE(pkv, ir_CONST_U8(0))
                     : ir_AND(IR_BOOL, ir_NE(pkv, ir_CONST_U8(0)),
                              ir_EQ(g.kt, ir_CONST_I32(JT_INT)));
@@ -3751,15 +3944,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                      * 即该线实死，load 仅作 phi 输入保结构正确），
                      * MERGE 处 phi 桥给紧邻 ADD——免 take 2 store +
                      * ADD 1 load 的槽往返。 */
-                    int fwd_on = 0;
-                    if (!fold_add && fetch_fwd_enabled() && aop &&
-                        aop->op == OP_ADD && aop->tr == OPD_CV &&
-                        ((aop->t1 == OPD_CV && aop->a1 == aop->ar &&
-                          aop->t2 == op->tr && aop->a2 == op->ar) ||
-                         (aop->t2 == OPD_CV && aop->a2 == aop->ar &&
-                          aop->t1 == op->tr && aop->a1 == op->ar)) &&
-                        !stop_has(stops, nstops, np1) &&
-                        !is_jump_target(j->fn, np1))
+                    if (fwd_pair)   /* 形状门已在外层（spec_ht 分支同源） */
                         fwd_on = spec_c && j->spec_body_tmp &&
                                  op->ar == j->spec_body_tmp;
                     ir_ref fwd_hit = 0, fwd_miss = 0;
@@ -3855,6 +4040,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (!spec_c) {
                     ir_ref ePack = ir_END();
                 ir_IF_FALSE(ifp);
+                    ir_ref eIc;
+                    if (j->spec && j->spec_ht) {
+                        /* 批4a：ht 作用域跳过 generic 8-fail 门——形态由
+                         * guard+体内零写整循环锁定（快照恒成立），misses
+                         * 字段本路径零读者（镜像批2 spec_c 不 emit 论证；
+                         * 冷态首几轮 chain 快照失败 → miss → helper 装填
+                         * 照常，与门无关） */
+                        eIc = dimic_ic_chain(&g, 0);
+                    } else {
                     /* generic 回退门（JSC 同款）：单态假设破灭的 site
                      * （轮转键/形态翻转）≥8 次链失败 → 跳链直 call
                      * helper（v1 成本），不再付失败链 */
@@ -3867,14 +4061,16 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         dimic_miss(&g, false);   /* 锁死态不计数 */
                         ir_ref eLocked = ir_END();
                     ir_MERGE_2(eChain, eLocked);
-                    ir_ref eIc = ir_END();
+                    eIc = ir_END();
+                    }
                 ir_MERGE_2(ePack, eIc);
                 ir_ref ct = ir_END();
             ir_IF_FALSE(ifa);
                 dimic_miss(&g, false);   /* 非数组 TypeError 走 helper 语义 */
                 ir_ref cf = ir_END();
-            ir_MERGE_2(ct, cf);   /* 主尾活线，emit_seq 继续 */
+                ir_MERGE_2(ct, cf);   /* 主尾活线，emit_seq 继续 */
             }
+            }   /* spec_ht_ok else：generic/bound/链段结束 */
             /* 类型特化批1：配对 ADD 紧邻（spec_scan 证）→ 元素 TMP 身份
              * 传给 lower_binop 的 tb 检查点（消费即清，见 spec_bit_int）。
              * spec 作用域外/非配对情形不设。 */

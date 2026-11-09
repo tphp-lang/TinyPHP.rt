@@ -4416,6 +4416,28 @@ int tphp_jit_spec_guard(TVal *base) {
     return 1;
 }
 
+/* ---- 类型特化批4a（PLAN/type-spec.md §8.3-2）：hash 形态 guard ----
+ * T_ARR && !packed && 全活跃桶值 INT。kv 循环每外层迭代进一次 preheader
+ * （CI 形态 200k 次）→ all_int flag 首查是必须项（批3 缓存，语义扩为
+ * 布局无关：写路径/布局破坏清位见 value.h）。扫描全桶 [0..hmask+1)，
+ * val_off==UINT32_MAX = 空桶/墓碑统一跳过（array.c 初始化 40/163 与
+ * unset tombstone 452 同标记），活跃值取 data[val_off]。packed 基的
+ * 2-fetch 形态在此失配 → RETURN 交解释器（批1 guard-fail 同策略，
+ * §8.7-1 记账的回退面）。1 = 假设成立；0 = 失败。 */
+int tphp_jit_spec_guard_ht(TVal *base) {
+    if (base->t != T_ARR) return 0;
+    TArr *a = (TArr *)base->u.p;
+    if (a->packed || !a->buckets) return 0;
+    if (a->all_int) return 1;
+    for (uint32_t i = 0, n = a->hmask + 1; i < n; i++) {
+        uint32_t vo = a->buckets[i].val_off;
+        if (vo == UINT32_MAX) continue;
+        if (a->data[vo].t != T_INT) return 0;
+    }
+    a->all_int = 1;
+    return 1;
+}
+
 static int32_t op_rethrow(VM *vm, TOp *op) {
     if (!vm->x.exception)
         vm_raise(vm, ex_class("Error"), op, "Internal: rethrow without exception");
