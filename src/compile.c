@@ -338,6 +338,17 @@ static int get_var(Ctx *c, TStr *name) {
 
 static int tmp_new(Ctx *c) { return c->n_tmps++; }
 
+/* logstat 百菜第三点开关：TPHP_CONCAT_REUSE=0 关（同二进制 A/B=HEAD
+ * 行为，每步新 TMP）。compile 单遍期读一次缓存。 */
+static int concat_reuse_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_CONCAT_REUSE");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* mark a variable as a `global` alias inside the current function */
 static void mark_global_var(Ctx *c, TStr *name) {
     for (int i = 0; i < c->n_vars; i++) {
@@ -1329,7 +1340,23 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         Loc l = compile_expr(c, e->u.bin.l, LOC_NONE);
         Loc r = compile_expr(c, e->u.bin.r, LOC_NONE);
         if (op == P_GT || op == P_GE) { Loc t = l; l = r; r = t; }
-        Loc dst = tmp_dst(c, want);
+        Loc dst;
+        if (op == P_DOT && concat_reuse_enabled() && want.kind == OPD_UNUSED &&
+            l.kind == OPD_TMP &&
+            e->u.bin.l->tag == A_BINARY && e->u.bin.l->u.bin.op == P_DOT) {
+            /* logstat 百菜第三点（11-10）：concat 左结合链 dst 复用左槽——
+             * 左值是本链上一步刚产出的临时（tmp_new 纯 bump 无回收，右子树
+             * 先编译不撞槽；concat 结果恒 STR、中间 TMP rc==1）→ dst 复用
+             * 后 emit 的 inplace 判（t1==tr&&a1==ar）自动命中 →
+             * tphp_jit_concat 走 tstr_append_inplace 原地追加，免每步
+             * 中间串 alloc+copy。兜底：append 失败/rc>1 自然回落新建
+             * （helper release dst 旧值）；want 有提示位不动（结果直落
+             * 目标的既有省 COPY 优化保留）；解释器面 dst 复用同样正确
+             * （op_concat 新建后 release 旧中间串，无泄漏）。 */
+            dst = l;
+        } else {
+            dst = tmp_dst(c, want);
+        }
         emit(c, bin_opcode(op), l, r, dst, e->line);
         return dst;
     }

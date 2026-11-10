@@ -349,6 +349,10 @@ TVal tval_mod(TVal a, TVal b) {
     int64_t x = tval_to_int(a), y = tval_to_int(b);
     if (y == 0)
         tphp_raise("DivisionByZeroError", "Modulo by zero");
+    /* PHP 对齐：x % -1 恒 0。x86 idiv 的 INT64_MIN/-1 组合触发 #DE
+     * （0xC0000094 静默崩，logstat 百菜专项 mod_edge 勘察首暴露）；
+     * 其余 -1 除数硬件本就给 0，此分支同时消 UB。 */
+    if (y == -1) return num_result_i(0);
     return num_result_i(x % y);
 }
 

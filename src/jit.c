@@ -1709,6 +1709,8 @@ static bool dst_src_alias(TOp *op) {
            (op->t2 == op->tr && op->a2 == op->ar);
 }
 
+static int mod_fast_enabled(void);      /* 定义在开关区（logstat 百菜），lower_binop 用 */
+
 static void lower_binop(JitC *j, TOp *op) {
     JIT_CTX();
     ir_ref aa = slot_addr(j, op->a1), da = slot_addr(j, op->ar);
@@ -1807,6 +1809,40 @@ static void lower_binop(JitC *j, TOp *op) {
             ir_ref eSlow = ir_END();
         ir_MERGE_2(eFast, eSlow);
         }
+    } else if (op->op == OP_MOD && mod_fast_enabled()) {
+        /* logstat 百菜第一点（11-10）：MOD int 快线——双 INT 已证时 IR
+         * IR_MOD 直出（x86 后端 idiv），免 CALL tval_mod 的类型分发+to_int
+         * 框架；除数 0 显式落既有 slow（DivisionByZeroError 逐位原样，
+         * 亦避开 idiv #DE）；除数 -1 恒 0（PHP 语义，与 tval_mod 慢线修复
+         * 同式，消 INT64_MIN/-1 UB）；非双 INT → slow 原样（float 取整
+         * mod 语义在 tval_mod 内）。开关 TPHP_MOD_FAST=0 = HEAD 恒 slow。 */
+        ir_ref bothm = ir_AND(IR_BOOL,
+            ir_EQ(ta, ir_CONST_I32(JT_INT)),
+            ir_EQ(tb, ir_CONST_I32(JT_INT)));
+        ir_ref ifm = ir_IF(bothm);
+        ir_IF_TRUE(ifm);
+            ir_ref ifz = ir_IF(ir_EQ(pb, ir_CONST_I64(0)));
+            ir_IF_TRUE(ifz);
+                call_slow_binop(j, op->op, da, ta, pa, tb, pb);   /* raise */
+                ir_ref eZ = ir_END();
+            ir_IF_FALSE(ifz);
+                if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                    rel_dst_gate(j, da);   /* wtake 语义；slow 分支自释放不发 */
+                ir_ref ifm1 = ir_IF(ir_EQ(pb, ir_CONST_I64(-1)));
+                ir_IF_TRUE(ifm1);
+                    store_imm(j, da, JT_INT, ir_CONST_I64(0));
+                    ir_ref eM1 = ir_END();
+                ir_IF_FALSE(ifm1);
+                    store_imm(j, da, JT_INT, ir_MOD_I64(pa, pb));
+                    ir_ref eM2 = ir_END();
+                ir_MERGE_2(eM1, eM2);
+                ir_ref eNZ = ir_END();
+            ir_MERGE_2(eZ, eNZ);
+            ir_ref eT = ir_END();
+        ir_IF_FALSE(ifm);
+            call_slow_binop(j, op->op, da, ta, pa, tb, pb);
+            ir_ref eS = ir_END();
+        ir_MERGE_2(eT, eS);
     } else {
         call_slow_binop(j, op->op, da, ta, pa, tb, pb);
     }
@@ -2894,6 +2930,17 @@ static int call_str_slow_enabled(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TPHP_CALL_STR_SLOW");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* logstat 百菜第一点（11-10）：MOD int 快线开关——默认开，TPHP_MOD_FAST=0
+ * 关（同二进制 A/B）= HEAD 行为（恒 CALL tval_mod）。 */
+static int mod_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_MOD_FAST");
         v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
     }
     return v;
