@@ -90,6 +90,22 @@ _Static_assert(sizeof(TVal) == 16, "TVal size");
 #define TVAL_SZ  16
 #define TVAL_TAG 8
 
+/* prop v1.5 批1：布局锁（PLAN/prop-ic.md §2.4）——TProp/TObj/TClass 布局
+ * 变动即编译期炸，防 offsetof 手抄漂移。 */
+_Static_assert(sizeof(TProp) == 80, "TProp size");
+_Static_assert(offsetof(TObj, cls) == 24, "TObj.cls");
+_Static_assert(offsetof(TObj, props) == 32, "TObj.props");
+_Static_assert(offsetof(TClass, n_props) == 80, "TClass.n_props");
+_Static_assert(offsetof(TClass, props) == 72, "TClass.props");
+_Static_assert(offsetof(TProp, name) == 0, "TProp.name");
+_Static_assert(offsetof(TProp, visibility) == 24, "TProp.visibility");
+_Static_assert(offsetof(TProp, has_hooks) == 72, "TProp.has_hooks");
+_Static_assert(offsetof(TProp, set_visibility) == 25, "TProp.set_visibility");
+_Static_assert(offsetof(TProp, type) == 8, "TProp.type");
+_Static_assert(offsetof(TProp, is_readonly) == 27, "TProp.is_readonly");
+_Static_assert(offsetof(TClass, flags) == 28, "TClass.flags");
+_Static_assert(offsetof(GCHead, kind) == 5, "GCHead.kind");
+
 #define JT_NULL  ((int32_t)T_NULL)
 #define JT_FALSE ((int32_t)T_FALSE)
 #define JT_TRUE  ((int32_t)T_TRUE)
@@ -2907,6 +2923,17 @@ static int prop_helper_enabled(void) {
     return v;
 }
 
+/* prop v1.5 批1（PLAN/prop-ic.md）开关：默认开，TPHP_PROP_INLINE=0 关
+ * = 回 HEAD helper 路径（同二进制 A/B）。仅 CONST 名生效；动态名恒慢路。 */
+static int prop_inline_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_PROP_INLINE");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* 刀5C（11-06）嵌套调用 emit 开关：**默认开**（11-06 用户拍板）。
  * 历史：曾默认关——A/B 实测 bench() 计时壳 JIT 化后 call_dyn 使被测
  * 闭包未预编译 → 循环中途 OSR 编译开销落进计时区 → 全表前段虚高。
@@ -4275,11 +4302,201 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_FETCH_PROP: {
-            /* 刀5：helper 化（替代单 op 回放）——vm.c 造假帧跑真 handler，
-             * frameless callee/OSR/fn 级三态通用；raise → 局部 setjmp →
-             * 返 0 → IR RETURN：fn 级=0（exception 由 op_do_fcall 从 C 帧
-             * 上传，不重跑）；OSR=本 op pc（解释器见挂起异常直接传播，
-             * replay-opseq 同款"不重跑"语义）。开关关 → 单 op 回放。 */
+            /* prop v1.5 批1（PLAN/prop-ic.md §2.1）：CONST 名 + helper 开
+             * → IR 内联快路（镜像解释器 P0-19 round-6 IC 快路）；miss 落
+             * 既有 helper。开关关/动态名/helper 关 → HEAD 路径零改动。 */
+            if (prop_inline_enabled() && prop_helper_enabled()
+                && op->t2 == OPD_CONST
+                && j->fn->lits[op->a2].t == T_STR) {
+                JIT_CTX();
+                TStr *namep = (TStr *)j->fn->lits[op->a2].u.p;
+                ir_ref name_c = ir_CONST_ADDR((uintptr_t)namep);
+                ir_ref obj_a = slot_addr(j, op->a1);
+                ir_ref obj_t = load_tag(j, obj_a);
+                ir_ref ends[6];
+                int ne = 0;
+
+                /* L1: tag==T_OBJ */
+                ir_ref if1 = ir_IF(ir_EQ(obj_t, ir_CONST_I32(T_OBJ)));
+                ir_IF_TRUE(if1);
+                    ir_ref obj_p = load_pay(j, obj_a);
+                    ir_ref kind = ir_LOAD_U8(ir_ADD_A(obj_p,
+                        ir_CONST_ADDR(offsetof(GCHead, kind))));
+                    /* L2: kind==GC_KIND_OBJ */
+                    ir_ref if2 = ir_IF(ir_EQ(kind, ir_CONST_U8(GC_KIND_OBJ)));
+                    ir_IF_TRUE(if2);
+                        /* load ic (slot+1)、cls、np — 全部安全 */
+                        ir_ref ic_raw = ir_LOAD_I64(
+                            ir_CONST_ADDR((uintptr_t)&op->ic));
+                        ir_ref cls = ir_LOAD_A(ir_ADD_A(obj_p,
+                            ir_CONST_ADDR(offsetof(TObj, cls))));
+                        ir_ref np32 = ir_LOAD_I32(ir_ADD_A(cls,
+                            ir_CONST_ADDR(offsetof(TClass, n_props))));
+                        ir_ref slot = ir_SUB_I64(ic_raw, ir_CONST_I64(1));
+                        ir_ref np64 = ir_ZEXT(IR_I64, np32);
+                        /* L3: ic 已填 && slot < np（合并——均只需已载值） */
+                        ir_ref ok3 = ir_AND(IR_BOOL,
+                            ir_NE(ic_raw, ir_CONST_I64(0)),
+                            ir_LT(slot, np64));
+                        ir_ref if3 = ir_IF(ok3);
+                        ir_IF_TRUE(if3);
+                            /* load pp/pname/vis/hooks — slot 已证合法 */
+                            ir_ref props_arr = ir_LOAD_A(ir_ADD_A(cls,
+                                ir_CONST_ADDR(offsetof(TClass, props))));
+                            ir_ref pp = ir_ADD_A(props_arr,
+                                ir_MUL_I64(slot, ir_CONST_I64(sizeof(TProp))));
+                            ir_ref pname = ir_LOAD_A(pp);  /* TProp.name @0 */
+                            ir_ref vis = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, visibility))));
+                            ir_ref hooks = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, has_hooks))));
+                            /* L4: 名指针相等 + PUBLIC + !hooks */
+                            ir_ref ok4 = ir_AND(IR_BOOL,
+                                ir_AND(IR_BOOL,
+                                    ir_EQ(pname, name_c),
+                                    ir_EQ(vis, ir_CONST_U8(CVIS_PUBLIC))),
+                                ir_EQ(hooks, ir_CONST_U8(0)));
+                            ir_ref if4 = ir_IF(ok4);
+                            ir_IF_TRUE(if4);
+                                /* ---- HIT：镜像解释器 4214-4218 ---- */
+                                ir_ref vaddr = ir_ADD_A(
+                                    ir_LOAD_A(ir_ADD_A(obj_p,
+                                        ir_CONST_ADDR(offsetof(TObj, props)))),
+                                    ir_MUL_I64(slot, ir_CONST_I64(TVAL_SZ)));
+                                /* addref v（dimic_take 同款菱形） */
+                                ir_ref vtag = ir_LOAD_I32(
+                                    ir_ADD_A(vaddr, ir_CONST_ADDR(TVAL_TAG)));
+                                ir_ref ifv = ir_IF(ir_AND(IR_BOOL,
+                                    ir_GE(vtag, ir_CONST_I32(T_STR)),
+                                    ir_LE(vtag, ir_CONST_I32(T_CLOSURE))));
+                                ir_IF_TRUE(ifv);
+                                    ir_ref gcv = ir_LOAD_A(vaddr);
+                                    ir_ref fv = ir_ZEXT(IR_I32,
+                                        ir_LOAD_U8(ir_ADD_A(gcv,
+                                            ir_CONST_ADDR(offsetof(GCHead, flags)))));
+                                    ir_ref ifiv = ir_IF(ir_EQ(
+                                        ir_AND_I32(fv,
+                                            ir_CONST_I32(GC_FLAG_INTERNED)),
+                                        ir_CONST_I32(0)));
+                                    ir_IF_TRUE(ifiv);
+                                        ir_ref rcv = ir_LOAD_I32(gcv);
+                                        ir_STORE(gcv,
+                                            ir_ADD_I32(rcv, ir_CONST_I32(1)));
+                                        ir_ref eV1 = ir_END();
+                                    ir_IF_FALSE(ifiv);
+                                        ir_ref eV0 = ir_END();
+                                    ir_MERGE_2(eV1, eV0);
+                                    ir_ref eRefV = ir_END();
+                                ir_IF_FALSE(ifv);
+                                    ir_ref eScV = ir_END();
+                                ir_MERGE_2(eRefV, eScV);
+                                /* wtake：UNUSED=释 src；否则释 dst + 16B store */
+                                if (op->tr == OPD_UNUSED) {
+                                    ir_ref tr[1] = { vaddr };
+                                    ir_CALL_N(IR_VOID,
+                                        ir_CONST_ADDR((uintptr_t)tval_release),
+                                        1, tr);
+                                } else {
+                                    ir_ref dst = slot_addr(j, op->ar);
+                                    if (dst_gate_needed(j, op))
+                                        rel_dst_gate(j, dst);
+                                    store_pay(j, dst, ir_LOAD_I64(vaddr));
+                                    store_tag(j, dst, vtag);
+                                }
+                                ends[ne++] = ir_END();  /* HIT */
+                            ir_IF_FALSE(if4);
+                                /* MISS：helper */
+                                ir_ref t5[5] = { j->r_vm,
+                                    ir_CONST_ADDR((uintptr_t)j->fn),
+                                    ir_CONST_ADDR((uintptr_t)op),
+                                    ir_CONST_I32((int32_t)pc),
+                                    j->r_slots };
+                                ir_ref ok = ir_CALL_N(IR_I32,
+                                    ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_prop),
+                                    5, t5);
+                                ir_ref ifp = ir_IF(ir_EQ(ok, ir_CONST_I32(0)));
+                                ir_IF_TRUE(ifp);
+                                    ir_RETURN(ir_CONST_I32(
+                                        j->osr ? (int32_t)pc : 0));
+                                ir_IF_FALSE(ifp);
+                                ends[ne++] = ir_END();  /* helper ok */
+                            /* MERGE hit/helper → 这是 if3-TRUE 的出口 */
+                            ir_ref e4t = ends[ne - 2], e4f = ends[ne - 1];
+                            ne -= 2;
+                            ir_MERGE_2(e4t, e4f);
+                            ends[ne++] = ir_END();  /* 关闭 if3-TRUE */
+                        ir_IF_FALSE(if3);
+                            /* ic 未填 / OOB → helper */
+                            ir_ref t3[5] = { j->r_vm,
+                                ir_CONST_ADDR((uintptr_t)j->fn),
+                                ir_CONST_ADDR((uintptr_t)op),
+                                ir_CONST_I32((int32_t)pc),
+                                j->r_slots };
+                            ir_ref ok3b = ir_CALL_N(IR_I32,
+                                ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_prop),
+                                5, t3);
+                            ir_ref ifp3 = ir_IF(ir_EQ(ok3b, ir_CONST_I32(0)));
+                            ir_IF_TRUE(ifp3);
+                                ir_RETURN(ir_CONST_I32(
+                                    j->osr ? (int32_t)pc : 0));
+                            ir_IF_FALSE(ifp3);
+                            ends[ne++] = ir_END();  /* if3-FALSE */
+                        /* MERGE if3 T/F → 关闭 if2-TRUE */
+                        {
+                            ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                            ne -= 2;
+                            ir_MERGE_2(a, b);
+                            ends[ne++] = ir_END();
+                        }
+                    ir_IF_FALSE(if2);
+                        /* 非 GC_KIND_OBJ → helper */
+                        ir_ref t2[5] = { j->r_vm,
+                            ir_CONST_ADDR((uintptr_t)j->fn),
+                            ir_CONST_ADDR((uintptr_t)op),
+                            ir_CONST_I32((int32_t)pc),
+                            j->r_slots };
+                        ir_ref ok2 = ir_CALL_N(IR_I32,
+                            ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_prop),
+                            5, t2);
+                        ir_ref ifp2 = ir_IF(ir_EQ(ok2, ir_CONST_I32(0)));
+                        ir_IF_TRUE(ifp2);
+                            ir_RETURN(ir_CONST_I32(
+                                j->osr ? (int32_t)pc : 0));
+                        ir_IF_FALSE(ifp2);
+                        ends[ne++] = ir_END();  /* if2-FALSE */
+                    /* MERGE if2 T/F → 关闭 if1-TRUE */
+                    {
+                        ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                        ne -= 2;
+                        ir_MERGE_2(a, b);
+                        ends[ne++] = ir_END();
+                    }
+                ir_IF_FALSE(if1);
+                    /* 非 T_OBJ → helper */
+                    ir_ref t1[5] = { j->r_vm,
+                        ir_CONST_ADDR((uintptr_t)j->fn),
+                        ir_CONST_ADDR((uintptr_t)op),
+                        ir_CONST_I32((int32_t)pc),
+                        j->r_slots };
+                    ir_ref ok1 = ir_CALL_N(IR_I32,
+                        ir_CONST_ADDR((uintptr_t)tphp_jit_fetch_prop),
+                        5, t1);
+                    ir_ref ifp1 = ir_IF(ir_EQ(ok1, ir_CONST_I32(0)));
+                    ir_IF_TRUE(ifp1);
+                        ir_RETURN(ir_CONST_I32(
+                            j->osr ? (int32_t)pc : 0));
+                    ir_IF_FALSE(ifp1);
+                    ends[ne++] = ir_END();  /* if1-FALSE */
+                /* 最终 MERGE：if1 T/F 两条路径 */
+                {
+                    ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                    ne -= 2;
+                    ir_MERGE_2(a, b);
+                }
+                pc++;
+                break;
+            }
+            /* HEAD 路径：helper 或 replay */
             if (!prop_helper_enabled()) {
                 lower_replay(j, pc, pc + 1);
                 pc++;
@@ -4301,7 +4518,225 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
-        case OP_ASSIGN_PROP:
+        case OP_ASSIGN_PROP: {
+            /* prop v1.5 批2（PLAN/prop-ic.md §2.2）：CONST 名 → IR 内联
+             * 快路（镜像解释器 3119-3138）；miss/dynamic/关 → HEAD replay。 */
+            if (prop_inline_enabled()
+                && op->t2 == OPD_CONST
+                && j->fn->lits[op->a2].t == T_STR) {
+                JIT_CTX();
+                TStr *namep = (TStr *)j->fn->lits[op->a2].u.p;
+                ir_ref name_c = ir_CONST_ADDR((uintptr_t)namep);
+                ir_ref obj_a = slot_addr(j, op->a1);
+                ir_ref obj_t = load_tag(j, obj_a);
+                /* 值源：tr/ar = o3（镜像 rdv(op,3)）；写回恒 slots[ar] */
+                ir_ref ends[8];
+                int ne = 0;
+
+                /* L1: tag==T_OBJ */
+                ir_ref if1 = ir_IF(ir_EQ(obj_t, ir_CONST_I32(T_OBJ)));
+                ir_IF_TRUE(if1);
+                    ir_ref obj_p = load_pay(j, obj_a);
+                    ir_ref kind = ir_LOAD_U8(ir_ADD_A(obj_p,
+                        ir_CONST_ADDR(offsetof(GCHead, kind))));
+                    /* L2: kind==GC_KIND_OBJ */
+                    ir_ref if2 = ir_IF(ir_EQ(kind, ir_CONST_U8(GC_KIND_OBJ)));
+                    ir_IF_TRUE(if2);
+                        ir_ref ic_raw = ir_LOAD_I64(
+                            ir_CONST_ADDR((uintptr_t)&op->ic));
+                        ir_ref cls = ir_LOAD_A(ir_ADD_A(obj_p,
+                            ir_CONST_ADDR(offsetof(TObj, cls))));
+                        ir_ref np32 = ir_LOAD_I32(ir_ADD_A(cls,
+                            ir_CONST_ADDR(offsetof(TClass, n_props))));
+                        ir_ref slot = ir_SUB_I64(ic_raw, ir_CONST_I64(1));
+                        ir_ref np64 = ir_ZEXT(IR_I64, np32);
+                        /* L3: ic 已填 && slot < np */
+                        ir_ref ok3 = ir_AND(IR_BOOL,
+                            ir_NE(ic_raw, ir_CONST_I64(0)),
+                            ir_LT(slot, np64));
+                        ir_ref if3 = ir_IF(ok3);
+                        ir_IF_TRUE(if3);
+                            ir_ref props_arr = ir_LOAD_A(ir_ADD_A(cls,
+                                ir_CONST_ADDR(offsetof(TClass, props))));
+                            ir_ref pp = ir_ADD_A(props_arr,
+                                ir_MUL_I64(slot, ir_CONST_I64(sizeof(TProp))));
+                            ir_ref pname = ir_LOAD_A(pp);  /* TProp.name @0 */
+                            /* L4+L5：名指针 + PUBLIC + !set_vis + !hooks
+                             * + !type + !is_readonly + !(cls.flags&CLS_READONLY)
+                             * （镜像解释器 3124-3126） */
+                            ir_ref vis = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, visibility))));
+                            ir_ref setv = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, set_visibility))));
+                            ir_ref hooks = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, has_hooks))));
+                            ir_ref ptype = ir_LOAD_A(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, type))));
+                            ir_ref ro = ir_LOAD_U8(ir_ADD_A(pp,
+                                ir_CONST_ADDR(offsetof(TProp, is_readonly))));
+                            ir_ref cflags = ir_LOAD_U8(ir_ADD_A(cls,
+                                ir_CONST_ADDR(offsetof(TClass, flags))));
+                            ir_ref ok4 = ir_AND(IR_BOOL,
+                                ir_AND(IR_BOOL,
+                                    ir_AND(IR_BOOL,
+                                        ir_EQ(pname, name_c),
+                                        ir_EQ(vis, ir_CONST_U8(CVIS_PUBLIC))),
+                                    ir_AND(IR_BOOL,
+                                        ir_EQ(setv, ir_CONST_U8(0)),
+                                        ir_EQ(hooks, ir_CONST_U8(0)))),
+                                ir_AND(IR_BOOL,
+                                    ir_AND(IR_BOOL,
+                                        ir_EQ(ptype, ir_CONST_ADDR(0)),
+                                        ir_EQ(ro, ir_CONST_U8(0))),
+                                    ir_EQ(ir_AND_I32(
+                                        ir_ZEXT(IR_I32, cflags),
+                                        ir_CONST_I32(CLS_READONLY)),
+                                        ir_CONST_I32(0))));
+                            ir_ref if4 = ir_IF(ok4);
+                            ir_IF_TRUE(if4);
+                                /* ---- HIT：镜像解释器 3127-3136 ---- */
+                                /* 取 val：CONST→lits 常量 / 否则 slots[ar] */
+                                ir_ref vt, vp;
+                                if (op->tr == OPD_CONST) {
+                                    TVal cv = j->fn->lits[op->ar];
+                                    vt = ir_CONST_I32((int32_t)cv.t);
+                                    vp = ir_CONST_I64(cv.u.i);
+                                } else {
+                                    ir_ref va = slot_addr(j, op->ar);
+                                    vt = load_tag(j, va);
+                                    vp = load_pay(j, va);
+                                }
+                                /* addref(val) — tag∈[T_STR,T_CLOSURE] 门 */
+                                ir_ref ifv = ir_IF(ir_AND(IR_BOOL,
+                                    ir_GE(vt, ir_CONST_I32(T_STR)),
+                                    ir_LE(vt, ir_CONST_I32(T_CLOSURE))));
+                                ir_IF_TRUE(ifv);
+                                    ir_ref gcv = vp;
+                                    ir_ref fv = ir_ZEXT(IR_I32,
+                                        ir_LOAD_U8(ir_ADD_A(gcv,
+                                            ir_CONST_ADDR(offsetof(GCHead,
+                                                flags)))));
+                                    ir_ref ifiv = ir_IF(ir_EQ(
+                                        ir_AND_I32(fv,
+                                            ir_CONST_I32(GC_FLAG_INTERNED)),
+                                        ir_CONST_I32(0)));
+                                    ir_IF_TRUE(ifiv);
+                                        ir_ref rcv = ir_LOAD_I32(gcv);
+                                        ir_STORE(gcv,
+                                            ir_ADD_I32(rcv,
+                                                ir_CONST_I32(1)));
+                                        ir_ref eV1 = ir_END();
+                                    ir_IF_FALSE(ifiv);
+                                        ir_ref eV0 = ir_END();
+                                    ir_MERGE_2(eV1, eV0);
+                                    ir_ref eRefV = ir_END();
+                                ir_IF_FALSE(ifv);
+                                    ir_ref eScV = ir_END();
+                                ir_MERGE_2(eRefV, eScV);
+                                /* 释旧 prop + 16B store */
+                                ir_ref prop_a = ir_ADD_A(
+                                    ir_LOAD_A(ir_ADD_A(obj_p,
+                                        ir_CONST_ADDR(offsetof(TObj,
+                                            props)))),
+                                    ir_MUL_I64(slot,
+                                        ir_CONST_I64(TVAL_SZ)));
+                                ir_ref trp[1] = { prop_a };
+                                ir_CALL_N(IR_VOID,
+                                    ir_CONST_ADDR((uintptr_t)tval_release),
+                                    1, trp);
+                                ir_STORE(prop_a, vp);
+                                ir_STORE(ir_ADD_A(prop_a,
+                                    ir_CONST_ADDR(TVAL_TAG)), vt);
+                                /* 表达式结果写回 slots[ar]（tr!=UNUSED） */
+                                if (op->tr != OPD_UNUSED) {
+                                    ir_ref da = slot_addr(j, op->ar);
+                                    /* addref(val) again */
+                                    ir_ref ifv2 = ir_IF(ir_AND(IR_BOOL,
+                                        ir_GE(vt, ir_CONST_I32(T_STR)),
+                                        ir_LE(vt,
+                                            ir_CONST_I32(T_CLOSURE))));
+                                    ir_IF_TRUE(ifv2);
+                                        ir_ref gcv2 = vp;
+                                        ir_ref fv2 = ir_ZEXT(IR_I32,
+                                            ir_LOAD_U8(ir_ADD_A(gcv2,
+                                                ir_CONST_ADDR(
+                                                    offsetof(GCHead,
+                                                        flags)))));
+                                        ir_ref ifiv2 = ir_IF(ir_EQ(
+                                            ir_AND_I32(fv2,
+                                                ir_CONST_I32(
+                                                    GC_FLAG_INTERNED)),
+                                            ir_CONST_I32(0)));
+                                        ir_IF_TRUE(ifiv2);
+                                            ir_ref rcv2 =
+                                                ir_LOAD_I32(gcv2);
+                                            ir_STORE(gcv2,
+                                                ir_ADD_I32(rcv2,
+                                                    ir_CONST_I32(1)));
+                                            ir_ref eV1b = ir_END();
+                                        ir_IF_FALSE(ifiv2);
+                                            ir_ref eV0b = ir_END();
+                                        ir_MERGE_2(eV1b, eV0b);
+                                        ir_ref eRefV2 = ir_END();
+                                    ir_IF_FALSE(ifv2);
+                                        ir_ref eScV2 = ir_END();
+                                    ir_MERGE_2(eRefV2, eScV2);
+                                    /* 释 slots[ar] 旧值 + 16B store */
+                                    rel_dst_gate(j, da);
+                                    ir_STORE(da, vp);
+                                    ir_STORE(ir_ADD_A(da,
+                                        ir_CONST_ADDR(TVAL_TAG)), vt);
+                                }
+                                ends[ne++] = ir_END();  /* HIT */
+                            ir_IF_FALSE(if4);
+                                /* L4/L5 fail → replay（回填 ic） */
+                                lower_replay(j, pc, pc + 1);
+                                ends[ne++] = ir_END();  /* if4-FALSE */
+                            /* MERGE if4 T/F → 关闭 if3-TRUE */
+                            {
+                                ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                                ne -= 2;
+                                ir_MERGE_2(a, b);
+                                ends[ne++] = ir_END();
+                            }
+                        ir_IF_FALSE(if3);
+                            /* ic 未填 / OOB → replay */
+                            lower_replay(j, pc, pc + 1);
+                            ends[ne++] = ir_END();  /* if3-FALSE */
+                        /* MERGE if3 T/F → 关闭 if2-TRUE */
+                        {
+                            ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                            ne -= 2;
+                            ir_MERGE_2(a, b);
+                            ends[ne++] = ir_END();
+                        }
+                    ir_IF_FALSE(if2);
+                        lower_replay(j, pc, pc + 1);
+                        ends[ne++] = ir_END();  /* if2-FALSE */
+                    /* MERGE if2 T/F → 关闭 if1-TRUE */
+                    {
+                        ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                        ne -= 2;
+                        ir_MERGE_2(a, b);
+                        ends[ne++] = ir_END();
+                    }
+                ir_IF_FALSE(if1);
+                    lower_replay(j, pc, pc + 1);
+                    ends[ne++] = ir_END();  /* if1-FALSE */
+                /* 最终 MERGE：if1 T/F */
+                {
+                    ir_ref a = ends[ne - 2], b = ends[ne - 1];
+                    ne -= 2;
+                    ir_MERGE_2(a, b);
+                }
+                pc++;
+                break;
+            }
+            /* HEAD 路径：replay（真 handler 回填 ic） */
+            lower_replay(j, pc, pc + 1);
+            pc++;
+            break;
+        }
         case OP_ISSET_PROP: case OP_UNSET_PROP: {
             /* P0-14 批2-2：单 op pad 执行——真 handler 读自身操作数（动态
              * 名/槽皆活在本位）+ 写 dst 槽；magic __get/__set 与 raise 走
