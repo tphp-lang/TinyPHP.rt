@@ -452,6 +452,7 @@ static TVal eval_const2(Ctx *c, AExpr *e, bool *ok) {
             if (v.t == T_FLOAT) return TV_FLOAT(-v.u.d);
         }
         if (e->u.un.op == P_PLUS) return eval_const2(c, e->u.un.e, ok);
+        if (e->u.un.op == P_AT) return eval_const2(c, e->u.un.e, ok); /* @ 对纯常量无 warning 可压 = 透传精确 */
         *ok = false;
         return TV_NULL;
     case A_BINARY: {
@@ -1361,6 +1362,15 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
         return dst;
     }
     case A_UNARY: {
+        /* @ 抑制（11-10）：ON 先落（emit append-only ⇒ 恰在子表达式 ops
+         * 之前），子表达式照常编译，OFF 收尾；raise 路径 OFF 被跳过由
+         * unwind 归 0 兜底。 */
+        if (e->u.un.op == P_AT) {
+            emit(c, OP_SUPPRESS_ON, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            Loc v = compile_expr(c, e->u.un.e, want);
+            emit(c, OP_SUPPRESS_OFF, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
+            return v;
+        }
         Loc v = compile_expr(c, e->u.un.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);
         Opcode opc;

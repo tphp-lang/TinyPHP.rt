@@ -208,7 +208,7 @@ TVal bi_json_encode(VM *vm, TVal *args, int n) {
     jb_init(&b);
     if (!enc_val(vm, &b, args[0], 0, options)) {
         tm_free(b.p);
-        fprintf(stderr, "PHP Warning:  json_encode(): Invalid UTF-8 or unsupported type\n");
+        tphp_warn("PHP Warning:  json_encode(): Invalid UTF-8 or unsupported type\n");
         return TV_FALSE;
     }
     TStr *s = tstr_new(b.p, b.len);
@@ -232,7 +232,7 @@ static void jskip(JDec *d) {
 
 static bool jfail(JDec *d, const char *msg) {
     if (!d->silent)
-        fprintf(stderr, "PHP Warning:  json_decode(): %s\n", msg);
+        tphp_warn("PHP Warning:  json_decode(): %s\n", msg);
     return false;
 }
 
@@ -469,7 +469,7 @@ TVal bi_json_decode(VM *vm, TVal *args, int n) {
     if (depth > 512) depth = 512;
 
     if (s->len == 0) {
-        fprintf(stderr, "PHP Warning:  json_decode(): Syntax error\n");
+        tphp_warn("PHP Warning:  json_decode(): Syntax error\n");
         return TV_NULL;
     }
     JDec d = { .p = s->c, .end = s->c + s->len, .vm = vm, .depth = 0 };
@@ -479,7 +479,7 @@ TVal bi_json_decode(VM *vm, TVal *args, int n) {
     jskip(&d);
     if (d.p != d.end) {
         tval_release(&out);
-        fprintf(stderr, "PHP Warning:  json_decode(): Syntax error\n");
+        tphp_warn("PHP Warning:  json_decode(): Syntax error\n");
         return TV_NULL;
     }
     /* assoc=false 时对象应转对象——M6 简化：始终 array（与 assoc=true 一致） */

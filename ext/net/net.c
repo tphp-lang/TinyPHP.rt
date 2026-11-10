@@ -114,7 +114,7 @@ static struct addrinfo *dns_resolve(VM *vm, const char *host) {
     if (rc != 0) {
         char what[256];
         snprintf(what, sizeof what, "gethostbyname(%s)", host);
-        fprintf(stderr, "PHP Warning: %s: %s\n", what, uv_strerror(rc));
+        tphp_warn("PHP Warning: %s: %s\n", what, uv_strerror(rc));
         return NULL;
     }
     tphp_sched_event_wait(&op.ev);
@@ -208,7 +208,7 @@ static uv_tcp_t *tcp_connect(VM *vm, const char *host, int port,
     }
     uv_freeaddrinfo(res);
     if (!have) {
-        fprintf(stderr, "PHP Warning: %s(): no IPv4 address for \"%s\"\n",
+        tphp_warn("PHP Warning: %s(): no IPv4 address for \"%s\"\n",
                 who, host);
         return NULL;
     }
@@ -228,7 +228,7 @@ static uv_tcp_t *tcp_connect(VM *vm, const char *host, int port,
     if (rc != 0) {
         char what[256];
         snprintf(what, sizeof what, "%s(): connect %s:%d", who, host, port);
-        fprintf(stderr, "PHP Warning: %s: %s\n", what, uv_strerror(rc));
+        tphp_warn("PHP Warning: %s: %s\n", what, uv_strerror(rc));
         uv_close((uv_handle_t *)tcp, tcp_free_cb);   /* 异步释放 */
         return NULL;
     }
@@ -238,7 +238,7 @@ static uv_tcp_t *tcp_connect(VM *vm, const char *host, int port,
         char what[256];
         snprintf(what, sizeof what, "%s(): unable to connect to %s:%d",
                  who, host, port);
-        fprintf(stderr, "PHP Warning: %s: %s\n", what,
+        tphp_warn("PHP Warning: %s: %s\n", what,
                 uv_strerror(op.status));
         uv_close((uv_handle_t *)tcp, tcp_free_cb);   /* 异步释放 */
         return NULL;
@@ -314,7 +314,7 @@ TVal tphp_net_server(VM *vm, TVal *args, int n) {
     srv->data = NULL;
     if ((rc = uv_tcp_bind(srv, (const struct sockaddr *)&addr, 0)) != 0 ||
         (rc = uv_listen((uv_stream_t *)srv, 64, accept_cb)) != 0) {
-        fprintf(stderr, "PHP Warning: stream_socket_server(): %s\n",
+        tphp_warn("PHP Warning: stream_socket_server(): %s\n",
                 uv_strerror(rc));
         uv_close((uv_handle_t *)srv, tcp_free_cb);   /* 异步释放 */
         return TV_FALSE;
@@ -440,7 +440,7 @@ TVal tcp_fwrite_impl(VM *vm, TStreamCtx *s, TStr *data) {
     int rc = uv_write(wreq, (uv_stream_t *)s->tcp, &b, 1, write_cb);
     if (rc != 0) {
         tm_free(wreq);
-        fprintf(stderr, "PHP Warning: fwrite(): %s\n", uv_strerror(rc));
+        tphp_warn("PHP Warning: fwrite(): %s\n", uv_strerror(rc));
         return TV_FALSE;
     }
     tphp_sched_event_wait(&ev);
@@ -705,7 +705,7 @@ static TStr *http_fetch(VM *vm, const char *url, TArr *extra_headers,
                     "PHP Warning: http_get(): https requires mbedtls"
                     " (not yet bundled) for %s\n", url);
         else
-            fprintf(stderr, "PHP Warning: http_get(): unsupported URL %s\n",
+            tphp_warn("PHP Warning: http_get(): unsupported URL %s\n",
                     url);
         return NULL;
     }
@@ -747,7 +747,7 @@ static TStr *http_fetch(VM *vm, const char *url, TArr *extra_headers,
         int rc = uv_write(wreq, (uv_stream_t *)tcp, &b, 1, write_cb);
         if (rc != 0) {
             tm_free(wreq);
-            fprintf(stderr, "PHP Warning: http_get(): %s\n", uv_strerror(rc));
+            tphp_warn("PHP Warning: http_get(): %s\n", uv_strerror(rc));
             uv_close((uv_handle_t *)tcp, tcp_free_cb);
             return NULL;
         }
@@ -767,7 +767,7 @@ static TStr *http_fetch(VM *vm, const char *url, TArr *extra_headers,
     char *raw = http_read_all(&tmp, &raw_len);
     uv_close((uv_handle_t *)tcp, tcp_free_cb);
     if (!raw) {
-        fprintf(stderr, "PHP Warning: http_get(): read failed for %s\n", url);
+        tphp_warn("PHP Warning: http_get(): read failed for %s\n", url);
         return NULL;
     }
     return http_parse_response(vm, raw, raw_len, url, 0, port, extra_headers,
@@ -874,7 +874,7 @@ static TlsSession *tls_connect(VM *vm, const char *host, int port) {
     (void)vm;
     int rc = tls_cacert_init();
     if (rc != 0) {
-        fprintf(stderr, "PHP Warning: https: CA bundle parse failed (%d)\n",
+        tphp_warn("PHP Warning: https: CA bundle parse failed (%d)\n",
                 rc);
         return NULL;
     }
@@ -985,7 +985,7 @@ static char *tls_read_all(TlsSession *ts, size_t *out_len) {
         if (r < 0) {
             char err[192];
             mbedtls_strerror(r, err, sizeof err);
-            fprintf(stderr, "PHP Warning: https: read failed: %s\n", err);
+            tphp_warn("PHP Warning: https: read failed: %s\n", err);
             tm_free(buf);
             *out_len = 0;
             return NULL;
@@ -1023,7 +1023,7 @@ static TStr *https_fetch(VM *vm, const char *url, TArr *extra_headers,
         return NULL;
     }
     if (!http_parse_url(url, host, sizeof host, &port, path, sizeof path)) {
-        fprintf(stderr, "PHP Warning: http_get(): unsupported URL %s\n", url);
+        tphp_warn("PHP Warning: http_get(): unsupported URL %s\n", url);
         return NULL;
     }
     TlsSession *ts = tls_connect(vm, host, port);
@@ -1052,7 +1052,7 @@ static TStr *https_fetch(VM *vm, const char *url, TArr *extra_headers,
     if (wrc != 0) {
         char err[192];
         mbedtls_strerror(wrc, err, sizeof err);
-        fprintf(stderr, "PHP Warning: https: write failed to %s: %s\n",
+        tphp_warn("PHP Warning: https: write failed to %s: %s\n",
                 url, err);
         tls_session_free(ts);
         return NULL;
@@ -1061,7 +1061,7 @@ static TStr *https_fetch(VM *vm, const char *url, TArr *extra_headers,
     char *raw = tls_read_all(ts, &raw_len);
     tls_session_free(ts);
     if (!raw) {
-        fprintf(stderr, "PHP Warning: http_get(): read failed for %s\n", url);
+        tphp_warn("PHP Warning: http_get(): read failed for %s\n", url);
         return NULL;
     }
     return http_parse_response(vm, raw, raw_len, url, 1, port, extra_headers,
@@ -1076,7 +1076,7 @@ static TStr *http_parse_response(VM *vm, char *raw, size_t raw_len,
     const char *eol = memchr(raw, '\n', raw_len);
     if (!eol) {
         tm_free(raw);
-        fprintf(stderr, "PHP Warning: http_get(): malformed response from %s\n",
+        tphp_warn("PHP Warning: http_get(): malformed response from %s\n",
                 url);
         return NULL;
     }
@@ -1101,7 +1101,7 @@ static TStr *http_parse_response(VM *vm, char *raw, size_t raw_len,
             }
     if (!body) {
         tm_free(raw);
-        fprintf(stderr, "PHP Warning: http_get(): no body from %s\n", url);
+        tphp_warn("PHP Warning: http_get(): no body from %s\n", url);
         return NULL;
     }
     size_t hdrs_len = (size_t)(body - hdr_start) - sep;

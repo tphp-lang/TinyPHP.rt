@@ -1461,7 +1461,7 @@ static void cb_encode_ret(FFIType *t, void *ret, TVal r) {
             }
         }
         if (r.t == T_STR) { *(void **)ret = ((TStr *)r.u.p)->c; return; }
-        fprintf(stderr, "PHP Warning: FFI callback return: "
+        tphp_warn("PHP Warning: FFI callback return: "
                         "expected pointer-compatible value\n");
         return;
     case FFI_STRUCT:
@@ -1475,11 +1475,11 @@ static void cb_encode_ret(FFIType *t, void *ret, TVal r) {
                 }
             }
         }
-        fprintf(stderr, "PHP Warning: FFI callback return: "
+        tphp_warn("PHP Warning: FFI callback return: "
                         "struct return requires a same-size CData\n");
         return;
     default:
-        fprintf(stderr, "PHP Warning: FFI callback return: "
+        tphp_warn("PHP Warning: FFI callback return: "
                         "unsupported return type\n");
         return;
     }
@@ -1565,7 +1565,7 @@ static void cb_async_drain(uv_async_t *a) {
             cb_ctx_restore(vm);
         } else {
             /* 理论不可达：loop 能跑说明线程在 run 中（VM 恒在） */
-            fprintf(stderr, "PHP Warning: FFI callback: no VM on owning "
+            tphp_warn("PHP Warning: FFI callback: no VM on owning "
                             "thread\n");
         }
         uv_mutex_lock(&q->mu);
@@ -1633,7 +1633,7 @@ static void cb_post_and_wait(FFIClosure *fc, void *ret, void **args) {
     uv_mutex_lock(&q->mu);
     if (q->dead) {
         uv_mutex_unlock(&q->mu);
-        fprintf(stderr, "PHP Warning: FFI callback dropped: owning "
+        tphp_warn("PHP Warning: FFI callback dropped: owning "
                         "runtime is shutting down\n");
         return;
     }

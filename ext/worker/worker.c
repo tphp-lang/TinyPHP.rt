@@ -408,7 +408,7 @@ static void worker_thread(void *arg) {
     TClosure *clo = worker_unserialize_closure(h->prog, h->entry_blob,
                                                h->entry_len, &pos);
     if (!clo) {
-        fprintf(stderr, "PHP Warning: Worker: failed to rebuild entry\n");
+        tphp_warn("PHP Warning: Worker: failed to rebuild entry\n");
         atomic_store(&h->state, 2);
         wbox_close(&h->to_parent);
         return;
@@ -579,7 +579,7 @@ static TVal nm_worker_recv(VM *vm, void *self, TVal *args, int n) {
     TVal v;
     if (!tphp_unserialize_val(vm, data, len, &v)) {
         tm_free(data);
-        fprintf(stderr, "PHP Warning: Worker recv(): malformed message\n");
+        tphp_warn("PHP Warning: Worker recv(): malformed message\n");
         return TV_FALSE;
     }
     tm_free(data);
@@ -602,7 +602,7 @@ static TVal nm_worker_try_recv(VM *vm, void *self, TVal *args, int n) {
     TVal v;
     if (!tphp_unserialize_val(vm, data, len, &v)) {
         tm_free(data);
-        fprintf(stderr, "PHP Warning: Worker tryRecv(): malformed message\n");
+        tphp_warn("PHP Warning: Worker tryRecv(): malformed message\n");
         return TV_NULL;
     }
     tm_free(data);
@@ -621,7 +621,7 @@ static TVal nm_worker_on(VM *vm, void *self, TVal *args, int n) {
         h->on_message = args[1];
         tval_addref(h->on_message);
     } else {
-        fprintf(stderr, "PHP Warning: Worker::on(): event \"%s\" ignored\n",
+        tphp_warn("PHP Warning: Worker::on(): event \"%s\" ignored\n",
                 tstr_val((TStr *)args[0].u.p));
     }
     return TV_NULL;

@@ -71,6 +71,9 @@ typedef enum {
                           * 摘帧装入 Generator 对象写回调用方 dst，返回控制 */
     OP_YIELD,          /* 产出：t1=值，t2=键（可空），tr/ar=send 目标槽；
                         * 暂停帧（摘链不销毁），控制交回驱动方 */
+    OP_SUPPRESS_ON,    /* @expr 起：vm.x.silence++（warning 打印抑制——
+                        * 只压打印不改返回值、不吞 Error/Exception） */
+    OP_SUPPRESS_OFF,   /* @expr 讫：silence--（配对执行；unwind 兜底归 0） */
     OP_MAX,
 } Opcode;
 
@@ -228,6 +231,9 @@ typedef struct TExecCtx {
     struct { const char *fn; int line; } trace[64];
     int n_trace;
     TVal thunk_ret;        /* expression thunk result (per-coroutine) */
+    int silence;           /* @ 抑制深度（11-10 P1）：>0 时 tphp_warn 静默；
+                            * ON/OFF op 配对增减，unwind 入口归 0（异常路径
+                            * 天然不泄漏——@ 不吞 Error，raise 后抑制即结束） */
     jmp_buf unwind;        /* exception landing point (set per coroutine) */
     TExObj *exception;     /* exception currently unwinding */
     bool done;             /* current coroutine finished */
@@ -238,6 +244,12 @@ typedef struct TExecCtx {
 
 /* lazy allocation of the per-context heap arrays (vm.c) */
 void tphp_ctx_ensure(TExecCtx *x);
+
+/* @ 抑制消费面（vm.c）：当前线程执行流是否处于 @ 抑制中；tphp_warn =
+ * stderr 警告统一出口（silence>0 静默，fmt 原样保留 "PHP Warning: "
+ * 前缀——调用点文本零漂移）。 */
+bool tphp_silenced(void);
+void tphp_warn(const char *fmt, ...);
 
 struct VM {
     TExecCtx x;            /* execution state of the RUNNING coroutine */

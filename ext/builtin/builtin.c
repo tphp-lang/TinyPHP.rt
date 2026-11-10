@@ -212,7 +212,7 @@ static TVal bi_unserialize(VM *vm, TVal *args, int n) {
     TStr *s = (TStr *)args[0].u.p;
     TVal out;
     if (!tphp_unserialize_val(vm, tstr_val(s), s->len, &out)) {
-        fprintf(stderr, "PHP Warning: unserialize(): Error at offset 0\n");
+        tphp_warn("PHP Warning: unserialize(): Error at offset 0\n");
         return TV_FALSE;
     }
     return out;

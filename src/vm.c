@@ -4581,6 +4581,8 @@ static void frame_destroy(VMFrame *f) {
  * *escaped = true 返回——trampoline 据此发 warning；floor==NULL 保持原语义。 */
 static void vm_unwind_core(VM *vm, VMFrame *floor, bool *escaped) {
     TExObj *ex = vm->x.exception;
+    vm->x.silence = 0;   /* @ 抑制：异常路径归 0——raise 打断任何 @ 表达式
+                          * （PHP @ 不吞 Error），catch 后不得残留抑制 */
     const_eval_reset();           /* P2-B: unwind 中断的常量求值允许重试 */
     vm->x.n_trace = 0;
     /* B6: 跨帧归因修正——帧被弹出说明异常来自其 callee，而调用方 pc 已在
@@ -4991,6 +4993,14 @@ static int32_t op_require(VM *vm, TOp *op) {
 }
 
 /* ---- handler table ---- */
+/* @ 抑制（11-10 P1）：ON/OFF 配对增减 vm.x.silence；OFF 防负（unwind
+ * 归 0 后迟到的 OFF 不再压）。无操作数 op，pc 恒 +1。 */
+static int32_t op_suppress_on(VM *vm, TOp *op) { (void)op; vm->x.silence++; return 1; }
+static int32_t op_suppress_off(VM *vm, TOp *op) {
+    (void)op;
+    if (vm->x.silence > 0) vm->x.silence--;
+    return 1;
+}
 #define H(f) ((OpHandler)(f))
 
 const OpHandler tphp_op_handlers[OP_MAX] = {
@@ -5022,6 +5032,7 @@ const OpHandler tphp_op_handlers[OP_MAX] = {
     H(op_require),
     H(op_prophook),
     H(op_generator_create), H(op_yield),
+    H(op_suppress_on), H(op_suppress_off),
 };
 
 const char *tphp_op_name(uint8_t op) {
@@ -5054,6 +5065,7 @@ const char *tphp_op_name(uint8_t op) {
         "PROPHOOK",
         "GENERATOR_CREATE",
         "YIELD",
+        "SUPPRESS_ON", "SUPPRESS_OFF",
     };
     return op < OP_MAX ? names[op] : "?";
 }
@@ -5169,6 +5181,16 @@ void tphp_ctx_ensure(TExecCtx *x) {
  * valid; sched.c reaches it via tphp_vm_instance() */
 static _Thread_local VM g_vm;
 VM *tphp_vm_instance(void) { return &g_vm; }
+
+/* ---- @ 抑制（11-10 P1）消费面 ---- */
+bool tphp_silenced(void) { return g_vm.x.silence > 0; }
+void tphp_warn(const char *fmt, ...) {
+    if (g_vm.x.silence > 0) return;   /* @ 内只压打印：返回值/语义零影响 */
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 /* run the current coroutine's frames until done. Must be called on the
  * coroutine's own fiber (setjmp/longjmp never cross a fiber switch). */

@@ -88,7 +88,7 @@ TStreamCtx *tphp_stream_from_obj(VM *vm, TVal v, const char *who) {
 static bool stream_live(VM *vm, TStreamCtx *s, const char *who) {
     (void)vm;
     if (s->closed) {
-        fprintf(stderr, "PHP Warning: %s(): supplied resource is not a "
+        tphp_warn("PHP Warning: %s(): supplied resource is not a "
                         "valid stream resource\n", who);
         return false;
     }
@@ -98,7 +98,7 @@ static bool stream_live(VM *vm, TStreamCtx *s, const char *who) {
 /* ---- 警告 ---- */
 
 static void io_warn(const char *what, const char *detail) {
-    fprintf(stderr, "PHP Warning: %s: %s\n", what, detail);
+    tphp_warn("PHP Warning: %s: %s\n", what, detail);
 }
 
 /* ---- bundle 虚拟资产路径（ASSET_ROOT = "tphp://asset"）----
@@ -426,7 +426,7 @@ TVal tphp_io_fopen(VM *vm, TVal *args, int n) {
         void *data = NULL;
         size_t len = 0;
         if (!tphp_pack_read(rel, &data, &len)) {
-            fprintf(stderr, "PHP Warning: fopen(%s): failed to open stream: %s\n",
+            tphp_warn("PHP Warning: fopen(%s): failed to open stream: %s\n",
                     path, asset_err());
             return TV_FALSE;
         }

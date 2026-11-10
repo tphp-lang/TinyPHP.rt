@@ -1742,7 +1742,7 @@ static int pkg_install_core(const char *proj_dir, const char *source,
                 if (gh_latest_ref(g.owner, g.repo, latest, sizeof latest)) {
                     eff_ref = latest;
                 } else {
-                    fprintf(stderr, "PHP Warning: pkg: cannot resolve "
+                    tphp_warn("PHP Warning: pkg: cannot resolve "
                             "latest release for %s/%s, using default "
                             "branch\n", g.owner, g.repo);
                 }

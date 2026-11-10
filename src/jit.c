@@ -4816,6 +4816,32 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             pc++;
             break;
         }
+        case OP_SUPPRESS_ON:
+        case OP_SUPPRESS_OFF: {
+            /* @ 抑制（11-10）：直接写 vm.x.silence（load/add|sub/store 三
+             * IR，与 handler 语义逐条同构；OFF 防负走 clamp 菱形）。 */
+            JIT_CTX();
+            ir_ref sa = ir_ADD_A(j->r_vm,
+                ir_CONST_ADDR(offsetof(VM, x) + offsetof(TExecCtx, silence)));
+            ir_ref v = ir_LOAD_I32(sa);
+            ir_ref nv = (op->op == OP_SUPPRESS_ON)
+                ? ir_ADD_I32(v, ir_CONST_I32(1))
+                : ir_SUB_I32(v, ir_CONST_I32(1));
+            if (op->op == OP_SUPPRESS_ON) {
+                ir_STORE(sa, nv);
+            } else {
+                ir_ref ifn = ir_IF(ir_LT(nv, ir_CONST_I32(0)));
+                ir_IF_TRUE(ifn);
+                ir_STORE(sa, ir_CONST_I32(0));
+                ir_ref eA = ir_END();
+                ir_IF_FALSE(ifn);
+                ir_STORE(sa, nv);
+                ir_ref eB = ir_END();
+                ir_MERGE_2(eA, eB);
+            }
+            pc++;
+            break;
+        }
         case OP_UNSET_CV: {
             /* 解释器 op_unset_cv 同款：释放槽值 + 置 UNDEF（dtor defer 于
              * mem.c，release 不进用户码不 raise → 无需 deopt 门） */

@@ -1271,6 +1271,15 @@ static AExpr *parse_unary(Parser *p) {
         e->u.un.e = parse_unary(p);
         return e;
     }
+    case P_AT: {
+        /* @ 抑制运算符（11-10 P1：解析器原直接拒 = 真实代码 Parse error）。
+         * 与 ! 同级单目，@ @x 合法嵌套；compile 侧包 ON/OFF 双 op。 */
+        advance(p);
+        AExpr *e = ae_new(A_UNARY, line);
+        e->u.un.op = P_AT;
+        e->u.un.e = parse_unary(p);
+        return e;
+    }
     case P_INC:
     case P_DEC: {
         int op = p->tok.kind;

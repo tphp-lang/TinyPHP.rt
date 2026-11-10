@@ -85,6 +85,11 @@ struct TVal;
 struct TVal *tphp_slots_alloc(unsigned n);
 void tphp_slots_release(struct TVal *p, unsigned n);
 
+/* @ 抑制消费面（vm.c 定义）：当前线程执行流是否处于 @ 抑制中；
+ * tphp_warn = stderr 警告统一出口（silence>0 静默，fmt 原样零漂移）。 */
+bool tphp_silenced(void);
+void tphp_warn(const char *fmt, ...);
+
 #ifdef __cplusplus
 }
 #endif
