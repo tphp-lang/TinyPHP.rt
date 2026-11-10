@@ -2607,6 +2607,66 @@ static bool vm_call_magic_method(VM *vm, TOp *op, TObj *o, TMethod *m,
     }
     /* caller pc advancement is the invoking handler's job (returns 1) */
     vm->x.frame = f;
+#ifdef TPHP_JIT
+    /* 5B′（11-10 重开，原 5B/刀8 于 11-05 A/B 证伪、用户拍板撤回后复活）：
+     * magic 方法（dtor/__get 等）JIT 直入——镜像 op_do_fcall 协议（hot/
+     * eager 编译门 + 直槽 ABI + 成功后手动收尾），失败（未编译/参数 UNDEF
+     * 洞/deopt）落下方解释器 run-to-completion 循环原样。
+     * 重开依据：原证伪根因 = dtor 体 ASSIGN_PROP 走 helper 付 setjmp+双
+     * memcpy(~25ns) > 省下的 dispatch(~10ns)——prop v1.5 批2 的 CONST 名
+     * IR 内联快路（TPHP_PROP_INLINE）已消该根因；5B 自测"emit 内联特化
+     * 上限 −10~15ns/iter"的前提现已免费具备。A/B 复验为验收硬门。
+     * 开关：TPHP_MAGIC_JIT=0 关（同二进制 A/B=HEAD 行为，含不触发编译）。 */
+    static int magic_jit_gate = -1;
+    if (magic_jit_gate < 0) {
+        const char *e = getenv("TPHP_MAGIC_JIT");
+        magic_jit_gate = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    int jdone = 0;
+    if (magic_jit_gate && tphp_jit_available() && o && fn->is_method) {
+        if (!fn->jit_entry && fn->hot != UINT16_MAX) {
+            ++fn->hot;
+            if ((fn->n_ops <= tphp_jit_eager_max_ops() &&
+                 !tphp_jit_defer_ic(fn)) ||
+                fn->hot >= TPHP_JIT_HOT_THRESHOLD)
+                tphp_jit_compile(fn);
+        }
+        if (fn->jit_entry && f->n_args_sent >= fn->n_params) {
+            bool guard_ok = true;
+            TVal *jargs = &vm->x.args[base];
+            for (uint16_t i = 0; i < fn->n_params; i++) {
+                if (jargs[i].t == T_UNDEF) { guard_ok = false; break; }
+            }
+            if (guard_ok) {
+                /* 直槽 ABI：方法 $this@slot0（上方已填）、参数 1..（magic
+                 * 体 RECV 由 JIT prologue 跳过，实参在此拷入并 addref） */
+                for (uint16_t i = 0; i < fn->n_params; i++) {
+                    f->slots[1 + i] = jargs[i];
+                    tval_addref(jargs[i]);
+                }
+                TVal jret = { .u.i = 0, .t = T_NULL };
+                int jok = ((JitEntry)fn->jit_entry)(vm, f->slots, &jret);
+                if (jok) {
+                    for (uint16_t i = 0; i < fn->n_params; i++) {
+                        tval_release(&jargs[i]);
+                        jargs[i] = (TVal){ .u.i = 0, .t = T_UNDEF };
+                    }
+                    vm->x.n_args = (int)base;
+                    vm->x.n_calls--;          /* rec（is_thunk、无 dst）*/
+                    vm->x.thunk_ret = jret;   /* postamble 读点照旧 */
+                    VMFrame *jprev = f->prev;
+                    frame_destroy(f);
+                    vm->x.frame = jprev;
+                    if (!vm->x.frame) vm->x.done = true;
+                    jdone = 1;
+                }
+                /* jok==0 = deopt：帧/参数态原样保留，解释器循环从 pc0 接
+                 * （RECV 收尾实参与默认值语义），与 op_do_fcall 同协议 */
+            }
+        }
+    }
+    if (!jdone)
+#endif
     /* run to completion of this frame (handles nested throws via unwind) */
     while (vm->x.frame == f) {
         TOp *cop = &f->fn->ops[f->pc];
