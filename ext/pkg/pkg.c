@@ -2192,6 +2192,11 @@ int tphp_pkg_add(const char *proj_dir, const char *source, const char *ref,
         sc.pkg_dir = proj_dir;
         sc.project_dir = proj_dir;
         sc.is_root = 1;
+        /* TEMP CI diag (11-11): root pre 的输入态——CI linux/mac not-found
+         * 调查用，层1 定案后移除 */
+        fprintf(stderr, "[dbg-rootpre] n_scripts=%d enabled=%d proj=%s name=%s\n",
+                root_pre.n_scripts[SC_PRE_INSTALL], scripts_enabled(),
+                proj_dir, root_pre.name ? root_pre.name : "-");
         int prc = run_script_slot(&root_pre,
             is_upd ? SC_PRE_UPDATE : SC_PRE_INSTALL, &sc, err, errcap);
         if (prc != 0 && prc != 3) {

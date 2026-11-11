@@ -83,7 +83,8 @@ foreach ($dir in @("lang", "oop", "async", "worker", "jit", "lib", "pkg", "bench
                 if ($dumpExit -ne 0) {
                     $dumpOk = $false
                     Write-Host "  DIAG compile --dump-opcodes exit=$dumpExit"
-                    $dumpOut | Select-Object -First 10 | ForEach-Object { Write-Host "  D: $_" }
+                    # 11-11: 10 -> 30（截断曾吞掉 Fatal 消息/关键行）
+                    $dumpOut | Select-Object -First 30 | ForEach-Object { Write-Host "  D: $_" }
                 } else {
                     Write-Host "  DIAG compile OK (opcodes dumped); crash is at execute"
                 }
@@ -91,7 +92,9 @@ foreach ($dir in @("lang", "oop", "async", "worker", "jit", "lib", "pkg", "bench
                 $errOut = @(& $tphp run $_.FullName 2>&1 | ForEach-Object { "$_" })
                 if ($errOut) {
                     Write-Host "  DIAG run stderr/out:"
-                    $errOut | Select-Object -First 10 | ForEach-Object { Write-Host "  R: $_" }
+                    # 11-11: 10 -> 80 —— First 10 曾把 PHP Fatal error（自带
+                    # "on line N"，执行期失败的定位关键）截在第 11 行之外
+                    $errOut | Select-Object -First 80 | ForEach-Object { Write-Host "  R: $_" }
                 }
             }
         }
