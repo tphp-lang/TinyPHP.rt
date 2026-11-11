@@ -796,6 +796,45 @@ TVal tphp_io_rename(VM *vm, TVal *args, int n) {
     return TV_TRUE;
 }
 
+/* 逐层 mkdir（PHP mkdir(..., $recursive=true)；11-11 修复：第 3 此前被
+ * 忽略 → 父目录缺失时静默 false）。中间层已存在目录跳过、存在但非目录
+ * 报 EEXIST；最终层已存在 → EEXIST（与 PHP 返回 false + warning 一致）。
+ * 返回 0 或 uv 错误码。 */
+static int mkdir_p(const char *path, int mode) {
+    char buf[1024];
+    size_t len = strlen(path);
+    if (len == 0) return UV_EINVAL;
+    if (len >= sizeof buf) return UV_ENAMETOOLONG;
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *q = buf; *q; q++) if (*q == '\\') *q = '/';
+    while (len > 1 && buf[len - 1] == '/') buf[--len] = 0;
+    char *start = buf + 1;
+    if (len >= 2 && buf[1] == ':') start = buf + 2;   /* 跳过 Windows 盘符 */
+    FsOp op;
+    for (char *p = start; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        memset(&op, 0, sizeof op);
+        FS_DO(&op, uv_fs_stat, buf);
+        if (op.result >= 0) {                         /* 已存在：目录放行 */
+            *p = '/';
+            if (!S_ISDIR(op.stat_mode)) return UV_EEXIST;
+            continue;
+        }
+        memset(&op, 0, sizeof op);
+        FS_DO(&op, uv_fs_mkdir, buf, mode);
+        if (op.result < 0 && op.result != UV_EEXIST) {
+            int e = (int)op.result;
+            *p = '/';
+            return e;
+        }
+        *p = '/';
+    }
+    memset(&op, 0, sizeof op);
+    FS_DO(&op, uv_fs_mkdir, buf, mode);
+    return op.result < 0 ? (int)op.result : 0;
+}
+
 TVal tphp_io_mkdir(VM *vm, TVal *args, int n) {
     (void)n;
     const char *path = arg_str(vm, args, n, 0, "mkdir");
@@ -804,6 +843,14 @@ TVal tphp_io_mkdir(VM *vm, TVal *args, int n) {
         return TV_FALSE;
     }
     int mode = n >= 2 && args[1].t == T_INT ? (int)args[1].u.i : 0777;
+    if (n >= 3 && args[2].t == T_TRUE) {
+        int rc = mkdir_p(path, mode);
+        if (rc != 0) {
+            io_warn("mkdir()", uv_strerror(rc));
+            return TV_FALSE;
+        }
+        return TV_TRUE;
+    }
     FsOp op;
     memset(&op, 0, sizeof op);
     FS_DO(&op, uv_fs_mkdir, path, mode);

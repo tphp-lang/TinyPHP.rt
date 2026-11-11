@@ -585,9 +585,21 @@ static Loc compile_andor(Ctx *c, AExpr *e, Loc want, bool is_and) {
     return dst;
 }
 
-/* DIM read; silent=true yields null for missing keys / undefined bases */
+/* DIM read; silent=true yields null for missing keys / undefined bases.
+ * silent 时整条下标链递归静默（isset/empty/?? 对任意深度的缺失键都
+ * 不得 raise——PHP 语义。11-11 修复：此前只静默紧邻一层，内层 A_DIM
+ * 经 compile_expr 落成非静默 FETCH_DIM_R → ≥3 维 isset 中间键缺失
+ * 即 UndefinedError；未定义变量基的多层下标同理）。 */
 static Loc compile_dim_read(Ctx *c, AExpr *e, bool silent, Loc want) {
-    Loc base = compile_expr(c, e->u.dim.base, LOC_NONE);
+    Loc base;
+    if (silent && e->u.dim.base->tag == A_DIM) {
+        base = compile_dim_read(c, e->u.dim.base, true, LOC_NONE);
+    } else if (silent && e->u.dim.base->tag == A_VAR) {
+        base = compile_var_read_silent(c, e->u.dim.base->u.name,
+                                       e->u.dim.base->line);
+    } else {
+        base = compile_expr(c, e->u.dim.base, LOC_NONE);
+    }
     Loc idx = LOC_NONE;
     if (e->u.dim.idx)
         idx = compile_expr(c, e->u.dim.idx, LOC_NONE);
