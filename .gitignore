@@ -20,3 +20,6 @@
 .workbuddy-ai/
 .commandcode/
 .workbuddy/
+
+# ---- tcc ----
+tcc/

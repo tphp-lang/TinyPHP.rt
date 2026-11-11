@@ -49,18 +49,20 @@ rd /s /q build\obj                 # Windows
 **拆分（11-05）**：测试自动、打包手动，只保留三个工作流——
 
 - `.github/workflows/test.yml`：**自动**（push/PR）——build → tests/run.ps1 → pack smoke → smoke，**不导出产物**
-- `.github/workflows/build.yml`：**仅手动**（workflow_dispatch）——五平台 build → Sanity(`-v`) → 导出 artifact（binary + libtphp.a + include/），不重跑测试
+- `.github/workflows/build.yml`：**仅手动**（workflow_dispatch）——五平台 build → Sanity(`-v`) → 下载 [tccbin](https://github.com/tphp-lang/tccbin) 对应平台包到 `tcc/` → 导出 artifact（binary + libtphp.a + include/ + **tcc/**），不重跑测试
 - `.github/workflows/perf.yml`：**仅手动**——13 项 perf 套 + mimalloc 变体对照
 
-| Job | Runner | 构建 |
-|---|---|---|
-| windows-x86_64 | windows-latest + msys2 CLANG64 | build.cmd |
-| linux-x86_64 | ubuntu-latest | build.sh |
-| linux-aarch64 | ubuntu-24.04-arm | build.sh |
-| macos-aarch64 | macos-latest | build.sh |
-| macos-x86_64 | macos-latest 交叉 | `TARGET_ARCH=x86_64 build.sh` |
+| Job | Runner | 构建 | tccbin 包 |
+|---|---|---|---|
+| windows-x86_64 | windows-latest + msys2 CLANG64 | build.cmd | `tcc-win-x86_64` |
+| linux-x86_64 | ubuntu-latest | build.sh | `tcc-linux-x86_64` |
+| linux-aarch64 | ubuntu-24.04-arm | build.sh | `tcc-linux-aarch64` |
+| macos-aarch64 | macos-latest | build.sh | `tcc-macos-aarch64` |
+| macos-x86_64 | macos-latest 交叉 | `TARGET_ARCH=x86_64 build.sh` | `tcc-macos-x86_64`（按**目标**架构） |
 
-test.yml 每个 job：**build → tests/run.ps1 → pack smoke → smoke**；build.yml 每个 job：**build → Sanity → 上传 artifact**。
+tcc 版本钉在 `build.yml` 顶栏 `env.TCCBIN_VERSION`（当前 `v0.0.4`）；包为可重定位发行版（支持文件按二进制旁路解析），解压后跑 `tcc -v` 做存在性检查。`.gitignore` 已忽略 `tcc/`，本地解压不会误提交。
+
+test.yml 每个 job：**build → tests/run.ps1 → pack smoke → smoke**；build.yml 每个 job：**build → Sanity → Fetch tccbin → 上传 artifact**。
 
 ## ASAN 调试构建（手工，未入库）
 

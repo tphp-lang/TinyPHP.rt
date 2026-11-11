@@ -1,7 +1,8 @@
 name: Build
 
 # Manual packaging/export (workflow_dispatch only): builds all five
-# platforms and uploads artifacts (binary + libtphp.a + include/).
+# platforms and uploads artifacts (binary + libtphp.a + include/ + tcc/).
+# tcc comes from tphp-lang/tccbin releases (relocatable compiler pack).
 # Tests run automatically on push via test.yml — not repeated here.
 on:
   workflow_dispatch:
@@ -9,6 +10,11 @@ on:
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  # tphp-lang/tccbin release tag — bump here when packaging a new tccbin
+  TCCBIN_VERSION: v0.0.4
+  TCCBIN_BASE: https://github.com/tphp-lang/tccbin/releases/download
 
 jobs:
   # ---------- Windows x86_64 (msys2 clang64) ----------
@@ -35,6 +41,23 @@ jobs:
         shell: pwsh
         run: ./build/tphp.exe -v
 
+      - name: Fetch tccbin
+        shell: pwsh
+        run: |
+          $url = "$env:TCCBIN_BASE/$env:TCCBIN_VERSION/tcc-win-x86_64.zip"
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile tccbin.zip -UseBasicParsing
+          Expand-Archive -Path tccbin.zip -DestinationPath . -Force
+          Remove-Item tccbin.zip
+          if (-not (Test-Path tcc/tcc.exe)) {
+            # zip may be flat (files at root) — normalize into tcc/
+            New-Item -ItemType Directory -Force -Path tcc | Out-Null
+            Get-ChildItem -File | Where-Object { $_.Name -ne 'tcc' } |
+              ForEach-Object { Move-Item $_.FullName tcc/ -Force }
+          }
+          if (-not (Test-Path tcc/tcc.exe)) { throw "tcc.exe missing after extract" }
+          ./tcc/tcc.exe -v
+
       - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
@@ -43,6 +66,7 @@ jobs:
             build/tphp.exe
             build/libtphp.a
             build/include
+            tcc
           if-no-files-found: error
 
   # ---------- Linux x86_64 ----------
@@ -65,6 +89,22 @@ jobs:
       - name: Sanity
         run: ./build/tphp -v
 
+      - name: Fetch tccbin
+        run: |
+          set -euo pipefail
+          url="$TCCBIN_BASE/$TCCBIN_VERSION/tcc-linux-x86_64.zip"
+          echo "downloading $url"
+          curl -fsSL -o tccbin.zip "$url"
+          unzip -q tccbin.zip -d .
+          rm -f tccbin.zip
+          if [ ! -x tcc/tcc ] && [ ! -f tcc/tcc ]; then
+            mkdir -p tcc
+            # flat zip: move package files into tcc/
+            find . -maxdepth 1 -type f ! -name 'tccbin.zip' -exec mv {} tcc/ \; 2>/dev/null || true
+          fi
+          test -x tcc/tcc || test -f tcc/tcc
+          ./tcc/tcc -v
+
       - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
@@ -73,6 +113,7 @@ jobs:
             build/tphp
             build/libtphp.a
             build/include
+            tcc
           if-no-files-found: error
 
   # ---------- Linux aarch64 ----------
@@ -95,6 +136,21 @@ jobs:
       - name: Sanity
         run: ./build/tphp -v
 
+      - name: Fetch tccbin
+        run: |
+          set -euo pipefail
+          url="$TCCBIN_BASE/$TCCBIN_VERSION/tcc-linux-aarch64.zip"
+          echo "downloading $url"
+          curl -fsSL -o tccbin.zip "$url"
+          unzip -q tccbin.zip -d .
+          rm -f tccbin.zip
+          if [ ! -x tcc/tcc ] && [ ! -f tcc/tcc ]; then
+            mkdir -p tcc
+            find . -maxdepth 1 -type f ! -name 'tccbin.zip' -exec mv {} tcc/ \; 2>/dev/null || true
+          fi
+          test -x tcc/tcc || test -f tcc/tcc
+          ./tcc/tcc -v
+
       - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
@@ -103,6 +159,7 @@ jobs:
             build/tphp
             build/libtphp.a
             build/include
+            tcc
           if-no-files-found: error
 
   # ---------- macOS aarch64 (Apple Silicon, native) ----------
@@ -123,6 +180,21 @@ jobs:
       - name: Sanity
         run: ./build/tphp -v
 
+      - name: Fetch tccbin
+        run: |
+          set -euo pipefail
+          url="$TCCBIN_BASE/$TCCBIN_VERSION/tcc-macos-aarch64.zip"
+          echo "downloading $url"
+          curl -fsSL -o tccbin.zip "$url"
+          unzip -q tccbin.zip -d .
+          rm -f tccbin.zip
+          if [ ! -x tcc/tcc ] && [ ! -f tcc/tcc ]; then
+            mkdir -p tcc
+            find . -maxdepth 1 -type f ! -name 'tccbin.zip' -exec mv {} tcc/ \; 2>/dev/null || true
+          fi
+          test -x tcc/tcc || test -f tcc/tcc
+          ./tcc/tcc -v
+
       - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
@@ -131,6 +203,7 @@ jobs:
             build/tphp
             build/libtphp.a
             build/include
+            tcc
           if-no-files-found: error
 
   # ---------- macOS x86_64: cross-compile on arm64 runner ----------
@@ -156,6 +229,23 @@ jobs:
       - name: Sanity
         run: ./build/tphp -v
 
+      - name: Fetch tccbin
+        run: |
+          set -euo pipefail
+          # Package matches the *target* arch of this artifact (x86_64)
+          url="$TCCBIN_BASE/$TCCBIN_VERSION/tcc-macos-x86_64.zip"
+          echo "downloading $url"
+          curl -fsSL -o tccbin.zip "$url"
+          unzip -q tccbin.zip -d .
+          rm -f tccbin.zip
+          if [ ! -x tcc/tcc ] && [ ! -f tcc/tcc ]; then
+            mkdir -p tcc
+            find . -maxdepth 1 -type f ! -name 'tccbin.zip' -exec mv {} tcc/ \; 2>/dev/null || true
+          fi
+          test -x tcc/tcc || test -f tcc/tcc
+          # Host is arm64; x86_64 tcc may need Rosetta — only check file exists
+          file tcc/tcc || true
+
       - name: Export artifact
         uses: actions/upload-artifact@v4
         with:
@@ -164,4 +254,5 @@ jobs:
             build/tphp
             build/libtphp.a
             build/include
+            tcc
           if-no-files-found: error
