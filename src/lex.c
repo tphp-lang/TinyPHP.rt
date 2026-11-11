@@ -451,6 +451,36 @@ static Token lex_number(Lex *lx) {
             return t;
         }
     }
+    /* legacy octal（PHP 纪律逐字，11-11 CI pkg-scripts 根因）：`0`+digit →
+     * 八进制（0777=511）；数字位遇 8/9 = php 8.5 实测 "Invalid numeric
+     * literal" Parse error（08/09/0778 同案）；`0` 后非数字（0/0.5/0e1）
+     * 照 decimal/float 原路。带 `_` 分隔与 overflow→float 同 0x 分支。 */
+    if (p[0] == '0' && p + 1 < lx->end &&
+        (is_digit((unsigned char)p[1]) || p[1] == '_')) {
+        const char *q = p + 1;
+        char buf[256]; size_t n = 0;
+        buf[n++] = '0';
+        while (q < lx->end && (is_digit((unsigned char)*q) || *q == '_')) {
+            if (*q == '_') { q++; continue; }          /* digit separator */
+            if (*q > '7') lex_error(lx, "Invalid numeric literal");
+            if (n < sizeof buf - 1) buf[n++] = *q;
+            q++;
+        }
+        lx->pos = q;
+        buf[n] = 0;
+        errno = 0;
+        long long v = strtoll(buf, NULL, 8);           /* 纯 0-7，无尾残 */
+        if (errno == ERANGE) {                          /* overflow -> float */
+            double dv = 0;
+            for (size_t k = 0; k < n; k++) dv = dv * 8 + (double)(buf[k] - '0');
+            Token t = tok_simple(L_FLOAT, line);
+            t.d = dv;
+            return t;
+        }
+        Token t = tok_simple(L_INT, line);
+        t.i = (int64_t)v;
+        return t;
+    }
     /* decimal / float */
     const char *start = p;
     while (p < lx->end && (is_digit((unsigned char)*p) || *p == '_')) p++;
