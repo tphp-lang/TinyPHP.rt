@@ -92,10 +92,12 @@ static void print_usage(FILE *out) {
         "  tphp phpc <dir> -o <out.c>      pack lib\\*.php into bundle_data.c\n"
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
-        "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
+        "  tphp new <name> [--lib|--ext] [--force]   scaffold app/lib/ext package\n"
         "  tphp add <source> [ref]         add dependency (GitHub repo URL[:ref] / zip URL / path)\n"
         "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
         "  tphp install [--force]          restore deps from mod.lock (or mod.json)\n"
+        "  tphp ext --add [source [ref]]   add C ext (no source = sync ext[])\n"
+        "          --remove <n> / --update [n] / --list / --relink\n"
         "  --ignore-scripts                skip mod.json lifecycle scripts (add/remove/install)\n"
         "  tphp upload                     print package publishing instructions\n"
         "  tphp -v, --version              print version\n",
@@ -779,16 +781,33 @@ int main(int argc, char **argv) {
             return run_phpc(dir, outp);
         }
         if (strcmp(a, "new") == 0) {
-            /* tphp new <name> [--lib]：应用骨架 / 库包骨架 */
-            bool lib = false;
+            /* tphp new <name> [--lib|--ext] [--force]：应用/库包/ext 脚手架 */
+            bool lib = false, ext = false, force = false;
             const char *name = NULL;
             for (int j = i + 1; j < argc; j++) {
                 if (strcmp(argv[j], "--lib") == 0) lib = true;
+                else if (strcmp(argv[j], "--ext") == 0) ext = true;
+                else if (strcmp(argv[j], "--force") == 0) force = true;
                 else if (!name) name = argv[j];
             }
             if (!name) {
                 fprintf(stderr, "tphp: new requires a package name\n");
                 return (int)TPHP_E_ARGS;
+            }
+            if (ext && lib) {
+                fprintf(stderr, "tphp: --ext and --lib are mutually exclusive\n");
+                return (int)TPHP_E_ARGS;
+            }
+            char err[512] = "";
+            if (ext) {
+                /* ext 脚手架 → <tphp_root>/ext/<name>/（§2.3，不写项目清单） */
+                int rc = tphp_pkg_new_ext(name, force, err, sizeof err);
+                if (rc != 0) {
+                    fprintf(stderr, "tphp: %s\n", err);
+                    return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+                }
+                printf("Created ext scaffold \"%s\" under <tphp_root>/ext/\n", name);
+                return (int)TPHP_OK;
             }
             /* 目标目录：应用 = 名字本身；库包 = 最后一段（foo/bar → bar） */
             char dir[512];
@@ -798,7 +817,6 @@ int main(int argc, char **argv) {
             } else {
                 snprintf(dir, sizeof dir, "%s", name);
             }
-            char err[512] = "";
             int rc = tphp_pkg_new(dir, name, lib, err, sizeof err);
             if (rc != 0) {
                 fprintf(stderr, "tphp: %s\n", err);
@@ -857,6 +875,72 @@ int main(int argc, char **argv) {
                 return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
             }
             printf("Installed dependencies\n");
+            return (int)TPHP_OK;
+        }
+        if (strcmp(a, "ext") == 0) {
+            /* tphp ext --add [source [ref]] | --remove <name> |
+             *     --update [name] | --list | --relink（PLAN/ext-packages.md §4）
+             * --add 无 source = 按项目 ext[] 补齐（sync）；cwd 有 mod.json
+             * = 项目模式（写回 ext[]），否则只装 */
+            const char *mode = NULL;
+            const char *pos[2];
+            int npos = 0;
+            for (int j = i + 1; j < argc; j++) {
+                const char *s = argv[j];
+                if (strcmp(s, "--add") == 0 || strcmp(s, "--remove") == 0 ||
+                    strcmp(s, "--update") == 0 || strcmp(s, "--list") == 0 ||
+                    strcmp(s, "--relink") == 0) {
+                    mode = s;
+                } else if (npos < 2) {
+                    pos[npos++] = s;
+                }
+            }
+            if (!mode) {
+                fprintf(stderr,
+                        "tphp: ext requires an option: --add [source [ref]] | "
+                        "--remove <name> | --update [name] | --list | --relink\n");
+                return (int)TPHP_E_ARGS;
+            }
+            if ((strcmp(mode, "--remove") == 0 && npos < 1) ||
+                (npos > 1 && strcmp(mode, "--update") != 0 &&
+                            strcmp(mode, "--add") != 0)) {
+                fprintf(stderr, "tphp: ext %s: wrong number of arguments\n", mode);
+                return (int)TPHP_E_ARGS;
+            }
+            char err[512] = "";
+            char *out = NULL;
+            int rc;
+            if (strcmp(mode, "--add") == 0) {
+                rc = (npos == 0)
+                     ? tphp_pkg_ext_sync(".", &out, err, sizeof err)
+                     : tphp_pkg_ext_add(".", pos[0], npos > 1 ? pos[1] : NULL,
+                                        err, sizeof err);
+            } else if (strcmp(mode, "--remove") == 0) {
+                rc = tphp_pkg_ext_remove(".", pos[0], err, sizeof err);
+            } else if (strcmp(mode, "--update") == 0) {
+                rc = tphp_pkg_ext_update(".", npos > 0 ? pos[0] : NULL, &out,
+                                         err, sizeof err);
+            } else if (strcmp(mode, "--list") == 0) {
+                rc = tphp_pkg_ext_list(".", &out, err, sizeof err);
+            } else {
+                rc = tphp_pkg_ext_relink(err, sizeof err);
+            }
+            if (rc != 0) {
+                tphp_pkg_free(out);
+                fprintf(stderr, "tphp: %s\n",
+                        err[0] ? err : "ext command failed");
+                return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
+            }
+            if (out) {
+                if (out[0]) fputs(out, stdout);
+                else if (strcmp(mode, "--list") != 0)
+                    printf("No ext[] declared\n");
+                tphp_pkg_free(out);
+            } else if (strcmp(mode, "--add") == 0 && npos > 0) {
+                printf("Installed ext from %s\n", pos[0]);
+            } else if (strcmp(mode, "--remove") == 0) {
+                printf("Removed ext %s\n", pos[0]);
+            }
             return (int)TPHP_OK;
         }
         if (strcmp(a, "upload") == 0) {

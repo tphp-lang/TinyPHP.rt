@@ -71,17 +71,6 @@ $add_ok = true;
 try { pkg_add($app, $src); }
 catch (Throwable $e) { echo "add-ex: ", $e->getMessage(), "\n"; $add_ok = false; }
 if ($add_ok) echo "add-ok\n";
-if (!$add_ok) {
-    // CI-only 探针（11-11 二轮）：exit=0 时 run.ps1 不触发 DIAG、stderr 全被
-    // 2>$null 吞——stdout 失败路径才可见（成功轮不输出、不进 EXPECT）。
-    // 定位 preInstall "script not found" 时 fixture 的实际创建态。
-    echo "PROBE app=", (file_exists($app) ? "y" : "n"),
-        " scriptsdir=", (file_exists($app . "/scripts") ? "y" : "n"),
-        " rootphp=", (file_exists($app . "/scripts/root.php") ? "y" : "n"),
-        " modjson=", (file_exists($app . "/mod.json") ? "y" : "n"),
-        " src=", (file_exists($src) ? "y" : "n"),
-        " srcpre=", (file_exists($src . "/scripts/pre.php") ? "y" : "n"), "\n";
-}
 
 $pre = @file_get_contents($app . "/vendor/demo/ps/pre.txt");
 $post = @file_get_contents($app . "/vendor/demo/ps/post.txt");

@@ -7,6 +7,7 @@
 ```bash
 tphp new <name>              # 创建应用项目（main.php + mod.json）
 tphp new --lib <name>        # 创建库包（src/ + tests/ + autoload）
+tphp new <name> --ext        # 创建 C 扩展脚手架 → <tphp_root>/ext/<name>/（双段名）
 
 tphp add <source> [ref]      # 添加依赖；source 为 GitHub 仓库 URL / zip URL / 路径
 tphp remove <name>           # 移除依赖（如 foo/bar）
@@ -15,6 +16,10 @@ tphp upload                  # 打印发布指引（占位，见下）
 ```
 
 所有命令在**项目根目录**（含 `mod.json` 的目录）执行。
+
+## C 扩展（ext）
+
+C 扩展与 PHP 包**完全分离**：源码落 `<tphp_root>/ext/<name>/`（与 tphp 二进制同级，不进 `vendor/`、不进 autoload），项目 `mod.json` 仅以 `ext[]` 数组声明 `{name,url,ref}`；扩展包自身 `type=ext` 且带编译契约 `ext{}`（sources/include/defines/cflags/libs/ldflags/os 分平台/tphp_abi/init）。**编译链入 + `tphp ext` 命令组 + lock 分栏尚在实现**（切片 4-8），权威规格与拍板决策见 [../PLAN/ext-packages.md](../PLAN/ext-packages.md)。
 
 ## 清单 `mod.json`
 

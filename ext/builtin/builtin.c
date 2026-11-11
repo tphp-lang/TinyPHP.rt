@@ -465,6 +465,74 @@ static TVal bi_pkg_install(VM *vm, TVal *args, int n) {
     return TV_TRUE;
 }
 
+/* pkg_ext_add(string $proj, string $source, string $ref = null): bool
+ * 项目模式写回 ext[]，非项目只装（PLAN/ext-packages.md §4.1） */
+static TVal bi_pkg_ext_add(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_ext_add() expects (string $proj, string $source, string $ref = \"\")");
+    if (n >= 3 && args[2].t != T_STR && args[2].t != T_NULL)
+        RAISE(vm, "TypeError", "pkg_ext_add(): Argument #3 ($ref) must be string or null");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    const char *source = tstr_val((TStr *)args[1].u.p);
+    const char *ref = (n >= 3 && args[2].t == T_STR) ? tstr_val((TStr *)args[2].u.p) : NULL;
+    char err[512] = "";
+    int rc = tphp_pkg_ext_add(proj, source, ref, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_add(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_add(): %s", err);
+    return TV_TRUE;
+}
+
+/* pkg_ext_sync(string $proj): string — 按 ext[] 补齐，返回逐项结果摘要 */
+static TVal bi_pkg_ext_sync(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "ArgumentCountError", "pkg_ext_sync() expects (string $proj)");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    char err[512] = "", *sum = NULL;
+    int rc = tphp_pkg_ext_sync(proj, &sum, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_sync(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_sync(): %s", err);
+    TVal out = TV_STR(tstr_new(sum ? sum : "", strlen(sum ? sum : "")));
+    tphp_pkg_free(sum);
+    return out;
+}
+
+/* pkg_ext_remove(string $proj, string $name): bool — 删目录 + ext[] 移除 */
+static TVal bi_pkg_ext_remove(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_ext_remove() expects (string $proj, string $name)");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    const char *name = tstr_val((TStr *)args[1].u.p);
+    char err[512] = "";
+    int rc = tphp_pkg_ext_remove(proj, name, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_remove(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_remove(): %s", err);
+    return TV_TRUE;
+}
+
+/* pkg_ext_list(string $proj): string — 三列对照表（表头 + 行） */
+static TVal bi_pkg_ext_list(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "ArgumentCountError", "pkg_ext_list() expects (string $proj)");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    char err[512] = "", *tab = NULL;
+    int rc = tphp_pkg_ext_list(proj, &tab, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_list(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_list(): %s", err);
+    TVal out = TV_STR(tstr_new(tab ? tab : "", strlen(tab ? tab : "")));
+    tphp_pkg_free(tab);
+    return out;
+}
+
 /* ---- autoload / class inspection ---- */
 static TVal bi_spl_autoload_register(VM *vm, TVal *args, int n) {
     (void)vm;
@@ -3296,6 +3364,10 @@ const Builtin tphp_builtins[] = {
     { "pkg_add", bi_pkg_add },
     { "pkg_remove", bi_pkg_remove },
     { "pkg_install", bi_pkg_install },
+    { "pkg_ext_add", bi_pkg_ext_add },
+    { "pkg_ext_sync", bi_pkg_ext_sync },
+    { "pkg_ext_remove", bi_pkg_ext_remove },
+    { "pkg_ext_list", bi_pkg_ext_list },
     { "getenv", bi_getenv },
     { "putenv", bi_putenv },
     /* 正则（ext/pcre；PLAN/preg.md） */

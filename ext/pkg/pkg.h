@@ -23,6 +23,39 @@ bool tphp_pkg_valid_name(const char *name, bool is_lib, const char **why);
 int tphp_pkg_new(const char *dir, const char *name, bool is_lib,
                  char *err, size_t errcap);
 
+/* ---- ext C 扩展（PLAN/ext-packages.md §2.3 脚手架） ---- */
+/* <tphp_root> = tphp 可执行文件所在目录（g_self_exe dirname）；
+ * 无法定位（self exe 未设）返回 false。 */
+bool tphp_pkg_ext_root(char *buf, size_t cap);
+/* tphp new <name> --ext：脚手架 → <tphp_root>/ext/<name>/（mod.json 契约 +
+ * src/<pkg>.c + include/<pkg>.h，不写任何项目清单）。name 双段 vendor/pkg。
+ * force：目标已存在时覆盖脚手架。0 成功；1 名字非法；2 IO。 */
+int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap);
+
+/* ---- ext 命令组（PLAN/ext-packages.md §4）----
+ * 落点 <tphp_root>/ext/<name>；proj_dir 有 mod.json 且非 type=ext = 项目
+ * 模式（写回 ext[]），否则只装。rc：0 成功；1 参数/校验；2 IO/清单。
+ * --add <source> [ref]：物化 + 校验（type=ext / 双段名 / 覆盖三查）。 */
+int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
+                     char *err, size_t errcap);
+/* 无 source = 按项目 ext[] 补齐缺失（§4.2 sync）。out_summary 可 NULL；
+ * 非 NULL 收逐项结果（tphp_pkg_free 释放）。 */
+int tphp_pkg_ext_sync(const char *proj_dir, char **out_summary,
+                      char *err, size_t errcap);
+/* --update [name]：按 url/ref 重下（name 省略 = 全部；需项目 ext[]）。 */
+int tphp_pkg_ext_update(const char *proj_dir, const char *name,
+                        char **out_summary, char *err, size_t errcap);
+/* --remove <name>：删目录 + 项目 ext[] 移除（先校验 mod.json name 对账）。 */
+int tphp_pkg_ext_remove(const char *proj_dir, const char *name,
+                        char *err, size_t errcap);
+/* --list：表头 + 每行 name/source/built-in/project（调用方负责打印）。 */
+int tphp_pkg_ext_list(const char *proj_dir, char **out,
+                      char *err, size_t errcap);
+/* --relink：全量重链（§5 编译管线未实现时返回 2）。 */
+int tphp_pkg_ext_relink(char *err, size_t errcap);
+/* 释放本模块返回的可变缓冲（list / summary）。 */
+void tphp_pkg_free(void *p);
+
 /* 重新生成 proj_dir/vendor/autoload.php（根项目 + vendor 下各包清单合并） */
 int tphp_pkg_gen_autoload(const char *proj_dir, char *err, size_t errcap);
 
