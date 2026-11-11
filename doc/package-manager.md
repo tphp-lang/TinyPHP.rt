@@ -47,8 +47,24 @@ tphp upload                  # 打印发布指引（占位，见下）
 | `autoload.psr-4` | 命名空间前缀 → 目录，可多条 |
 | `autoload.files` | 加载 autoload 时无条件 require 的文件（函数库等） |
 | `deps` | 依赖：`url` 可为 GitHub 仓库 URL（支持 `:ref` 后缀）、http(s) zip URL 或相对/绝对路径；`ref` = 显式指定或解析固化的版本 |
+| `scripts` | 可选生命周期钩子：`preInstall` / `postInstall` / `preUpdate` / `postUpdate` / `preRemove` / `postRemove`（string 或 string[]；`.php` 用 tphp 执行）。详见 [../PLAN/pkg-manager.md §2.1.1](../PLAN/pkg-manager.md) |
 
 **无 `main` 字段**：应用入口由命令行指定（`tphp run main.php`）。
+
+### 生命周期脚本示例
+
+```json
+"scripts": {
+  "postInstall": "scripts/post-install.php",
+  "preRemove": "scripts/pre-remove.php"
+}
+```
+
+- 子进程 cwd = 包根（根项目钩子 = 项目根）
+- 环境变量：`TPHP_PKG_ACTION`、`TPHP_PKG_PHASE`、`TPHP_PKG_NAME`、`TPHP_PKG_DIR`、`TPHP_PROJECT_DIR`、`TPHP_PKG_ROOT` 等（脚本内 `getenv()`）
+- `pre*` 失败中止操作；`post*` 失败警告且命令非 0 退出、不回滚
+- 跳过：`tphp add|remove|install --ignore-scripts` 或 `TPHP_PKG_SCRIPTS=0`
+- 非 `.php` 条目默认拒绝，需 `TPHP_PKG_SCRIPTS_SHELL=1`
 
 ## 目录布局
 

@@ -366,6 +366,33 @@ static TVal bi_defined(VM *vm, TVal *args, int n) {
 }
 
 /* ---- package manager (pkg.c; CLI 同一核心，测试/脚本化缝) ---- */
+
+/* getenv(string $name): string|false — 包钩子与通用脚本读环境 */
+static TVal bi_getenv(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "TypeError", "getenv(): expects string $name");
+    const char *k = tstr_val((TStr *)args[0].u.p);
+    const char *v = getenv(k);
+    if (!v) return TV_FALSE;
+    return TV_STR(tstr_new(v, strlen(v)));
+}
+
+/* putenv(string $kv): bool — "NAME=value"；无 = 时删除（PHP 语义简化） */
+static TVal bi_putenv(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "TypeError", "putenv(): expects string $entry");
+    const char *kv = tstr_val((TStr *)args[0].u.p);
+#ifdef _WIN32
+    if (putenv((char *)kv) != 0) return TV_FALSE;
+#else
+    char *copy = strdup(kv);
+    if (!copy) return TV_FALSE;
+    if (putenv(copy) != 0) { free(copy); return TV_FALSE; }
+    /* leak-by-design: putenv may retain pointer (POSIX) */
+#endif
+    return TV_TRUE;
+}
+
 static TVal bi_pkg_new(VM *vm, TVal *args, int n) {
     if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
         RAISE(vm, "ArgumentCountError",
@@ -3269,6 +3296,8 @@ const Builtin tphp_builtins[] = {
     { "pkg_add", bi_pkg_add },
     { "pkg_remove", bi_pkg_remove },
     { "pkg_install", bi_pkg_install },
+    { "getenv", bi_getenv },
+    { "putenv", bi_putenv },
     /* 正则（ext/pcre；PLAN/preg.md） */
     { "preg_match", bi_preg_match },
     { "preg_match_all", bi_preg_match_all },

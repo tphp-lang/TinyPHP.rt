@@ -17,7 +17,7 @@
 ## 硬性目标
 
 1. **无感异步**：无色模型——同步写法透明挂起/恢复（像 JS 的并发体验，无需 async/await 着色）
-2. **真线程**：Worker 模型——独立 VM 实例 + 堆隔离 + Channel 消息传递（像 C 的多核能力，无共享内存陷阱）
+2. **真线程**：`Tphp\Thread`——独立 VM 实例 + 堆隔离（像 C 的多核能力，无共享内存陷阱）
 3. **单二进制发布**：stdlib 用 PHP 自写、发布构建期由 phpc 工具打包为自有 opcode 的 C 数组编入 exe（txiki.js 模式）
 4. **PHP 8 语法完整版**：过程式 + 完整 OOP，用户可见语义对齐 PHP 8.x
 
@@ -35,14 +35,14 @@
 | HTTPS/TLS | vendor mbedtls + `cacert.pem` 根证书内嵌 exe（M4；libuv 无 TLS，txiki cacert.c 同款） |
 | 分配器 | mimalloc vendor 垫在 malloc 层（Linux/Windows 默认开；**macOS 默认 libc**——P0-19 簇1 mimalloc Darwin 小分配慢 2.2-3.2×，11-04 拍板确认，`USE_MIMALLOC=1` 可切回；与 ASAN 构建互斥，txiki 先例） |
 | 语义对拍 | 从 php-src `Zend/tests` 抽 .phpt 子集做对拍测试层（见 PLAN/04 §2） |
-| FFI | libffi vendor 进 deps（静态 .a + 头文件）；M5.5 已完成（含 dlopen/wchar/union/enum 常量） |
+| FFI | **已移除（2026-11-10）**；deps/libffi 仍在树中但不再链接 |
 
 ## 计划文档导航
 
 | 文件 | 内容 |
 |---|---|
 | [PLAN/01-syntax-spec.md](PLAN/01-syntax-spec.md) | 语法兼容到什么程度：逐层 ✅/❌ 清单、不支持清单、行为差异、**验收代码示例**（M3 结束全跑通） |
-| [PLAN/02-runtime-features.md](PLAN/02-runtime-features.md) | 运行时功能有哪些：透明异步 I/O 覆盖表、Async\ 完整 API、Worker 线程 API、stdlib 三层清单、CLI、**功能验收代码示例** |
+| [PLAN/02-runtime-features.md](PLAN/02-runtime-features.md) | 运行时功能有哪些：透明异步 I/O 覆盖表、Async\ 完整 API、Thread 线程池 API、stdlib 三层清单、CLI、**功能验收代码示例** |
 | [PLAN/03-architecture.md](PLAN/03-architecture.md) | 实现架构：目录结构、核心数据结构、opcode 64 个、异步/线程/打包的 VM 层落地、构建脚本 |
 | [PLAN/04-milestones-testing.md](PLAN/04-milestones-testing.md) | 里程碑 M0~M6（每阶段绑定语法+功能范围与验收标准）、测试策略、风险与规避 |
 | [PLAN/05-extension-guide.md](PLAN/05-extension-guide.md) | **贡献者规范**：内置扩展（builtin/内部类）开发模式、核心约定红线、错误处理与安全标准、工作流与上线检查清单 |
@@ -62,7 +62,7 @@
 - C11 + clang（MinGW64/ucrt64 或 clang64），目标 Windows/Linux/macOS
 - 构建纯命令行脚本（不用 Make/CMake），`.cmd`/`.sh` 纯 ASCII
 - CI：GitHub Actions，三个工作流——**自动** `test.yml`（push/PR：五平台 build + tests/run.ps1 + smoke，不导出产物）、**手动** `build.yml`（workflow_dispatch：五平台 build + 导出 binary/libtphp.a/include，不重跑测试）、**手动** `perf.yml`（13 项 perf 套 + mimalloc 对照）；平台 = Windows x86_64（msys2 clang64）、Linux x86_64/aarch64、macOS x86_64/arm64
-- vendored：libuv（I/O）、mimalloc（malloc 层）、mbedtls + cacert（HTTPS，M4）、fcontext 汇编（抄 php-src `Zend/asm/` 6 个 .S）、libffi（M5.5 FFI，静态库+头文件）
+- vendored：libuv（I/O）、mimalloc（malloc 层）、mbedtls + cacert（HTTPS，M4）、fcontext 汇编（抄 php-src `Zend/asm/` 6 个 .S）；libffi 已停用（FFI 已移除，deps/libffi 仅存档）
 - 仓库：`C:\project\tphp\TinyPHP.rt`，CLI 名 `tphp`
 
 ## 参考项目

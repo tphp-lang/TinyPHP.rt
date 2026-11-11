@@ -921,7 +921,7 @@ static uint8_t *g_bundle;         /* zip 常驻（Win=资源映射不拥有 / Un
 static size_t g_bundle_len;
 static mz_zip_archive g_rd;       /* 读侧；startup 内 eager 初始化，读取加锁 */
 static bool g_rd_ready;
-static char g_dll_root[1024];     /* DLL 提取根（UTF-8 绝对路径）；空 = 无/未提取 */
+static char g_dll_root[1024];     /* reserved: DLL extract root (unused after FFI removal) */
 
 static atomic_flag g_bundle_lock = ATOMIC_FLAG_INIT;
 
@@ -943,10 +943,6 @@ static void norm_rel(const char *rel, char *out, size_t cap) {
 
 bool tphp_pack_has_bundle(void) {
     return g_bundle != NULL;
-}
-
-const char *tphp_pack_dll_root(void) {
-    return g_dll_root[0] ? g_dll_root : NULL;
 }
 
 /* Source root recorded at build time (T12). Lazily read from the __source_root
@@ -1245,7 +1241,8 @@ static bool write_file_atomic(const char *dest, const void *data, size_t len) {
 
 /* 按 manifest 提取 DLL 到 exe 同级等效路径（<exedir>/<relpath>）。
  * 目标已存在且 sha1 与清单一致 → 跳过；否则校验 zip 侧 sha1 后原子写入。
- * 全部就绪才置 g_dll_root=exe 目录（FFI 据此拼等效绝对路径）。 */
+ * 依赖走应用目录默认搜索路径（无 FFI 后无 PHP 侧 loader，仍服务
+ * --with 原生库随包分发）。 */
 static void bundle_extract_dlls(void) {
     void *mf = NULL;
     size_t mfl = 0;

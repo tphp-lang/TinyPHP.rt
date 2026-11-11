@@ -31,7 +31,7 @@
 
 ### 3.1 Generator 对象（内部类）
 
-字段（存对象槽或注册表，同 FFI/Closure 模式）：
+字段（存对象槽或注册表，同 Closure 模式）：
 
 ```
 frame   VMFrame*        —— 挂起的帧（NULL=已关闭）
@@ -107,4 +107,4 @@ v2：`throw($e)`（暂停点注入异常）、一般 Traversable 的 foreach。
 
 - php-src 8.5.7：`zend_generators.c/.h`、`zend_compile.c`（zend_compile_yield / mark_function_as_generator / GENERATOR_CREATE 插入）、`zend_vm_def.h`（YIELD:8394 / GENERATOR_CREATE:4649 / GENERATOR_RETURN:4727）
 - 语义细节速查：2026-10-23 会话日志「深挖 PHP 生成器语义全集」
-- tphp 侧锚点：DO_FCALL 建帧（vm.c）、nested run deep（autoload/thunk 先例）、内部类注册（Closure/Worker 模式）、FE_RESET/FE_FETCH（vm.c:835）
+- tphp 侧锚点：DO_FCALL 建帧（vm.c）、nested run deep（autoload/thunk 先例）、内部类注册（Closure/Thread 模式）、FE_RESET/FE_FETCH（vm.c:835）

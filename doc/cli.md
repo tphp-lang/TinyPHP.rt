@@ -78,10 +78,10 @@ tphp build app.php --with vendor/ --with bar.dll -o app
   `scandir` 均支持
 - **`.dll` / `.so` / `.dylib` 按等效相对路径落盘到 exe 同级**：manifest `type=dll`
   条目提取为 `<exedir>/<包内相对路径>`（如 exe 旁 `vendor/foo.dll`）；磁盘已存在且
-  sha1 与清单一致则跳过，否则校验后原子写入。FFI 里直接用包内相对路径即可加载：
+  sha1 与清单一致则跳过，否则校验后原子写入。原生库随包分发时由应用侧
+  自行加载（运行时无 FFI）：
   ```php
-  $ffi = FFI::cdef("int point_sum(int,int);", "ext/foo.dll");
-  ```
+    ```
 - 防护：zip-slip（拒绝 `..`/绝对路径/盘符）；DLL 提取前 sha1 校验
 
 | 平台 | 嵌入方式 |

@@ -8,7 +8,7 @@
 
 **v1 范围**（M1）：
 - 函数级编译，无 OSR（只 JIT 从入口进入的调用；循环型函数下次整函数调用即走 native，够用）
-- **封闭类型世界**：函数体只允许 int/float/bool/null 域值（见 §5 资格判定）——无 string/array/object/闭包/异常/生成器/FFI
+- **封闭类型世界**：函数体只允许 int/float/bool/null 域值（见 §5 资格判定）——无 string/array/object/闭包/异常/生成器
 - 调用：仅静态解析的、同样通过资格判定的用户函数（fib 式递归/互递归）
 - **首发平台**：Windows/Linux/macOS **x86_64 + aarch64**（IR 双后端，emit 头已预生成入库：`ir_emit_x86.h` / `ir_emit_aarch64.h`）
 
@@ -62,7 +62,7 @@ typedef int (*JitEntry)(VM *vm, TVal *slots, TVal *ret);
 1. **opcode 白名单**（§6 列表外任一 op → 不合格）
 2. **lit 限定**：被引用的 `lits[]` 条目类型 ∈ {int,float,bool,null}（CONST 进入封闭世界的唯一外部源）
 3. **无异常表**（`n_ex == 0`）且非 generator/closure/method/main/variadic/is_global 槽
-4. **DIV/MOD 限制**：出现即要求除数为编译期常量且非零（否则可能 raise，JIT 帧上 longjmp 与 FFI 回调同类问题 → 不合格）
+4. **DIV/MOD 限制**：出现即要求除数为编译期常量且非零（否则可能 raise，JIT 帧上 longjmp 跨 C 栈问题 → 不合格）
 5. `n_params ≤ 8`（prologue guard 展开上限；后续可放宽）
 6. 非递归限定放开——允许任意调用白名单内函数（含自身/互递归）；调用目标在 INIT_FCALL 的 ic 已解析为用户 TFunc 且该 TFunc 也合格（惰性：被调方未合格则本函数也不编译）
 
@@ -126,7 +126,7 @@ void tphp_jit_cmp_slow(VM *vm, int op, TVal a, TVal b, TVal *out);
 
 - **构建**：IR 源 16 个白名单（spike 同款）编入 `build/obj_ir/`（**绝不进 build/obj/**——通配链接会与 src_main 冲突）；`src/jit.c` 进常规 obj；链接行显式追加 `build/obj_ir/*.o` + `tools/chkstk_stub.S`；无 libgcc 机器上 chkstk 桩必需（spike 教训）
 - **运行时禁用**：`TPHP_JIT=0` 环境变量关闭；x86_64 与 aarch64 均支持（IR 双后端）
-- **线程**：prog freeze 后跨 Worker 只读共享 ⇒ `TFunc.jit_entry` 全局一次写。v1 编译加**进程级 mutex** 串行化（防同 fn 双编译泄漏 code page）；生成码只读执行
+- **线程**：prog freeze 后跨 Thread 子线程只读共享 ⇒ `TFunc.jit_entry` 全局一次写。v1 编译加**进程级 mutex** 串行化（防同 fn 双编译泄漏 code page）；生成码只读执行
 - **code 内存**：`ir_jit_compile` 返回的页由 IR 管理；进程退出随 OS 回收（CLI 场景足够；常驻 server 再议）
 
 ## 11. 测试与验收
@@ -145,7 +145,7 @@ void tphp_jit_cmp_slow(VM *vm, int op, TVal a, TVal b, TVal *out);
 
 | 项 | 原因 |
 |---|---|
-| 体内异常路径 JIT | JIT 帧上 longjmp 与 FFI 回调同类问题（C 栈穿越）；资格判定整体排除 |
+| 体内异常路径 JIT | JIT 帧上 longjmp 跨 C 栈穿越；资格判定整体排除 |
 | v1 即做数组/字符串 | 语义面（COW/引用计数/in-place）×guard 组合爆炸；先用封闭世界把 lowering 框架与 ABI 打磨硬 |
 | 自研 regalloc/codegen | ir 的 Sea-of-Nodes + linear scan 就是买来的部分；胜负在 lowering 质量 |
 | 与解释器分两套语义实现 | slow helper 一律复用 tval_* 家族（§9） |

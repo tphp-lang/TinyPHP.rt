@@ -39,9 +39,9 @@ libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步
 
 死锁判据：`uv_run` 返回 0 且仍有挂起协程 → `DeadlockError`。
 
-### Worker 线程
+### Thread 线程（Tphp\Thread）
 
-- 每 Worker：独立 `TPhpRuntime`（VM 堆/intern/uv_loop/调度器全 TLS 隔离）
+- 每 Thread 子线程：独立 `TPhpRuntime`（VM 堆/intern/uv_loop/调度器全 TLS 隔离）
 - mailbox = `uv_mutex + 消息链 + uv_async`；值跨线程走 serialize 克隆
 - 字节码 freeze 后跨线程只读共享
 
@@ -56,7 +56,7 @@ libuv 事件循环；文件 I/O 走线程池（挂起等待），网络真异步
 
 ```
 src/     运行时核心引擎（lex/parse/compile/vm/sched/fiber/value/class/pack/...）
-ext/     内置扩展层（一扩展一子目录：builtin/ ffi/ net/ io/ worker/ json/ serialize/ pkg/）
+ext/     内置扩展层（一扩展一子目录：builtin/ net/ io/ worker/ json/ serialize/ pkg/）
 lib/     PHP 层 stdlib（phpc 打进 bundle）
 tests/   测试（见 testing.md）
 deps/    vendor 依赖

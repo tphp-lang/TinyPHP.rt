@@ -8,9 +8,8 @@
 ```
 
 - **无感异步**：fcontext 协程，业务函数不用标记；显式并发用 `async(EXPR)` / `spawn`
-- **真线程 Worker**：独立 VM + 堆隔离 + Channel
+- **真线程 Thread**：独立 VM + 堆隔离（Tphp\Thread）
 - **IR baseline JIT**：热函数编译为机器码（dstogov/ir 后端，与 PHP 8.4+ 官方 JIT 同源）
-- **FFI**：libffi 调 C 库（`FFI::cdef` / `CData`）
 - **生成器**：`yield` / `send` / `getReturn`
 - **正则**：`preg_*` 全批（vendor PCRE2）
 - **单文件应用**：`tphp build app.php --with assets/ -o app`（Windows/Linux/macOS）
@@ -27,11 +26,10 @@ build.cmd
 
 ```bash
 # Linux
-sudo apt-get install -y clang libffi-dev binutils
+sudo apt-get install -y clang binutils
 ./build.sh
 
 # macOS
-brew install libffi
 ./build.sh
 ```
 
@@ -63,10 +61,6 @@ $t->spawn(sleep(1));
 $t->spawn(sleep(2));
 $t->wait();
 
-// FFI
-$ffi = FFI::cdef("int abs(int j);", "msvcrt.dll");
-echo $ffi->abs(-5), "\n";
-
 // JSON
 echo json_encode(["ok" => true]), "\n";
 ```
@@ -90,8 +84,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 | [doc/build.md](doc/build.md) | 构建与 CI（5 平台） |
 | [doc/cli.md](doc/cli.md) | CLI：run / test / phpc / build |
 | [doc/architecture.md](doc/architecture.md) | 运行时架构 |
-| [doc/ffi.md](doc/ffi.md) | FFI API 与并发约定 |
-| [doc/ffi-security.md](doc/ffi-security.md) | FFI 安全分析（PHP/txiki/Bun 对照） |
 | [doc/testing.md](doc/testing.md) | 测试协议与目录 |
 | [doc/package-manager.md](doc/package-manager.md) | 内置包管理：new/add/remove/install/upload |
 | [PLAN/](PLAN/) | 完整设计规格（语法/功能/里程碑/扩展/包管理） |
@@ -100,10 +92,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 
 ```
 src/     运行时核心引擎（~2 万行 C）
-ext/     内置扩展层（builtin/ ffi/ net/ io/ worker/ json/ serialize/ pkg/）
+ext/     内置扩展层（builtin/ net/ io/ worker/ json/ serialize/ pkg/）
 lib/     PHP 层 stdlib（phpc 打进 exe）
 tests/   测试套件
-deps/    vendor：libuv mimalloc mbedtls libffi miniz asm pcre2 ir(JIT)
+deps/    vendor：libuv mimalloc mbedtls miniz asm pcre2 ir(JIT)
 PLAN/    设计文档（权威规格）
 doc/     用户/开发者文档
 tools/   辅助脚本（phpt 转换等）

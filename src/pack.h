@@ -54,10 +54,6 @@ bool tphp_pack_startup(char **out_main, size_t *out_main_len);
 /* zip 是否常驻（进程内打包应用） */
 bool tphp_pack_has_bundle(void);
 
-/* DLL 落盘根 = exe 所在目录（UTF-8 绝对路径；无待提取 DLL 时返回 NULL）。
- * FFI 用它把包内相对路径解析成等效绝对路径加载。 */
-const char *tphp_pack_dll_root(void);
-
 /* 读 zip 内文件到堆（*out = malloc(len+1)，已 NUL 结尾）。rel 用 '/'。 */
 bool tphp_pack_read(const char *rel, void **out, size_t *out_len);
 

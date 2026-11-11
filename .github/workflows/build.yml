@@ -55,7 +55,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang binutils libffi-dev
+          sudo apt-get install -y clang binutils
 
       - name: Build (build.sh)
         run: |
@@ -85,7 +85,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang binutils libffi-dev
+          sudo apt-get install -y clang binutils
 
       - name: Build (build.sh)
         run: |
@@ -114,8 +114,6 @@ jobs:
 
       - name: Install deps
         run: |
-          brew install libffi || true
-          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Build native arm64 (build.sh)
         run: |
@@ -144,8 +142,6 @@ jobs:
 
       - name: Install deps
         run: |
-          brew install libffi || true
-          echo "PKG_CONFIG_PATH=$(brew --prefix libffi)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Cross-compile x86_64 (build.sh TARGET_ARCH=x86_64)
         run: |

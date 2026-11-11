@@ -11,8 +11,8 @@
 | **M2 函数+异常**(1周) | 函数/闭包/箭头函数/命名参数/...、`|>` 管道（PHP 8.5）、heredoc、异常全体系 | builtin 首批、--dump-opcodes | 闭包捕获+递归+调用点缓存；finally 顺序+异常栈打印 | ~2200 |
 | **M3 OOP 完整**(1.5周) | PLAN/01 §11 OOP 示例全量可跑 + 命名空间全套（PLAN/01 §8：`namespace`/`use`(as)/`use function`/`use const`、限定名解析对齐 PHP） | class/iface/trait/enum/静态/构造器提升 + spl_autoload_register | 接口多实现+trait 冲突 as+enum match+静态晚期绑定 全部输出预期；命名空间限定名解析专测 | ~2500 |
 | **M4 协程+无感I/O**(1.5周) | — | 透明 I/O 全表 + HTTPS(mbedtls+cacert 内嵌) + Tphp\ API | 02 §6 异步示例全输出正确；3 并发 fetch 耗时≈max；sleep CPU 0%；死锁检测 | ~1800 |
-| **M5 Worker**(1周) | — | Worker API + 克隆协议 + serialize/unserialize | 02 §6 线程示例：4 worker 满载时主线程 IO 正常；ping-pong 1000 消息有序；stop 退出码 0 | ~1200 |
-| **M5.5 FFI**(0.5~1周) ✅ | — | FFI::cdef（C 声明子集解析）+ libffi 调用 + FFI\CData（new/memcpy/free）；DLL 打包器为后置可选项（PLAN/03 §6.1） | 系统库绑定零配置可用（user32/msvcrt）；struct 传参/返回；FFI\CData 读写与 owned 释放；阻塞性调用走 Worker 的文档示例（02 §4.5） | ~1600 已完成 |
+| **M5 Worker** | — | **用户 API 已移除（2026-11-10）**；serialize/克隆协议与 Thread 保留 | — | 移除 |
+| **M5.5 FFI** | — | **已移除（2026-11-10）** | — | 移除 |
 | **M6 打包+stdlib**(1周) ✅ | — | stdlib 全量 + phpc + test runner | 02 §6 打包示例；单 exe 零依赖；json/sprintf/date 正确；tests/run.cmd 全绿 | 已完成：JSON/date/require/phpc/tphp-test + m6-acceptance |
 
 总计约 **1.3 万行 C + 800 行 PHP**，单人 6~8 周。每里程碑 `tests\run.cmd` 全绿后进下一阶段，验收 CLI 实际输出贴给用户确认。
@@ -25,7 +25,6 @@
   - `tests/oop/`：trait 冲突矩阵（as/insteadof）、enum、接口、静态晚期绑定
   - `tests/async/`：并发时序断言、取消传播、Channel 背压、死锁检测
   - `tests/worker/`：消息序、克隆协议、退出协议、嵌套 worker
-  - `tests/ffi/`：系统库绑定（GetTickCount/msvcrt 数学）、struct 传参/返回、CData 读写与 owned 释放、cdef 拒绝预处理指令
   - `tests/lib/`：json/sprintf/date 对拍（与 php-src 输出逐例比对）
   - `tests/bench/`：fib(28)、10^6 push、读改写 10^5 —— 结果 EXPECT 恒定，耗时 `error_log` 走 stderr 做回归基线 ✅
   - `tests/php-compat/`：**php-src 对拍层**——`tools/convert-phpt.ps1` 抽 `Zend/tests` 纯 EXPECT 子集转 `test-*.php`；种子 17 例已入库（match/enum/anon/return_types），失败用例丢弃待能力补齐后重转（见 tests/php-compat/README.md）
@@ -40,7 +39,7 @@
 | 2 | 循环引用内存泄漏 | M1 就内置简易标记-清扫 GC（根集 = VM 帧 + 全局表 + **挂起协程链表**（含 fcontext 切走的 C 栈上暂存的 TVal）——M1 预留该根集槽位，M4 直接接入，不留到协程做完才返工） |
 | 3 | 递归下降优先级坑（`??` vs `?:` vs `=`） | 优先级表驱动而非手写嵌套，配 prec.php 30+ 用例 |
 | 4 | `==` 宽松语义矩阵大且易错 | 直接对照移植 php-src `zend_operators.c` 的 compare_function（唯一整段借鉴），tests/lang 逐例对拍 |
-| 5 | uv threadpool（默认 4）饱和 | 文件 I/O 走线程池、网络走真异步；Worker 内嵌套 I/O 限流；Channel 背压写文档+测试 |
+| 5 | uv threadpool（默认 4）饱和 | 文件 I/O 走线程池、网络走真异步；Thread 内嵌套 I/O 限流；Channel 背压写文档+测试 |
 | 6 | libuv vendor 方式 | 直接拷源码入库（txiki 同款，不用 submodule）；build.cmd 显式列 `deps\libuv\src\win\*.c` |
 | 7 | `.cmd` 非 ASCII 串行 | 构建脚本纯 ASCII（用户环境已知约束） |
 | 8 | 里程碑膨胀 | 每阶段绑定明确验收命令；不做验收外功能（用户"不为修而修"原则） |

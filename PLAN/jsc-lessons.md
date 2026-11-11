@@ -36,7 +36,7 @@ tphp 缺的不是更强的 JIT 后端（ir 后端已被 spike 证实不弱：手
 验收：kv-read / array-read bench 进 2× 带；224/224 绿。
 与 P0-3 关系：P0-3 字面量键 hash 缓存 = 本机制的静态特例雏形；P0-3 剩余项（opcode 级预存 hash）**并入本机制实现**，P0-3 收敛。
 
-**v1 实测（2026-10-28，已落地）**：`DimIC{arr,bk,boff,val_off}` 24B 快照挂 `TOp.ic`（DIM 类 opcode 该字段本就空闲）；解释器 `op_fetch_dim_r` + JIT helper `tphp_jit_fetch_dim_r`（emit 传 `ir_CONST_ADDR(ic)`）双路接入；失效验证链 = arr 指针 + buckets 指针（覆盖 rehash/扩容/惰性重建）+ 桶 key 匹配 + val_off 非 tombstone——全部锚定当前数组真实状态，DimIC 字段非原子竞态写最坏 miss 不会错命中（Worker 线程安全推理见 value.h/array.c 注释）。**结果**：kv-read 58.4→50.3ms（-14%）、array-read 15.6→14.4ms（-8%）、全表无回退、224/224 绿。**未达"进 2× 带"**——IC 已削掉 norm/hash/探测，剩余 31ns/次 ≈ helper 调用框架 + JitEntry 开销（PHP 侧 6.3ns 是全内联机器码）。**v2 方向 = IC 命中路径内联进 IR**（emit 直发比较链 + load，miss 才 call helper——JSC Baseline IC 的完整机器码形态），属 ir-jit 白名单深化，独立小立项。
+**v1 实测（2026-10-28，已落地）**：`DimIC{arr,bk,boff,val_off}` 24B 快照挂 `TOp.ic`（DIM 类 opcode 该字段本就空闲）；解释器 `op_fetch_dim_r` + JIT helper `tphp_jit_fetch_dim_r`（emit 传 `ir_CONST_ADDR(ic)`）双路接入；失效验证链 = arr 指针 + buckets 指针（覆盖 rehash/扩容/惰性重建）+ 桶 key 匹配 + val_off 非 tombstone——全部锚定当前数组真实状态，DimIC 字段非原子竞态写最坏 miss 不会错命中（Thread 子线程安全推理见 value.h/array.c 注释）。**结果**：kv-read 58.4→50.3ms（-14%）、array-read 15.6→14.4ms（-8%）、全表无回退、224/224 绿。**未达"进 2× 带"**——IC 已削掉 norm/hash/探测，剩余 31ns/次 ≈ helper 调用框架 + JitEntry 开销（PHP 侧 6.3ns 是全内联机器码）。**v2 方向 = IC 命中路径内联进 IR**（emit 直发比较链 + load，miss 才 call helper——JSC Baseline IC 的完整机器码形态），属 ir-jit 白名单深化，独立小立项。
 
 **v2 实测（2026-10-29，命中路径全内联 + generic 回退门，未达 2× 验收）**：
 - **全内联**：每 FETCH_DIM_R 生成双快路——packed int 直取（`(u64)key < (u64)n` 单条无符号比较天然覆盖负数）/ DimIC hash 链 7 层（链序照抄 tarr_get_ic，buckets 比较先于 bp 解引用 = 撕裂写序安全门）；命中 leaf = `tphp_jit_dim_take`（addref+release+store 语义单点），miss/非数组/raise 全落 v1 helper+deopt（语义零变化）。结构 = 逐层 IF+END+MERGE_2（lower_binop 姿势）。

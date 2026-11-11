@@ -74,30 +74,8 @@ if [ "$TARCH" != "$HOST_ARCH" ]; then
 fi
 INC="-Isrc -Ideps/libuv/include -Ideps/libuv/src -Ideps/mimalloc/include -Ideps/mimalloc/src -Ideps/mbedtls/include -Ideps/mbedtls/library -Ideps/miniz -Ideps/pcre2"
 
-# libffi: vendored headers OK (arch-independent); libs must be host-arch
-# (never deps/libffi/lib/libffi.a: mingw COFF, see link step)
-FFI_CFLAGS=""
-FFI_LIBS=""
-if [ -d deps/libffi/include ]; then
-  INC="$INC -Ideps/libffi/include"
-fi
-if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libffi; then
-  if [ -z "$FFI_CFLAGS" ]; then
-    FFI_CFLAGS=$(pkg-config --cflags libffi)
-    INC="$INC $FFI_CFLAGS"
-  fi
-  if [ "$CROSS" = 0 ]; then
-    FFI_LIBS=$(pkg-config --libs libffi)
-  fi
-fi
-if [ -z "$FFI_LIBS" ]; then
-  FFI_LIBS="-lffi"
-fi
-
-# ext\* include dirs MUST come after any libffi include: libffi's public
-# header is <ffi.h>; an -Iext/ffi earlier in the list with an ffi.h inside
-# would shadow it (same trap as the historic src/ffi.h naming ban).
-INC="$INC -Iext/ffi -Iext/net -Iext/io -Iext/worker -Iext/json -Iext/serialize -Iext/pkg -Iext/builtin -Iext/standard -Iext/pcre"
+# ext\* include dirs
+INC="$INC -Iext/net -Iext/io -Iext/worker -Iext/json -Iext/serialize -Iext/pkg -Iext/builtin -Iext/standard -Iext/pcre"
 
 # normalize arch: arm64 -> aarch64 for target string (Linux); keep arm64 on Darwin
 case "$TARCH" in
@@ -248,22 +226,13 @@ done
 
 # ---- [6/6] link ----
 echo "[6/6] linking..."
-# Unix NEVER links deps/libffi/lib/libffi.a (mingw COFF; Darwin ld rejects it).
-# Always system libffi: pkg-config or -lffi.
-if [ -n "$FFI_LIBS" ]; then
-  FFI_LIB="$FFI_LIBS"
-else
-  FFI_LIB="-lffi"
-fi
-echo "  link ffi: $FFI_LIB arch: ${ARCH_FLAG:-default}"
 # ARCH_FLAG must be on the link too when cross-compiling (else ld defaults
 # to host arch and ignores the -arch-built objects: "Undefined: _main").
-$CC $ARCH_FLAG "$OBJ"/*.o $FFI_LIB -o "$OUT" $LDLIBS
+$CC $ARCH_FLAG "$OBJ"/*.o -o "$OUT" $LDLIBS
 
 # ---- dev artifacts: single static lib + flat public header set ----
 # libtphp.a = engine + vendored deps objects (uv/mbedtls/mimalloc/pcre2/
-# miniz/ir/asm). libffi stays external: system lib here, vendored .a on
-# Windows (build.cmd parity) -- consumer links -lffi alongside.
+# miniz/ir/asm).
 # headers: src/*.h + ext/*/*.h are flat includes (no path refs, no name
 # clashes) + libuv uv.h/uv/ tree (tio.h pulls <uv.h> transitively).
 echo "[pkg] build/libtphp.a + build/include/"

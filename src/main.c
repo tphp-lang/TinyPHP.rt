@@ -64,10 +64,8 @@ void tphp_prog_freeze(Program *prog);
 void tphp_async_init(void);
 /* io.c：TStream 内部类注册（编译前；幂等） */
 void tphp_io_init(void);
-/* worker.c：tphp\Worker / WorkerContext 内部类注册（编译前；幂等） */
+/* worker.c：Tphp\Thread 内部类注册（编译前；幂等） */
 void tphp_worker_init(void);
-/* ffi.c：FFI / FFI\CData 内部类注册（编译前；幂等） */
-void tphp_ffi_init(void);
 /* exclass.c：内置异常层级注册为 TClass（P1-2，编译前；幂等） */
 void tphp_exclass_init(void);
 /* vm.c：Closure 内部类注册（P1-3，编译前；幂等） */
@@ -97,7 +95,8 @@ static void print_usage(FILE *out) {
         "  tphp new <name> [--lib]         scaffold a new app/lib package\n"
         "  tphp add <source> [ref]         add dependency (GitHub repo URL[:ref] / zip URL / path)\n"
         "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
-        "  tphp install                    restore deps from mod.lock (or mod.json)\n"
+        "  tphp install [--force]          restore deps from mod.lock (or mod.json)\n"
+        "  --ignore-scripts                skip mod.json lifecycle scripts (add/remove/install)\n"
         "  tphp upload                     print package publishing instructions\n"
         "  tphp -v, --version              print version\n",
         TPHP_VERSION);
@@ -488,10 +487,9 @@ static int run_source(const char *src, const char *name, bool dump) {
     static bool s_inited = false;
     if (!s_inited) {
         s_inited = true;
-        tphp_worker_init();           /* tphp\Worker 内部类先于编译注册 */
+        tphp_worker_init();           /* Tphp\Thread 内部类先于编译注册 */
         tphp_async_init();            /* 内部类先于编译期类检查注册 */
         tphp_io_init();
-        tphp_ffi_init();              /* M5.5 FFI 内部类 */
         tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
         tphp_closure_class_init();    /* P1-3: Closure 内部类 */
         tphp_generator_init();        /* PHP 8 generators（PLAN/generators.md） */
@@ -586,6 +584,27 @@ int main(int argc, char **argv) {
     /* --debug 可出现在任意位置，故先全量预扫（不消耗 argv） */
     for (int di = 1; di < argc; di++)
         if (strcmp(argv[di], "--debug") == 0) { g_debug = true; break; }
+
+    /* pkg lifecycle scripts：自身 exe 路径 + --ignore-scripts */
+    {
+#ifdef _WIN32
+        wchar_t wself[MAX_PATH];
+        if (GetModuleFileNameW(NULL, wself, MAX_PATH)) {
+            char self[1024];
+            int n = WideCharToMultiByte(CP_UTF8, 0, wself, -1,
+                                        self, sizeof self, NULL, NULL);
+            if (n > 0) tphp_pkg_set_self_exe(self);
+        }
+#else
+        char self[1024];
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (n > 0) { self[n] = 0; tphp_pkg_set_self_exe(self); }
+        else if (argc > 0 && argv[0]) tphp_pkg_set_self_exe(argv[0]);
+#endif
+        for (int di = 1; di < argc; di++)
+            if (strcmp(argv[di], "--ignore-scripts") == 0)
+                tphp_pkg_set_ignore_scripts(true);
+    }
 
     /* pkg add 的 HTTP(S) zip 下载回调 */
     tphp_pkg_set_fetch(fetch_http);
@@ -801,7 +820,8 @@ int main(int argc, char **argv) {
             char err[512] = "";
             int rc = tphp_pkg_add(".", source, ref, err, sizeof err);
             if (rc != 0) {
-                fprintf(stderr, "tphp: %s\n", err);
+                fprintf(stderr, "tphp: %s\n",
+                        err[0] ? err : "package script failed");
                 return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
             }
             printf("Added %s\n", source);
@@ -816,7 +836,8 @@ int main(int argc, char **argv) {
             char err[512] = "";
             int rc = tphp_pkg_remove(".", argv[i + 1], err, sizeof err);
             if (rc != 0) {
-                fprintf(stderr, "tphp: %s\n", err);
+                fprintf(stderr, "tphp: %s\n",
+                        err[0] ? err : "package script failed");
                 return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
             }
             printf("Removed %s\n", argv[i + 1]);
@@ -831,7 +852,8 @@ int main(int argc, char **argv) {
             char err[512] = "";
             int rc = tphp_pkg_install(".", force, err, sizeof err);
             if (rc != 0) {
-                fprintf(stderr, "tphp: %s\n", err);
+                fprintf(stderr, "tphp: %s\n",
+                        err[0] ? err : "package script failed");
                 return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
             }
             printf("Installed dependencies\n");

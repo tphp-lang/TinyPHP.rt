@@ -63,10 +63,50 @@
 | `license` | 建议 | 建议 | `tphp build` 再分发时追溯 |
 | `autoload` | 可选 | 可选 | `psr-4` + `files`；应用自身类同样可用 |
 | `pack` | 可选 | 可选 | `include`/`exclude`，控制 `tphp build` 打包集 |
+| `scripts` | 可选 | 可选 | 生命周期钩子，见 §2.1.1 |
 | `deps` | 可选 | 可选 | `"foo/bar": { url, ref }`（读取兼容旧 `git` 键） |
 
 **无 `main`**：autoload 覆盖库的类加载；应用入口由 CLI 指定（`tphp run src/index.php`）。
 **无单一 `namespace`**：包可含多个命名空间，由 `autoload.psr-4` 映射表声明。
+
+#### 2.1.1 `scripts`（生命周期钩子，2026-11-10）
+
+```jsonc
+"scripts": {
+  "preInstall":  "scripts/pre-install.php",       // string
+  "postInstall": ["scripts/post.php", "echo hi"], // 或 string[]
+  "preUpdate":   "scripts/pre-update.php",
+  "postUpdate":  "scripts/post-update.php",
+  "preRemove":   "scripts/pre-remove.php",
+  "postRemove":  "scripts/post-remove.php"
+}
+```
+
+| 键 | 时机 | cwd |
+|---|---|---|
+| `preInstall` | 新装前 | 包：源/暂存目录；根：项目根 |
+| `postInstall` | 落盘后 | 包/根的最终目录 |
+| `preUpdate` | 覆盖已有包前 | **旧** vendor 包根 |
+| `postUpdate` | 覆盖后 | 新 vendor 包根 |
+| `preRemove` | 删除前 | 即将删除的包根（根钩子=项目根） |
+| `postRemove` | lock/autoload 后 | **仅根**（包已不存在） |
+
+**条目形态**
+- 以 `.php` 结尾 → 用当前 `tphp` 可执行文件在 `cwd` 下执行（新进程）
+- 其它 → **默认拒绝**；`TPHP_PKG_SCRIPTS_SHELL=1` 时经平台 shell 执行
+- 路径必须相对包根，禁止 `..` / 绝对路径
+
+**环境变量**（子进程继承）：`TPHP_PKG_ACTION`（install|update|remove）、`TPHP_PKG_PHASE`（pre|post）、`TPHP_PKG_NAME`、`TPHP_PKG_VERSION`、`TPHP_PKG_REF`、`TPHP_PKG_DIR`、`TPHP_PROJECT_DIR`、`TPHP_PKG_ROOT`（1=根项目钩子）。
+
+**执行顺序**：根 `pre*` → 各涉及包 `pre*`（落盘）→ 包 `post*` → … → lock+autoload → 根 `post*`。  
+**add 同 url 再装** = update（跑 update 钩子）；`install --force` = update；缺依赖补装 = install。
+
+**失败语义**
+- `pre*` 非 0 / 脚本缺失 / 路径逃逸 → **中止**，不改 deps/lock/vendor
+- `post*` 非 0 → **警告 + 命令退出码非 0**，**不回滚**已落盘状态
+- 开关：`TPHP_PKG_SCRIPTS=0` 或 CLI `--ignore-scripts` 跳过全部钩子
+
+**安全**：装包即信任（与 pkg 定位一致）；第三方包可带 `scripts`，审查 `mod.json` 时检查该段。shell 形态默认关。
 
 ### 2.2 `mod.lock`（锁定，生成物，建议提交）
 
@@ -96,7 +136,7 @@
 - 校验点只有两个：**install 的 skip 判断**与 **build 打包 vendor 时**；运行时（`tphp run`）不校验
 - 不匹配 = fail-closed 报错（列出文件）+ 显式 `tphp install --force` 才重装，不静默冲掉用户本地改动
 - 新增文件也算不匹配（挡"侧载 DLL 进 vendor"）；旧 lock 无 `integrity` 段 = 不校验，下次 install 成功后自动补写（向后兼容）
-- 本机制不引入密钥/标识/配置面——与 ffi-security.md 的结论一致（不做 FFI 标识、不做运行时总闸）
+- 本机制不引入密钥/标识/配置面（FFI 已移除；历史 ffi-security 拍板：不做运行时总闸）
 
 ### 2.3 目录布局
 

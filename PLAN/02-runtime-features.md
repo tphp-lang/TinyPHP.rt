@@ -71,7 +71,11 @@ class Task {                                               // async($callable) �
 - **多等待者**：`recv` 空 / `send` 满时的等待者按 **FIFO** 排队唤醒，多消费者与多生产者都支持；`send` 优先直接交接给队首 `recv`（值走协程私有槽），否则入缓冲。因此 Channel 可直接当**信号量**做并发限流（预置 N 个令牌，任务 `recv` 取、`finally` 归还）
 - 后置（M7+）：`Tphp\scope()` 结构化并发、`Tphp\select()`、`withTimeout($c, $ms)`
 
-## 3. Worker 线程 API（M5，真 OS 线程）
+## 3. Worker 线程 API（**已移除 2026-11-10**——用户拍板「不好用」；Thread 见 §3.1）
+
+> **状态**：`Tphp\Worker` / `Tphp\Worker\Context` 用户 API 已删除。
+> C 层 mailbox/WHandle 仍保留供 `Tphp\Thread` 内部一次性 worker 复用（不注册为用户可见类）。
+> 历史设计（下文）仅作存档，不再是现行规格；Thread 现行 API 见 §3.1。
 
 ```php
 namespace tphp;
@@ -144,15 +148,15 @@ class Thread {
 | 捕获变量 | 同一份内存 | 跨线程**深拷贝**（序列化协议） |
 | 适用 | I/O 密集、大量并发 | 阻塞/计算密集；**UI 线程回调里跑长任务** |
 
-**为什么 UI 回调里必须用真线程**：协程是单线程协作式调度，`webview_run` 这类 C 阻塞调用占着唯一的 UI 线程 → 协程永远得不到调度（"点了按钮没反应"）；让 main 主动挂起则 UI 消息泵冻结。真线程不依赖调度器让出，在 FFI/C 回调里 `spawn` 立即开跑。
+**为什么 UI 回调里必须用真线程**：协程是单线程协作式调度，`webview_run` 这类 C 阻塞调用占着唯一的 UI 线程 → 协程永远得不到调度（"点了按钮没反应"）；让 main 主动挂起则 UI 消息泵冻结。真线程不依赖调度器让出，在 C 回调/bind 场景里 `Thread::spawn` 立即开跑。
 
 **实现要点**：
-- 每次 `spawn` = 一个一次性 Worker（复用 §3 的 mailbox + 序列化基础设施），入口 = 三形态之一（见上方签名；字符串/数组形态不建 thunk、不捕获 `$this`）
+- 每次 `spawn` = 一个一次性子线程（复用内部 mailbox + 序列化基础设施；用户 API 仅 Thread），入口 = 三形态之一（见上方签名；字符串/数组形态不建 thunk、不捕获 `$this`）
 - **子线程继承父线程全局 Program 视图**（P1-10）：入口 owner 作 `vm->prog`，主 + 其余 inc_progs 挂进子线程 `inc_progs`——入口函数跨文件调用、动态按名调用与父线程同一张全局符号表（PHP 单请求符号表的等价物）
 - `main` 返回值经 `tphp_sched_run(TVal *main_ret)` 传出 → 子线程 serialize 后经 mailbox 回传父线程
 - `poll()` 用非阻塞 `tryRecv`，供 UI 线程安全收割（不挂起协程）
-- `detach()` 把 Worker 引用移交进程级孤儿表（父侧不再跟踪、不 join）
-- **捕获对象需实现 `__cloneState()`/`__restoreCloneState()`**，否则抛 `NotCloneableError`；闭包可捕获（走 T_CLOSURE 序列化：Program id + 函数索引 + 递归捕获）。入口闭包的捕获在构造时**预检**（worker_cap_ok），不可序列化（FFI CData / 无 `__cloneState` 的对象，典型 = 方法内普通闭包自动捕获的 `$this`）→ 报错并指引改用函数名/`[Cls,'method']`/`static function` 形态
+- `detach()` 把内部 worker 引用移交进程级孤儿表（父侧不再跟踪、不 join）
+- **捕获对象需实现 `__cloneState()`/`__restoreCloneState()`**，否则抛 `NotCloneableError`；闭包可捕获（走 T_CLOSURE 序列化：Program id + 函数索引 + 递归捕获）。入口闭包的捕获在构造时**预检**（worker_cap_ok），不可序列化（无 `__cloneState` 的对象，典型 = 方法内普通闭包自动捕获的 `$this`）→ 报错并指引改用函数名/`[Cls,'method']`/`static function` 形态
 - 方法内定义的普通闭包自动捕获 `$this`（P1-3，PHP 对齐）；spawn 场景请用 `static function`（不绑 `$this`，`self::` 作用域仍生效）或函数名/静态方法形态——pebview `bindAsync` 即此改法
 
 ## 4. 标准库清单
@@ -170,7 +174,10 @@ class Thread {
 
 **后置**（M7+）：pcre2 vendor 后 `preg_*` 全套、内置 SQLite（libsqlite3 vendor，`Sqlite\Db` 对象 + 协程化）、HTTP server（`Http\Server`）、REPL
 
-## 4.5 FFI（M5.5 ✅ 已完成，txiki mod_ffi 路线）
+## 4.5 FFI（**已移除 2026-11-10**——用户拍板「不好用」；下文为历史设计存档，不再是现行规格）
+
+> **状态**：`ext/ffi/`、`tests/ffi/`、`doc/ffi*.md` 已删除；build/CI 不再链接 libffi；
+> `tphp_pack_dll_root` 已删（打包 DLL 提取保留）。历史设计（下文）仅作存档。
 
 **定位三层，与单二进制正交**：
 1. **系统库绑定**：user32/kernel32/ws2_32/msvcrt（Linux libc/libm）每台机器自带 → `FFI::cdef('...', 'user32.dll')` 零配置天然兼容单 exe
@@ -264,29 +271,22 @@ try {
 }
 ```
 
-**线程示例（M5 验收）**：
+**线程示例（Thread 验收；原 Worker 消息 API 已移除）**：
 ```php
 <?php
-use Tphp\Worker;
+use Tphp\Thread;
 
-// 父线程：开 4 个 worker 跑 CPU 密集任务，主线程事件循环不受影响
-$workers = [];
+// 4 个一次性 OS 线程跑 CPU 密集任务，wait 按序收结果
+$g = new Thread();
 for ($i = 0; $i < 4; $i++) {
-    $w = new Worker(function () {
-        $me = Worker::self();
-        while ($job = $me->recv()) {           // 空则挂起在本线程 loop 上
-            $me->post(sha256_benchmark($job)); // CPU 密集随便跑满一核
-        }
+    $g->spawn(function () use ($i) {
+        $s = 0;
+        for ($k = 0; $k < 2000000; $k++) $s += ($k + $i) % 7;
+        return $s;
     });
-    $w->on('message', function ($result) use ($w) {
-        echo "[worker {$w->id()}] $result\n";
-    });
-    $workers[] = $w;
 }
-foreach ($workers as $w) $w->post('job-data');
-// 主线程此时 sleep/file_get_contents 照常并发（worker 不阻塞 loop）
-sleep(2);
-foreach ($workers as $w) $w->stop();
+$results = $g->wait();   // 阻塞收集；也可 detach() 放飞
+echo "done ", count($results), "\n";
 ```
 
 **单二进制示例（M6 验收）**：

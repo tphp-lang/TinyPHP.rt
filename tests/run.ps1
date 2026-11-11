@@ -24,22 +24,15 @@ if (-not (Test-Path $tphp)) {
     }
 }
 
-# Windows-only tests (msvcrt/user32/kernel32/lstrcmpW) — skipped on Linux/macOS
-$winOnly = @(
-    "test-ffi-simple-calls.php",
-    "test-ffi-system-libs.php",
-    "test-ffi-variadic.php",
-    "test-ffi-wchar.php",
-    "test-ffi-in-worker.php",
-    "m5.5-acceptance.php"
-)
+# Windows-only tests historically skipped on Linux/macOS — none required now
+$winOnly = @()
 
 $pass = 0
 $fail = 0
 $skip = 0
 $failed = @()
 
-foreach ($dir in @("lang", "oop", "async", "worker", "ffi", "jit", "lib", "pkg", "bench", "php-compat", "standard")) {
+foreach ($dir in @("lang", "oop", "async", "worker", "jit", "lib", "pkg", "bench", "php-compat", "standard")) {
     $dirPath = Join-Path $PSScriptRoot $dir
     if (-not (Test-Path $dirPath)) { continue }
     $files = Get-ChildItem -Path $dirPath -Filter "*.php" -ErrorAction SilentlyContinue |

@@ -94,7 +94,7 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 |---|---|
 | 多态/投机类型（JSC DFG 式 speculation） | **不做**——tphp 是 baseline 档，白名单静态封闭；类型投机属 P0-17③ 类型特化，另立项 |
 | OSR exit 的反向（JIT→解释器逐 op 精确恢复中间状态） | v1 只需 resume_pc + slots 同布局；不做 DFGOSRExit 921 行级逐 slot 物化（tphp 无需） |
-| 循环体含 raise/generator/FFI | 不做——封闭世界白名单排除，同 ir-jit §13 |
+| 循环体含 raise/generator/（历史）FFI | 不做——封闭世界白名单排除，同 ir-jit §13 |
 | 编译停顿 | v1 同步 + 阈值 10000 + n_ops≤96；异步化归 P2-13 批 3 |
 | on-stack 值替换/逃逸分析 | P0-9/P0-17② 域，不混入 |
 
@@ -157,11 +157,11 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 ### 批 2-6：linux CI test-osr-005 段错误——deps/ir LSRA 实参 hint 窗口 bug，chunk 内 COPY 改内联绕行（2026-11-02）
 
 - **CI 现象**：linux x86_64 + mac x86_64 的 test-osr-005 挂在 c2（`$s2 += $u` TypeError "Unsupported operand types"），Windows 本地全绿——批2-3 放行的 new+prop+COPY chunk 形态首次在 SysV 上跑。
-- **本地复现环境（重大基建）**：`wsl --install -d Ubuntu-24.04`（与 CI 同版）+ `apt clang binutils libffi-dev` + `sh build.sh`（注意：**rsync 带 CRLF 的 build.sh 要先 `sed -i 's/\r$//'`**；`/mnt/c` 可读源码；Docker Desktop 路线两次自爆后弃用）。复现：JIT=1 挂、**JIT=0 全绿** ⇒ 纯 JIT 生成码问题。
+- **本地复现环境（重大基建）**：`wsl --install -d Ubuntu-24.04`（与 CI 同版）+ `apt clang binutils` + `sh build.sh`（注意：**rsync 带 CRLF 的 build.sh 要先 `sed -i 's/\r$//'`**；`/mnt/c` 可读源码；Docker Desktop 路线两次自爆后弃用）。复现：JIT=1 挂、**JIT=0 全绿** ⇒ 纯 JIT 生成码问题。
 - **取证链**：chunk 机器码 dump（jit.c 临时 `TPHP_JIT_CODEDUMP`，已撤）→ objdump：`tv_copy` 调用点只装了 `rdi(dst)`，**rsi(src) 全程未装**；gdb 断 `tphp_jit_binop_slow`：`tb=876466986`（垃圾 tag）；gdb 断 `tphp_jit_tv_copy`：src=栈垃圾而真值 &t（slot5）正确躺在栈 spill；**ARGDBG**（dasc pass1 插针，已撤）实锤：`j=4 type=ADDR src=6(RSI) dst=6(RSI)` → emit 认定"值已在 RSI"跳过回装与拷贝。**Win64 对照反汇编**：同 IR 下 hint(RDX) 竞争败给 preserved r14，发出 `mov rdx,r14` 正确——**Win 绿纯属侥幸**。
 - **根因（上游域）**：deps/ir **LSRA 把跨前置 call 活跃的实参值按 SysV hint 钉进 call 易失的 RSI 且不发回装**（ir_ra.c/ir_emit.c 与上游 HEAD b8d619a 逐字一致 = 上游同存，无现成修复可同步；cf39e5d/3470e7e 本地补丁与7个 post-vendor 上游提交逐一对拍排除）。**去 hint 试验（hints_count=0）被否决**：hint 是 call load pos 固定窗的承重结构，全局段错误——不能作为绕行。
 - **绕行（落地）**：**OSR chunk 内 OP_COPY/OP_ASSIGN 改内联**（新 `lower_tv_copy_inline`：镜像 `tphp_jit_tv_copy` 的 addref→release→16B store，块结构同 dimic_take）——chunk 内不再产生"双 slot-addr 实参跨 call"的调用形态；函数级保持 helper 调用（历史全绿，不动）。
-- **验证**：Linux 本地 test-osr-005 **3 连跑 c1-c6 全绿** + 全量 EXPECT sweep **219 PASS / 5 FAIL（5 个全是 CI SKIP 的 windows-only FFI，本地 runner 未实现 SKIP 而已）**；Windows **241/241**；bench 定点复测包内（机制上 bench 零 OSR chunk、函数级 COPY 路径未动）。
+- **验证**：Linux 本地 test-osr-005 **3 连跑 c1-c6 全绿** + 全量 EXPECT sweep **219 PASS / 5 FAIL（5 个全是当时 CI SKIP 的 windows-only FFI（已移除），本地 runner 未实现 SKIP 而已）**；Windows **241/241**；bench 定点复测包内（机制上 bench 零 OSR chunk、函数级 COPY 路径未动）。
 - **上游 issue 不提交（用户拍板 2026-11-02）**：dstogov/ir 作者疑似停更——**绕行转正为长期方案**（非临时），deps/ir 转为**本仓自维护**（后续上游域 bug 自行修复，vendor 时照旧对拍上游提交）。同族风险核查：CONCAT 等跨 call 实参形态**不在 osr_body_ok 白名单**（chunk 内只有 COPY，已内联）；函数级 helper 路径历史全绿。issue 草稿作废（%TEMP%\dstogov_ir_issue.md，诊断结论已全量入档本节 + memory 续7）。
 
 ### f0：无帧直调 × replay 体——opseq 自框化 temp VMFrame（2026-11-02 立，11-03 落地）
@@ -257,7 +257,7 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 |---|---|
 | 多态/投机类型（JSC DFG 式 speculation） | **不做**——tphp 是 baseline 档，白名单静态封闭；类型投机属 P0-17③ 类型特化，另立项 |
 | OSR exit 的反向（JIT→解释器逐 op 精确恢复中间状态） | v1 只需 resume_pc + slots 同布局；不做 DFGOSRExit 921 行级逐 slot 物化（tphp 无需） |
-| 循环体含 raise/generator/FFI | 不做——封闭世界白名单排除，同 ir-jit §13 |
+| 循环体含 raise/generator/（历史）FFI | 不做——封闭世界白名单排除，同 ir-jit §13 |
 | 编译停顿 | v1 同步 + 阈值 10000 + n_ops≤96；异步化归 P2-13 批 3 |
 | on-stack 值替换/逃逸分析 | P0-9/P0-17② 域，不混入 |
 

@@ -12,7 +12,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 ```
 
 - 退出码 0 = 全绿；非 0 = 有失败
-- 非 Windows 自动 **SKIP** 6 个 FFI Windows-only 测试（msvcrt/user32 等）
 
 ## EXPECT 协议（txiki 风格）
 
@@ -36,8 +35,7 @@ echo "hello\n";
 | `tests/lang/` | 语言核心：算术/数组/字符串/控制流/闭包/命名空间 |
 | `tests/oop/` | OOP：类/接口/trait/enum/魔术方法/可见性/属性钩子 |
 | `tests/async/` | 协程：spawn/await/cancel/Channel/死锁/IO 并发；真线程 `Tphp\Thread`（spawn/wait/detach/poll） |
-| `tests/worker/` | Worker：mailbox/克隆/stop/ping-pong；Thread 入口三形态与跨 Program 作用域（test-thread-scope） |
-| `tests/ffi/` | FFI：CData/struct/union/系统库/拒绝预处理 |
+| `tests/worker/` | Thread：入口三形态与跨 Program 作用域（test-thread-scope）；serialize 协议 |
 | `tests/lib/` | stdlib：json/date/array/require/bundle |
 | `tests/pkg/` | 包管理：new/add/remove/install 骨架与依赖图 |
 | `tests/bench/` | 性能基线：fib(28)、1e6 push、读改写（耗时走 stderr） |
@@ -61,7 +59,7 @@ ASAN 构建（**不定义** `TPHP_USE_MIMALLOC`，走 CRT malloc，ASAN 才能�
 clang -O1 -g -std=c11 -fno-omit-frame-pointer -fsanitize=address -D_GNU_SOURCE \
       -Isrc -Ideps/... -c src/*.c -o build/obj_asan/src_XXX.o
 # 链接时把 deps 目标文件一起带上
-clang -fsanitize=address build/obj_asan/src_*.o <deps .o> deps/libffi/lib/libffi.a \
+clang -fsanitize=address build/obj_asan/src_*.o <deps .o> \
       -o build/tphp_asan.exe <系统库>
 ```
 
@@ -70,7 +68,7 @@ clang -fsanitize=address build/obj_asan/src_*.o <deps .o> deps/libffi/lib/libffi
 （线程模型下 worker 线程退出时的挂起引用不算 bug）。
 
 > 实例（2026-10-26）：`Tphp\Thread` 退出时报 `mimalloc: corrupted free list entry of size 64b`。
-> ASAN 报的是 `heap-use-after-free`——`nm_thread_spawn` 把 Worker 对象同时交给
+> ASAN 报的是 `heap-use-after-free`——`nm_thread_spawn` 把内部 worker 对象同时交给
 > 跟踪数组和 spawn 返回值两处持有，但 `tarr_append` 按约定**不做 addref**
 > （见 `src/vm.c` 的 `op_assign`：`tval_addref(val)` 后才 `tarr_append`），
 > 于是两处共用同一份引用计数：`wait()` 释放数组时提前 free，调用方帧随后再 release

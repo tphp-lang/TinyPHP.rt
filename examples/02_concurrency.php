@@ -14,7 +14,6 @@
 
 use function Tphp\{spawn, await, all, async};
 use Tphp\Thread;
-use Tphp\Worker;
 
 // ─────────────────────────────────────────────────────────────
 // 1. 业务函数：无色。不写 async，不写 await。
@@ -116,24 +115,19 @@ function demoChannel(): void
 }
 
 // ─────────────────────────────────────────────────────────────
-// 7. Worker：真 OS 线程 + 独立 VM。
-//    handler 是一个"消息进、消息出"的循环；闭包必须定义在主脚本里
-//    （不能来自 autoload 的库文件），这是当前的硬约束。
-//    约定：消息用数组/对象，不要用裸 false —— recv() 用 false 表示 EOF。
+// 7. Thread：真 OS 线程 + 独立 VM（一次性 spawn + wait 收结果）。
+//    与协程 spawn 不同：真并行、阻塞 wait；适合 CPU 密集任务。
 // ─────────────────────────────────────────────────────────────
-function demoWorker(): void
+function demoThread(): void
 {
-    $w = new Worker(function () {
-        $me = Worker::self();
-        while (($msg = $me->recv()) !== false) {
-            $me->post(['result' => $msg['n'] * 2]);
-        }
+    $t = new Thread();
+    $t->spawn(function () {
+        $s = 0;
+        for ($i = 0; $i < 1000000; $i++) $s += $i % 7;
+        return $s;
     });
-
-    $w->post(['n' => 21]);
-    $reply = $w->recv();
-    echo "worker   : ", $reply['result'], "\n";
-    $w->stop();
+    [$sum] = $t->wait();
+    echo "thread   : ", ($sum > 0 ? "ok" : "bad"), "\n";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -166,15 +160,14 @@ function demoThrottle(): void
 }
 
 // ─────────────────────────────────────────────────────────────
-// 9. 任务组：new Thread()（= Tphp\TaskGroup）+ spawn + wait。
-//    与 all([...]) 等价，但更适合"分散启动、统一收口"的流程。
+// 9. 任务组：new Thread() 的 spawn + wait 批量收口。
 //    wait() 按登记序返回结果数组，可重复调用（幂等）。
 // ─────────────────────────────────────────────────────────────
 function demoGroup(): void
 {
     $g = new Thread();
-    $g->spawn(fetchUser(...), 4);
-    $g->spawn(fetchOrders(...), 4);
+    $g->spawn(function () { return fetchUser(4); });
+    $g->spawn(function () { return fetchOrders(4); });
     [$user, $orders] = $g->wait();
     echo "group    : ", $user['name'], " ", implode(",", $orders), "\n";
 }
@@ -206,7 +199,7 @@ demoParallel();
 demoError();
 demoCancel();
 demoChannel();
-demoWorker();
+demoThread();
 demoThrottle();
 demoGroup();
 demoTask();

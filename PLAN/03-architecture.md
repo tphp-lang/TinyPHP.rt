@@ -104,7 +104,7 @@ Fiber：boost.context fcontext（抄 `Zend/asm`），栈 mmap/VirtualAlloc + gua
 
 io_timer：每个 timer 单独 `uv_timer_t` 堆分配 + `uv_close` 回调销毁（照抄 txiki `src/timers.c`，不建 handle 池）。HTTPS：`http_get`/`file_get_contents` 的 `https://` 走 mbedtls 握手（uv_tcp 之上接 TLS 层），根证书从内嵌 cacert.pem 加载。
 
-## 5. Worker 落地（txiki 模式）
+## 5. Thread 子线程落地（原 Worker 机械；用户 API 已收窄为 Thread）
 
 - `uv_thread_create` + `uv_sem` 握手（构造返回时子 runtime 已就绪）
 - 子线程独立 TPhpRuntime（VM 栈/intern 动态区/uv_loop/调度器全独立）
@@ -126,7 +126,7 @@ lib\*.php --(tools/phpc.c，与 src 共享 lex/parse/compile 编译单元)-->
 
 ### 6.1 原生资产打包器（✅ M6.1 已实现，跨平台）
 
-phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包与 phpc **正交**，FFI 层零改动：
+phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包与 phpc **正交**（运行时无 FFI loader，DLL 仍可随包提取）：
 
 - 构建：`tphp build app.php --with vendor\ --with ext\bar.dll -o app`
   `--with` 接受**文件或目录**（可重复）：目录递归收全部非 .php 文件（.php 默认排除并警告），
@@ -144,7 +144,7 @@ phpc 管 PHP 字节码（编译期 bundle_data.c）；原生文件打包与 phpc
   `ASSET_ROOT`（`tphp://asset/`）是直接访问包根的次要前缀路径。manifest 中
   `type=dll`（`.dll/.so/.dylib`）按**等效相对路径**提取到 **exe 同级**
   （`<exedir>/<relpath>`；磁盘已存在且 sha1 与清单一致则跳过，
-  否则校验 zip 侧 sha1 后原子写 .tmp → rename）；FFI 用包内相对路径命中清单 →
+  否则校验 zip 侧 sha1 后原子写 .tmp → rename）；应用侧按包内相对路径命中清单（提取到 exe 旁）→
   `<exedir>/<relpath>` 绝对加载（`LOAD_WITH_ALTERED_SEARCH_PATH`，依赖走应用目录默认搜索）
   无嵌入 → 零开销正常启动；有嵌入主脚本且无 CLI 参数 → 执行
   防护：zip-slip（拒绝 `..`/绝对路径/盘符）；DLL 提取 sha1 校验

@@ -1,21 +1,17 @@
 /*
- * TinyPHP.rt - worker.c - M5-c 真 OS 线程 Worker（txiki 模式）
+ * TinyPHP.rt - worker.c - Tphp\Thread 真 OS 线程（内部复用一次性 worker 机械）
  *
- * 模型（PLAN/02 §3 + PLAN/03 §5）：
+ * 模型（PLAN/02 §3.1）：
  *   - 子线程 = 独立 runtime（thread-local VM/loop/调度器/类表克隆/堆），
- *     与父线程绝不共享 PHP 对象；并发安全靠隔离 + 消息
+ *     与父线程绝不共享 PHP 对象；并发安全靠隔离 + 结果回传
  *   - mailbox：uv_mutex + 消息链表 + uv_async_send 唤醒对端 loop；
- *     消息体 = serialize 字节流（serialize.c 协议），收端 unserialize
+ *     Thread::wait/poll 经 to_parent 取 callable 返回值
  *   - 入口闭包：fn 以 prog 内索引共享（freeze 后字节码只读），捕获值
  *     逐个 serialize 进子线程
- *   - 生命周期父线程独占：post/recv/on；stop → 关闭子 mailbox（EOF）→
- *     子线程入口返回 → 父 join
  *
- * PHP API：
- *   $w = new tphp\Worker(function () { $me = Worker::self(); ... });
- *   $w->post($v); $w->recv(); $w->on('message'|'close', fn); $w->stop();
- *   $w->isRunning(); $w->id();
- *   子线程内：$me = tphp\Worker::self(); $me->recv(); $me->post($r);
+ * PHP API：仅 Tphp\Thread（spawn/wait/detach/count/poll）。
+ * 历史 Tphp\Worker 消息 API 已移除（2026-11-10）；C 层 WHandle/mailbox
+ * 仍供 Thread 内部使用，不注册为用户可见类。
  */
 #include "tphp.h"
 #include "value.h"
@@ -43,7 +39,6 @@ void *tphp_vm_resolve_fn_global(VM *vm, TStr *name, bool *is_builtin); /* vm.c *
 void  tphp_worker_init(void);            /* 本文件尾：内部类注册 */
 void  tphp_async_init(void);             /* sched.c */
 void  tphp_io_init(void);                /* io.c */
-void  tphp_ffi_init(void);               /* ffi.c */
 void  tphp_exclass_init(void);           /* exclass.c P1-2 */
 void  tphp_closure_class_init(void);     /* vm.c P1-3 */
 /* mem.c */
@@ -181,7 +176,6 @@ static bool g_handles_mu_inited;
 
 static _Thread_local WHandle *g_self_handle;   /* 子线程视角 */
 static _Thread_local TClass *g_worker_cls;
-static _Thread_local TClass *g_wctx_cls;
 static _Thread_local bool g_worker_inited;
 
 static int handle_register(WHandle *h) {
@@ -231,10 +225,7 @@ static uint32_t prog_func_index(Program *p, TFunc *fn) {
 
 /* ---- 入口闭包捕获预检（P1-10）----
  * 对齐 serialize.c sw_val 的拒绝面，在序列化前给出指向三形态入口的明确
- * 错误（而不是深处一句 NotCloneableError 让人去猜）。典型症状：spawn 的
- * thunk/闭包继承调用方 $this，对象图里带 FFI CData 指针——指针是
- * 线程本地注册表下标，跨线程毫无意义，必须拒绝。 */
-bool tphp_ffi_is_cdata_cls(TClass *cls);   /* ext/ffi/ffi.c */
+ * 错误（而不是深处一句 NotCloneableError 让人去猜）。 */
 
 static bool worker_cap_ok(TVal v, char *why, size_t why_sz,
                           TVal *seen, int *ns, int depth) {
@@ -259,10 +250,6 @@ static bool worker_cap_ok(TVal v, char *why, size_t why_sz,
     case T_OBJ: {
         TObj *o = (TObj *)v.u.p;
         if (o->cls->kind == CK_ENUM) return true;   /* enum case：按名重建 */
-        if (tphp_ffi_is_cdata_cls(o->cls)) {
-            snprintf(why, why_sz, "an FFI CData pointer");
-            return false;
-        }
         if (!tphp_class_find_method(o->cls, "__clonestate")) {
             snprintf(why, why_sz, "an instance of %s", tstr_val(o->cls->name));
             return false;
@@ -390,7 +377,6 @@ static void worker_thread(void *arg) {
     /* 独立 runtime 初始化（thread-local 全套） */
     tphp_worker_init();          /* 内部类（本线程） */
     tphp_async_init();
-    tphp_ffi_init();             /* M5.5：Worker 线程内也可用 FFI */
     tphp_io_init();
     tphp_closure_class_init();   /* P1-3（线程表注册，同 Coroutine 模式；
                                   * exclass 的异常类经 clone_thread 从 master
@@ -669,19 +655,9 @@ static TVal nm_worker_id(VM *vm, void *self, TVal *args, int n) {
     return TV_INT(h ? h->id : -1);
 }
 
-/* static Worker::self()：子线程内取自身上下文（WorkerContext） */
-static TVal nm_worker_self(VM *vm, TVal *args, int n) {
-    (void)args; (void)n;
-    if (!g_self_handle || !g_wctx_cls)
-        tphp_vm_raise(vm, "Error", "Worker::self() outside a worker thread");
-    TObj *o = tphp_obj_alloc(g_wctx_cls);
-    o->props[0] = TV_INT(g_self_handle->id);
-    return TV_OBJ(o);
-}
-
 /* ---- Tphp\Thread（真线程池）----
- * spawn(entry)：起一个一次性 Worker，entry 三形态（P1-10，与
- *   new Worker 相同，见 nm_worker_construct）：
+ * spawn(entry)：起一个一次性 worker，entry 三形态（P1-10，见
+ *   nm_worker_construct）：
  *     Closure          —— 按 Program 索引序列化（捕获须可序列化）
  *     string 'fn_name' —— 全局解析（main + inc_progs + builtins）
  *     [Cls, 'method']  —— 静态方法（类名+方法名重建，可触发 autoload）
@@ -689,7 +665,7 @@ static TVal nm_worker_self(VM *vm, TVal *args, int n) {
  * wait()：按 spawn 顺序收集结果（阻塞等待，不能在 bind 回调里用）。
  * detach()：不再跟踪——线程自己跑完，WHandle 由进程退出回收。
  * 注意：这是真并行（OS 线程），不是协程；在 bind 回调里 spawn 是安全的
- * （不依赖 main 挂起），但不能在子线程里再调 Tphp\Worker（类已内部化）。 */
+ * （不依赖 main 挂起）。 */
 static _Thread_local TClass *g_thread_cls;
 
 /* detach 的 Worker 交给全局孤儿表：线程自己跑完，进程退出时统一回收。
@@ -828,11 +804,14 @@ static TClass *worker_make_class(const char *name) {
     return cls;
 }
 
-/* 内部类注册（编译前调用；每线程独立 TClass，注册进本线程表） */
+/* 内部类注册（编译前调用；每线程独立 TClass）。
+ * Tphp\Worker / Worker\\Context 已从用户 API 移除（2026-11-10）：
+ * 仅创建内部 g_worker_cls 供 Thread::spawn 复用（不 tphp_class_register）。 */
 void tphp_worker_init(void) {
     if (g_worker_inited) return;
     g_worker_inited = true;
 
+    /* 内部一次性 worker 类：Thread 直接调 nm_worker_*，不经 PHP 方法分发。 */
     TClass *w = worker_make_class("Tphp\\Worker");
     w->m_ctor = (int16_t)w->n_methods;
     worker_add_native(w, "__construct", (void *)nm_worker_construct, false);
@@ -843,17 +822,8 @@ void tphp_worker_init(void) {
     worker_add_native(w, "stop", (void *)nm_worker_stop, false);
     worker_add_native(w, "isrunning", (void *)nm_worker_is_running, false);
     worker_add_native(w, "id", (void *)nm_worker_id, false);
-    worker_add_native(w, "self", (void *)nm_worker_self, true);
-    tphp_class_register(w);
+    /* 不 tphp_class_register：用户不可 new Worker */
     g_worker_cls = w;
-
-    TClass *c = worker_make_class("Tphp\\Worker\\Context");
-    worker_add_native(c, "post", (void *)nm_worker_post, false);
-    worker_add_native(c, "recv", (void *)nm_worker_recv, false);
-    worker_add_native(c, "isrunning", (void *)nm_worker_is_running, false);
-    worker_add_native(c, "id", (void *)nm_worker_id, false);
-    tphp_class_register(c);
-    g_wctx_cls = c;
 
     /* Tphp\Thread：真线程池（真并行，与协程组 TaskGroup 互补） */
     TClass *th = worker_make_class("Tphp\\Thread");

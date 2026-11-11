@@ -94,13 +94,14 @@
 `json_encode` `json_decode` `json_last_error` `json_last_error_msg`
 
 ### 序列化
-`serialize` `unserialize`（自有格式，与 PHP 文本不互通；跨 Worker 传值用）
+`serialize` `unserialize`（自有格式，与 PHP 文本不互通；跨线程传值用）
 
 ### 回调
 `call_user_func` `call_user_func_array`
 
 ### 包管理（开发期；CLI 命令的 PHP 可调用层，见 package-manager.md）
 `pkg_new($dir, $name, $lib = false)` `pkg_add($proj, $source, $ref = "")` `pkg_remove($proj, $name)` `pkg_install($proj, $force = false)`
+`getenv($name)` `putenv($kv)`（包钩子与脚本读环境）
 
 名字/条件非法抛 `ValueError`，IO 失败抛 `RuntimeException`；成功返回 `true`。
 
@@ -204,35 +205,24 @@ $r = $t->wait();                    // 按 spawn 序返回结果数组（阻塞�
 - `count()`——当前跟踪中的线程数
 - `poll()`——非阻塞收割已完成线程的返回值（不挂起协程，UI 线程可安全调用）
 
-**捕获变量跨线程是深拷贝**：对象需实现 `__cloneState()`/`__restoreCloneState()` 才能被捕获（否则抛 `NotCloneableError`）；闭包本身可捕获（走 `T_CLOSURE` 序列化协议）。入口闭包捕获在构造时预检——捕获 FFI CData 指针、无 `__cloneState` 的对象（典型：方法内普通闭包自动捕获的 `$this`）直接报错并指引改用函数名/`[Cls,'method']`/`static function` 形态。
+**捕获变量跨线程是深拷贝**：对象需实现 `__cloneState()`/`__restoreCloneState()` 才能被捕获（否则抛 `NotCloneableError`）；闭包本身可捕获（走 `T_CLOSURE` 序列化协议）。入口闭包捕获在构造时预检——无 `__cloneState` 的对象（典型：方法内普通闭包自动捕获的 `$this`）直接报错并指引改用函数名/`[Cls,'method']`/`static function` 形态。
 
 > **坑**：方法内定义的普通闭包会自动捕获 `$this`（PHP 对齐）。在实例方法里 `spawn` 请用 `static function () use (...)`（不绑 `$this`，`self::` 作用域仍生效），或改用函数名/静态方法形态——pebview `bindAsync` 即此改法。
 
 **为什么 UI 回调里必须用真线程**：协程调度器在 C 栈阻塞（如 WebView 的 `webview_run`）时永远不会让出，
 `spawn` 出来的协程永远得不到调度——表现为"点了按钮没反应"。真线程不依赖调度器让出，
-在 FFI/C 回调里 `spawn` 立即开跑。
+在 bind 回调里 `Thread::spawn` 立即开跑。
 
-## Worker（`Tphp\`，真 OS 线程 + 消息传递）
+## Thread（`Tphp\Thread`，真 OS 线程池）
 
 ```php
-$w = new Tphp\Worker(function () {
-    $me = Tphp\Worker::self();     // 子线程内的上下文（Tphp\Worker\Context）
-    $me->post($msg);
-    while (($m = $me->recv()) !== false) { ... }
-});
-$w->post($data);
-$w->recv();
-$w->on('message', $cb);   // stop drain 时分发
-$w->stop();
-$w->isRunning();
-$w->id();
+$g = new Tphp\Thread();
+$g->spawn(function () { return 42; });   // Closure / 'fn' / [Cls,'method']
+$results = $g->wait();                   // 阻塞按 spawn 序收结果
+$g->detach();                            // fire-and-forget
 ```
 
-独立线程 + 独立 VM 堆；值跨线程 serialize 克隆；入口与 `Thread::spawn` 同三形态（Closure / string 全局函数名 / `[Cls,'method']`，见上节）。
-
-## FFI
-
-见 [ffi.md](ffi.md)：`FFI::cdef/new/free/memcpy/sizeof/...`、`FFI\CData` 下标与字段读写。
+独立线程 + 独立 VM 堆；值跨线程 serialize 克隆；入口三形态与全局解析见 PLAN/02 §3.1。
 
 ## lib\ PHP 层（phpc 打进 exe）
 
@@ -255,4 +245,4 @@ $w->id();
 - `preg_*`（M7+，需 vendor pcre2）
 - `PDO`/SQLite、HTTP server、REPL（M7+）
 - 被包含文件顶层 `return` 作为**字面量内联**形态的返回值（内联模型下 `return` 归属调用方；表达式固定 1/false；动态路径才支持文件 return 值）
-- Worker 线程内动态 require 的函数对主线程可见性（inc_progs 为 per-VM，跨线程共享后置）
+- Thread 子线程内动态 require 的函数对主线程可见性（inc_progs 为 per-VM，跨线程共享后置）

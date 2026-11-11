@@ -21,6 +21,9 @@
 #include <string.h>
 #include <time.h>
 #include <uv.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include "miniz.h"
 
@@ -249,6 +252,19 @@ static char *jsonc_strip(const char *src, size_t len) {
 typedef struct { char *prefix; char *dir; } ModPsr4;
 typedef struct { char *name; char *url; char *ref; } ModDep;
 
+/* mod.json.scripts 生命周期键（PLAN/pkg-manager.md §2.1） */
+enum {
+    SC_PRE_INSTALL = 0, SC_POST_INSTALL,
+    SC_PRE_UPDATE, SC_POST_UPDATE,
+    SC_PRE_REMOVE, SC_POST_REMOVE,
+    SC_N
+};
+static const char *const sc_keys[SC_N] = {
+    "preInstall", "postInstall",
+    "preUpdate", "postUpdate",
+    "preRemove", "postRemove"
+};
+
 typedef struct {
     char *name, *version, *type, *author, *description, *license;
     ModPsr4 *psr4; int n_psr4;
@@ -256,6 +272,7 @@ typedef struct {
     char **pack_include; int n_include;
     char **pack_exclude; int n_exclude;
     ModDep *deps; int n_deps;
+    char **scripts[SC_N]; int n_scripts[SC_N];
 } TMod;
 
 static void tmod_init(TMod *m) { memset(m, 0, sizeof *m); }
@@ -277,6 +294,10 @@ static void tmod_free(TMod *m) {
         tm_free(m->deps[i].name); tm_free(m->deps[i].url); tm_free(m->deps[i].ref);
     }
     tm_free(m->deps);
+    for (int k = 0; k < SC_N; k++) {
+        for (int i = 0; i < m->n_scripts[k]; i++) tm_free(m->scripts[k][i]);
+        tm_free(m->scripts[k]);
+    }
     memset(m, 0, sizeof *m);
 }
 
@@ -357,6 +378,21 @@ static void parse_strlist(TArr *a, char ***arr, int *n) {
     }
 }
 
+/* scripts.<key>：string | string[] → char** */
+static void parse_script_slot(TArr *o, const char *key, char ***arr, int *n) {
+    TVal *v = mget(o, key);
+    if (!v) return;
+    if (v->t == T_STR) {
+        TStr *s = (TStr *)v->u.p;
+        char *r = tm_malloc(s->len + 1);
+        memcpy(r, s->c, s->len + 1);
+        strlist_push(arr, n, r);
+        tm_free(r);
+    } else if (v->t == T_ARR) {
+        parse_strlist((TArr *)v->u.p, arr, n);
+    }
+}
+
 /* TVal（assoc 数组）→ TMod；失败返回 false 并写 err */
 static bool tmod_from_json(TVal v, TMod *m, char *err, size_t errcap) {
     if (v.t != T_ARR) {
@@ -391,6 +427,11 @@ static bool tmod_from_json(TVal v, TMod *m, char *err, size_t errcap) {
         if (inc) parse_strlist(inc, &m->pack_include, &m->n_include);
         TArr *exc = mget_obj(pk, "exclude");
         if (exc) parse_strlist(exc, &m->pack_exclude, &m->n_exclude);
+    }
+    TArr *sc = mget_obj(o, "scripts");
+    if (sc) {
+        for (int k = 0; k < SC_N; k++)
+            parse_script_slot(sc, sc_keys[k], &m->scripts[k], &m->n_scripts[k]);
     }
     TArr *dp = mget_obj(o, "deps");
     if (dp) {
@@ -514,6 +555,35 @@ static int tmod_save(const char *path, const TMod *m, char *err, size_t errcap) 
         }
         pb_puts(&b, "\n  }");
     }
+    {
+        bool any = false;
+        for (int k = 0; k < SC_N; k++)
+            if (m->n_scripts[k] > 0) { any = true; break; }
+        if (any) {
+            pb_puts(&b, ",\n  \"scripts\": {");
+            bool firstk = true;
+            for (int k = 0; k < SC_N; k++) {
+                if (m->n_scripts[k] <= 0) continue;
+                pb_puts(&b, firstk ? "\n" : ",\n");
+                firstk = false;
+                pb_puts(&b, "    ");
+                pb_json_str(&b, sc_keys[k]);
+                if (m->n_scripts[k] == 1) {
+                    pb_puts(&b, ": ");
+                    pb_json_str(&b, m->scripts[k][0]);
+                } else {
+                    pb_puts(&b, ": [\n");
+                    for (int i = 0; i < m->n_scripts[k]; i++) {
+                        pb_puts(&b, "      ");
+                        pb_json_str(&b, m->scripts[k][i]);
+                        pb_puts(&b, (i + 1 < m->n_scripts[k]) ? ",\n" : "\n");
+                    }
+                    pb_puts(&b, "    ]");
+                }
+            }
+            pb_puts(&b, "\n  }");
+        }
+    }
     if (m->n_deps > 0) {
         pb_puts(&b, ",\n  \"deps\": {\n");
         for (int i = 0; i < m->n_deps; i++) {
@@ -535,6 +605,209 @@ static int tmod_save(const char *path, const TMod *m, char *err, size_t errcap) 
     tm_free(b.p);
     if (rc < 0) set_err(err, errcap, "cannot write %s", path);
     return rc < 0 ? 2 : 0;
+}
+
+/* ---- lifecycle scripts runner（PLAN/pkg-manager.md §2.1） ---- */
+
+static char g_self_exe[1024];
+static bool g_ignore_scripts = false;
+
+void tphp_pkg_set_self_exe(const char *path) {
+    if (!path || !path[0]) return;
+    snprintf(g_self_exe, sizeof g_self_exe, "%s", path);
+}
+
+void tphp_pkg_set_ignore_scripts(bool on) { g_ignore_scripts = on; }
+
+static int scripts_enabled(void) {
+    if (g_ignore_scripts) return 0;
+    const char *e = getenv("TPHP_PKG_SCRIPTS");
+    if (e && e[0] == '0') return 0;
+    return 1;
+}
+
+static int shell_scripts_enabled(void) {
+    const char *e = getenv("TPHP_PKG_SCRIPTS_SHELL");
+    return e && e[0] == '1';
+}
+
+static bool rel_path_ok(const char *rel) {
+    if (!rel || !rel[0]) return false;
+    if (rel[0] == '/' || rel[0] == '\\') return false;
+    if (strlen(rel) >= 2 && rel[1] == ':') return false;   /* C:\ */
+    if (strstr(rel, "..")) return false;
+    return true;
+}
+
+static bool ends_with_ci(const char *s, const char *suf) {
+    size_t n = strlen(s), m = strlen(suf);
+    if (n < m) return false;
+    for (size_t i = 0; i < m; i++) {
+        char a = s[n - m + i], b = suf[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static void pkg_env_set(const char *k, const char *v) {
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    setenv(k, v ? v : "", 1);
+#endif
+}
+
+/* 同步跑子进程（cwd=pkg_dir）。 */
+static int g_child_status = -1;
+static void on_child_exit(uv_process_t *h, int64_t status, int term) {
+    (void)h; (void)term;
+    g_child_status = (int)status;
+}
+
+static int run_child(const char *exe, char *const args[], const char *cwd,
+                     char *err, size_t errcap) {
+    uv_loop_t *loop = uv_default_loop();
+    uv_process_t proc;
+    uv_process_options_t opts;
+    memset(&opts, 0, sizeof opts);
+    opts.file = (char *)exe;
+    opts.args = args;
+    opts.cwd = (char *)cwd;
+    opts.exit_cb = on_child_exit;
+    g_child_status = -1;
+    int r = uv_spawn(loop, &proc, &opts);
+    if (r != 0) {
+        set_err(err, errcap, "spawn %s failed: %s", exe, uv_strerror(r));
+        return 2;
+    }
+    uv_run(loop, UV_RUN_DEFAULT);
+    if (g_child_status != 0) {
+        set_err(err, errcap, "%s exited with status %d",
+                exe, g_child_status);
+        return 3;
+    }
+    return 0;
+}
+
+/* 执行一个 scripts 条目。cwd = 包根/项目根。 */
+static int run_script_entry(const char *entry, const char *cwd,
+                            char *err, size_t errcap) {
+    if (!rel_path_ok(entry)) {
+        set_err(err, errcap, "script path escapes package root: %s", entry);
+        return 1;
+    }
+    bool is_php = ends_with_ci(entry, ".php");
+    if (!is_php && !shell_scripts_enabled()) {
+        set_err(err, errcap,
+                "non-PHP script %s blocked (set TPHP_PKG_SCRIPTS_SHELL=1 "
+                "to allow shell commands)", entry);
+        return 1;
+    }
+    if (is_php) {
+        if (!g_self_exe[0]) {
+            set_err(err, errcap, "self exe not set for PHP scripts");
+            return 2;
+        }
+        char script[1400];
+        snprintf(script, sizeof script, "%s/%s", cwd, entry);
+        /* 相对 entry 传给子进程 + cwd，避免绝对路径引号问题 */
+        char *args[3];
+        args[0] = g_self_exe;
+        args[1] = (char *)entry;
+        args[2] = NULL;
+        /* script 存在性 */
+        if (!fs_exists(script)) {
+            set_err(err, errcap, "script not found: %s", script);
+            return 1;
+        }
+        return run_child(g_self_exe, args, cwd, err, errcap);
+    }
+    /* shell 命令（opt-in）：经平台 shell 在 cwd 执行 */
+#ifdef _WIN32
+    char cmd[1600];
+    snprintf(cmd, sizeof cmd, "cd /d \"%s\" && %s", cwd, entry);
+    int rc = system(cmd);
+    int st = rc == -1 ? -1 : (rc & 0xFF);
+#else
+    char cmd[1600];
+    snprintf(cmd, sizeof cmd, "cd \"%s\" && %s", cwd, entry);
+    int rc = system(cmd);
+    int st = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+#endif
+    if (st != 0) {
+        set_err(err, errcap, "command failed (%d): %s", st, entry);
+        return 3;
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *action;   /* install|update|remove */
+    const char *phase;    /* pre|post */
+    const char *pkg_name;
+    const char *pkg_version;
+    const char *pkg_ref;
+    const char *pkg_dir;
+    const char *project_dir;
+    int is_root;
+} ScriptCtx;
+
+static void fill_script_env(const ScriptCtx *c) {
+    pkg_env_set("TPHP_PKG_ACTION", c->action);
+    pkg_env_set("TPHP_PKG_PHASE", c->phase);
+    pkg_env_set("TPHP_PKG_NAME", c->pkg_name ? c->pkg_name : "");
+    pkg_env_set("TPHP_PKG_VERSION", c->pkg_version ? c->pkg_version : "");
+    pkg_env_set("TPHP_PKG_REF", c->pkg_ref ? c->pkg_ref : "");
+    pkg_env_set("TPHP_PKG_DIR", c->pkg_dir ? c->pkg_dir : "");
+    pkg_env_set("TPHP_PROJECT_DIR", c->project_dir ? c->project_dir : "");
+    pkg_env_set("TPHP_PKG_ROOT", c->is_root ? "1" : "0");
+}
+
+/* 跑 m 的 scripts[key]。pre 失败 → 返回非 0（调用方中止）；
+ * post 失败 → 警告并返回 3（状态已提交，不回滚）。 */
+static int run_script_slot(const TMod *m, int key, const ScriptCtx *c,
+                           char *err, size_t errcap) {
+    if (!scripts_enabled()) return 0;
+    if (!m || m->n_scripts[key] <= 0) return 0;
+    if (!c->pkg_dir || !c->pkg_dir[0]) return 0;
+    fill_script_env(c);
+    int worst = 0;
+    for (int i = 0; i < m->n_scripts[key]; i++) {
+        char e2[512] = "";
+        int rc = run_script_entry(m->scripts[key][i], c->pkg_dir,
+                                  e2, sizeof e2);
+        if (rc == 0) continue;
+        if (rc == 3) {
+            tphp_warn("PHP Warning: pkg script %s (%s/%s) failed: %s\n",
+                      m->scripts[key][i], c->action, sc_keys[key], e2);
+            worst = 3;
+            continue;
+        }
+        /* pre 类硬失败（1/2）：立即返回 */
+        set_err(err, errcap, "%s script %s failed: %s",
+                sc_keys[key], m->scripts[key][i], e2);
+        return rc;
+    }
+    return worst;
+}
+
+/* 从 dir 的 mod.json 跑某槽（dir 可能尚无 mod.json → 0） */
+static int run_scripts_from_dir(const char *dir, int key,
+                                const ScriptCtx *c,
+                                char *err, size_t errcap) {
+    if (!scripts_enabled() || !dir || !dir[0]) return 0;
+    char mj[1450];
+    snprintf(mj, sizeof mj, "%s/mod.json", dir);
+    if (!fs_exists(mj)) return 0;
+    TMod m;
+    if (!tmod_load(mj, &m, NULL, 0)) return 0;
+    ScriptCtx cc = *c;
+    cc.pkg_dir = dir;
+    int rc = run_script_slot(&m, key, &cc, err, errcap);
+    tmod_free(&m);
+    return rc;
 }
 
 /* ---- 名字校验 ---- */
@@ -1686,6 +1959,43 @@ static int install_from_src(const char *proj_dir, const char *src,
 
     char dest[1400];
     vendor_path_of(dest, sizeof dest, proj_dir, pkg.name);
+    bool existed = false;
+    {
+        char emj[1450];
+        snprintf(emj, sizeof emj, "%s/mod.json", dest);
+        existed = fs_exists(emj);
+    }
+    const char *action = existed ? "update" : "install";
+
+    ScriptCtx sc;
+    memset(&sc, 0, sizeof sc);
+    sc.action = action;
+    sc.pkg_name = pkg.name;
+    sc.pkg_version = pkg.version;
+    sc.pkg_ref = "";   /* install_from_src 无 ref 上下文；add 层可补 */
+    sc.project_dir = proj_dir;
+    sc.is_root = 0;
+
+    /* pre：install → src（新包脚本）；update → 旧 dest 的 preUpdate */
+    {
+        char e2[512] = "";
+        int prc = 0;
+        sc.phase = "pre";
+        if (existed) {
+            sc.pkg_dir = dest;
+            prc = run_scripts_from_dir(dest, SC_PRE_UPDATE, &sc,
+                                       e2, sizeof e2);
+        } else {
+            sc.pkg_dir = src;
+            prc = run_script_slot(&pkg, SC_PRE_INSTALL, &sc,
+                                  e2, sizeof e2);
+        }
+        if (prc != 0 && prc != 3) {
+            set_err(err, errcap, "%s", e2[0] ? e2 : "pre script failed");
+            tmod_free(&pkg);
+            return prc == 1 ? 1 : 2;
+        }
+    }
 
     /* 覆盖安装：先删旧目录（有用户工作区嫌疑则拒绝，见上） */
     const char *block = vendor_overwrite_blocked(dest, pkg.name);
@@ -1707,9 +2017,28 @@ static int install_from_src(const char *proj_dir, const char *src,
         }
     }
 
+    /* post：从 dest（已就位的新包）读 scripts */
+    int post_rc = 0;
+    {
+        char e2[512] = "";
+        sc.phase = "post";
+        sc.pkg_dir = dest;
+        int prc = run_scripts_from_dir(dest,
+            existed ? SC_POST_UPDATE : SC_POST_INSTALL, &sc, e2, sizeof e2);
+        if (prc == 3) {
+            tphp_warn("PHP Warning: pkg post script failed for %s: %s\n",
+                      pkg.name, e2);
+            post_rc = 3;
+        } else if (prc != 0) {
+            tphp_warn("PHP Warning: pkg post script error for %s: %s\n",
+                      pkg.name, e2);
+        }
+    }
+
     int rc = install_deps(proj_dir, &pkg, err, errcap);
     tmod_free(&pkg);
-    return rc;
+    if (rc != 0) return rc;
+    return post_rc;   /* 3 = 完成但 post 失败（不回滚） */
 }
 
 static int pkg_install_core(const char *proj_dir, const char *source,
@@ -1838,9 +2167,49 @@ int tphp_pkg_add(const char *proj_dir, const char *source, const char *ref,
     gh_classify(source, url_only, sizeof url_only, urlref, sizeof urlref, &g);
     const char *eff = (ref && ref[0]) ? ref : urlref;
 
+    /* 根 pre*：按 deps 是否已存在区分 install / update */
+    TMod root_pre;
+    bool have_root = tmod_load(root_mj, &root_pre, err, errcap);
+    bool is_upd = false;
+    if (have_root) {
+        /* 粗判：源路径/URL 与现有 dep 相同或 vendor 已有同名（名未知时
+         * 用 vendor 扫描过重——v1：deps 里 url 相同即视为 update） */
+        for (int i = 0; i < root_pre.n_deps; i++) {
+            if (root_pre.deps[i].url &&
+                strcmp(root_pre.deps[i].url, url_only) == 0) {
+                is_upd = true;
+                break;
+            }
+        }
+    }
+    if (have_root) {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = is_upd ? "update" : "install";
+        sc.phase = "pre";
+        sc.pkg_name = root_pre.name;
+        sc.pkg_version = root_pre.version;
+        sc.pkg_dir = proj_dir;
+        sc.project_dir = proj_dir;
+        sc.is_root = 1;
+        int prc = run_script_slot(&root_pre,
+            is_upd ? SC_PRE_UPDATE : SC_PRE_INSTALL, &sc, err, errcap);
+        if (prc != 0 && prc != 3) {
+            tmod_free(&root_pre);
+            return prc == 1 ? 1 : 2;
+        }
+        tmod_free(&root_pre);
+    }
+
     char *pkg_name = NULL;
     int rc = pkg_install_core(proj_dir, source, eff, &pkg_name, resolved,
                               err, errcap);
+    int post_fail = 0;
+    if (rc == 3) {
+        /* 包已装好，仅 post 钩子失败：继续写 deps/lock，最后返回 3 */
+        post_fail = 3;
+        rc = 0;
+    }
     if (rc != 0) { tm_free(pkg_name); return rc; }
 
     const char *store_ref = (ref && ref[0]) ? ref
@@ -1877,11 +2246,28 @@ int tphp_pkg_add(const char *proj_dir, const char *source, const char *ref,
         tmod_free(&root);
         return 2;
     }
-    tmod_free(&root);
 
     lock_save(proj_dir, err, errcap);
     tphp_pkg_gen_autoload(proj_dir, err, errcap);
-    return 0;
+
+    /* 根 post*（autoload 已重写） */
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = is_upd ? "update" : "install";
+        sc.phase = "post";
+        sc.pkg_name = root.name;
+        sc.pkg_version = root.version;
+        sc.pkg_dir = proj_dir;
+        sc.project_dir = proj_dir;
+        sc.is_root = 1;
+        int prc = run_script_slot(&root,
+            is_upd ? SC_POST_UPDATE : SC_POST_INSTALL, &sc, err, errcap);
+        tmod_free(&root);
+        if (prc == 3) post_fail = 3;
+        else if (prc != 0) return prc == 1 ? 1 : 2;
+    }
+    return post_fail;   /* 0 ok；3 = 完成但 post 失败 */
 }
 
 /* ---- remove ---- */
@@ -1914,6 +2300,24 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
         set_err(err, errcap, "\"%s\" is not a dependency", name);
         tmod_free(&root);
         return 1;
+    }
+
+    /* 根 preRemove */
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = "remove";
+        sc.phase = "pre";
+        sc.pkg_name = root.name;
+        sc.pkg_version = root.version;
+        sc.pkg_dir = proj_dir;
+        sc.project_dir = proj_dir;
+        sc.is_root = 1;
+        int prc = run_script_slot(&root, SC_PRE_REMOVE, &sc, err, errcap);
+        if (prc != 0 && prc != 3) {
+            tmod_free(&root);
+            return prc == 1 ? 1 : 2;
+        }
     }
 
     /* 标记删除：从 root deps 出发 BFS 可达集；不在集内的 vendor 包删掉 */
@@ -1950,6 +2354,30 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
     /* 删除目标 + 所有不在 keep 里的 vendor 包 */
     char tgt[1400];
     vendor_path_of(tgt, sizeof tgt, proj_dir, name);
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = "remove";
+        sc.phase = "pre";
+        sc.pkg_name = name;
+        sc.pkg_dir = tgt;
+        sc.project_dir = proj_dir;
+        sc.is_root = 0;
+        char e2[512] = "";
+        int prc = run_scripts_from_dir(tgt, SC_PRE_REMOVE, &sc,
+                                       e2, sizeof e2);
+        if (prc != 0 && prc != 3) {
+            set_err(err, errcap, "%s", e2[0] ? e2 : "preRemove failed");
+            for (int i = 0; i < nkeep; i++) {
+                for (int j = 0; j < root.n_deps; j++)
+                    if (keep[i] == root.deps[j].name) { keep[i] = NULL; break; }
+                if (keep[i]) tm_free(keep[i]);
+            }
+            tm_free(keep);
+            tmod_free(&root);
+            return prc == 1 ? 1 : 2;
+        }
+    }
     fs_rm_rf(tgt);
 
     char vdir[1250];
@@ -2015,6 +2443,14 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
     }
     uv_fs_req_cleanup(&req);
     for (int i = 0; i < ntodel; i++) {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = "remove";
+        sc.phase = "pre";
+        sc.pkg_dir = todel[i];
+        sc.project_dir = proj_dir;
+        sc.is_root = 0;
+        run_scripts_from_dir(todel[i], SC_PRE_REMOVE, &sc, NULL, 0);
         fs_rm_rf(todel[i]);
         tm_free(todel[i]);
     }
@@ -2032,9 +2468,25 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
         tmod_free(&root);
         return 2;
     }
-    tmod_free(&root);
     lock_save(proj_dir, err, errcap);
     tphp_pkg_gen_autoload(proj_dir, err, errcap);
+
+    /* 根 postRemove（包已删，仅根） */
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = "remove";
+        sc.phase = "post";
+        sc.pkg_name = root.name;
+        sc.pkg_version = root.version;
+        sc.pkg_dir = proj_dir;
+        sc.project_dir = proj_dir;
+        sc.is_root = 1;
+        int prc = run_script_slot(&root, SC_POST_REMOVE, &sc, err, errcap);
+        tmod_free(&root);
+        if (prc == 3) return 3;
+        if (prc != 0) return prc == 1 ? 1 : 2;
+    }
     return 0;
 }
 
@@ -2046,12 +2498,35 @@ int tphp_pkg_install(const char *proj_dir, bool force,
         set_err(err, errcap, "install requires project dir");
         return 1;
     }
+    int post_fail_any = 0;
     char root_mj[1200], lockp[1250];
     snprintf(root_mj, sizeof root_mj, "%s/mod.json", proj_dir);
     snprintf(lockp, sizeof lockp, "%s/mod.lock", proj_dir);
     if (!fs_exists(root_mj)) {
         set_err(err, errcap, "no mod.json in %s (not a package project?)", proj_dir);
         return 1;
+    }
+
+    /* 根 pre*：有 lock 且存在已装包 + force → update；否则 install。
+     * 简化：force 视为 update，否则 install（新机器补装）。 */
+    TMod root_pre;
+    if (tmod_load(root_mj, &root_pre, err, errcap)) {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = force ? "update" : "install";
+        sc.phase = "pre";
+        sc.pkg_name = root_pre.name;
+        sc.pkg_version = root_pre.version;
+        sc.pkg_dir = proj_dir;
+        sc.project_dir = proj_dir;
+        sc.is_root = 1;
+        int prc = run_script_slot(&root_pre,
+            force ? SC_PRE_UPDATE : SC_PRE_INSTALL, &sc, err, errcap);
+        if (prc != 0 && prc != 3) {
+            tmod_free(&root_pre);
+            return prc == 1 ? 1 : 2;
+        }
+        tmod_free(&root_pre);
     }
 
     /* lock 存在：逐条恢复缺失包；否则从 mod.json deps 递归 */
@@ -2122,6 +2597,7 @@ int tphp_pkg_install(const char *proj_dir, bool force,
             char e2[512] = "";
             int rc = pkg_install_core(proj_dir, absurl, ref, NULL, NULL,
                                       e2, sizeof e2);
+            if (rc == 3) { post_fail_any = 1; rc = 0; }
             if (rc != 0) {
                 set_err(err, errcap, "install %s failed: %s", tstr_val(ks), e2);
                 tval_release(&lv);
@@ -2152,6 +2628,7 @@ int tphp_pkg_install(const char *proj_dir, bool force,
             char e2[512] = "";
             int rc = pkg_install_core(proj_dir, absurl, root.deps[i].ref,
                                       NULL, NULL, e2, sizeof e2);
+            if (rc == 3) { post_fail_any = 1; rc = 0; }
             if (rc != 0) {
                 set_err(err, errcap, "install %s failed: %s",
                         root.deps[i].name, e2);
@@ -2164,7 +2641,28 @@ int tphp_pkg_install(const char *proj_dir, bool force,
 
     lock_save(proj_dir, err, errcap);
     tphp_pkg_gen_autoload(proj_dir, err, errcap);
-    return 0;
+
+    /* 根 post* */
+    {
+        TMod root_post;
+        if (tmod_load(root_mj, &root_post, NULL, 0)) {
+            ScriptCtx sc;
+            memset(&sc, 0, sizeof sc);
+            sc.action = force ? "update" : "install";
+            sc.phase = "post";
+            sc.pkg_name = root_post.name;
+            sc.pkg_version = root_post.version;
+            sc.pkg_dir = proj_dir;
+            sc.project_dir = proj_dir;
+            sc.is_root = 1;
+            int prc = run_script_slot(&root_post,
+                force ? SC_POST_UPDATE : SC_POST_INSTALL, &sc, err, errcap);
+            tmod_free(&root_post);
+            if (prc == 3) post_fail_any = 1;
+            else if (prc != 0) return prc == 1 ? 1 : 2;
+        }
+    }
+    return post_fail_any ? 3 : 0;
 }
 
 /* build 自动打包 vendor 前的 integrity 卡口（阶段 E）：读 mod.lock，

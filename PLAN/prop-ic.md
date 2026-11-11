@@ -115,7 +115,7 @@ v1 选 A；若 A 后 guard 仍成瓶颈再评估 B（另立项）。
 | private/protected | 快路仅 PUBLIC（scope 相关不可缓存）→ 非 public 恒 slow |
 | magic `__get/__set`、hooks、virtual | 守卫 `!has_hooks` 等 → miss 走 helper 完整逻辑 |
 | typed/readonly/asymmetric | assign 守卫逐字段排除（镜像 3124） |
-| FFI CData | `kind==GC_KIND_OBJ` + n_props=0 → bounds/name 失配 → miss |
+| ~~FFI CData~~ | FFI 已移除（2026-11-10）；守卫链仍兼容 kind/n_props 形态 |
 | enum `->value/name` | slot 查找失败路径在 helper，快路不进 |
 | 继承/多态 | interned 名指针相等（解释器同款）；重声明换 slot → miss 重填 |
 | by-ref `&$o->v` | **v1 按普通 get 执行**（ast.h `get_by_ref` 注释：解析保留、不产引用）——与 HEAD 同语义，快路无需特判；若未来真 by-ref 引用语义落地再排除 |
@@ -145,7 +145,7 @@ v1 选 A；若 A 后 guard 仍成瓶颈再评估 B（另立项）。
 
 1. **TProp 布局漂移**（最高频坑）：offset 全部 offsetof + Static_assert；TProp 加字段即炸编译。
 2. **语义漂移**（typed UNDEF / 可见性 scope / hooks 边角）：HIT 条件逐字段镜像解释器源码；
-   对拍矩阵含 private/hooks/readonly/typed/FFI/继承重声明/动态名。
+   对拍矩阵含 private/hooks/readonly/typed/继承重声明/动态名（FFI 已移除）。
 3. **ic 格式冲突**：绝不改 slot+1 格式；开工先 grep 确认 FETCH_PROP/ASSIGN_PROP 的 ic 无他用。
 4. **by-ref 形态**：v1 普通 get 语义（见 §3），快路与 HEAD 同行为；未来真引用语义时再加排除闸。
 5. **emit 双上下文漏点**：开关关/动态名/非 CONST 三路回 HEAD，checklist 镜像 rel_dst_gate 纪律。
@@ -157,7 +157,7 @@ v1 选 A；若 A 后 guard 仍成瓶颈再评估 B（另立项）。
 - **探针**：`tools/probe_object_recon3.php` 复跑（prop_direct/method_get/full 三段主指标）。
 - **语义矩阵**（新测试 `tests/jit/test-jit-propinline-001.php`）：
   public 读写 / 表达式 dst / private→miss / hooks→miss / readonly+typed assign→miss /
-  继承（父声明子实例）/ 子类重声明换 slot / FFI CData / 动态名 / UNDEF typed 读 /
+  继承（父声明子实例）/ 子类重声明换 slot / 动态名 / UNDEF typed 读 /
   rc 平衡（STR 属性 1e5 读写）/ guard 失败后 ic 回填再命中。
 - **DEBUG=1**：快路命中不打 helper；miss 打 helper 且二次执行不再打（ic 已填）。
 - **全量**：260×3（默认 / PROP_INLINE=0 / JIT=0）。

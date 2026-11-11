@@ -55,7 +55,7 @@ kv-read 常量键形态在 opcache 开/JIT 关下**进程间双态**：约一半
 **排除性结论（防翻案）**：
 - ❌ 借壳 JSC/JSC JIT——JIT 不可剥离语言引擎（JSC 编译 JS 字节码，与 JSValue/JSCell 对象模型耦合）；"PHP→JS 转译"是 HipHop for PHP 用十年验证过的死路（语义保真灾难 + Facebook 官方放弃 PHP 兼容）
 - ❌ WASM/嵌 HHVM——同理或已不兼容 PHP
-- ✅ 姊妹项目 TinyPHP（AOT）是数值密集场景的既定答案；tphp 热点可用 FFI 调 C/TinyPHP 产物（现成逃逸舱）
+- ✅ 姊妹项目 TinyPHP（AOT）是数值密集场景的既定答案；（历史：曾设想 FFI 调 C——FFI 已移除）
 
 **关键事实**：绝大多数真实 PHP 部署**不开 JIT**（共享主机/默认 ini）。追平"开 opcache 的 PHP"即超过约 90% 的实际部署，且 tphp 额外附送无感异步 + 真线程 + 单二进制——性能叙事主轴在此，不与 Zend JIT 正面决战（决战路径见 §5，已因 IR 大幅拉近）。
 
@@ -106,13 +106,13 @@ kv-read 常量键形态在 opcache 开/JIT 关下**进程间双态**：约一半
   该函数 opcode → IR lowering（带 TVal 类型 guard）
   → IR 编译机器码；入口 guard：
       int/float 密集路径 → untagged 寄存器运算
-      guard 失败（对象/字符串/异常/FFI/协程）→ deopt 回解释器
+      guard 失败（对象/字符串/异常/协程）→ deopt 回解释器
 ```
 
 - 分工：lowering + 类型 guard/deopt = tphp；优化/regalloc/机器码 = IR 全包
 - **公平竞赛点**：Zend JIT 8.4+ 与 tphp 用同一后端——胜负取决于 lowering 质量；tphp 纯值 TVal 无 IS_REFERENCE 棱角，guard 更干净（结构性优势）
 - 对照设计：本机 php-src 8.5.7 的 `ext/opcache/jit/zend_jit.c`（zval lowering 直接可抄）
-- v1 范围：函数级 baseline，**不做 OSR**（只 JIT 从入口进的函数，砍一半复杂度）；不碰异常路径/FFI/协程/对象密集代码
+- v1 范围：函数级 baseline，**不做 OSR**（只 JIT 从入口进的函数，砍一半复杂度）；不碰异常路径/协程/对象密集代码
 - 首发平台：Windows x64（IR 支持 ✓）
 
 ### 5.3 风险

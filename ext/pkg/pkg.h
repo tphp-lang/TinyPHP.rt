@@ -48,6 +48,12 @@ int tphp_pkg_remove(const char *proj_dir, const char *name,
 int tphp_pkg_install(const char *proj_dir, bool force,
                      char *err, size_t errcap);
 
+/* lifecycle scripts（PLAN/pkg-manager.md §2.1 scripts）：
+ * self_exe = 当前 tphp 可执行文件绝对路径（PHP 钩子用）；main 启动时设置。 */
+void tphp_pkg_set_self_exe(const char *path);
+/* CLI --ignore-scripts 或环境 TPHP_PKG_SCRIPTS=0 → 跳过全部钩子 */
+void tphp_pkg_set_ignore_scripts(bool on);
+
 /* build 自动打包 vendor 前的 integrity 卡口：对照 mod.lock 快照逐文件
  * 校验已装包（无 lock / 旧 lock 无快照 = 放行）。0 通过；2 不匹配。 */
 int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap);
