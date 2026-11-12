@@ -51,8 +51,12 @@ int tphp_pkg_ext_remove(const char *proj_dir, const char *name,
 /* --list：表头 + 每行 name/source/built-in/project（调用方负责打印）。 */
 int tphp_pkg_ext_list(const char *proj_dir, char **out,
                       char *err, size_t errcap);
-/* --relink：全量重链（§5 编译管线未实现时返回 2）。 */
+/* --relink：全量编译所有 type=ext 包并重链当前 tphp（§5）。
+ * 成功后重写 <tphp_root>/ext/.built。0 成功；1 无包/参数；2 编译/链接/IO。 */
 int tphp_pkg_ext_relink(char *err, size_t errcap);
+/* 链入扩展的 init 钩子（基座空实现；重链时由生成的 registry 挂上）。
+ * main 启动时调用一次。 */
+void tphp_run_ext_inits(void);
 /* 释放本模块返回的可变缓冲（list / summary）。 */
 void tphp_pkg_free(void *p);
 

@@ -5,20 +5,26 @@
 // EXPECT: add-ok
 // EXPECT: writeback-ok
 // EXPECT: nonproj-ok
-// EXPECT: rownp=tst/extcmd|y|n|-
+// EXPECT: rownp=tst/extcmd|y|y|-
 // EXPECT: sync-installed
 // EXPECT: sync-present
-// EXPECT: row1=tst/extcmd|y|n|y
+// EXPECT: lock-ext-ok
+// EXPECT: lock-ext-ic-ok
+// EXPECT: ic-tamper-blocked
+// EXPECT: force-update-ok
+// EXPECT: readd-ok
+// EXPECT: row1=tst/extcmd|y|y|y
 // EXPECT: row2=tst/ghost|n|n|y
 // EXPECT: sync-miss-rej-ok
 // EXPECT: remove-ok
 // EXPECT: remove-wb-ok
 // EXPECT: cleanup-ok
 
-// ext 命令组（PLAN/ext-packages.md §4 切片 4）：
+// ext 命令组（PLAN/ext-packages.md §4 切片 4 + §5 编译链入）：
 // 非法 type 拒 / 单段名拒 / 项目写回 / 非项目不写 /
 // --list 三列 source×built-in×project（无项目列 "-"；声明缺源 n） /
-// sync 补齐 + 幂等 / 缺源码报错 / remove 时 ext[] 写回。
+// sync 补齐 + 幂等 / 缺源码报错 / remove 时 ext[] 写回 /
+// add/sync 后自动 relink → built-in 变 y（切片 5）。
 // 落点 <tphp_root>/ext = build/ext（tphp 根 = build/）。
 $root = __DIR__ . "/../..";
 $src = $root . "/build/pkgtest-ext-src";
@@ -135,6 +141,40 @@ echo trim($s1) === "tst/extcmd: installed"
 $s2 = pkg_ext_sync($app);
 echo trim($s2) === "tst/extcmd: already present"
     ? "sync-present\n" : "sync2-FAIL: " . trim($s2) . "\n";
+
+// --- lock ext 分栏 + integrity（§6 切片 6） ---
+$lk = file_get_contents($app . "/mod.lock");
+$has_ext = strpos($lk, '"ext"') !== false
+        && strpos($lk, "tst/extcmd") !== false;
+echo $has_ext ? "lock-ext-ok\n" : "lock-ext-FAIL\n";
+// integrity 快照：含源文件、不含 build/ 产物（.o）
+// 注意：url 本身可能含 /build/ 路径，故不查整串 "/build/"
+$has_ic = strpos($lk, '"integrity"') !== false
+       && strpos($lk, "src/extcmd.c") !== false
+       && strpos($lk, ".o\"") === false;
+echo $has_ic ? "lock-ext-ic-ok\n" : "lock-ext-ic-FAIL\n";
+
+// 篡改已装 ext → 再 add（覆盖前 integrity）应 fail-closed
+// 包路径 = build/ext/<vendor>/<pkg> = build/ext/tst/extcmd
+file_put_contents($exttst . "/extcmd/src/extcmd.c",
+    "void tphp_ext_tst_extcmd_init(void) { /* tampered */ }\n");
+$ic_block = false; $ic_msg = "";
+try { pkg_ext_add($app, $src); }
+catch (Throwable $e) { $ic_block = true; $ic_msg = $e->getMessage(); }
+echo ($ic_block && strpos($ic_msg, "integrity") !== false)
+    ? "ic-tamper-blocked\n" : "ic-tamper-FAIL: " . $ic_msg . "\n";
+
+// --update（force）跳过 integrity 重装恢复
+$uok = true;
+try { pkg_ext_update($app, "tst/extcmd"); }
+catch (Throwable $e) { echo "force-upd-ex: ", $e->getMessage(), "\n"; $uok = false; }
+echo $uok ? "force-update-ok\n" : "force-update-FAIL\n";
+
+// 恢复后再 add 应通过（内容与 lock 一致）
+$a2ok = true;
+try { pkg_ext_add($app, $src); }
+catch (Throwable $e) { echo "readd-ex: ", $e->getMessage(), "\n"; $a2ok = false; }
+echo $a2ok ? "readd-ok\n" : "readd-FAIL\n";
 
 // --- ghost 声明（缺源）+ list 三列 ---
 $am = json_decode(file_get_contents($app . "/mod.json"), true);

@@ -1,6 +1,7 @@
-# tphp ext · C 扩展包管理（设计稿，未实现）
+# tphp ext · C 扩展包管理
 
-状态：**设计定稿 2026-11-10（用户逐条拍板），代码未动**。开工时以本文为唯一规格。
+状态：**切片 1–8 全部完成（2026-11-11）**——设计定稿 + `new --ext` + TMod 双形态 + `tphp ext` 命令组 + 编译链入 + lock `ext` 分栏/integrity + 测试（`test-pkg-ext`）+ 文档收口。
+权威规格与拍板决策见本文 §10；进度日志 `memory/2026-11-11.md`。
 上级索引：[../PLAN.md](../PLAN.md)；PHP 包管理见 [pkg-manager.md](pkg-manager.md)（二者边界见 §1）。
 CI 导出含 tcc/libtphp.a/include 见 [../doc/build.md](../doc/build.md) CI 节。
 

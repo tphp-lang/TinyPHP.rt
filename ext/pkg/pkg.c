@@ -15,6 +15,7 @@
 #include "value.h"
 #include "tphp.h"
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2089,8 +2090,10 @@ static void intlist_free(IntList *l) {
 }
 
 /* 递归扫描 dir：全部文件（跳过 '.' 开头条目）→ (rel, sha1)。rel 相对 dir
- * 根、'/' 分隔。返回 0；scandir 失败 -1。 */
-static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
+ * 根、'/' 分隔。返回 0；scandir 失败 -1。
+ * skip_build：跳过名为 build 的子目录（ext 包编译产物，§6）。 */
+static int integrity_scan_ex(const char *dir, const char *prefix, IntList *l,
+                             bool skip_build) {
     uv_fs_t req;
     if (uv_fs_scandir(NULL, &req, dir, 0, NULL) < 0) {
         uv_fs_req_cleanup(&req);
@@ -2099,12 +2102,13 @@ static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
     uv_dirent_t ent;
     while (uv_fs_scandir_next(&req, &ent) == 0) {
         if (ent.name[0] == '.') continue;
+        if (skip_build && strcmp(ent.name, "build") == 0) continue;
         char sub[1500], rel[1024];
         snprintf(sub, sizeof sub, "%s/%s", dir, ent.name);
         if (prefix[0]) snprintf(rel, sizeof rel, "%s/%s", prefix, ent.name);
         else snprintf(rel, sizeof rel, "%s", ent.name);
         if (fs_isdir(sub)) {
-            if (integrity_scan(sub, rel, l) != 0) {
+            if (integrity_scan_ex(sub, rel, l, skip_build) != 0) {
                 uv_fs_req_cleanup(&req);
                 return -1;
             }
@@ -2116,6 +2120,10 @@ static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
     }
     uv_fs_req_cleanup(&req);
     return 0;
+}
+
+static int integrity_scan(const char *dir, const char *prefix, IntList *l) {
+    return integrity_scan_ex(dir, prefix, l, false);
 }
 
 /* 把 lock 条目里的 integrity 对象展开成 IntList（拷贝，脱离 TArr 生命周期） */
@@ -2137,13 +2145,14 @@ static void integrity_from_snap(TArr *snap, IntList *l) {
 }
 
 /* 对照快照校验 vdir：快照每文件存在且 sha1 一致；磁盘无快照外新文件。
- * snap=NULL → 不校验（旧 lock 向后兼容）。0 通过；-1 不匹配（err 列出）。 */
-static int integrity_check(const char *vdir, TArr *snap,
-                           char *err, size_t errcap) {
+ * snap=NULL → 不校验（旧 lock 向后兼容）。0 通过；-1 不匹配（err 列出）。
+ * skip_build：ext 包校验时跳过 build/（与 lock 写侧一致）。 */
+static int integrity_check_ex(const char *vdir, TArr *snap, bool skip_build,
+                              char *err, size_t errcap) {
     if (!snap) return 0;
     IntList expect = {0}, actual = {0};
     integrity_from_snap(snap, &expect);
-    if (integrity_scan(vdir, "", &actual) != 0) {
+    if (integrity_scan_ex(vdir, "", &actual, skip_build) != 0) {
         intlist_free(&expect);
         set_err(err, errcap, "cannot scan %s", vdir);
         return -1;
@@ -2188,6 +2197,42 @@ static int integrity_check(const char *vdir, TArr *snap,
     set_err(err, errcap, "%d file(s) mismatched: %s%s", bad, shown,
             bad > shown_n ? ", ..." : "");
     return -1;
+}
+
+/* vendor 路径默认不跳 build（兼容既有调用点） */
+static int integrity_check(const char *vdir, TArr *snap,
+                           char *err, size_t errcap) {
+    return integrity_check_ex(vdir, snap, false, err, errcap);
+}
+
+/* 覆盖前对照 mod.lock ext[name].integrity 校验 destdir（§6）。
+ * 无 lock/无条目/无快照 → 0（不校验，向后兼容）。
+ * 0 通过；-1 不匹配；-2 读 lock 失败。 */
+static int ext_overwrite_integrity(const char *proj_dir, const char *name,
+                                   const char *destdir,
+                                   char *err, size_t errcap) {
+    char lockp[1250];
+    snprintf(lockp, sizeof lockp, "%s/mod.lock", proj_dir);
+    if (!fs_exists(lockp)) return 0;
+    size_t len = 0;
+    char *raw = fs_read(lockp, &len);
+    if (!raw) return -2;
+    char *stripped = jsonc_strip(raw, len);
+    tm_free(raw);
+    TVal lv;
+    bool ok = tphp_json_decode_c(stripped, strlen(stripped), &lv);
+    tm_free(stripped);
+    if (!ok || lv.t != T_ARR) return 0;
+    TArr *lock = (TArr *)lv.u.p;
+    TArr *ent = NULL;
+    TArr *ext = mget_obj(lock, "ext");
+    if (ext) ent = mget_obj(ext, name);
+    TArr *snap = ent ? mget_obj(ent, "integrity") : NULL;
+    int rc = 0;
+    if (snap)
+        rc = integrity_check_ex(destdir, snap, true, err, errcap);
+    tval_release(&lv);
+    return rc < 0 ? -1 : 0;
 }
 
 static int lock_save(const char *proj_dir, char *err, size_t errcap) {
@@ -2274,10 +2319,53 @@ static int lock_save(const char *proj_dir, char *err, size_t errcap) {
             intlist_free(&snap);
         }
         pb_puts(&b, "\n  }");
-        pb_puts(&b, (i + 1 < n) ? ",\n" : "\n");
+        pb_puts(&b, (i + 1 < n || root.n_exts > 0) ? ",\n" : "\n");
         tm_free(names[i]); tm_free(urls[i]); tm_free(refs[i]);
     }
     tm_free(names); tm_free(urls); tm_free(refs);
+
+    /* ext 分栏（§6）：保留键 "ext"（包 ID 必含 /，不会与 deps 撞名）。
+     * 结构 = { name: {url,ref,resolved,integrity?} }；integrity 排除 build/。 */
+    if (root.n_exts > 0) {
+        char eroot[1024];
+        bool have_root = tphp_pkg_ext_root(eroot, sizeof eroot);
+        pb_puts(&b, "  \"ext\": {\n");
+        for (int i = 0; i < root.n_exts; i++) {
+            const ModDep *d = &root.exts[i];
+            pb_puts(&b, "    ");
+            pb_json_str(&b, d->name);
+            pb_puts(&b, ": {\n      \"url\": ");
+            pb_json_str(&b, d->url ? d->url : "");
+            pb_puts(&b, ",\n      \"ref\": ");
+            pb_json_str(&b, d->ref ? d->ref : "");
+            pb_puts(&b, ",\n      \"resolved\": ");
+            pb_json_str(&b, ts);
+            if (have_root) {
+                char ep[1450];
+                snprintf(ep, sizeof ep, "%s/ext/%s", eroot, d->name);
+                if (fs_isdir(ep)) {
+                    IntList snap = {0};
+                    if (integrity_scan_ex(ep, "", &snap, true) == 0 &&
+                        snap.n > 0) {
+                        pb_puts(&b, ",\n      \"integrity\": {");
+                        for (int k = 0; k < snap.n; k++) {
+                            pb_puts(&b, k ? ",\n        " : "\n        ");
+                            pb_json_str(&b, snap.v[k].rel);
+                            pb_puts(&b, ": ");
+                            pb_json_str(&b, snap.v[k].sha1);
+                        }
+                        pb_puts(&b, "\n      }");
+                    }
+                    intlist_free(&snap);
+                }
+            }
+            pb_puts(&b, "\n    }");
+            pb_puts(&b, (i + 1 < root.n_exts) ? ",\n" : "\n");
+        }
+        pb_puts(&b, "  }");
+        pb_puts(&b, "\n");
+    }
+
     tmod_free(&root);
 
     pb_puts(&b, "}\n");
@@ -3138,8 +3226,8 @@ int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap) {
 }
 
 /* ================================================================
- * ext 命令组（PLAN/ext-packages.md §4，切片 4）
- * 落点 <tphp_root>/ext/<name>；编译链入 / .built 重写 = 切片 5。
+ * ext 命令组（PLAN/ext-packages.md §4）+ 编译链入（§5，切片 5-6 完成）
+ * 落点 <tphp_root>/ext/<name>；项目模式写回 ext[]；add/sync 未链入自动 relink。
  * 铁律（§10.9）：不进 vendor/、不进 autoload、无 scripts。
  * ================================================================ */
 
@@ -3148,6 +3236,10 @@ typedef struct {
     char url[1400];   /* 规范化：GitHub 剥 :ref；其余按输入原样 */
     char ref[128];    /* 生效 ref：CLI > :ref > 解析结果（如最新发布） */
 } ExtInfo;
+
+/* §5 编译管线（定义在文件尾） */
+static int ext_compile_all(char *err, size_t errcap);
+static bool ext_built_has(const char *eroot, const char *name);
 
 /* <tphp_root>/ext/<name>；无法定位 tphp root 返回 false */
 static bool ext_pkg_dir(const char *name, char *out, size_t cap) {
@@ -3190,7 +3282,8 @@ static void ext_abs_url(const char *proj_dir, const char *url,
  *  expect_name 非 NULL → 源包名必须一致（sync/update 声明对账，防装错位）；
  *  覆盖安全 = vendor 同款三查（mod.json / .git / 名字符合）。 */
 static int ext_install(const char *source, const char *ref,
-                       const char *expect_name, ExtInfo *out,
+                       const char *expect_name, const char *proj_dir,
+                       bool force, ExtInfo *out,
                        char *err, size_t errcap) {
     char eroot[1024];
     if (!tphp_pkg_ext_root(eroot, sizeof eroot)) {
@@ -3237,6 +3330,18 @@ static int ext_install(const char *source, const char *ref,
     if (block) {
         set_err(err, errcap, "refusing to overwrite %s: %s", dest, block);
         tmod_free(&pkg); fs_rm_rf(staging); return 2;
+    }
+
+    /* 覆盖前 integrity（§6）：有项目 lock 才校验；force（--update）跳过 */
+    if (!force && proj_dir && proj_dir[0] && fs_exists(dest)) {
+        char e2[512] = "";
+        if (ext_overwrite_integrity(proj_dir, pkg.name, dest,
+                                    e2, sizeof e2) != 0) {
+            set_err(err, errcap, "integrity check failed for ext %s: %s "
+                    "(delete %s manually or use --update to overwrite)",
+                    pkg.name, e2[0] ? e2 : "mismatch", dest);
+            tmod_free(&pkg); fs_rm_rf(staging); return 2;
+        }
     }
 
     /* source 就是目标目录（原地重装）→ 不复制 */
@@ -3292,7 +3397,10 @@ static int ext_writeback(const char *proj_dir, const ExtInfo *info,
     }
     int rc = tmod_save(mj, &root, err, errcap);
     tmod_free(&root);
-    return rc == 0 ? 0 : 2;
+    if (rc != 0) return 2;
+    /* lock ext 分栏同步（§6）：读回 ext[] 写 mod.lock */
+    if (lock_save(proj_dir, err, errcap) != 0) return 2;
+    return 0;
 }
 
 int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
@@ -3305,17 +3413,30 @@ int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
     int rc = ext_proj_mode(proj_dir, &is_proj, err, errcap);
     if (rc != 0) return rc;
     ExtInfo info;
-    rc = ext_install(source, ref, NULL, &info, err, errcap);
+    rc = ext_install(source, ref, NULL, is_proj ? proj_dir : NULL, false,
+                     &info, err, errcap);
     if (rc != 0) return rc;
-    if (is_proj) return ext_writeback(proj_dir, &info, err, errcap);
+    if (is_proj) {
+        rc = ext_writeback(proj_dir, &info, err, errcap);
+        if (rc != 0) return rc;
+    }
+    /* 未链入 → 全量重链（§4.1：装 + 编） */
+    char eroot[1024];
+    if (tphp_pkg_ext_root(eroot, sizeof eroot) &&
+        !ext_built_has(eroot, info.name)) {
+        return ext_compile_all(err, errcap);
+    }
     return 0;
 }
 
 /* ext[] [lo,hi) 落盘（sync/update 共用）：已装且非 force → skip 行；
- * 否则按 url/ref 安装（url 相对 proj 解析，声明名对账）。逐项结果进 sb。 */
+ * 否则按 url/ref 安装（url 相对 proj 解析，声明名对账）。逐项结果进 sb。
+ * *out_need_link：存在「新装/更新/有源未链入」任一 → 调用方随后 compile_all。 */
 static int ext_fill_range(const char *proj_dir, const TMod *root,
                           const char *eroot, int lo, int hi, bool force,
-                          PkgBuf *sb, char *err, size_t errcap) {
+                          bool *out_need_link, PkgBuf *sb,
+                          char *err, size_t errcap) {
+    if (out_need_link) *out_need_link = false;
     for (int i = lo; i < hi; i++) {
         const ModDep *d = &root->exts[i];
         char dest[1400], dmj[1450];
@@ -3325,6 +3446,8 @@ static int ext_fill_range(const char *proj_dir, const TMod *root,
         if (existed && !force) {
             pb_puts(sb, d->name);
             pb_puts(sb, ": already present\n");
+            if (out_need_link && !ext_built_has(eroot, d->name))
+                *out_need_link = true;
             continue;
         }
         if (!d->url || !d->url[0]) {
@@ -3334,7 +3457,8 @@ static int ext_fill_range(const char *proj_dir, const TMod *root,
         char absurl[1400], e2[512] = "";
         ext_abs_url(proj_dir, d->url, absurl, sizeof absurl);
         ExtInfo info;
-        int irc = ext_install(absurl, d->ref, d->name, &info, e2, sizeof e2);
+        int irc = ext_install(absurl, d->ref, d->name, proj_dir, force,
+                              &info, e2, sizeof e2);
         if (irc != 0) {
             set_err(err, errcap, "ext %s: %s", d->name,
                     e2[0] ? e2 : "install failed");
@@ -3342,6 +3466,13 @@ static int ext_fill_range(const char *proj_dir, const TMod *root,
         }
         pb_puts(sb, d->name);
         pb_puts(sb, (force && existed) ? ": updated\n" : ": installed\n");
+        if (out_need_link) *out_need_link = true;
+    }
+    /* 项目侧 lock ext 分栏（§6）：有变更才写；调用方在 compile 前后均可 */
+    if (proj_dir && proj_dir[0] && out_need_link && *out_need_link) {
+        char e2[512] = "";
+        if (lock_save(proj_dir, e2, sizeof e2) != 0)
+            tphp_warn("PHP Warning: pkg: lock_save after ext: %s\n", e2);
     }
     return 0;
 }
@@ -3369,10 +3500,15 @@ int tphp_pkg_ext_sync(const char *proj_dir, char **out_summary,
 
     PkgBuf sb;
     pb_init(&sb);
+    bool need_link = false;
     rc = ext_fill_range(proj_dir, &root, eroot, 0, root.n_exts, false,
-                        &sb, err, errcap);
+                        &need_link, &sb, err, errcap);
     tmod_free(&root);
     if (rc != 0) { tm_free(sb.p); return rc; }
+    if (need_link) {
+        rc = ext_compile_all(err, errcap);
+        if (rc != 0) { tm_free(sb.p); return rc; }
+    }
     if (sb.p == NULL) pb_put(&sb, "", 0);
     if (out_summary) *out_summary = sb.p; else tm_free(sb.p);
     return 0;
@@ -3414,10 +3550,15 @@ int tphp_pkg_ext_update(const char *proj_dir, const char *name,
 
     PkgBuf sb;
     pb_init(&sb);
+    bool need_link = false;
     rc = ext_fill_range(proj_dir, &root, eroot, lo, hi, true,
-                        &sb, err, errcap);
+                        &need_link, &sb, err, errcap);
     tmod_free(&root);
     if (rc != 0) { tm_free(sb.p); return rc; }
+    if (need_link) {
+        rc = ext_compile_all(err, errcap);
+        if (rc != 0) { tm_free(sb.p); return rc; }
+    }
     if (sb.p == NULL) pb_put(&sb, "", 0);
     if (out_summary) *out_summary = sb.p; else tm_free(sb.p);
     return 0;
@@ -3481,12 +3622,13 @@ int tphp_pkg_ext_remove(const char *proj_dir, const char *name,
         rc = tmod_save(pmj, &root, err, errcap);
         tmod_free(&root);
         if (rc != 0) return 2;
+        /* lock ext 分栏同步（§6） */
+        if (lock_save(proj_dir, err, errcap) != 0) return 2;
     }
     return 0;
 }
 
-/* .built（§4.3）：每行 "<name> <version>"，仅成功重链后整体重写（切片 5）。
- * sidecar 与手工换二进制可能脱节 → 文档要求换后 --relink（§4.3 备选后置）。 */
+/* .built（§4.3）：每行 "<name> <version>"，成功重链后整体重写。 */
 static bool ext_built_has(const char *eroot, const char *name) {
     char p[1200];
     snprintf(p, sizeof p, "%s/ext/.built", eroot);
@@ -3621,13 +3763,645 @@ int tphp_pkg_ext_list(const char *proj_dir, char **out,
     return 0;
 }
 
+/* ================================================================
+ * ext 编译 + 链接（PLAN/ext-packages.md §5，切片 5）
+ * ================================================================ */
+
+/* 运行期 init 钩子：基座在 libtphp.a；重链时生成的 ext_registry.o
+ * 用 constructor 把自己的 run_all 挂上（避免 weak/重复符号）。 */
+void (*tphp_ext_inits_hook)(void) = 0;
+void tphp_run_ext_inits(void) {
+#ifdef _WIN32
+    /* relink 遗留 tphp.exe.old：尽力删（仍被占用则下次启动再试） */
+    if (g_self_exe[0]) {
+        char oldp[1200];
+        snprintf(oldp, sizeof oldp, "%s.old", g_self_exe);
+        remove(oldp);
+    }
+#endif
+    if (tphp_ext_inits_hook) tphp_ext_inits_hook();
+}
+
+static int ext_current_os(void) {
+#if defined(_WIN32)
+    return EXT_OS_WIN;
+#elif defined(__APPLE__)
+    return EXT_OS_DARWIN;
+#else
+    return EXT_OS_LINUX;
+#endif
+}
+
+static int ext_sys_run(const char *cmd) {
+#ifdef _WIN32
+    int rc = system(cmd);
+    return rc == -1 ? -1 : (rc & 0xFF);
+#else
+    int rc = system(cmd);
+    if (rc == -1) return -1;
+    return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+#endif
+}
+
+/* 引擎级默认链接库（§5：Windows 对齐 build.cmd；unix 见 build.sh LDLIBS） */
+static const char *ext_engine_libs(int os) {
+    if (os == EXT_OS_WIN)
+        return "-ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi "
+               "-lshell32 -lole32 -loleaut32 -luuid -lbcrypt "
+               "-lsynchronization -luserenv -lcrypt32";
+    if (os == EXT_OS_DARWIN)
+        return "-lm -framework CoreFoundation -framework CoreServices";
+    return "-lpthread -ldl -lrt -lm";
+}
+
+/* cc 探测：os.cc > TPHP_EXT_CC > <root>/tcc > clang > cc/gcc */
+static bool ext_find_cc(const char *eroot, const TExtSpec *spec,
+                        char *out, size_t cap) {
+    int os = ext_current_os();
+    if (spec && spec->os_cc[os] && spec->os_cc[os][0]) {
+        snprintf(out, cap, "%s", spec->os_cc[os]);
+        return true;
+    }
+    const char *env = getenv("TPHP_EXT_CC");
+    if (env && env[0]) {
+        snprintf(out, cap, "%s", env);
+        return true;
+    }
+#ifdef _WIN32
+    snprintf(out, cap, "%s/tcc/tcc.exe", eroot);
+    if (fs_exists(out)) return true;
+    snprintf(out, cap, "%s/tcc/tcc", eroot);
+    if (fs_exists(out)) return true;
+    snprintf(out, cap, "clang");
+    return true;   /* PATH 探测交给 system */
+#else
+    snprintf(out, cap, "%s/tcc/tcc", eroot);
+    if (fs_exists(out)) return true;
+    snprintf(out, cap, "clang");
+    return true;
+#endif
+}
+
+/* 递归收集 *.c（跳过 build/ 与 '.' 开头条目） */
+static int ext_collect_cs(const char *dir, char ***out, int *n) {
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, dir, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&req);
+        return -1;
+    }
+    uv_dirent_t ent;
+    int rc = 0;
+    while (uv_fs_scandir_next(&req, &ent) == 0) {
+        if (ent.name[0] == '.') continue;
+        char path[1600];
+        snprintf(path, sizeof path, "%s/%s", dir, ent.name);
+        if (fs_isdir(path)) {
+            if (strcmp(ent.name, "build") == 0) continue;
+            if (ext_collect_cs(path, out, n) != 0) { rc = -1; break; }
+        } else {
+            size_t L = strlen(ent.name);
+            if (L > 2 && strcmp(ent.name + L - 2, ".c") == 0)
+                strlist_push(out, n, path);
+        }
+    }
+    uv_fs_req_cleanup(&req);
+    return rc;
+}
+
+/* 扫 <eroot>/ext 下 type=ext 包目录（一级 + 两级），返回目录列表 */
+static int ext_find_pkg_dirs(const char *eroot, char ***out, int *n) {
+    char base[1200];
+    snprintf(base, sizeof base, "%s/ext", eroot);
+    uv_fs_t req;
+    if (uv_fs_scandir(NULL, &req, base, 0, NULL) < 0) {
+        uv_fs_req_cleanup(&req);
+        return 0;
+    }
+    uv_dirent_t ent;
+    while (uv_fs_scandir_next(&req, &ent) == 0) {
+        if (ent.name[0] == '.') continue;
+        char sub[1400];
+        snprintf(sub, sizeof sub, "%s/%s", base, ent.name);
+        if (!fs_isdir(sub)) continue;
+        char mj[1450];
+        snprintf(mj, sizeof mj, "%s/mod.json", sub);
+        if (fs_exists(mj)) {
+            strlist_push(out, n, sub);
+            continue;
+        }
+        /* 两级：vendor/pkg */
+        uv_fs_t r2;
+        if (uv_fs_scandir(NULL, &r2, sub, 0, NULL) < 0) {
+            uv_fs_req_cleanup(&r2);
+            continue;
+        }
+        uv_dirent_t e2;
+        while (uv_fs_scandir_next(&r2, &e2) == 0) {
+            if (e2.name[0] == '.') continue;
+            char pkg[1600], pmj[1650];
+            snprintf(pkg, sizeof pkg, "%s/%s", sub, e2.name);
+            if (!fs_isdir(pkg)) continue;
+            snprintf(pmj, sizeof pmj, "%s/mod.json", pkg);
+            if (fs_exists(pmj)) strlist_push(out, n, pkg);
+        }
+        uv_fs_req_cleanup(&r2);
+    }
+    uv_fs_req_cleanup(&req);
+    return 0;
+}
+
+/* 拼 -I/-D/cflags：包 include + 根 include；default cflags + os cflags */
+static void ext_append_compile_args(PkgBuf *b, const char *eroot,
+                                    const char *pkgdir, const TExtSpec *x) {
+    int os = ext_current_os();
+    pb_puts(b, " -I\"");
+    pb_puts(b, eroot);
+    pb_puts(b, "/include\"");
+    for (int i = 0; i < x->n_include; i++) {
+        pb_puts(b, " -I\"");
+        pb_puts(b, pkgdir);
+        pb_puts(b, "/");
+        pb_puts(b, x->include[i]);
+        pb_puts(b, "\"");
+    }
+    for (int i = 0; i < x->n_defines; i++) {
+        pb_puts(b, " -D");
+        pb_puts(b, x->defines[i]);
+    }
+    for (int i = 0; i < x->n_cflags; i++) {
+        pb_puts(b, " ");
+        pb_puts(b, x->cflags[i]);
+    }
+    for (int i = 0; i < x->n_os_cflags[os]; i++) {
+        pb_puts(b, " ");
+        pb_puts(b, x->os_cflags[os][i]);
+    }
+}
+
+/* 编译单个包的全部 .c → objs[]（调用方提供缓冲）；返回 0 成功 */
+static int ext_compile_pkg(const char *eroot, const char *pkgdir,
+                           const TMod *m, const char *cc,
+                           char ***objs, int *nobjs,
+                           char *err, size_t errcap) {
+    const TExtSpec *x = &m->ext_spec;
+    if (x->n_sources == 0) {
+        set_err(err, errcap, "%s: ext.sources is empty", m->name);
+        return 1;
+    }
+    if (x->tphp_abi && x->tphp_abi[0] &&
+        strcmp(x->tphp_abi, TPHP_VERSION) != 0) {
+        set_err(err, errcap,
+                "%s: ABI mismatch (package requires tphp %s, this is %s)",
+                m->name, x->tphp_abi, TPHP_VERSION);
+        return 1;
+    }
+
+    char **cs = NULL;
+    int ncs = 0;
+    for (int i = 0; i < x->n_sources; i++) {
+        char sdir[1500];
+        snprintf(sdir, sizeof sdir, "%s/%s", pkgdir, x->sources[i]);
+        if (!fs_isdir(sdir)) {
+            set_err(err, errcap, "%s: sources dir not found: %s",
+                    m->name, x->sources[i]);
+            tm_strlist_free(cs, ncs);
+            return 1;
+        }
+        if (ext_collect_cs(sdir, &cs, &ncs) != 0) {
+            set_err(err, errcap, "%s: cannot scan %s", m->name, x->sources[i]);
+            tm_strlist_free(cs, ncs);
+            return 2;
+        }
+    }
+    if (ncs == 0) {
+        set_err(err, errcap, "%s: no .c files under sources", m->name);
+        tm_strlist_free(cs, ncs);
+        return 1;
+    }
+
+    char bdir[1500];
+    snprintf(bdir, sizeof bdir, "%s/build", pkgdir);
+    if (fs_mkdir_p(bdir) < 0) {
+        set_err(err, errcap, "%s: cannot create build/", m->name);
+        tm_strlist_free(cs, ncs);
+        return 2;
+    }
+
+    char flags[4096];
+    {
+        PkgBuf fb;
+        pb_init(&fb);
+        ext_append_compile_args(&fb, eroot, pkgdir, x);
+        snprintf(flags, sizeof flags, "%s", fb.p ? fb.p : "");
+        tm_free(fb.p);
+    }
+
+    for (int i = 0; i < ncs; i++) {
+        /* 对象名：相对 pkgdir 打平 src_foo.o */
+        const char *rel = cs[i];
+        size_t plen = strlen(pkgdir);
+        if (strncmp(rel, pkgdir, plen) == 0) {
+            rel += plen;
+            while (*rel == '/' || *rel == '\\') rel++;
+        }
+        char flat[512];
+        size_t k = 0;
+        for (const char *p = rel; *p && k + 4 < sizeof flat; p++) {
+            char c = *p;
+            if (c == '/' || c == '\\' || c == '.' || c == ':') c = '_';
+            flat[k++] = c;
+        }
+        flat[k] = 0;
+        char obj[1600], cmd[8192];
+        snprintf(obj, sizeof obj, "%s/%s.o", bdir, flat);
+        snprintf(cmd, sizeof cmd, "%s -c%s -o \"%s\" \"%s\"",
+                 cc, flags, obj, cs[i]);
+        int rc = ext_sys_run(cmd);
+        if (rc != 0) {
+            set_err(err, errcap, "%s: compile failed (%d): %s",
+                    m->name, rc, cs[i]);
+            tm_strlist_free(cs, ncs);
+            return 2;
+        }
+        strlist_push(objs, nobjs, obj);
+    }
+    tm_strlist_free(cs, ncs);
+    return 0;
+}
+
+/* 生成 <eroot>/ext/.registry.c：constructor 挂 tphp_ext_inits_hook */
+static int ext_write_registry(const char *eroot,
+                              char **pkgs, int npkg, char **inits,
+                              char *err, size_t errcap) {
+    PkgBuf b;
+    pb_init(&b);
+    pb_puts(&b, "/* generated by tphp ext relink — do not edit */\n");
+    pb_puts(&b, "extern void (*tphp_ext_inits_hook)(void);\n");
+    for (int i = 0; i < npkg; i++) {
+        pb_puts(&b, "void ");
+        pb_puts(&b, inits[i]);
+        pb_puts(&b, "(void);\n");
+    }
+    pb_puts(&b, "static void tphp_ext_run_all(void) {\n");
+    for (int i = 0; i < npkg; i++) {
+        pb_puts(&b, "    ");
+        pb_puts(&b, inits[i]);
+        pb_puts(&b, "();\n");
+    }
+    pb_puts(&b, "}\n");
+    pb_puts(&b, "__attribute__((constructor)) static void tphp_ext_install_hook(void) {\n");
+    pb_puts(&b, "    tphp_ext_inits_hook = tphp_ext_run_all;\n");
+    pb_puts(&b, "}\n");
+    (void)pkgs;
+
+    char path[1400];
+    snprintf(path, sizeof path, "%s/ext/.registry.c", eroot);
+    int rc = fs_write(path, b.p, b.len);
+    tm_free(b.p);
+    if (rc < 0) {
+        set_err(err, errcap, "cannot write %s", path);
+        return 2;
+    }
+    return 0;
+}
+
+/* 路径归一为 /（clang @rsp 在 Windows 会把 \ 当转义） */
+static void ext_path_fwd(char *s) {
+    for (char *q = s; *q; q++) if (*q == '\\') *q = '/';
+}
+
+/* Windows 8191 上限 → @response 文件（clang/lld 支持；路径用 /） */
+static int ext_write_link_rsp(const char *rsp, const char *reg_o,
+                              char **objs, int nobjs,
+                              char **eng, int neng, const char *next,
+                              char *err, size_t errcap) {
+    PkgBuf lb;
+    pb_init(&lb);
+    char tmp[1600];
+    snprintf(tmp, sizeof tmp, "%s", reg_o); ext_path_fwd(tmp);
+    pb_puts(&lb, "\""); pb_puts(&lb, tmp); pb_puts(&lb, "\"\n");
+    for (int i = 0; i < nobjs; i++) {
+        snprintf(tmp, sizeof tmp, "%s", objs[i]); ext_path_fwd(tmp);
+        pb_puts(&lb, "\""); pb_puts(&lb, tmp); pb_puts(&lb, "\"\n");
+    }
+    for (int i = 0; i < neng; i++) {
+        snprintf(tmp, sizeof tmp, "%s", eng[i]); ext_path_fwd(tmp);
+        pb_puts(&lb, "\""); pb_puts(&lb, tmp); pb_puts(&lb, "\"\n");
+    }
+    {
+        PkgBuf libs;
+        pb_init(&libs);
+        pb_puts(&libs, ext_engine_libs(ext_current_os()));
+        char *p = libs.p;
+        if (p) {
+            while (*p) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                char *s = p;
+                while (*p && *p != ' ') p++;
+                char save = *p; *p = 0;
+                pb_puts(&lb, s);
+                pb_puts(&lb, "\n");
+                *p = save;
+            }
+        }
+        tm_free(libs.p);
+    }
+    pb_puts(&lb, "-o\n\"");
+    snprintf(tmp, sizeof tmp, "%s", next); ext_path_fwd(tmp);
+    pb_puts(&lb, tmp);
+    pb_puts(&lb, "\"\n");
+    int rc = fs_write(rsp, lb.p, lb.len);
+    tm_free(lb.p);
+    if (rc < 0) {
+        set_err(err, errcap, "cannot write %s", rsp);
+        return 2;
+    }
+    return 0;
+}
+
+/* 链接 all .o + registry.o + 引擎对象 → tphp.next，再原子替换。
+ * 引擎对象：优先 <root>/obj/*.o（与 build.cmd 同款直链，避开
+ * libtphp.a 的 pcre2 dllimport 归档语义）；否则解压 libtphp.a。 */
+static int ext_link_and_replace(const char *eroot, const char *cc,
+                                char **objs, int nobjs,
+                                char *err, size_t errcap) {
+    char liba[1400], next[1400], reg_c[1400], reg_o[1400];
+    snprintf(liba, sizeof liba, "%s/libtphp.a", eroot);
+    snprintf(reg_c, sizeof reg_c, "%s/ext/.registry.c", eroot);
+    snprintf(reg_o, sizeof reg_o, "%s/ext/.registry.o", eroot);
+    if (!fs_exists(reg_c)) {
+        set_err(err, errcap, "registry source missing: %s", reg_c);
+        return 2;
+    }
+    {
+        char cmd[4096], rcpath[1600], rcsrc[1600];
+        snprintf(rcpath, sizeof rcpath, "%s", reg_o); ext_path_fwd(rcpath);
+        snprintf(rcsrc, sizeof rcsrc, "%s", reg_c); ext_path_fwd(rcsrc);
+        snprintf(cmd, sizeof cmd, "%s -c -o \"%s\" \"%s\"", cc, rcpath, rcsrc);
+        int rc = ext_sys_run(cmd);
+        if (rc != 0) {
+            set_err(err, errcap, "compile registry failed (%d)", rc);
+            return 2;
+        }
+    }
+
+    char **eng = NULL;
+    int neng = 0;
+    char linkdir[1400];
+    linkdir[0] = 0;
+    char objdir[1400];
+    snprintf(objdir, sizeof objdir, "%s/obj", eroot);
+    if (fs_isdir(objdir)) {
+        uv_fs_t req;
+        if (uv_fs_scandir(NULL, &req, objdir, 0, NULL) >= 0) {
+            uv_dirent_t ent;
+            while (uv_fs_scandir_next(&req, &ent) == 0) {
+                size_t L = strlen(ent.name);
+                if (L > 2 && strcmp(ent.name + L - 2, ".o") == 0) {
+                    char p[1600];
+                    snprintf(p, sizeof p, "%s/%s", objdir, ent.name);
+                    strlist_push(&eng, &neng, p);
+                }
+            }
+            uv_fs_req_cleanup(&req);
+        }
+    }
+    if (neng == 0) {
+        if (!fs_exists(liba)) {
+            set_err(err, errcap,
+                    "libtphp.a not found in %s (need full artifact: tphp + "
+                    "libtphp.a + include/)", eroot);
+            return 2;
+        }
+        snprintf(linkdir, sizeof linkdir, "%s/ext/.linkobjs", eroot);
+        fs_rm_rf(linkdir);
+        if (fs_mkdir_p(linkdir) < 0) {
+            set_err(err, errcap, "cannot create %s", linkdir);
+            return 2;
+        }
+        char cmd[2048], la[1600], ld[1600];
+        snprintf(la, sizeof la, "%s", liba); ext_path_fwd(la);
+        snprintf(ld, sizeof ld, "%s", linkdir); ext_path_fwd(ld);
+#ifdef _WIN32
+        snprintf(cmd, sizeof cmd,
+                 "cd /d \"%s\" && (llvm-ar x \"%s\" || ar x \"%s\")",
+                 ld, la, la);
+#else
+        snprintf(cmd, sizeof cmd,
+                 "cd \"%s\" && (llvm-ar x \"%s\" || ar x \"%s\")",
+                 ld, la, la);
+#endif
+        if (ext_sys_run(cmd) != 0) {
+            set_err(err, errcap, "extract %s failed", liba);
+            return 2;
+        }
+        uv_fs_t req;
+        if (uv_fs_scandir(NULL, &req, linkdir, 0, NULL) >= 0) {
+            uv_dirent_t ent;
+            while (uv_fs_scandir_next(&req, &ent) == 0) {
+                size_t L = strlen(ent.name);
+                if (L > 2 && strcmp(ent.name + L - 2, ".o") == 0) {
+                    char p[1600];
+                    snprintf(p, sizeof p, "%s/%s", linkdir, ent.name);
+                    strlist_push(&eng, &neng, p);
+                }
+            }
+            uv_fs_req_cleanup(&req);
+        }
+        if (neng == 0) {
+            set_err(err, errcap, "no .o members in %s", liba);
+            return 2;
+        }
+    }
+
+    const char *bn = "tphp";
+    if (g_self_exe[0]) {
+        const char *p = g_self_exe;
+        for (const char *q = g_self_exe; *q; q++)
+            if (*q == '/' || *q == '\\') p = q + 1;
+        if (p[0]) bn = p;
+    }
+    snprintf(next, sizeof next, "%s/%s.next", eroot, bn);
+
+    char rsp[1400];
+    snprintf(rsp, sizeof rsp, "%s/ext/.link.rsp", eroot);
+    if (ext_write_link_rsp(rsp, reg_o, objs, nobjs, eng, neng,
+                           next, err, errcap) != 0) {
+        tm_strlist_free(eng, neng);
+        return 2;
+    }
+    char cmd[1600], rspp[1600];
+    snprintf(rspp, sizeof rspp, "%s", rsp); ext_path_fwd(rspp);
+    snprintf(cmd, sizeof cmd, "%s @\"%s\"", cc, rspp);
+    int rc = ext_sys_run(cmd);
+    remove(rsp);
+    if (rc != 0) {
+        set_err(err, errcap, "link failed (%d): %s @%s", rc, cc, rsp);
+        tm_strlist_free(eng, neng);
+        return 2;
+    }
+    tm_strlist_free(eng, neng);
+    if (linkdir[0]) fs_rm_rf(linkdir);
+
+    /* 原子替换 */
+    char cur[1400], oldp[1400];
+    snprintf(cur, sizeof cur, "%s/%s", eroot, bn);
+    snprintf(oldp, sizeof oldp, "%s/%s.old", eroot, bn);
+#ifdef _WIN32
+    /* 两次 relink 同进程：第一次 cur=运行中镜像 → rename 到 .old；
+     * 第二次 cur=上次产物（未运行）→ 直接 remove 再放入 next。
+     * .old 可能仍被旧进程占用，remove 失败可忽略。 */
+    remove(oldp);
+    if (remove(cur) == 0) {
+        if (rename(next, cur) != 0) {
+            set_err(err, errcap, "cannot move %s into place", next);
+            remove(next);
+            return 2;
+        }
+    } else {
+        if (rename(cur, oldp) != 0) {
+            set_err(err, errcap, "cannot rename running %s; "
+                    "close other tphp processes and retry --relink", cur);
+            remove(next);
+            return 2;
+        }
+        if (rename(next, cur) != 0) {
+            set_err(err, errcap, "cannot move %s into place", next);
+            rename(oldp, cur);
+            return 2;
+        }
+    }
+#else
+    if (rename(next, cur) != 0) {
+        set_err(err, errcap, "cannot replace %s: %s", cur, strerror(errno));
+        remove(next);
+        return 2;
+    }
+#endif
+    return 0;
+}
+
+/* 成功重链后整体重写 ext/.built（§4.3） */
+static int ext_rewrite_built(const char *eroot,
+                             char **names, char **versions, int n,
+                             char *err, size_t errcap) {
+    PkgBuf b;
+    pb_init(&b);
+    for (int i = 0; i < n; i++) {
+        pb_puts(&b, names[i]);
+        pb_puts(&b, " ");
+        pb_puts(&b, versions[i] ? versions[i] : "0.0.0");
+        pb_puts(&b, "\n");
+    }
+    char path[1400];
+    snprintf(path, sizeof path, "%s/ext/.built", eroot);
+    int rc = fs_write(path, b.p ? b.p : "", b.len);
+    tm_free(b.p);
+    if (rc < 0) {
+        set_err(err, errcap, "cannot write %s", path);
+        return 2;
+    }
+    return 0;
+}
+
+/* 全量：编译所有 type=ext 包 → registry → 链接替换 → .built */
+static int ext_compile_all(char *err, size_t errcap) {
+    char eroot[1024];
+    if (!tphp_pkg_ext_root(eroot, sizeof eroot)) {
+        set_err(err, errcap, "cannot locate tphp root (self exe unknown)");
+        return 2;
+    }
+    char **dirs = NULL;
+    int ndirs = 0;
+    ext_find_pkg_dirs(eroot, &dirs, &ndirs);
+    if (ndirs == 0) {
+        tm_strlist_free(dirs, ndirs);
+        set_err(err, errcap, "no ext packages under %s/ext", eroot);
+        return 1;
+    }
+
+    char cc[512];
+    /* 首个包的契约参与 cc 探测（os.cc）；失败则默认链 */
+    {
+        char mj0[1600];
+        snprintf(mj0, sizeof mj0, "%s/mod.json", dirs[0]);
+        TMod m0;
+        if (tmod_load(mj0, &m0, NULL, 0)) {
+            ext_find_cc(eroot, &m0.ext_spec, cc, sizeof cc);
+            tmod_free(&m0);
+        } else {
+            ext_find_cc(eroot, NULL, cc, sizeof cc);
+        }
+    }
+
+    char **objs = NULL;
+    int nobjs = 0;
+    char **names = NULL;
+    char **versions = NULL;
+    char **inits = NULL;
+    int nbuild = 0;
+    int rc = 0;
+
+    for (int i = 0; i < ndirs; i++) {
+        char mj[1650];
+        snprintf(mj, sizeof mj, "%s/mod.json", dirs[i]);
+        TMod m;
+        if (!tmod_load(mj, &m, err, errcap)) { rc = 2; break; }
+        if (!m.has_ext_spec || !m.type || strcmp(m.type, "ext") != 0) {
+            set_err(err, errcap, "%s: not type=ext", dirs[i]);
+            tmod_free(&m);
+            rc = 1;
+            break;
+        }
+        char pkgcc[512];
+        ext_find_cc(eroot, &m.ext_spec, pkgcc, sizeof pkgcc);
+        /* 单包编译用包自己的 cc；链接统一用首个探测结果（见上） */
+        int crc = ext_compile_pkg(eroot, dirs[i], &m, pkgcc,
+                                  &objs, &nobjs, err, errcap);
+        if (crc != 0) { tmod_free(&m); rc = crc; break; }
+
+        char sym[600];
+        if (m.ext_spec.init && m.ext_spec.init[0])
+            snprintf(sym, sizeof sym, "%s", m.ext_spec.init);
+        else
+            ext_init_sym(m.name, sym, sizeof sym);
+
+        names = tm_realloc(names, sizeof(char *) * (size_t)(nbuild + 1));
+        versions = tm_realloc(versions, sizeof(char *) * (size_t)(nbuild + 1));
+        inits = tm_realloc(inits, sizeof(char *) * (size_t)(nbuild + 1));
+        names[nbuild] = xstrdup(m.name);
+        versions[nbuild] = xstrdup(m.version ? m.version : "0.0.0");
+        inits[nbuild] = xstrdup(sym);
+        nbuild++;
+        tmod_free(&m);
+    }
+
+    if (rc == 0) {
+        rc = ext_write_registry(eroot, names, nbuild, inits, err, errcap);
+    }
+    if (rc == 0) {
+        rc = ext_link_and_replace(eroot, cc, objs, nobjs, err, errcap);
+    }
+    if (rc == 0) {
+        rc = ext_rewrite_built(eroot, names, versions, nbuild, err, errcap);
+    }
+    if (rc == 0) {
+        /* stderr：不污染 EXPECT（stdout）对拍 */
+        fprintf(stderr, "Linked %d ext package(s) into tphp\n", nbuild);
+    }
+
+    for (int i = 0; i < nbuild; i++) {
+        tm_free(names[i]); tm_free(versions[i]); tm_free(inits[i]);
+    }
+    tm_free(names); tm_free(versions); tm_free(inits);
+    tm_strlist_free(objs, nobjs);
+    tm_strlist_free(dirs, ndirs);
+    return rc;
+}
+
 int tphp_pkg_ext_relink(char *err, size_t errcap) {
-    /* 切片 5（§5）：cc 探测链 + 逐 .c→.o + libtphp.a 重链 +
-     * tphp.next 原子替换 + ext/.built 重写；init registry 调用点同批勘察 */
-    set_err(err, errcap,
-            "ext relink not available in this build "
-            "(compile pipeline: PLAN/ext-packages.md §5)");
-    return 2;
+    return ext_compile_all(err, errcap);
 }
 
 void tphp_pkg_free(void *p) { tm_free(p); }

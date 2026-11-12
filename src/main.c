@@ -495,6 +495,7 @@ static int run_source(const char *src, const char *name, bool dump) {
         tphp_exclass_init();          /* P1-2: 内置异常层级（用户异常类可 extends） */
         tphp_closure_class_init();    /* P1-3: Closure 内部类 */
         tphp_generator_init();        /* PHP 8 generators（PLAN/generators.md） */
+        tphp_run_ext_inits();         /* 链入的 C 扩展 init（§5；无则 no-op） */
         if (g_debug) fprintf(stderr, "DIAG:init-ok\n");
     }
     AStmtList *ast = tphp_parse_script(src, name);

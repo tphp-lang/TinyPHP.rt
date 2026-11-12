@@ -79,6 +79,8 @@ for %%f in (src\*.h) do copy /y "%%f" "build\include\" >nul || goto :fail
 for /d %%d in (ext\*) do for %%f in ("%%d\*.h") do copy /y "%%f" "build\include\" >nul || goto :fail
 xcopy /e /i /y deps\libuv\include\uv "build\include\uv" >nul || goto :fail
 copy /y deps\libuv\include\uv.h "build\include\" >nul || goto :fail
+rem ar rcs 只增不删——先删旧档，防已删源（如 FFI）的 .o 残留
+if exist build\libtphp.a del /f /q build\libtphp.a
 llvm-ar rcs build\libtphp.a %OBJ%\*.o || ar rcs build\libtphp.a %OBJ%\*.o || goto :fail
 
 echo Build OK: %OUT%

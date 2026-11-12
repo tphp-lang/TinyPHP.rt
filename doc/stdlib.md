@@ -101,9 +101,10 @@
 
 ### 包管理（开发期；CLI 命令的 PHP 可调用层，见 package-manager.md）
 `pkg_new($dir, $name, $lib = false)` `pkg_add($proj, $source, $ref = "")` `pkg_remove($proj, $name)` `pkg_install($proj, $force = false)`
+`pkg_ext_add($proj, $source, $ref = "")` `pkg_ext_sync($proj)` `pkg_ext_update($proj, $name = null)` `pkg_ext_remove($proj, $name)` `pkg_ext_list($proj)` `pkg_ext_relink()`
 `getenv($name)` `putenv($kv)`（包钩子与脚本读环境）
 
-名字/条件非法抛 `ValueError`，IO 失败抛 `RuntimeException`；成功返回 `true`。
+名字/条件非法抛 `ValueError`，IO/编译失败抛 `RuntimeException`；成功返回 `true` 或字符串摘要/表（`pkg_ext_list`/`sync`/`update`）。
 
 ### 正则（vendor pcre2；见 PLAN/preg.md）
 `preg_match` `preg_match_all` `preg_replace` `preg_split` `preg_grep` `preg_quote` `preg_last_error` `preg_last_error_msg`

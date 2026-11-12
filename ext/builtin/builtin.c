@@ -501,6 +501,25 @@ static TVal bi_pkg_ext_sync(VM *vm, TVal *args, int n) {
     return out;
 }
 
+/* pkg_ext_update(string $proj, string $name = null): string — 按 url/ref 重下 */
+static TVal bi_pkg_ext_update(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "ArgumentCountError", "pkg_ext_update() expects (string $proj)");
+    if (n >= 2 && args[1].t != T_STR && args[1].t != T_NULL)
+        RAISE(vm, "TypeError", "pkg_ext_update(): Argument #2 ($name) must be string or null");
+    const char *proj = tstr_val((TStr *)args[0].u.p);
+    const char *name = (n >= 2 && args[1].t == T_STR) ? tstr_val((TStr *)args[1].u.p) : NULL;
+    char err[512] = "", *sum = NULL;
+    int rc = tphp_pkg_ext_update(proj, name, &sum, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_update(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_update(): %s", err);
+    TVal out = TV_STR(tstr_new(sum ? sum : "", strlen(sum ? sum : "")));
+    tphp_pkg_free(sum);
+    return out;
+}
+
 /* pkg_ext_remove(string $proj, string $name): bool — 删目录 + ext[] 移除 */
 static TVal bi_pkg_ext_remove(VM *vm, TVal *args, int n) {
     if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
@@ -531,6 +550,18 @@ static TVal bi_pkg_ext_list(VM *vm, TVal *args, int n) {
     TVal out = TV_STR(tstr_new(tab ? tab : "", strlen(tab ? tab : "")));
     tphp_pkg_free(tab);
     return out;
+}
+
+/* pkg_ext_relink(): bool — 全量编译链入（§5） */
+static TVal bi_pkg_ext_relink(VM *vm, TVal *args, int n) {
+    (void)args; (void)n;
+    char err[512] = "";
+    int rc = tphp_pkg_ext_relink(err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_ext_relink(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_ext_relink(): %s", err);
+    return TV_TRUE;
 }
 
 /* ---- autoload / class inspection ---- */
@@ -3366,8 +3397,10 @@ const Builtin tphp_builtins[] = {
     { "pkg_install", bi_pkg_install },
     { "pkg_ext_add", bi_pkg_ext_add },
     { "pkg_ext_sync", bi_pkg_ext_sync },
+    { "pkg_ext_update", bi_pkg_ext_update },
     { "pkg_ext_remove", bi_pkg_ext_remove },
     { "pkg_ext_list", bi_pkg_ext_list },
+    { "pkg_ext_relink", bi_pkg_ext_relink },
     { "getenv", bi_getenv },
     { "putenv", bi_putenv },
     /* 正则（ext/pcre；PLAN/preg.md） */

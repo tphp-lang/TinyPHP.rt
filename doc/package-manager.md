@@ -19,7 +19,11 @@ tphp upload                  # 打印发布指引（占位，见下）
 
 ## C 扩展（ext）
 
-C 扩展与 PHP 包**完全分离**：源码落 `<tphp_root>/ext/<name>/`（与 tphp 二进制同级，不进 `vendor/`、不进 autoload），项目 `mod.json` 仅以 `ext[]` 数组声明 `{name,url,ref}`；扩展包自身 `type=ext` 且带编译契约 `ext{}`（sources/include/defines/cflags/libs/ldflags/os 分平台/tphp_abi/init）。**编译链入 + `tphp ext` 命令组 + lock 分栏尚在实现**（切片 4-8），权威规格与拍板决策见 [../PLAN/ext-packages.md](../PLAN/ext-packages.md)。
+C 扩展与 PHP 包**完全分离**：源码落 `<tphp_root>/ext/<name>/`（与 tphp 二进制同级，不进 `vendor/`、不进 autoload），项目 `mod.json` 仅以 `ext[]` 数组声明 `{name,url,ref}`；扩展包自身 `type=ext` 且带编译契约 `ext{}`（sources/include/defines/cflags/libs/ldflags/os 分平台/tphp_abi/init）。
+
+**命令**：`tphp new <name> --ext` 脚手架；`tphp ext --add [source [ref]]`（项目内写回 `ext[]`，无 source=按 `ext[]` sync）/ `--remove` / `--update` / `--list` / `--relink`。未链入时 add/sync/update 自动编译重链（`.built` 记录已链入集）。
+
+**lock**：`mod.lock` 顶层保留键 `"ext"` 分栏（与 `deps` 分离），含 url/ref/integrity（排除 `build/`）；覆盖已装包前校验 integrity，`--update` force 跳过。权威规格 [../PLAN/ext-packages.md](../PLAN/ext-packages.md)。
 
 ## 清单 `mod.json`
 

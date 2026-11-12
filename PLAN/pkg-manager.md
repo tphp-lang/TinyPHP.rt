@@ -1,7 +1,7 @@
 # pkg-manager · 内置包管理器（无外部工具）
 
 > 状态：**四阶段已实现**（A 2026-10-20 / B·C·D 2026-10-21）。定稿 2026-10-20；2026-10-21 演进为**无 git 版**（用户拍板：不要求用户机器安装 git）。
-> **2026-11-10**：lifecycle `scripts` 已实现（§2.1.1）；**C 扩展包管理设计已定稿、代码未动** → [ext-packages.md](ext-packages.md)（`tphp new --ext` / `tphp ext` / 项目 `ext[]` / 与本文件 `deps` 全面分离）。
+> **2026-11-10**：lifecycle `scripts` 已实现（§2.1.1）；**C 扩展包管理切片 1–6 已落地**（`tphp new --ext` / `tphp ext` / 编译链入 / lock `ext` 分栏）→ [ext-packages.md](ext-packages.md)（与本文件 `deps` 全面分离）。
 > 上级索引：[../PLAN.md](../PLAN.md)。本文档是包管理子系统的权威规格。用户文档见 [../doc/package-manager.md](../doc/package-manager.md)。
 
 ## 1. 定位与决策
