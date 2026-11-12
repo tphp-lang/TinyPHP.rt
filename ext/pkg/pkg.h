@@ -9,10 +9,19 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include "opcode.h"   /* BuiltinFn（用户 ext 注册面，v1） */
 
 /* json.c C-level API（无 VM、静默失败；pkg 专用） */
 struct TVal;
 bool tphp_json_decode_c(const char *src, size_t len, struct TVal *out);
+
+/* ---- 用户 ext 注册 API v1（init 内调用；进程生命周期）----
+ * 名字带 FQ：函数 "Ns\\fn"、常量 "Ns\\CONST"（全局则裸名）。vm 侧查询口
+ * 见 opcode.h；类直接用 class.h（exclass.c 蓝本 + tphp_class_register_compile）。*/
+void tphp_ext_reg_const_str(const char *fq_name, const char *v);
+void tphp_ext_reg_const_int(const char *fq_name, int64_t v);
+void tphp_ext_reg_fn(const char *fq_name, BuiltinFn fn);
 
 /* 名字校验：app = 单段 [a-z0-9][a-z0-9_-]*；lib = <seg>/<seg>。
  * 非法时 *why 指向原因（静态串，可为 NULL）。 */
@@ -27,10 +36,11 @@ int tphp_pkg_new(const char *dir, const char *name, bool is_lib,
 /* <tphp_root> = tphp 可执行文件所在目录（g_self_exe dirname）；
  * 无法定位（self exe 未设）返回 false。 */
 bool tphp_pkg_ext_root(char *buf, size_t cap);
-/* tphp new <name> --ext：脚手架 → <tphp_root>/ext/<name>/（mod.json 契约 +
- * src/<pkg>.c + include/<pkg>.h，不写任何项目清单）。name 双段 vendor/pkg。
+/* tphp new <name> --ext：脚手架 → dir（= cwd/<pkg>/，最后一段同 --lib，
+ * 2026-11-12 拍板；<tphp_root>/ext/ 仅是 ext --add/sync 的安装落盘）（mod.json
+ * 契约 + src/<pkg>.c + include/<pkg>.h，不写任何项目清单）。name 双段 vendor/pkg。
  * force：目标已存在时覆盖脚手架。0 成功；1 名字非法；2 IO。 */
-int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap);
+int tphp_pkg_new_ext(const char *dir, const char *name, bool force, char *err, size_t errcap);
 
 /* ---- ext 命令组（PLAN/ext-packages.md §4）----
  * 落点 <tphp_root>/ext/<name>；proj_dir 有 mod.json 且非 type=ext = 项目

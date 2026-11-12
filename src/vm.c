@@ -1017,6 +1017,11 @@ static void *resolve_fn(VM *vm, TStr *name, bool *is_builtin) {
             *is_builtin = true;
             return (void *)tphp_builtins[i].fn;
         }
+    /* 用户 ext 注册的原生函数（pkg.c reg API v1）：同 builtin 调用协议 */
+    {
+        void *xf = tphp_ext_fn_find(tstr_val(name));
+        if (xf) { *is_builtin = true; return xf; }
+    }
     return NULL;
 }
 
@@ -1873,6 +1878,21 @@ static int32_t op_fetch_const(VM *vm, TOp *op) {
                 TVal v = vm->consts[i].v;
                 tval_addref(v);
                 wtake(vm, op, v);
+                return 1;
+            }
+        }
+    }
+    /* 用户 ext 注册的常量（pkg.c reg API v1）：全名 + （unqualified 时）裸名 */
+    {
+        TVal ev;
+        if (tphp_ext_const_find(tstr_val(name), &ev)) {
+            wtake(vm, op, ev);
+            return 1;
+        }
+        if (op->ext == 1) {
+            TStr *bare = ns_bare_name(name);
+            if (tphp_ext_const_find(tstr_val(bare), &ev)) {
+                wtake(vm, op, ev);
                 return 1;
             }
         }

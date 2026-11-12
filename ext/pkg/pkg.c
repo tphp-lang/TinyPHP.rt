@@ -1468,15 +1468,85 @@ static void ext_init_sym(const char *name, char *out, size_t cap) {
     out[n] = 0;
 }
 
+/* ext 脚手架模板（PLAN/scaffold.md §4.1，2026-11-12 拍板：质量对齐 app/lib
+ * + C 桩自注册最小三件）。EXT_C_TMPL 的 %s 顺序（9 个，勿乱）：
+ * name, ns_php, name, ns_php, ns_c, ns_c, sym, ns_c, ns_c。
+ * ns_php = acme\hello（PHP 注释/声明形）；ns_c = acme\\hello（C 字面量形）。 */
 static const char EXT_C_TMPL[] =
-    "/* %s - tphp C extension (scaffold; PLAN/ext-packages.md 2.3). */\n"
+    "/* %s - tphp C extension (scaffold; PLAN/ext-packages.md 2.3 + §2.4)。\n"
+    " * 自注册最小三件（2026-11-12 拍板）：常量 VERSION + 函数 hello + 空类 Example——\n"
+    " * `tphp ext --add <本包>` 链入后 examples/usage.php 开箱可跑。\n"
+    " * 动手改注册内容前先读 PLAN/ext-packages.md §2.4（注册 API v1）。 */\n"
+    "#include \"pkg.h\"      /* tphp_ext_reg_const_str / tphp_ext_reg_fn */\n"
+    "#include \"class.h\"    /* TClass / tphp_class_register_compile */\n"
+    "#include \"value.h\"    /* TVal / TV_* / tstr_* / tm_malloc / CK_CLASS */\n"
+    "#include \"opcode.h\"   /* VM / BuiltinFn */\n"
+    "#include <stdio.h>\n"
+    "#include <string.h>\n"
     "\n"
-    "/* Linked-in entry invoked by tphp after relink (mod.json ext.init).\n"
-    " * Register builtin functions/classes here once the registration API is\n"
-    " * exposed; the stub below is compile- and link-ready as-is. */\n"
+    "/* 示例函数：%s\\hello(string $who) —— 手写判型（最小桩不引 builtin.h） */\n"
+    "static TVal scaffold_hello(VM *vm, TVal *args, int n) {\n"
+    "    (void)vm;\n"
+    "    const char *who = (n >= 1 && args[0].t == T_STR)\n"
+    "                    ? tstr_val((TStr *)args[0].u.p) : \"world\";\n"
+    "    char buf[256];\n"
+    "    snprintf(buf, sizeof buf, \"hello, %%s (from %s)\", who);\n"
+    "    return TV_STR(tstr_new(buf, strlen(buf)));\n"
+    "}\n"
+    "\n"
+    "/* 示例空类：%s\\Example（无成员；exclass 蓝本最小子集） */\n"
+    "static TClass *scaffold_example_class(void) {\n"
+    "    TClass *cls = tm_malloc(sizeof *cls);\n"
+    "    memset(cls, 0, sizeof *cls);\n"
+    "    cls->name = tstr_intern(\"%s\\\\Example\", strlen(\"%s\\\\Example\"));\n"
+    "    cls->kind = CK_CLASS;\n"
+    "    cls->m_ctor = cls->m_dtor = cls->m_get = cls->m_set = cls->m_isset =\n"
+    "        cls->m_unset = cls->m_call = cls->m_callstatic = cls->m_tostring =\n"
+    "        cls->m_invoke = cls->m_clone = cls->m_debuginfo = cls->m_clonestate = -1;\n"
+    "    return cls;\n"
+    "}\n"
+    "\n"
+    "/* 链入后 registry 调用（mod.json ext.init；首脚本编译前一次） */\n"
     "void %s(void) {\n"
-    "    /* register here */\n"
+    "    tphp_ext_reg_const_str(\"%s\\\\VERSION\", \"0.1.0\");\n"
+    "    tphp_ext_reg_fn(\"%s\\\\hello\", scaffold_hello);\n"
+    "    tphp_class_register_compile(scaffold_example_class());\n"
     "}\n";
+
+/* 消费示例（examples/usage.php）：%s = name, ns_php */
+static const char EXT_USAGE_TMPL[] =
+    "<?php\n"
+    "// %s 的消费示例：本包 C 扩展自注册的最小三件（src/ 模板生成）。\n"
+    "// 先链入：tphp ext --add <本包路径>（重链后下次运行生效）。\n"
+    "// 再跑：  tphp run examples/usage.php\n"
+    "namespace %s;\n"
+    "\n"
+    "echo \"const: \", VERSION, \"\\n\";\n"
+    "echo \"fn: \", hello(\"world\"), \"\\n\";\n"
+    "$e = new Example();\n"
+    "echo \"class: \", ($e instanceof Example) ? \"Example ok\" : \"?\", \"\\n\";\n";
+
+/* README：%s = name, ns_php, ns_php, ns_php, name */
+static const char EXT_README_TMPL[] =
+    "# %s\n\n"
+    "`tphp` C extension package. The scaffold self-registers a minimal trio via the\n"
+    "registration API (PLAN/ext-packages.md §2.4): const `%s\\VERSION`, fn `%s\\hello()`,\n"
+    "class `%s\\Example`.\n\n"
+    "## Next\n\n"
+    "```bash\n"
+    "tphp ext --add <this-package-path>   # compile & relink into current tphp (next run picks it up)\n"
+    "tphp run examples/usage.php         # consume the registered const/fn/class\n"
+    "tphp ext --remove %s                # uninstall & relink the base tphp\n"
+    "```\n\n"
+    "Spec: PLAN/ext-packages.md §2.3 (contract) / §2.4 (registration API).\n";
+
+/* ext 编译链产物（包内 build/、重链中间件） */
+static const char EXT_GITIGNORE[] =
+    "build/\n"
+    "*.o\n"
+    "*.obj\n"
+    "tphp.next\n"
+    "tphp.old\n";
 
 static const char EXT_H_TMPL[] =
     "#ifndef %s\n"
@@ -1487,20 +1557,17 @@ static const char EXT_H_TMPL[] =
     "\n"
     "#endif\n";
 
-int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap) {
+int tphp_pkg_new_ext(const char *dir, const char *name, bool force, char *err, size_t errcap) {
     const char *why = NULL;
     if (!tphp_pkg_valid_name(name, true, &why)) {
         set_err(err, errcap, "invalid extension name \"%s\": %s (need vendor/package)",
                 name ? name : "", why ? why : "");
         return 1;
     }
-    char root[1024];
-    if (!tphp_pkg_ext_root(root, sizeof root)) {
-        set_err(err, errcap, "cannot locate tphp root (self exe unknown)");
-        return 2;
+    if (!dir || !dir[0]) {
+        set_err(err, errcap, "target directory is empty");
+        return 1;
     }
-    char dir[1300];
-    snprintf(dir, sizeof dir, "%s/ext/%s", root, name);
     if (fs_exists(dir)) {
         if (!force) {
             set_err(err, errcap,
@@ -1539,6 +1606,21 @@ int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap) {
     /* src/<pkg>.c + include/<pkg>.h（pkg = name 最后一段） */
     const char *slash = strrchr(name, '/');
     const char *pkg = slash ? slash + 1 : name;
+    /* 派生 ns：ns_php = acme\hello（PHP 形）/ ns_c = acme\\hello（C 字面量形） */
+    char ns_php[640], ns_c[640];
+    size_t ni = 0, jc = 0, kc = 0;
+    while (name[ni]) {
+        if (name[ni] == '/') {
+            if (jc + 1 < sizeof ns_php) ns_php[jc++] = '\\';
+            if (kc + 2 < sizeof ns_c) { ns_c[kc++] = '\\'; ns_c[kc++] = '\\'; }
+        } else {
+            if (jc + 1 < sizeof ns_php) ns_php[jc++] = name[ni];
+            if (kc + 1 < sizeof ns_c) ns_c[kc++] = name[ni];
+        }
+        ni++;
+    }
+    ns_php[jc] = 0;
+    ns_c[kc] = 0;
     char sub[1400], body[4096];
     snprintf(sub, sizeof sub, "%s/src", dir);
     if (fs_mkdir_p(sub) < 0) {
@@ -1552,7 +1634,9 @@ int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap) {
         fs_rm_rf(dir);
         return 2;
     }
-    snprintf(body, sizeof body, EXT_C_TMPL, name, sym);
+    /* %s 序：name, ns_php, name, ns_php, ns_c, ns_c, sym, ns_c, ns_c（见模板头注） */
+    snprintf(body, sizeof body, EXT_C_TMPL,
+             name, ns_php, name, ns_php, ns_c, ns_c, sym, ns_c, ns_c);
     snprintf(sub, sizeof sub, "%s/src/%s.c", dir, pkg);
     if (fs_write(sub, body, strlen(body)) < 0) {
         set_err(err, errcap, "cannot write %s", sub);
@@ -1563,6 +1647,37 @@ int tphp_pkg_new_ext(const char *name, bool force, char *err, size_t errcap) {
     snprintf(guard, sizeof guard, "TPHP_EXT_%s_INCLUDED", sym);
     snprintf(body, sizeof body, EXT_H_TMPL, guard, guard, name, sym);
     snprintf(sub, sizeof sub, "%s/include/%s.h", dir, pkg);
+    if (fs_write(sub, body, strlen(body)) < 0) {
+        set_err(err, errcap, "cannot write %s", sub);
+        fs_rm_rf(dir);
+        return 2;
+    }
+
+    /* README + .gitignore + examples/usage.php（PLAN/scaffold.md §4.1：
+     * 质量对齐 app/lib；usage 配套自注册三件，链入即开箱可跑） */
+    char readme[2400];
+    snprintf(readme, sizeof readme, EXT_README_TMPL,
+             name, ns_php, ns_php, ns_php, name);
+    snprintf(sub, sizeof sub, "%s/README.md", dir);
+    if (fs_write(sub, readme, strlen(readme)) < 0) {
+        set_err(err, errcap, "cannot write %s", sub);
+        fs_rm_rf(dir);
+        return 2;
+    }
+    snprintf(sub, sizeof sub, "%s/.gitignore", dir);
+    if (fs_write(sub, EXT_GITIGNORE, sizeof EXT_GITIGNORE - 1) < 0) {
+        set_err(err, errcap, "cannot write %s", sub);
+        fs_rm_rf(dir);
+        return 2;
+    }
+    snprintf(sub, sizeof sub, "%s/examples", dir);
+    if (fs_mkdir_p(sub) < 0) {
+        set_err(err, errcap, "cannot create %s", sub);
+        fs_rm_rf(dir);
+        return 2;
+    }
+    snprintf(body, sizeof body, EXT_USAGE_TMPL, name, ns_php);
+    snprintf(sub, sizeof sub, "%s/examples/usage.php", dir);
     if (fs_write(sub, body, strlen(body)) < 0) {
         set_err(err, errcap, "cannot write %s", sub);
         fs_rm_rf(dir);
@@ -1646,7 +1761,7 @@ int tphp_pkg_new(const char *dir, const char *name, bool is_lib,
         pb_init(&rb);
         pb_puts(&rb, "# ");
         pb_puts(&rb, name);
-        pb_puts(&rb, is_lib ? "\n\n`tphp` library package.\n"
+        pb_puts(&rb, is_lib ? "\n\n`tphp` library package.\n\n```bash\ntphp test tests\n```\n"
                             : "\n\n`tphp` application.\n\n```bash\ntphp run main.php\n```\n");
         snprintf(path, sizeof path, "%s/README.md", dir);
         if (fs_write(path, rb.p, rb.len) < 0) { tm_free(rb.p); goto io_fail; }
@@ -3227,7 +3342,8 @@ int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap) {
 
 /* ================================================================
  * ext 命令组（PLAN/ext-packages.md §4）+ 编译链入（§5，切片 5-6 完成）
- * 落点 <tphp_root>/ext/<name>；项目模式写回 ext[]；add/sync 未链入自动 relink。
+ * 落点 <tphp_root>/ext/<name>；项目模式写回 ext[]；add 恒编译重链（11-12
+ * 拍板：改源再 add 即出新 tphp），sync/update 未链入时编译。
  * 铁律（§10.9）：不进 vendor/、不进 autoload、无 scripts。
  * ================================================================ */
 
@@ -3420,13 +3536,10 @@ int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
         rc = ext_writeback(proj_dir, &info, err, errcap);
         if (rc != 0) return rc;
     }
-    /* 未链入 → 全量重链（§4.1：装 + 编） */
-    char eroot[1024];
-    if (tphp_pkg_ext_root(eroot, sizeof eroot) &&
-        !ext_built_has(eroot, info.name)) {
-        return ext_compile_all(err, errcap);
-    }
-    return 0;
+    /* 2026-11-12 拍板：add 恒编译重链——不再看 .built「已链入」跳过。
+       改了源码再 add 立刻出新 tphp（重复 add 的代价 = 一次 relink，秒级）；
+       Windows 换像机制不变：本次进程仍跑旧镜像，下次启动即新 tphp。 */
+    return ext_compile_all(err, errcap);
 }
 
 /* ext[] [lo,hi) 落盘（sync/update 共用）：已装且非 force → skip 行；
@@ -3780,6 +3893,60 @@ void tphp_run_ext_inits(void) {
     }
 #endif
     if (tphp_ext_inits_hook) tphp_ext_inits_hook();
+}
+
+/* ---- 用户 ext 注册 API v1（PLAN/ext-packages.md §2.3；init 内调用）----
+ * 生命周期 = 进程（tphp_run_ext_inits 只在首个脚本前跑一次，注册先于
+ * 编译/执行）。查询口在 opcode.h（vm.c resolve_fn / op_fetch_const 挂钩，
+ * 另 bi_defined 认常量）。类无需注册 API：include/class.h 直接按 exclass
+ * 蓝本构造 TClass + tphp_class_register_compile() 即可。 */
+typedef struct { const char *name; TVal v; } ExtConstN;
+typedef struct { const char *name; BuiltinFn fn; } ExtFnN;
+static ExtConstN *s_ext_consts; static int s_n_ext_consts;
+static ExtFnN *s_ext_fns;       static int s_n_ext_fns;
+
+void tphp_ext_reg_const_str(const char *fq_name, const char *v) {
+    if (!fq_name || !v) return;
+    s_ext_consts = realloc(s_ext_consts,
+                           sizeof(ExtConstN) * (size_t)(s_n_ext_consts + 1));
+    s_ext_consts[s_n_ext_consts].name = tstr_val(tstr_intern(fq_name, strlen(fq_name)));
+    s_ext_consts[s_n_ext_consts].v = TV_STR(tstr_new(v, strlen(v)));
+    s_n_ext_consts++;
+}
+
+void tphp_ext_reg_const_int(const char *fq_name, int64_t v) {
+    if (!fq_name) return;
+    s_ext_consts = realloc(s_ext_consts,
+                           sizeof(ExtConstN) * (size_t)(s_n_ext_consts + 1));
+    s_ext_consts[s_n_ext_consts].name = tstr_val(tstr_intern(fq_name, strlen(fq_name)));
+    s_ext_consts[s_n_ext_consts].v = TV_INT(v);
+    s_n_ext_consts++;
+}
+
+void tphp_ext_reg_fn(const char *fq_name, BuiltinFn fn) {
+    if (!fq_name || !fn) return;
+    s_ext_fns = realloc(s_ext_fns, sizeof(ExtFnN) * (size_t)(s_n_ext_fns + 1));
+    s_ext_fns[s_n_ext_fns].name = tstr_val(tstr_intern(fq_name, strlen(fq_name)));
+    s_ext_fns[s_n_ext_fns].fn = fn;
+    s_n_ext_fns++;
+}
+
+/* vm.c 查询口：命中返回 addref 后的 TVal / 原生 fn 指针 */
+bool tphp_ext_const_find(const char *name, TVal *out) {
+    for (int i = 0; i < s_n_ext_consts; i++)
+        if (strcmp(s_ext_consts[i].name, name) == 0) {
+            *out = s_ext_consts[i].v;
+            tval_addref(*out);
+            return true;
+        }
+    return false;
+}
+
+void *tphp_ext_fn_find(const char *name) {
+    for (int i = 0; i < s_n_ext_fns; i++)
+        if (strcmp(s_ext_fns[i].name, name) == 0)
+            return (void *)s_ext_fns[i].fn;
+    return 0;
 }
 
 static int ext_current_os(void) {

@@ -343,6 +343,14 @@ static TVal bi_define(VM *vm, TVal *args, int n) {
     for (int i = 0; i < vm->n_consts; i++)
         if (tstr_eq(vm->consts[i].name, name))
             return TV_FALSE;               /* PHP 8: redefinition warns, returns false */
+    /* 预定义（用户 ext 注册）常量不可 re-define —— 同 PHP 内建常量语义 */
+    {
+        TVal ev;
+        if (tphp_ext_const_find(tstr_val(name), &ev)) {
+            tval_release(&ev);
+            return TV_FALSE;
+        }
+    }
     if (vm->n_consts >= 256)
         RAISE(vm, "Error", "Too many constants");
     TVal v = args[1];
@@ -362,6 +370,14 @@ static TVal bi_defined(VM *vm, TVal *args, int n) {
     for (int i = 0; i < vm->n_consts; i++)
         if (tstr_eq(vm->consts[i].name, name))
             return TV_TRUE;
+    /* 用户 ext 注册的预定义常量同样 defined() = true */
+    {
+        TVal ev;
+        if (tphp_ext_const_find(tstr_val(name), &ev)) {
+            tval_release(&ev);
+            return TV_TRUE;
+        }
+    }
     return TV_FALSE;
 }
 
@@ -408,6 +424,26 @@ static TVal bi_pkg_new(VM *vm, TVal *args, int n) {
         RAISE(vm, "ValueError", "pkg_new(): %s", err);
     if (rc != 0)
         RAISE(vm, "RuntimeException", "pkg_new(): %s", err);
+    return TV_TRUE;
+}
+
+/* pkg_new_ext(string $dir, string $name, bool $force = false): bool
+ * tphp new --ext 的 PHP 可调用层（脚手架落 cwd 由调用方给 dir） */
+static TVal bi_pkg_new_ext(VM *vm, TVal *args, int n) {
+    if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
+        RAISE(vm, "ArgumentCountError",
+              "pkg_new_ext() expects (string $dir, string $name, bool $force = false)");
+    if (n >= 3 && args[2].t != T_TRUE && args[2].t != T_FALSE)
+        RAISE(vm, "TypeError", "pkg_new_ext(): Argument #3 ($force) must be bool");
+    const char *dir = tstr_val((TStr *)args[0].u.p);
+    const char *name = tstr_val((TStr *)args[1].u.p);
+    bool force = n >= 3 && args[2].t == T_TRUE;
+    char err[512] = "";
+    int rc = tphp_pkg_new_ext(dir, name, force, err, sizeof err);
+    if (rc == 1)
+        RAISE(vm, "ValueError", "pkg_new_ext(): %s", err);
+    if (rc != 0)
+        RAISE(vm, "RuntimeException", "pkg_new_ext(): %s", err);
     return TV_TRUE;
 }
 
@@ -3392,6 +3428,7 @@ const Builtin tphp_builtins[] = {
     { "http_get", tphp_net_http_get },
     /* 包管理（pkg.c；tphp new/add/... 的 PHP 可调用层） */
     { "pkg_new", bi_pkg_new },
+    { "pkg_new_ext", bi_pkg_new_ext },
     { "pkg_add", bi_pkg_add },
     { "pkg_remove", bi_pkg_remove },
     { "pkg_install", bi_pkg_install },

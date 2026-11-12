@@ -92,7 +92,7 @@ static void print_usage(FILE *out) {
         "  tphp phpc <dir> -o <out.c>      pack lib\\*.php into bundle_data.c\n"
         "  tphp build <app.php> --with <p>... -o <app.exe>\n"
         "                                  build single exe with embedded assets\n"
-        "  tphp new <name> [--lib|--ext] [--force]   scaffold app/lib/ext package\n"
+        "  tphp new <name> [--lib|--ext] [--force]   scaffold app/lib/ext package (--force: ext only, overwrite existing dir)\n"
         "  tphp add <source> [ref]         add dependency (GitHub repo URL[:ref] / zip URL / path)\n"
         "  tphp remove <name>              remove dependency (e.g. foo/bar)\n"
         "  tphp install [--force]          restore deps from mod.lock (or mod.json)\n"
@@ -801,13 +801,19 @@ int main(int argc, char **argv) {
             }
             char err[512] = "";
             if (ext) {
-                /* ext 脚手架 → <tphp_root>/ext/<name>/（§2.3，不写项目清单） */
-                int rc = tphp_pkg_new_ext(name, force, err, sizeof err);
+                /* ext 脚手架 → cwd/<pkg>/（2026-11-12 拍板：new --ext 创建的是
+                   ext 包，与 --app/--lib 同落当前目录；目录取最后一段（同
+                   --lib，不嵌 vendor）；<tphp_root>/ext/ 是 ext --add/sync 的
+                   安装落盘，脚手架随后由 add 链入） */
+                const char *slash = strrchr(name, '/');
+                char dir[512];
+                snprintf(dir, sizeof dir, "%s", slash ? slash + 1 : name);
+                int rc = tphp_pkg_new_ext(dir, name, force, err, sizeof err);
                 if (rc != 0) {
                     fprintf(stderr, "tphp: %s\n", err);
                     return rc == 1 ? (int)TPHP_E_ARGS : (int)TPHP_E_IO;
                 }
-                printf("Created ext scaffold \"%s\" under <tphp_root>/ext/\n", name);
+                printf("Created ext scaffold \"%s\" in %s/\n", name, dir);
                 return (int)TPHP_OK;
             }
             /* 目标目录：应用 = 名字本身；库包 = 最后一段（foo/bar → bar） */

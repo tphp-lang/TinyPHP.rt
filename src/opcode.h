@@ -152,6 +152,10 @@ typedef TVal (*NativeMethodFn)(VM *vm, void *self, TVal *args, int n);
 typedef struct { const char *name; BuiltinFn fn; } Builtin;
 extern const Builtin tphp_builtins[];
 extern const int tphp_builtin_count;
+/* 用户 ext 注册面（pkg.c reg API v1）：vm 解析旁路——resolve_fn 在内置
+ * 表未命中后查 ext fn；op_fetch_const / bi_defined 认 ext 常量。 */
+void *tphp_ext_fn_find(const char *name);
+bool tphp_ext_const_find(const char *name, TVal *out);
 
 /* raise a typed exception from anywhere holding a VM* (never returns) */
 void tphp_vm_raise(VM *vm, const char *cls, const char *fmt, ...)
