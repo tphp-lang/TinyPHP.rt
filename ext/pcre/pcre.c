@@ -12,6 +12,11 @@
 #include "class.h"
 #include "pcre.h"
 #define PCRE2_CODE_UNIT_WIDTH 8
+#ifndef PCRE2_STATIC        /* 静态链接 vendored pcre2：免 dllimport 导入桩
+                             * （否则 MSVC/lld 链接期每符号一条 LNK4217 噪音，
+                             * 见 build.cmd PCRE2_DEFS 库侧同款定义） */
+#define PCRE2_STATIC 1
+#endif
 #include <pcre2.h>
 #include <string.h>
 #include <stdio.h>
