@@ -98,8 +98,10 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
 
 ### 2.3 `--ext` 脚手架生成物
 
+> **2026-11-12 拍板修正**：`new --ext` 创建的是 ext **包** → 落**当前目录**（cwd，与 `--app`/`--lib` 同侧，目录取**最后一段** `pkg`，同 `--lib` 不嵌 vendor）；`<tphp_root>/ext/` 仅是 `ext --add/sync` 的**安装落盘**，脚手架随后由 `ext --add <path>` 链入。
+
 ```text
-<tphp_root>/ext/acme/foo/
+./foo/                             ← cwd（CLI：tphp new acme/foo --ext → ./foo/）
 ├── mod.json          // 上表，init=tphp_ext_acme_foo_init，tphp_abi=当前版本
 ├── src/foo.c         // 约定 init/abi 符号 + 最小示例
 └── include/foo.h
@@ -117,6 +119,20 @@ int  tphp_ext_acme_foo_abi(void);    // 可选
 ```
 
 `name` 中 `/`、`-` → `_`：`tphp_ext_<vendor>_<pkg>_init`。
+
+### 2.4 注册 API v1（2026-11-12 落地）
+
+`init` 内可用（进程生命周期，先于首脚本编译——`main.c` `tphp_run_ext_inits` 在 parse 前）：
+
+| 面 | API | 查询侧（引擎挂钩） |
+|---|---|---|
+| 常量 | `tphp_ext_reg_const_str/int("Ns\\NAME", v)`（pkg.h） | `op_fetch_const` 全名 +（unqualified 时）裸名旁路；`defined()` 认账；`define()` 视为预定义不可覆盖 |
+| 函数 | `tphp_ext_reg_fn("Ns\\fn", BuiltinFn)`（pkg.h） | `resolve_fn` 内置表未命中后旁路，同 builtin 调用协议（含 ns bare 重试） |
+| 类 | 无需注册口：按 `src/exclass.c` 蓝本构造 `TClass`（`TMethod.native` 原生方法、`props` 槽位）+ `tphp_class_register_compile()`（class.h） | 类解析原生注册表路径（编译期 A_NEW 存在性检查亦认） |
+
+- 实现居 `ext/pkg/pkg.c`（与 `tphp_run_ext_inits` 同基座），查询口声明在 `src/opcode.h`；公开面随 `build/include` 分发（pkg.h / class.h / opcode.h / value.h / builtin.h 全在）。
+- 端到端示例（库外手测）：demo 扩展包 `src/demo.c` 注册 `Tphp\Demo\VERSION/BASE/hello/Counter` → `ext --add` 链入 → `demo.php` 消费（C 段输出 `C const/C fn/C class`），**242 套件在链入态全绿**。
+- 套件内暂无自动化锁：注册进 exe 需 relink 后**下次启动**生效，单进程 test runner 无法自验——后续切片可补 relink+二次启动集成测试。
 
 ## 3. 项目侧 `mod.json`：`ext[]`
 
@@ -138,9 +154,9 @@ int  tphp_ext_acme_foo_abi(void);    // 可选
 ## 4. 命令
 
 ```text
-tphp new <name> --ext              # 脚手架 → <tphp_root>/ext/<name>/
+tphp new <name> --ext              # 脚手架 → ./<pkg>/（cwd 最后一段；add 后才落 <tphp_root>/ext/）
 
-tphp ext --add <source> [ref]      # 装源码 + 按需编译（见下）
+tphp ext --add <source> [ref]      # 装源码 + 恒编译重链（11-12 拍板，见下）
 tphp ext --add                     # 无 source：按当前项目 ext[] 补齐（= sync）
 tphp ext --remove <name>           # 删 <tphp_root>/ext/<name>/
 tphp ext --update [name]           # 按 url/ref 重下；变了则重编；省略 name=全部
@@ -223,7 +239,7 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 
 1. 规格入库（本文）+ `PLAN/pkg-manager.md` 指针 + `doc/package-manager.md` 摘要  
 2. `TMod`：项目 `ext[]` 解析/写出；扩展包 `type=ext` + `ext{}` 解析（含 `os`）  
-3. `tphp_root()` + `tphp new --ext` 脚手架  
+3. `tphp_root()` + `tphp new --ext` 脚手架（root 供 add/sync；脚手架 2026-11-12 改落 cwd）  
 4. `tphp ext --add/--remove/--update/--list/--relink`（含项目内写回 `ext[]`、无参 sync）  
 5. 编译链接 + `.built` + Windows 替换  
 6. lock `ext` 分栏 + integrity（可与 4 同 PR）  

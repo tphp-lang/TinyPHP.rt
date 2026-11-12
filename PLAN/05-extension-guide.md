@@ -2,7 +2,7 @@
 
 > 上级索引：[../PLAN.md](../PLAN.md)。面向后续加入的开发者（人类或 AI）：如何给本项目添加新的内置能力、必须遵守哪些红线、按什么流程交付。
 > 本项目所有"扩展"都是**内置**的（编译进 exe），不存在动态加载的 Zend 扩展——PHP 原生扩展 DLL 与本项目 ABI 不兼容（扩展是 php8.dll 的插件，直接解引用 zval/HashTable 内存布局）。
-> **用户侧 C 扩展包**（`tphp new --ext` / `tphp ext`，源码在 tphp 二进制旁 `ext/`、编译链入当前 tphp）是另一条路径，见 [ext-packages.md](ext-packages.md)——与本指南的源码树 `ext/` 内置层不同目录、不同流程。
+> **用户侧 C 扩展包**（`tphp new --ext` 在当前目录创建包脚手架 / `tphp ext` 安装到 tphp 二进制旁 `ext/` 并编译链入当前 tphp）是另一条路径，见 [ext-packages.md](ext-packages.md)——与本指南的源码树 `ext/` 内置层不同目录、不同流程。
 
 ## 1. 新能力选型（先问路径，再动手）
 

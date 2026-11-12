@@ -7,7 +7,7 @@
 ```bash
 tphp new <name>              # 创建应用项目（main.php + mod.json）
 tphp new --lib <name>        # 创建库包（src/ + tests/ + autoload）
-tphp new <name> --ext        # 创建 C 扩展脚手架 → <tphp_root>/ext/<name>/（双段名）
+tphp new <name> --ext        # 创建 C 扩展包脚手架 → 当前目录 ./<pkg>/（最后一段，不嵌 vendor；ext --add 才安装到 <tphp_root>/ext/）
 
 tphp add <source> [ref]      # 添加依赖；source 为 GitHub 仓库 URL / zip URL / 路径
 tphp remove <name>           # 移除依赖（如 foo/bar）
@@ -21,7 +21,7 @@ tphp upload                  # 打印发布指引（占位，见下）
 
 C 扩展与 PHP 包**完全分离**：源码落 `<tphp_root>/ext/<name>/`（与 tphp 二进制同级，不进 `vendor/`、不进 autoload），项目 `mod.json` 仅以 `ext[]` 数组声明 `{name,url,ref}`；扩展包自身 `type=ext` 且带编译契约 `ext{}`（sources/include/defines/cflags/libs/ldflags/os 分平台/tphp_abi/init）。
 
-**命令**：`tphp new <name> --ext` 脚手架；`tphp ext --add [source [ref]]`（项目内写回 `ext[]`，无 source=按 `ext[]` sync）/ `--remove` / `--update` / `--list` / `--relink`。未链入时 add/sync/update 自动编译重链（`.built` 记录已链入集）。
+**命令**：`tphp new <name> --ext` 脚手架；`tphp ext --add [source [ref]]`（项目内写回 `ext[]`，无 source=按 `ext[]` sync）/ `--remove` / `--update` / `--list` / `--relink`。**add 恒编译重链**（11-12 拍板：改了源码再 add 直接出新 tphp，不再看 `.built` 跳过）；sync/update 未链入时编译（`.built` 记录已链入集）。
 
 **lock**：`mod.lock` 顶层保留键 `"ext"` 分栏（与 `deps` 分离），含 url/ref/integrity（排除 `build/`）；覆盖已装包前校验 integrity，`--update` force 跳过。权威规格 [../PLAN/ext-packages.md](../PLAN/ext-packages.md)。
 
