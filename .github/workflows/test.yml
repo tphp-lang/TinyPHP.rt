@@ -35,8 +35,14 @@ jobs:
           cmd.exe //c build.cmd
 
       - name: Test
-        shell: pwsh
-        run: ./tests/run.ps1
+        # Must share the CLANG64 env with Build: test-pkg-ext relinks
+        # tphp.exe by spawning `clang @.link.rsp`; under pwsh, PATH's clang
+        # is the runner's MSVC-mode LLVM, whose link cannot resolve the
+        # MinGW-built objects (__mingw_*/___chkstk_ms/__main, 35 unresolved).
+        shell: msys2 {0}
+        run: |
+          which clang
+          pwsh -File ./tests/run.ps1
 
       - name: Pack smoke (PE resources)
         shell: pwsh
