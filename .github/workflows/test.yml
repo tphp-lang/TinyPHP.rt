@@ -32,17 +32,20 @@ jobs:
         run: |
           which clang
           clang --version
+          # Export the CLANG64 bin dir to later steps: test-pkg-ext relinks
+          # tphp.exe by spawning `clang @.link.rsp`, and the Test step's
+          # pwsh PATH otherwise resolves to the runner's MSVC-mode LLVM,
+          # whose link cannot take the MinGW-built objects (__mingw_*,
+          # ___chkstk_ms, __main -- 35 unresolved, LNK1120). Before the
+          # build so the step still fails on build.cmd errors.
+          echo "$(cygpath -w /clang64/bin)" >> "$GITHUB_PATH"
           cmd.exe //c build.cmd
 
       - name: Test
-        # Must share the CLANG64 env with Build: test-pkg-ext relinks
-        # tphp.exe by spawning `clang @.link.rsp`; under pwsh, PATH's clang
-        # is the runner's MSVC-mode LLVM, whose link cannot resolve the
-        # MinGW-built objects (__mingw_*/___chkstk_ms/__main, 35 unresolved).
-        shell: msys2 {0}
-        run: |
-          which clang
-          pwsh -File ./tests/run.ps1
+        # clang for the ext relink comes from GITHUB_PATH (CLANG64, set in
+        # the Build step) -- same toolchain that built build/obj.
+        shell: pwsh
+        run: ./tests/run.ps1
 
       - name: Pack smoke (PE resources)
         shell: pwsh
