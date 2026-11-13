@@ -4237,10 +4237,27 @@ static void ext_path_fwd(char *s) {
     for (char *q = s; *q; q++) if (*q == '\\') *q = '/';
 }
 
-/* Windows 8191 上限 → @response 文件（clang/lld 支持；路径用 /） */
+/* rsp 逐 token 独立成行（clang @rsp 一行一项） */
+static void rsp_put_tokens(PkgBuf *lb, const char *s) {
+    if (!s) return;
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *t = p;
+        while (*p && *p != ' ') p++;
+        pb_put(lb, t, (size_t)(p - t));
+        pb_put(lb, "\n", 1);
+    }
+}
+
+/* Windows 8191 上限 → @response 文件（clang/lld 支持；路径用 /）。
+ * extra_link：包契约声明的链接指令（libs + os.libs + ldflags + os.ldflags，
+ * 空格分隔），追加在引擎库之后、-o 之前。 */
 static int ext_write_link_rsp(const char *rsp, const char *reg_o,
                               char **objs, int nobjs,
                               char **eng, int neng, const char *next,
+                              const char *extra_link,
                               char *err, size_t errcap) {
     PkgBuf lb;
     pb_init(&lb);
@@ -4255,25 +4272,8 @@ static int ext_write_link_rsp(const char *rsp, const char *reg_o,
         snprintf(tmp, sizeof tmp, "%s", eng[i]); ext_path_fwd(tmp);
         pb_puts(&lb, "\""); pb_puts(&lb, tmp); pb_puts(&lb, "\"\n");
     }
-    {
-        PkgBuf libs;
-        pb_init(&libs);
-        pb_puts(&libs, ext_engine_libs(ext_current_os()));
-        char *p = libs.p;
-        if (p) {
-            while (*p) {
-                while (*p == ' ') p++;
-                if (!*p) break;
-                char *s = p;
-                while (*p && *p != ' ') p++;
-                char save = *p; *p = 0;
-                pb_puts(&lb, s);
-                pb_puts(&lb, "\n");
-                *p = save;
-            }
-        }
-        tm_free(libs.p);
-    }
+    rsp_put_tokens(&lb, ext_engine_libs(ext_current_os()));
+    if (extra_link && extra_link[0]) rsp_put_tokens(&lb, extra_link);
     pb_puts(&lb, "-o\n\"");
     snprintf(tmp, sizeof tmp, "%s", next); ext_path_fwd(tmp);
     pb_puts(&lb, tmp);
@@ -4291,7 +4291,7 @@ static int ext_write_link_rsp(const char *rsp, const char *reg_o,
  * 引擎对象：优先 <root>/obj/*.o（与 build.cmd 同款直链，避开
  * libtphp.a 的 pcre2 dllimport 归档语义）；否则解压 libtphp.a。 */
 static int ext_link_and_replace(const char *eroot, const char *cc,
-                                char **objs, int nobjs,
+                                char **objs, int nobjs, const char *extra_link,
                                 char *err, size_t errcap) {
     char liba[1400], next[1400], reg_c[1400], reg_o[1400];
     snprintf(liba, sizeof liba, "%s/libtphp.a", eroot);
@@ -4394,7 +4394,7 @@ static int ext_link_and_replace(const char *eroot, const char *cc,
     char rsp[1400];
     snprintf(rsp, sizeof rsp, "%s/ext/.link.rsp", eroot);
     if (ext_write_link_rsp(rsp, reg_o, objs, nobjs, eng, neng,
-                           next, err, errcap) != 0) {
+                           next, extra_link, err, errcap) != 0) {
         tm_strlist_free(eng, neng);
         return 2;
     }
@@ -4509,6 +4509,11 @@ static int ext_compile_all(char *err, size_t errcap) {
     char **inits = NULL;
     int nbuild = 0;
     int rc = 0;
+    /* 包契约声明的链接指令（libs/os.libs/ldflags/os.ldflags）累积，
+     * 链接时随 rsp 一并下发（§2 契约字段的消费端） */
+    PkgBuf xlink;
+    pb_init(&xlink);
+    int os_now = ext_current_os();
 
     for (int i = 0; i < ndirs; i++) {
         char mj[1650];
@@ -4541,6 +4546,20 @@ static int ext_compile_all(char *err, size_t errcap) {
         versions[nbuild] = xstrdup(m.version ? m.version : "0.0.0");
         inits[nbuild] = xstrdup(sym);
         nbuild++;
+        {
+            const TExtSpec *xs = &m.ext_spec;
+            struct { char **a; int n; } gl[] = {
+                { xs->libs, xs->n_libs },
+                { xs->ldflags, xs->n_ldflags },
+                { xs->os_libs[os_now], xs->n_os_libs[os_now] },
+                { xs->os_ldflags[os_now], xs->n_os_ldflags[os_now] },
+            };
+            for (size_t g = 0; g < sizeof gl / sizeof gl[0]; g++)
+                for (int j = 0; j < gl[g].n; j++) {
+                    pb_put(&xlink, " ", 1);
+                    pb_puts(&xlink, gl[g].a[j]);
+                }
+        }
         tmod_free(&m);
     }
 
@@ -4548,7 +4567,8 @@ static int ext_compile_all(char *err, size_t errcap) {
         rc = ext_write_registry(eroot, names, nbuild, inits, err, errcap);
     }
     if (rc == 0) {
-        rc = ext_link_and_replace(eroot, cc, objs, nobjs, err, errcap);
+        rc = ext_link_and_replace(eroot, cc, objs, nobjs, xlink.p,
+                                  err, errcap);
     }
     if (rc == 0) {
         rc = ext_rewrite_built(eroot, names, versions, nbuild, err, errcap);
@@ -4562,6 +4582,7 @@ static int ext_compile_all(char *err, size_t errcap) {
         tm_free(names[i]); tm_free(versions[i]); tm_free(inits[i]);
     }
     tm_free(names); tm_free(versions); tm_free(inits);
+    tm_free(xlink.p);
     tm_strlist_free(objs, nobjs);
     tm_strlist_free(dirs, ndirs);
     return rc;
