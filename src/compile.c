@@ -349,6 +349,19 @@ static int concat_reuse_enabled(void) {
     return v;
 }
 
+/* object 刀（11-13）：一元负号字面量折叠开关——TPHP_NEG_FOLD=0 关（同
+ * 二进制 A/B=HEAD：`-1` 编译为 CONST 1 + OP_NEG，热循环/dtor 每次付
+ * NEG 慢线 CALL）。默认开：字面量直折为 OP_CONST（tval_neg 同源语义，
+ * INT_MIN→float），解释器与 JIT 双面受益。 */
+static int neg_fold_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_NEG_FOLD");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* mark a variable as a `global` alias inside the current function */
 static void mark_global_var(Ctx *c, TStr *name) {
     for (int i = 0; i < c->n_vars; i++) {
@@ -1382,6 +1395,24 @@ static Loc compile_expr(Ctx *c, AExpr *e, Loc want) {
             Loc v = compile_expr(c, e->u.un.e, want);
             emit(c, OP_SUPPRESS_OFF, LOC_NONE, LOC_NONE, LOC_NONE, e->line);
             return v;
+        }
+        /* 一元负号字面量折叠（object 刀 11-13，TPHP_NEG_FOLD 默认开）：
+         * HEAD 对 `-1` 发 CONST 1 + OP_NEG——解释器每执行一次付 op 分发、
+         * JIT 落 call_slow_binop 慢线 CALL（recon4 实锤：dtor 体 prop 写段
+         * 差主体 ≈28ns/次全是它）。仅折 A_INT/A_FLOAT 直接操作数（无侧效、
+         * 无分配）；tval_neg 与运行时同源（INT64_MIN→float，对齐 PHP），值
+         * 逐位不变。非字面量（-$x、-PHP_INT_MIN、-'5'）照旧走 OP_NEG 运行
+         * 期语义。 */
+        if (e->u.un.op == P_MINUS && neg_fold_enabled()) {
+            AExpr *ch = e->u.un.e;
+            if (ch->tag == A_INT || ch->tag == A_FLOAT) {
+                TVal nv = tval_neg(ch->tag == A_INT ? TV_INT(ch->u.i)
+                                                    : TV_FLOAT(ch->u.d));
+                Loc fdst = tmp_dst(c, want);
+                emit(c, OP_CONST, LOC_CONST(push_lit(c, nv)), LOC_NONE,
+                     fdst, e->line);
+                return fdst;
+            }
         }
         Loc v = compile_expr(c, e->u.un.e, LOC_NONE);
         Loc dst = tmp_dst(c, want);

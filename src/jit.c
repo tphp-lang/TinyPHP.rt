@@ -1902,6 +1902,7 @@ static bool dst_src_alias(TOp *op) {
 }
 
 static int mod_fast_enabled(void);      /* 定义在开关区（logstat 百菜），lower_binop 用 */
+static int neg_fast_enabled(void);      /* 定义在开关区（object 刀），lower_un 用 */
 
 static void lower_binop(JitC *j, TOp *op) {
     JIT_CTX();
@@ -2248,9 +2249,35 @@ static void lower_un(JitC *j, TOp *op) {
         store_bool(j, da, t);
         break;
     }
-    case OP_NEG:
-        call_slow_binop(j, OP_NEG, da, ta, pa, ta, pa);
+    case OP_NEG: {
+        /* object 刀（11-13）：INT 快线——tag==INT 且 pay!=INT64_MIN 时
+         * IR 直接取负（免 CALL tval_neg 的 to_num 分发框架）；INT64_MIN
+         * 落 slow（→float，PHP 语义）、非 INT（float/str/bool...）落 slow
+         * 原样。释放门镜像 MOD 快线（slow 分支自释放不发；dst==src 别名
+         * 时源已是本值不发）。开关 TPHP_NEG_FAST=0 = HEAD 恒 slow。 */
+        if (!neg_fast_enabled()) {
+            call_slow_binop(j, OP_NEG, da, ta, pa, ta, pa);
+            break;
+        }
+        ir_ref ifni = ir_IF(ir_EQ(ta, ir_CONST_I32(JT_INT)));
+        ir_IF_TRUE(ifni);
+            ir_ref ifmin = ir_IF(ir_EQ(pa, ir_CONST_I64(INT64_MIN)));
+            ir_IF_TRUE(ifmin);
+                call_slow_binop(j, OP_NEG, da, ta, pa, ta, pa);   /* →float */
+                ir_ref eMin = ir_END();
+            ir_IF_FALSE(ifmin);
+                if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                    rel_dst_gate(j, da);
+                store_imm(j, da, JT_INT, ir_SUB_I64(ir_CONST_I64(0), pa));
+                ir_ref eNeg = ir_END();
+            ir_MERGE_2(eMin, eNeg);
+            ir_ref eInt = ir_END();
+        ir_IF_FALSE(ifni);
+            call_slow_binop(j, OP_NEG, da, ta, pa, ta, pa);
+            ir_ref eSlowN = ir_END();
+        ir_MERGE_2(eInt, eSlowN);
         break;
+    }
     case OP_POS:
         call_slow_binop(j, OP_POS, da, ta, pa, ta, pa);
         break;
@@ -3204,6 +3231,17 @@ static int mod_fast_enabled(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TPHP_MOD_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* object 刀（11-13）：NEG int 快线开关——默认开，TPHP_NEG_FAST=0 关（同
+ * 二进制 A/B）= HEAD 行为（恒 CALL tval_neg 慢线）。 */
+static int neg_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_NEG_FAST");
         v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
     }
     return v;
