@@ -10,7 +10,13 @@ CI（run 42190592708 @ e2679be）：linux-x64 array-read 比值 3.42→**2.81×*
 触发制）。**批4b-i key-fwd 落地（2026-11-13，未提交）**：TPHP_KEY_FWD
 （默认开）——F1 (pay,tag) 三层 MERGE phi 直供 F2 键位，免 STR take+槽
 往返，kv 本机 A/B 双轮 −13.1%/−13.9%；含 tstr_hash 实参 bug 修正。
-4b-ii（链式 fwd+N-fetch 扩形）/4c/4d 未动；WSL 第二口径与 CI 复核待办。**
+4b-ii（链式 fwd+N-fetch 扩形）**已落地（2026-11-13，实测 §8.10，
+未提交）**：TPHP_CHAIN_FWD（默认开）——cv8 链 A/B 双轮 −57.6%、const
+链 −50.5%。**批4c 单 fetch ht 化已落地（2026-11-13，实测 §8.11，
+未提交）**：TPHP_ONEKEY（默认开）——onekey −52%、const 单查 −29% 双轮稳、
+read 专项 0%；guard-fail 降级面（键非 STR/packed +943%/+1418%、混合值
++134%）**用户拍板全放行+记账**（4a 先例、4d 触发制）。4d 未动；WSL
+第二口径与 CI 复核待办。**
 
 历史：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
 上游依据：emit-ssa.md §③ 类型特化；read 减法定案（memory/2026-11-05.md 主刀轮收口）。
@@ -368,10 +374,12 @@ emit 两份循环体，emit_seq 单遍约束不变）；key 恒 STR 的 all_str 
   take+槽往返；rc 论证落地（热路径键只被探针身份比较+hash 读写、不落槽
   不逃逸，kb 零写证元素自持；冷出口 kfwd_materialize 按 take 序物化，
   槽恒持一份 owned，帧销毁/解释器复跑配平）。
-  **4b-ii 未动**：链式 fwd（binop→binop phi，cv8/const 多 fetch 形态的
-  spec_scan N-fetch 扩形）。
-- **批4c**：1key（键 CV 恒 STR——guard 加一条槽 tag==STR 检查）与
-  CONST 字面量键（lit 类型编译期即知，免 kt 装载）形态。
+  ~~链式 fwd（binop→binop phi，cv8/const 多 fetch 形态的 spec_scan
+  N-fetch 扩形）~~ **4b-ii 已落地（2026-11-13，见 §8.10）**。
+- **批4c**：~~1key（键 CV 恒 STR——guard 加一条槽 tag==STR 检查）与
+  CONST 字面量键（lit 类型编译期即知，免 kt 装载）形态~~ **已落地
+  （2026-11-13，见 §8.11）**：键==idx 分流走 read 原样、键≠idx 单 fetch
+  走 onekey（ht=1+kstr 分级），STR 证免 STR 分派菱形。
 - **批4d（观察触发）**：guard-fail 回退面治理——若 8.7-1 专项实测回退
   显著，选项 = 静态证明线（literal ARRAY_INIT 溯源免 helper）或其它
   非双版本方案，另立小设计稿拍板。
@@ -449,4 +457,101 @@ emit 两份循环体，emit_seq 单遍约束不变）；key 恒 STR 的 all_str 
 
 **记账**：kv 本机 A/B 口径（bench-vs-php kv-read 1.6e6）13.7 → 11.8
 （−13.9%，双轮稳）；4a 口径（另一 bench 形态 16.5→9.5）不直比。
-4b-ii（链式 fwd + spec_scan N-fetch 扩形，cv8/const 形态）= 下一刀。
+4b-ii（链式 fwd + spec_scan N-fetch 扩形，cv8/const 形态）已落地 → §8.10。
+
+### 8.10 批4b-ii 链式 fwd 实测（2026-11-13，未提交）
+
+**切面**（src/jit.c 单文件，`TPHP_CHAIN_FWD` 默认开，关 = spec_scan 链式
+不放行 = 批4b-i 行为，A/B 主口径）：
+
+- **spec_scan 链式状态机**：F2 键 CV/CONST/字面量物化 TMP（kv F2 键恒
+  TMP=F1 dst，上方分支先吃）⇒ 分叉；严格交替 F F (A_c F)\* A_c A_rmw
+  INC（N=2..16、单 base CV、A_c dst TMP src 配对、RMW 收尾配末链 dst）；
+  OP_CONST 字面量物化白名单放行（非链式收尾拒 = 保今日行为、4c 不随本刀
+  放行）；F1..F2 相邻前提泛化为"间唯 OP_CONST"（物化直线写自有 TMP 不
+  消费 spec_bit_int，链式 F1 是值 fetch 恒 INT 证无 STR 假证面）。身份 =
+  CV 集 {acc,ix,base,键 CV 去重}（TMP 域 relocate 不交 + tmp_new 单调）；
+  写点约束扩全部键 CV；form 输出 ht=1 + chain=1 + tmp=0。
+- **待发表 spec_ctab[2]**（镜像 spec_fwd/kfwd 纪律）：F1 活跃跨 F2 =
+  2 在场、此后恒 {前链 dst, 本 fetch} = 2 ⇒ 插位必有空位；kind+idx 消费
+  即清（含 spec_tmp_valid 对齐）。pay=0 = 槽已写（fwd 门失败/纯证明模式）
+  ——INT 证明独立于 pay 存在，消费端退化槽 load。三处出体清点镜像
+  （出体/scan-ok/scan 拒）。
+- **消费（lower_binop 双操作数，先于刀16 通道）**：命中 ⇒ ta/tb=CONST
+  INT（guard 证元素恒 INT + 链加溢出 RETURN 不落 FLOAT）+ pay=phi（或
+  槽 load）；A1 双 phi、A_i 链+fetch 混合、RMW（acc 走 spec_bit_int +
+  末链走 ctab）三配对自然覆盖。**链加尾携带（binop→binop）**：特化快线
+  记 spec_ctab_sum，dispatch 挂下一加——链 dst 每迭代照常 store（物化永
+  不需要它），携带只省下一加的槽 load；慢线/无消费端恒不挂。
+- **形状门 chain_consumer_pc**：def 后跳 OP_CONST 找首个引用本 dst 的
+  ADD（隔 0/1 FETCH 两型），(def, 消费端] 全程 stop/jump 断块检查（镜像
+  刀16/kfwd）；门失败仍挂条目（只作证明）。
+- **物化 ctab_mat_all**（rel_dst_gate 自带释放门 ⇒ 不依赖 preheader 消灭，
+  TAKE_THIN=0 行为不变；链 dst unwritten=0 恒跳）挂三类出口：
+  dimic_miss ok==0 RETURN 前 / lower_binop 溢出 RETURN（只补被本加消费
+  的 unwritten 条目——活跃集 ⊆ 操作数，结构证）/ lower_incdec 溢出
+  RETURN（INC 可插 F/链加间 ⇒ 全表）。preheader 消灭链式跳过
+  （s_chain 闸）。
+
+**过程发现**：字面量键编译为 OP_CONST→TMP 后入 FETCH 键位（非
+FETCH t2==OPD_CONST 直折）——首轮 cchain 拒因 "CONST"（OP_CONST 白名单
+外）由此扩展；F1..F2 被 OP_CONST 打断 ⇒ 相邻前提必须泛化。
+
+**验证**：
+| 项 | 结果 |
+|---|---|
+| 编译 | 零新增警告；TPHP_JIT_DEBUG=2 **ir_check=1 ×14、FAILED=0**，chain=1 命中 12 函数 |
+| 全量 | **244×7 模式全绿**（默认 + CHAIN_FWD=0 / FETCH_FWD=0 / KEY_FWD=0 / TYPE_SPEC=0 / JIT=0 / TAKE_THIN=0 六超集，各 244 passed 0 failed） |
+| 新测试 | `tests/jit/test-jit-chainfwd-001.php` 十三案（cv8/N=2/N=3/全 const/混键/动态 STR hash 惰性/混合值 guard-fail/packed guard-fail/absent raise 复跑/溢出 deopt double/INT 键 helper/身份撞车负+键复用/guard 轮转）三模逐字一致 + 双臂 ×64 复跑 0 diff |
+| cv8 A/B | min-of-6 双轮换序（仅 Windows 口径）：轮1 ON 7.0 vs OFF 16.5 = **−57.6%**；轮2 ON 7.0 vs OFF 16.5 = **−57.6%** 双轮稳 |
+| const A/B | 轮1 11.3 vs 22.7 = **−50.4%**；轮2 11.2 vs 22.8 = **−50.9%** 双轮稳 |
+| guard-fail 专项 | 混合值链（半 float）ON 66.2/65.7 vs OFF 64.9/65.6 = **+2.0%/+0.2%**——4a 的 +156% 回退面在链式形态不重演（带内） |
+| 全表 | 14 项双轮 ±4.3% 内且多数反号；同向项 **8 交替专项**：call 0%、json −0.8%、jsonagg 0% 归零；push −4.7%（两臂对 push 生成码逐字相同 ⇒ 纯噪声）；零回退 |
+
+**记账**：cv8 本机 16.5（关）→ **7.0（开）**、const 链 22.7 → 11.3；
+本刀无 CI 计分形态直接受益（bench-vs-php 无链式形态），CI 面以全表零
+回退验收。packed/混合值链式 guard-fail 交解释器回退面实测带内（4d 触发
+制不因本刀触发）。剩余 = 4d（触发制）、WSL 第二口径与 CI 复核。
+
+### 8.11 批4c 单 fetch ht 化实测（2026-11-13，未提交）
+
+**切面**（src/jit.c 单文件，`TPHP_ONEKEY` 默认开，关 = 分流不放行 =
+今日行为，A/B 主口径）：
+
+- **静态分流（设计核心）**：单 fetch 的 INC 目标==键槽 ⇒ read 路径逐字
+  原样（ht=0 packed 路线，**A/B read 专项 0% 实证零误伤**）；INC 目标≠
+  键槽（nfetch==1、nadd==1）⇒ **onekey** 形态：ht=1 + kstr 分级——
+  1=CV 键（guard 合取键槽 tag==STR，键循环期不写由写点约束证）、
+  2=STR 字面量键（OPD_CONST 直折或 OP_CONST 物化 TMP，`lits[].t==T_STR`
+  编译期证 guard 免查；**非 STR lit 收尾拒 = 保今日通用 JIT 零新面**）。
+  键 STR ⇒ 数组必 hash ⇒ guard_ht 无 layout 赌。kt_out 复用为键槽
+  （与 kv 键 TMP 语义互斥）。identity/写点约束扩键 CV。
+- **免 STR 分派（DimIcCtx.kt_fix）**：spec_kstr 非 0 且 spec_ht_ok →
+  `g.kt = CONST T_STR` 预置（免槽 tag 装载），emit_ht_fetch 的 STR 线
+  主体抽为 `ht_str_probe`（hash 惰性+≤4 步直探，4b-i ksa 分流保留）——
+  kt_fix 时菱形不发、non-STR→dimic_miss 线不可达不发、fwd 直赋免外层
+  phi。kv/chain/read 的 spec_kstr 恒 0 ⇒ 零变化。
+- 其余全通吃零改动：emit_ht_fetch 直探、刀16 fwd（fwd_pair&&g.thin）、
+  preheader 消灭（s_chain==0 照发）、spec_tmp/spec_bit_int 证链。
+
+**验证**：
+| 项 | 结果 |
+|---|---|
+| 编译/IR | 零新增警告；DEBUG=2 **ir_check=1 ×12、FAILED=0**、kstr=1 ×16 / kstr=2 ×2 命中、read 分流 ht=0 打点 ×6 |
+| 全量 | **245×8 模式**（默认 + ONEKEY/CHAIN_FWD/FETCH_FWD/KEY_FWD/TYPE_SPEC/JIT/TAKE_THIN=0 七超集）——JIT=0 首轮 1 例偶发（外网 flaky 惯例），复跑 245/0 全绿 |
+| 新测试 | `tests/jit/test-jit-onekey-001.php` **十三案三模逐字一致**（1key/const lit/动态 STR hash 惰性/INT 键降级/packed INT 键降级/混合值降级/absent raise 复跑/溢出 deopt double/read 对照/键==acc 撞车拒/int-lit 拒/guard 轮转/×500 稳定）+ 双臂 ×64 复跑 0 diff |
+| **onekey A/B** | min-of-6 双轮换序：轮1 ON 6.0 vs OFF 12.5 = **−52.0%**；轮2 ON 6.0 vs OFF 12.6 = **−52.4%** 双轮稳 |
+| const A/B | 轮1 11.3 vs 15.9 = **−28.9%**；轮2 11.2 vs 15.9 = **−29.6%** 双轮稳 |
+| **read 专项** | array-read ON 2.4 vs OFF 2.4 = **0%**（双轮，最高验收线 ✓） |
+| guard-fail 专项 | 键 CV=INT（hash）ON ~130 vs OFF 12.6 = **+943%**；键 CV=INT（packed）129 vs 8.5 = **+1418%**；STR 键混合值 139 vs 59.5 = **+134%**（双轮一致） |
+| 全表 | 14 项双轮 ±3.4% 内、超带项全反号（kv +3.4/−0.8、jsonagg +8.6/−2.1）= 零回退，无需 8 交替 |
+
+**guard-fail 降级面拍板（2026-11-13 用户）**：键类型/数组布局运行时才知
+⇒ guard 失败 = 整函数交解释器，量级 10-15×（远超 4a 的 2.56×）——三面
+均不在 bench/CI 计分形态、245 测试语义全过、全表零回退——**拍板全放行
++记账（4a 先例），4d 静态证明线（literal ARRAY_INIT 溯源等）触发制留档**；
+实需触发时另立小设计稿。
+
+**记账**：onekey 本机 12.5（关）→ **6.0（开）**、const 单查 15.9 → 11.3；
+11-09 侦察口径 kv-1key 8.5 参考（探针形态不同不直比）。剩余 = 4d
+（触发制）、WSL 第二口径与 CI 复核。
