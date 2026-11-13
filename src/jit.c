@@ -1005,6 +1005,12 @@ typedef struct {
     uint32_t spec_fwd_idx;
     ir_ref spec_fwd_pay;       /* phi 结果（hit=IF_TRUE 内 element load /
                                 * miss=helper 写 dst 后 load） */
+    uint8_t spec_kfwd_valid;   /* 批4b-i key-fwd：F1 (pay,tag) phi 已挂起，
+                                * 供紧邻 F2 的键位（消费即清） */
+    uint32_t spec_kfwd_idx;    /* 挂起键 phi 的目标槽（F1 dst——F2 按
+                                * kind+idx 双等消费，镜像 spec_fwd 纪律） */
+    ir_ref spec_kfwd_pay;      /* F1 取值 pay phi（三层 MERGE 汇出） */
+    ir_ref spec_kfwd_tag;      /* F1 取值 tag phi——F2 STR 分派/探针比对用 */
     uint32_t spec_base;        /* 批2：guard 证过的 base CV（FETCH 结构折叠
                                 * 只对本 base 生效——cond 区异 base 的
                                 * preguard 候选无 guard 证，不得折叠） */
@@ -1283,7 +1289,81 @@ typedef struct DimIcCtx {
                  * 非 spec 点恒 0——g 在 DimIcCtx 初始化处清零） */
     int fwd;    /* 批4a-ii：ht 直探值汇流开关（hit=LOAD pay 免 16B store、
                  * miss=helper 写 dst 后 load）——仅 emit_ht_fetch 填 */
+    int kfwd_prod; /* 批4b-i F1 角色：phi 生产——链尾从 dst 收集 pay/tag
+                    * （命中线免 take、miss 线 helper 已写 dst） */
+    int kfwd_mat;  /* 批4b-i F2 角色：dimic_miss 前把 phi 键物化进 key 槽 */
+    ir_ref kfwd_pay, kfwd_tag; /* F1=链尾收集输出；F2=待物化的 phi 键 */
 } DimIcCtx;
+
+/* 批4b-i：kfwd 键物化（冷路径专用——F2 的 miss/deopt 出口前把 phi 键按
+ * take 语义写回 g->key 槽）。rc 论证（§8.4）：
+ * - 热路径键只被探针身份比较（tag/pay 双 EQ）、hash 读 + 惰性写 hash 字段
+ *   （非所有权操作）、STR 分派比较——不落槽不逃逸，kb 元素由 kb 自身持有
+ *   （spec_scan 写点约束证体内零写 kb）→ 免 addref 安全；
+ * - 本函数只在冷出口跑：addref 新（先）→ release 旧槽（后）→ store
+ *   （pay 先、tag 后），顺序镜像 dimic_take 防同对象先减归零 → 槽恒持
+ *   一份 owned 引用：解释器从 F2 pc 复跑读键槽拿到 owned 值、帧销毁释放
+ *   配平；物化必先 release 旧 → 反复物化不叠 rc、UNDEF 旧值 no-op。 */
+static void kfwd_materialize(DimIcCtx *g) {
+    JitC *j = g->j;
+    JIT_CTX();
+    /* --- addref 新（kfwd pay/tag 是 phi 值，无 vaddr，菱形按值判） --- */
+    ir_ref ifv = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(g->kfwd_tag, ir_CONST_I32(T_STR)),
+        ir_LE(g->kfwd_tag, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifv);
+        ir_ref gcv = ir_BITCAST_A(g->kfwd_pay);
+        ir_ref fv = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcv, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifiv = ir_IF(ir_EQ(ir_AND_I32(fv, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifiv);
+            ir_ref rcv = ir_LOAD_I32(gcv);   /* rc @0 */
+            ir_STORE(gcv, ir_ADD_I32(rcv, ir_CONST_I32(1)));
+            ir_ref eV1 = ir_END();
+        ir_IF_FALSE(ifiv);
+            ir_ref eV0 = ir_END();
+        ir_MERGE_2(eV1, eV0);
+        ir_ref eRefV = ir_END();
+    ir_IF_FALSE(ifv);
+        ir_ref eScV = ir_END();
+    ir_MERGE_2(eRefV, eScV);
+
+    /* --- release 旧槽（dimic_take release dst 同款，源换 g->key） --- */
+    ir_ref td = ir_LOAD_I32(ir_ADD_A(g->key, ir_CONST_ADDR(TVAL_TAG)));
+    ir_ref ifd = ir_IF(ir_AND(IR_BOOL,
+        ir_GE(td, ir_CONST_I32(T_STR)), ir_LE(td, ir_CONST_I32(T_CLOSURE))));
+    ir_IF_TRUE(ifd);
+        ir_ref gcd = ir_LOAD_A(g->key);
+        ir_ref fd = ir_ZEXT(IR_I32,
+            ir_LOAD_U8(ir_ADD_A(gcd, ir_CONST_ADDR(offsetof(GCHead, flags)))));
+        ir_ref ifid = ir_IF(ir_EQ(ir_AND_I32(fd, ir_CONST_I32(GC_FLAG_INTERNED)),
+                                  ir_CONST_I32(0)));
+        ir_IF_TRUE(ifid);
+            ir_ref rcd = ir_LOAD_I32(gcd);
+            ir_ref ifrc = ir_IF(ir_GT(rcd, ir_CONST_I32(1)));
+            ir_IF_TRUE(ifrc);
+                ir_STORE(gcd, ir_SUB_I32(rcd, ir_CONST_I32(1)));
+                ir_ref eDec = ir_END();
+            ir_IF_FALSE(ifrc);
+                ir_ref tr[1] = { g->key };
+                ir_CALL_N(IR_VOID,
+                          ir_CONST_ADDR((uintptr_t)tval_release), 1, tr);
+                ir_ref eSlow = ir_END();
+            ir_MERGE_2(eDec, eSlow);
+            ir_ref eD1 = ir_END();
+        ir_IF_FALSE(ifid);
+            ir_ref eD0 = ir_END();
+        ir_MERGE_2(eD1, eD0);
+        ir_ref eRefD = ir_END();
+    ir_IF_FALSE(ifd);
+        ir_ref eScD = ir_END();
+    ir_MERGE_2(eRefD, eScD);
+
+    /* --- 16B store（pay 先、tag 后，与 dimic_take 同序） --- */
+    ir_STORE(g->key, g->kfwd_pay);
+    ir_STORE(ir_ADD_A(g->key, ir_CONST_ADDR(TVAL_TAG)), g->kfwd_tag);
+}
 
 /* miss：整链落 v1 helper + deopt（线留开供 MERGE；RETURN 线不参与）。
  * count=true = 进过 IC 链的失败——misses++（generic 回退门计数，锁死
@@ -1291,6 +1371,7 @@ typedef struct DimIcCtx {
 static void dimic_miss(DimIcCtx *g, bool count) {
     JitC *j = g->j;
     JIT_CTX();
+    if (g->kfwd_mat) kfwd_materialize(g);   /* 批4b-i：helper 读键槽前物化 */
     if (count) {
         ir_ref ma = ir_ADD_A(g->ic, ir_CONST_ADDR(offsetof(DimIC, misses)));
         ir_STORE(ma, ir_ADD_I32(ir_LOAD_I32(ma), ir_CONST_I32(1)));
@@ -1603,6 +1684,15 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
             cf = ir_END();
         }
     ir_MERGE_2(ct, cf);
+    /* 批4b-i：链尾 lift（仅 kv F1 的 kfwd 生产——g->kfwd_prod 门控，
+     * 其余 fetch 恒 0 零 IR 变化）。链 END 封块后调用方无法 load，
+     * 故在最外层（lvl==0）尾 MERGE 后、END 前从键槽收集 (pay,tag)：
+     * 链叶 take 已写槽（F1 thin=0 full take），lift 读槽值真；槽内
+     * owned 残留由物化 release-旧/帧销毁配平。 */
+    if (g->kfwd_prod && lvl == 0) {
+        g->kfwd_pay = load_pay(j, g->dst);
+        g->kfwd_tag = load_tag(j, g->dst);
+    }
     return ir_END();
 }
 
@@ -1671,17 +1761,25 @@ static ir_ref ht_probe_rec(DimIcCtx *g, ir_ref slot, ir_ref hm, ir_ref bk, int p
 static void emit_ht_fetch(JitC *j, DimIcCtx *g, int pi, int lvl, int fwd_on) {
     JIT_CTX();
     g->fwd = fwd_on;
-    g->kt = load_tag(j, g->key);
+    /* 批4b-i：kfwd 时键 (tag,pay) 由 F1 phi 直供——槽恒不写，不得 load 槽；
+     * 非 kfwd 照旧 load。kt 已在消费头预置（phi tag），此处仅补非 kfwd。 */
+    if (!g->kfwd_mat)
+        g->kt = load_tag(j, g->key);
     g->a = j->pre_a[lvl][pi];
     ir_ref v_str = 0, v_no = 0;
     ir_ref ifstr = ir_IF(ir_EQ(g->kt, ir_CONST_I32(T_STR)));
     ir_IF_TRUE(ifstr);
-        /* hash 惰性（lvl4 同款）：h==0 → tstr_hash 冷填写回，合流 reload */
-        ir_ref ksa = ir_LOAD_A(g->key);
+        /* hash 惰性（lvl4 同款）：h==0 → tstr_hash 冷填写回，合流 reload。
+         * ksa 来源分流：kfwd = phi pay 直接位转 TStr*（槽无值）；否则 load。 */
+        ir_ref ksa = g->kfwd_mat
+            ? ir_BITCAST_A(g->kfwd_pay) : ir_LOAD_A(g->key);
         ir_ref h0 = ir_LOAD_U32(ir_ADD_A(ksa, ir_CONST_ADDR(offsetof(TStr, hash))));
         ir_ref ifh0 = ir_IF(ir_EQ(h0, ir_CONST_U32(0)));
         ir_IF_TRUE(ifh0);
-            ir_ref th[1] = { g->key };
+            /* 4b-i 顺手修：实参应为 TStr*（ksa），原传 g->key（TVal* 槽
+             * 地址）→ tstr_hash 读错结构（len/hash 偏移全错、写回错位），
+             * 与 lvl4 同款（1498 传 ksa）对齐；kfwd 下槽无值更不可传。 */
+            ir_ref th[1] = { ksa };
             ir_CALL_N(IR_U32, ir_CONST_ADDR((uintptr_t)tstr_hash), 1, th);
             ir_ref ehT = ir_END();
         ir_IF_FALSE(ifh0);
@@ -1694,7 +1792,7 @@ static void emit_ht_fetch(JitC *j, DimIcCtx *g, int pi, int lvl, int fwd_on) {
         v_str = ht_probe_rec(g, slot, hm, bk, 0);
         ir_ref eStrT = ir_END();
     ir_IF_FALSE(ifstr);
-        dimic_miss(g, false);   /* 非 STR 键 → C 侧 norm/全语义兜底 */
+        dimic_miss(g, false);   /* 非 STR 键 → C 侧 norm/全语义兜底（先物化） */
         if (fwd_on) v_no = load_pay(j, g->dst);
         ir_ref eStrF = ir_END();
     ir_MERGE_2(eStrT, eStrF);
@@ -2924,6 +3022,17 @@ static int fetch_fwd_enabled(void) {
     return v;
 }
 
+/* 批4b-i（key-fwd）开关：默认开，TPHP_KEY_FWD=0 关（同二进制 A/B）。
+ * 关 = F1 键槽 take 照旧 + F2 键位槽 load 照旧（= 批4a 行为）。 */
+static int key_fwd_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_KEY_FWD");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* 刀19（11-09 静态直调非 INT 慢路）开关：默认开，TPHP_CALL_STR_SLOW=0 关
  * （同二进制 A/B）= HEAD 行为（INT 契约失配 RETURN0 → pc0 全量重跑）。 */
 static int call_str_slow_enabled(void) {
@@ -3485,6 +3594,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->spec_lo = j->spec_hi = 0;
             j->spec_tmp_valid = 0;
             j->spec_fwd_valid = 0;
+            j->spec_kfwd_valid = 0;
             j->spec_base = 0;
             j->spec_ht = 0;
             j->spec_body_tmp = 0;
@@ -3622,6 +3732,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec = 1;
                     j->spec_tmp_valid = 0;
                     j->spec_fwd_valid = 0;
+                    j->spec_kfwd_valid = 0;
                     if (jit_dbg())
                         fprintf(stderr, "[jit] spec guard hdr=%u acc=%u idx=%u base=%u osr=%d ht=%d\n",
                                 pc, s_acc, s_idx, s_base, j->osr, s_ht);
@@ -3632,6 +3743,7 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     j->spec_lo = j->spec_hi = 0;
                     j->spec_tmp_valid = 0;
                     j->spec_fwd_valid = 0;
+                    j->spec_kfwd_valid = 0;
                     j->spec_base = 0;
                     j->spec_ht = 0;
                     j->spec_body_tmp = 0;
@@ -3930,7 +4042,24 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             g.key = key_addr;
             g.ic = ir_CONST_ADDR((uintptr_t)op->ic);
             g.a = g.kt = g.kp = IR_UNUSED;
-            g.kp = load_pay(j, g.key);
+            g.kfwd_prod = g.kfwd_mat = 0;
+            g.kfwd_pay = g.kfwd_tag = 0;
+            /* 批4b-i key-fwd 消费（F2 头）：紧邻 F1 挂起的 (pay,tag) phi
+             * 按 kind+idx 双等接进键位——免槽 load；键槽恒不写，所有
+             * helper/deopt 出口（dimic_miss）先物化（take 序）保证解释器
+             * 复跑读到 owned 值。消费即清，F2 尾由 kfwd_on=0 自清残留。 */
+            int kfwd_in = j->spec_kfwd_valid && op->t2 == OPD_TMP &&
+                          op->a2 == j->spec_kfwd_idx;
+            if (kfwd_in) {
+                g.kp = j->spec_kfwd_pay;
+                g.kt = j->spec_kfwd_tag;
+                g.kfwd_mat = 1;
+                g.kfwd_pay = j->spec_kfwd_pay;
+                g.kfwd_tag = j->spec_kfwd_tag;
+                j->spec_kfwd_valid = 0;
+            } else {
+                g.kp = load_pay(j, g.key);
+            }
             /* 批4a：链叶 thin 透传（ht 作用域 + body_tmp 身份恒等；
              * 元素恒 INT 由 guard_ht 证、槽遗留由 preheader 消灭证——
              * 与 spec_c 路径 3783 处的 thin 同一证明面） */
@@ -3976,6 +4105,34 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                 !stop_has(stops, nstops, np1) &&
                 !is_jump_target(j->fn, np1);
             int fwd_on = 0;
+            /* 批4b-i key-fwd（§8.6）：spec_ht 2-fetch 形态中本 fetch 是
+             * F1——紧邻 FETCH 的键恰为本 dst（emit 期复验 spec_scan F2
+             * 判据）→ (pay,tag) 经三层 MERGE phi 汇出，紧邻 F2 键位直供，
+             * 免 F1 STR take（addref/release/misses/16B store）+ F2 槽
+             * 往返。rc 论证：热路径键只被探针身份比较与 hash 读写（非所
+             * 有权），不落槽不逃逸；kb 元素由 kb 自持（spec_scan 写点约
+             * 束体内零写）→ 免 addref 安全；helper/deopt 出口 dimic_miss
+             * 物化（take 序）→ 解释器复跑读 owned 值、帧销毁配平。
+             * 块连续判据镜像刀16 fwd_pair（防 phi 跨块/外部跳入失准）。 */
+            int kfwd_on = key_fwd_enabled() && !fold_add &&
+                j->spec && j->spec_ht && op->tr == OPD_TMP &&
+                aop && aop->op == OP_FETCH_DIM_R && aop->t1 == OPD_CV &&
+                aop->t2 == OPD_TMP && aop->a2 == op->ar &&
+                /* F2 必走 spec_ht 直探（=必消费本 phi）的静态保证：
+                 * base==spec_base + 在 preguard cand（镜像 spec_scan 对
+                 * bs 的两条检查）——否则 F1 跳过 take 而 F2 读 UNDEF 槽 */
+                aop->a1 == j->spec_base &&
+                preguard_lookup(j, aop->a1) >= 0 &&
+                !stop_has(stops, nstops, np1) &&
+                !is_jump_target(j->fn, np1);
+            g.kfwd_prod = kfwd_on ? 1 : 0;
+            /* phi 生产三变量（外层声明，尾部挂起用；有效 ref 恒 >0） */
+            ir_ref kfwd_hit_pay = 0, kfwd_hit_tag = 0;
+            ir_ref kfwd_m0_pay = 0, kfwd_m0_tag = 0;  /* bound 越界线输入 */
+            ir_ref kfwd_cf_pay = 0, kfwd_cf_tag = 0;  /* 非数组线输入 */
+            ir_ref kfwd_p1 = 0, kfwd_p1t = 0;    /* bound 层 MERGE 后 */
+            ir_ref kfwd_p2 = 0, kfwd_p2t = 0;    /* packed/链层 MERGE 后 */
+            ir_ref kfwd_p3 = 0, kfwd_p3t = 0;    /* 主尾 MERGE 后（挂起用） */
             ir_ref ifa = 0, ifp = 0;
             if (spec_ht_ok) {
                 fwd_on = fwd_pair && g.thin;
@@ -4035,8 +4192,14 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                              * FETCH 身份（preheader 已 gate+UNDEF 消灭
                              * spec_body_tmp 槽）双满足才瘦身；cond 区
                              * FETCH/未消灭槽一律原样三门。刀16：fwd_on
-                             * 时连 16B store 一并免（值走 phi）。 */
-                            if (fwd_on)
+                             * 时连 16B store 一并免（值走 phi）。批4b-i：
+                             * kfwd_on 时键槽整段不写——(pay,tag) 双 load
+                             * 作 phi 输入直供紧邻 F2（键不逃逸免 rc，见
+                             * 门注释）。 */
+                            if (kfwd_on) {
+                                kfwd_hit_pay = load_pay(j, leaf);
+                                kfwd_hit_tag = load_tag(j, leaf);
+                            } else if (fwd_on)
                                 fwd_hit = ir_LOAD_I64(leaf);
                             else
                                 dimic_take(&g, leaf,
@@ -4107,10 +4270,23 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                          * 实死，load 仅为 phi 结构占位（若可达则值亦真）。 */
                         if (fwd_on)
                             fwd_miss = load_pay(j, g.dst);
+                        /* 批4b-i：kfwd miss 线——helper 成功写键槽后取
+                         * (pay,tag) 作 phi 输入（raise 线 RETURN 不汇流）。
+                         * kfwd_on⟹aop 是 FETCH⟹fwd_on 恒 0，两门互斥。 */
+                        if (kfwd_on) {
+                            kfwd_m0_pay = load_pay(j, g.dst);
+                            kfwd_m0_tag = load_tag(j, g.dst);
+                        }
                         ir_ref eP0 = ir_END();
                     ir_MERGE_2(eP1, eP0);
                     if (fwd_on)
                         j->spec_fwd_pay = ir_PHI_2(IR_I64, fwd_hit, fwd_miss);
+                    if (kfwd_on) {
+                        /* 第一层：bound 命中（leaf 双 load）/越界（helper
+                         * 写槽后双 load）汇流——与刀16 fwd phi 同 MERGE 并列 */
+                        kfwd_p1 = ir_PHI_2(IR_I64, kfwd_hit_pay, kfwd_m0_pay);
+                        kfwd_p1t = ir_PHI_2(IR_I32, kfwd_hit_tag, kfwd_m0_tag);
+                    }
             if (!spec_c) {
                     ir_ref ePack = ir_END();
                 ir_IF_FALSE(ifp);
@@ -4138,11 +4314,28 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     eIc = ir_END();
                     }
                 ir_MERGE_2(ePack, eIc);
+                if (kfwd_on) {
+                    /* 第二层：packed 直取线（携带 kfwd_p1）/链线（尾 lift
+                     * 经 g->kfwd_pay 汇入——链 END 封块，lift 在链内做） */
+                    kfwd_p2 = ir_PHI_2(IR_I64, kfwd_p1, g.kfwd_pay);
+                    kfwd_p2t = ir_PHI_2(IR_I32, kfwd_p1t, g.kfwd_tag);
+                }
                 ir_ref ct = ir_END();
             ir_IF_FALSE(ifa);
                 dimic_miss(&g, false);   /* 非数组 TypeError 走 helper 语义 */
+                if (kfwd_on) {
+                    /* 第三层 cf 输入：helper 成功写键槽后双 load */
+                    kfwd_cf_pay = load_pay(j, g.dst);
+                    kfwd_cf_tag = load_tag(j, g.dst);
+                }
                 ir_ref cf = ir_END();
                 ir_MERGE_2(ct, cf);   /* 主尾活线，emit_seq 继续 */
+                if (kfwd_on) {
+                    /* 第三层：packed/链线（携带 kfwd_p2）/非数组线汇流
+                     * → 挂起值（尾部 spec_kfwd_* 取此） */
+                    kfwd_p3 = ir_PHI_2(IR_I64, kfwd_p2, kfwd_cf_pay);
+                    kfwd_p3t = ir_PHI_2(IR_I32, kfwd_p2t, kfwd_cf_tag);
+                }
             }
             }   /* spec_ht_ok else：generic/bound/链段结束 */
             /* 类型特化批1：配对 ADD 紧邻（spec_scan 证）→ 元素 TMP 身份
@@ -4154,6 +4347,15 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
              * 未挂起则清位防上一次残留串用。 */
             j->spec_fwd_valid = fwd_on ? 1 : 0;
             if (fwd_on) { j->spec_fwd_kind = op->tr; j->spec_fwd_idx = op->ar; }
+            /* 批4b-i：key-fwd 挂起（F1 尾置、紧邻 F2 头消费即清；F2 自身
+             * kfwd_on 恒 0——其 aop 是 ADD 非 FETCH——尾置 0 = 防残留，
+             * 与 spec_fwd 同纪律）。 */
+            j->spec_kfwd_valid = kfwd_on ? 1 : 0;
+            if (kfwd_on) {
+                j->spec_kfwd_idx = op->ar;
+                j->spec_kfwd_pay = kfwd_p3;
+                j->spec_kfwd_tag = kfwd_p3t;
+            }
             pc++;
             break;
         }

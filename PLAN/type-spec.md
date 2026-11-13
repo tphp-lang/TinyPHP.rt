@@ -7,7 +7,10 @@ CI（run 42190592708 @ e2679be）：linux-x64 array-read 比值 3.42→**2.81×*
 4a 全部落地（4a-i 五件 + 4a-ii 直探/fwd）待提交：kv 本机 16.5→9.5
 （A/B 双轮 −40/−41%，累计 −42%，超设计目标）、259×5（含 FWD/THIN 超集关）、
 11 案矩阵三模绿；guard-fail 混合值 +156% 已定量并拍板接受记账（4d 留档
-触发制）。4b/4c/4d 未动；WSL 第二口径与 CI 复核待办。**
+触发制）。**批4b-i key-fwd 落地（2026-11-13，未提交）**：TPHP_KEY_FWD
+（默认开）——F1 (pay,tag) 三层 MERGE phi 直供 F2 键位，免 STR take+槽
+往返，kv 本机 A/B 双轮 −13.1%/−13.9%；含 tstr_hash 实参 bug 修正。
+4b-ii（链式 fwd+N-fetch 扩形）/4c/4d 未动；WSL 第二口径与 CI 复核待办。**
 
 历史：**设计稿 v1（2026-11-05，用户拍板"先设计"）**——规格、机制选型、风险、分批计划。
 上游依据：emit-ssa.md §③ 类型特化；read 减法定案（memory/2026-11-05.md 主刀轮收口）。
@@ -360,9 +363,13 @@ emit 两份循环体，emit_seq 单遍约束不变）；key 恒 STR 的 all_str 
 ### 8.6 分批计划
 
 - **批4a（首刀）**：§8.3 五件 + 新矩阵测试；验收 §8.8。
-- **批4b**：key-fwd（fetch1 pay phi 直供 fetch2 键位，免 STR take+槽往返
-  ≈1ms；需 rc 论证：键只被探针身份比较、不逃逸）+ 链式 fwd
-  （binop→binop phi，cv8/const 多 fetch 形态的 spec_scan N-fetch 扩形）。
+- **批4b**：~~key-fwd~~ **4b-i 已落地（2026-11-13，见 §8.9）**——
+  fetch1 (pay,tag) 双 phi 经三层 MERGE 汇出直供 fetch2 键位，免 STR
+  take+槽往返；rc 论证落地（热路径键只被探针身份比较+hash 读写、不落槽
+  不逃逸，kb 零写证元素自持；冷出口 kfwd_materialize 按 take 序物化，
+  槽恒持一份 owned，帧销毁/解释器复跑配平）。
+  **4b-ii 未动**：链式 fwd（binop→binop phi，cv8/const 多 fetch 形态的
+  spec_scan N-fetch 扩形）。
 - **批4c**：1key（键 CV 恒 STR——guard 加一条槽 tag==STR 检查）与
   CONST 字面量键（lit 类型编译期即知，免 kt 装载）形态。
 - **批4d（观察触发）**：guard-fail 回退面治理——若 8.7-1 专项实测回退
@@ -407,3 +414,39 @@ emit 两份循环体，emit_seq 单遍约束不变）；key 恒 STR 的 all_str 
   IC-STATS helper 率（现 27% → 直探下 probe 命中、miss 率实测）。
 - **CI 投影**：kv tphp 16.5（本机）/22（CI 带）→ 比值 2.44×→~1.5-1.7×；
   主口径 clean11 ln 杠杆约 −0.6/13。
+
+### 8.9 批4b-i key-fwd 实测（2026-11-13，未提交）
+
+**切面**（src/jit.c 单文件，`TPHP_KEY_FWD` 默认开，关 = 批4a 行为）：
+- **F1 生产**（spec_ht 2-fetch 形态的键查表 fetch，emit 期形状门复验
+  spec_scan F2 判据 + F2 必消费静态保证）：bound-hit 线免 take、
+  (pay,tag) 双 load；三层 MERGE 逐层 PHI 汇出（bound 越界线/非数组线 =
+  helper 写槽后 load；链线 = `dimic_ic_chain` lvl0 尾门控 lift——链 END
+  封块，lift 只能在链内做，`g->kfwd_prod` 门控对其余 fetch 零 IR 变化）；
+  尾部挂起 `spec_kfwd_{valid,idx,pay,tag}`（镜像 spec_fwd 纪律）。
+- **F2 消费**（case 头 kind+idx 双等）：`g.kp/g.kt` 直接吃 phi，键槽恒不
+  写；`emit_ht_fetch` 的 kt 装载/ksa（`ir_BITCAST_A(phi pay)`）分流；
+  `dimic_miss` 进口 `kfwd_materialize`（take 序：addref 新→release 旧→
+  store，防同对象先减归零）覆盖全部 helper/deopt 出口。
+- **rc 论证（§8.4 前置）落地**：热路径键只被探针身份比较 + hash 读写
+  （非所有权操作），不落槽不逃逸；kb 元素由 kb 自持（spec_scan 写点约束
+  体内零写）→ 免 addref 安全；冷出口物化 → 槽恒持一份 owned，反复物化
+  release-旧配平、帧销毁释放尾值、解释器复跑读 owned 值。
+- **顺手修真 bug**：`emit_ht_fetch` 的 `tstr_hash` 实参原传 `g->key`
+  （TVal\* 槽地址）非 `ksa`（TStr\*）——读错结构（len/hash 偏移全错）、
+  hash 永不回填真串、写回落槽 padding；与 lvl4 同款传 ksa 对齐。
+  KEY_FWD=0 行为随之变，属正确性修复（动态 STR 键 hash==0 路径 =
+  测试 dyn 案回归面）。
+
+**验证**：
+| 项 | 结果 |
+|---|---|
+| 编译 | 零新增警告；TPHP_JIT_DEBUG=2 探针 **ir_check=1** 无 FAILED |
+| 全量 | **243×256** 默认全绿（含新测试）；KEY_FWD=0 / FETCH_FWD=0 / TYPE_SPEC=0 / JIT=0 四超集各 242×64 绿 |
+| 新测试 | `tests/jit/test-jit-keyfwd-001.php` 七案（命中热路径/键不在表物化+deopt catch 复跑/混合类型键 non-STR 物化/动态 STR 键 hash 惰性/rc 稳定×500+物化轮转/guard-fail 混合值轮转）三模逐字一致 |
+| kv A/B | min-of-6 双轮换序（仅 Windows 口径）：轮1 ON 11.9 vs OFF 13.7 = **−13.1%**；轮2 ON 11.8 vs OFF 13.7 = **−13.9%** 双轮稳 |
+| 全表超带 | read/push 恒带内（2.4/46.7-47）；rmw −5.9%/string −10% 单轮出现次轮消失=波动；jsonagg +3.2% 双轮同向 → **8 交替专项归零**（ON min 8.8 < OFF 9.3，噪声带） |
+
+**记账**：kv 本机 A/B 口径（bench-vs-php kv-read 1.6e6）13.7 → 11.8
+（−13.9%，双轮稳）；4a 口径（另一 bench 形态 16.5→9.5）不直比。
+4b-ii（链式 fwd + spec_scan N-fetch 扩形，cv8/const 形态）= 下一刀。
