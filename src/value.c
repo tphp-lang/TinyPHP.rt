@@ -403,9 +403,39 @@ TVal tval_shr(TVal a, TVal b) {
     return num_result_i(x >> s);
 }
 
-TVal tval_band(TVal a, TVal b) { return num_result_i(tval_to_int(a) & tval_to_int(b)); }
-TVal tval_bor(TVal a, TVal b) { return num_result_i(tval_to_int(a) | tval_to_int(b)); }
-TVal tval_bxor(TVal a, TVal b) { return num_result_i(tval_to_int(a) ^ tval_to_int(b)); }
+/* PHP zend_operators.c bitwise_string_function 族：两操作数均 string 时
+ * 逐字节返回 string——& 与 ^ 结果长 MIN（截断；^ 补 \0 会泄露长侧原文，
+ * zend 取 MIN），| 结果长 MAX（短侧按 \0 补齐）；二进制安全（串内可含
+ * \0）。混合 string/int 仍走整数路径（与 PHP 一致）。VM（BIN_HANDLER）
+ * 与 JIT（call_slow_binop）共用本层。 */
+static TVal str_bitwise(TVal a, TVal b, char op) {
+    TStr *sa = a.u.p, *sb = b.u.p;
+    size_t la = sa->len, lb = sb->len;
+    size_t n = op == '|' ? (la > lb ? la : lb) : (la < lb ? la : lb);
+    const unsigned char *pa = (const unsigned char *)sa->c;
+    const unsigned char *pb = (const unsigned char *)sb->c;
+    unsigned char *buf = tm_malloc(n ? n : 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char x = i < la ? pa[i] : 0, y = i < lb ? pb[i] : 0;
+        buf[i] = (unsigned char)(op == '&' ? (x & y) : op == '|' ? (x | y) : (x ^ y));
+    }
+    TVal r = TV_STR(tstr_new((const char *)buf, n));
+    tm_free(buf);
+    return r;
+}
+
+TVal tval_band(TVal a, TVal b) {
+    if (a.t == T_STR && b.t == T_STR) return str_bitwise(a, b, '&');
+    return num_result_i(tval_to_int(a) & tval_to_int(b));
+}
+TVal tval_bor(TVal a, TVal b) {
+    if (a.t == T_STR && b.t == T_STR) return str_bitwise(a, b, '|');
+    return num_result_i(tval_to_int(a) | tval_to_int(b));
+}
+TVal tval_bxor(TVal a, TVal b) {
+    if (a.t == T_STR && b.t == T_STR) return str_bitwise(a, b, '^');
+    return num_result_i(tval_to_int(a) ^ tval_to_int(b));
+}
 
 TVal tval_bool_not(TVal v) { return tval_to_bool(v) ? TV_FALSE : TV_TRUE; }
 TVal tval_neg(TVal v) {
@@ -420,7 +450,17 @@ TVal tval_pos(TVal v) {
     ANum x; to_num(v, &x, "+");
     return x.k == AN_INT ? num_result_i(x.i) : num_result_d(x.d);
 }
-TVal tval_bit_not(TVal v) { return num_result_i(~tval_to_int(v)); }
+TVal tval_bit_not(TVal v) {
+    if (v.t == T_STR) {
+        TStr *s = v.u.p;
+        unsigned char *buf = tm_malloc(s->len ? s->len : 1);
+        for (size_t i = 0; i < s->len; i++) buf[i] = (unsigned char)~(unsigned char)s->c[i];
+        TVal r = TV_STR(tstr_new((const char *)buf, s->len));
+        tm_free(buf);
+        return r;
+    }
+    return num_result_i(~tval_to_int(v));
+}
 
 /* ---- string increment (PHP quirk), "a"->"b", "z"->"aa", "A1"->"A2" ---- */
 static TStr *str_inc_alpha(TStr *s) {

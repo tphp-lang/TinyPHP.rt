@@ -56,7 +56,7 @@ for %%f in (src\*.c) do %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~
 for /d %%d in (ext\*) do for %%f in ("%%d\*.c") do if exist "%%f" %CC% %CFLAGS_US% %DEFS% %INC% -c "%%f" -o "%OBJ%\src_%%~nf.o" || goto :fail
 
 echo [5/6] linking...
-%CC% %OBJ%\*.o -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 || goto :fail
+%CC% %OBJ%\*.o -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 -static || goto :fail
 
 rem M6: two-stage - if lib\*.php exists, pack into bundle_data.c and relink
 if not exist lib goto :done
@@ -65,7 +65,7 @@ if errorlevel 1 goto :done
 echo [6/6] packing lib\*.php into bundle_data.c...
 %OUT% phpc lib -o src\bundle_data.c || goto :fail
 %CC% %CFLAGS_US% %DEFS% %INC% -c src\bundle_data.c -o "%OBJ%\src_bundle_data.o" || goto :fail
-%CC% %OBJ%\*.o -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 || goto :fail
+%CC% %OBJ%\*.o -o %OUT% -ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi -lshell32 -lole32 -loleaut32 -luuid -lbcrypt -lsynchronization -luserenv -lcrypt32 -static || goto :fail
 
 :done
 rem dev artifacts: single static lib (engine + vendored deps objects)

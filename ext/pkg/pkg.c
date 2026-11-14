@@ -3970,12 +3970,15 @@ static int ext_sys_run(const char *cmd) {
 #endif
 }
 
-/* 引擎级默认链接库（§5：Windows 对齐 build.cmd；unix 见 build.sh LDLIBS） */
+/* 引擎级默认链接库（§5：Windows 对齐 build.cmd；unix 见 build.sh LDLIBS）。
+ * -static 必须与 build.cmd 链接行一致：exe 重链后仍须自包含（缺 clang64
+ * PATH 即 0xC0000135，2026-11-14 bug#2），否则 ext relink 会把静态 exe
+ * 打回动态 winpthread 依赖。 */
 static const char *ext_engine_libs(int os) {
     if (os == EXT_OS_WIN)
         return "-ldbghelp -lws2_32 -ladvapi32 -luser32 -liphlpapi -lpsapi "
                "-lshell32 -lole32 -loleaut32 -luuid -lbcrypt "
-               "-lsynchronization -luserenv -lcrypt32";
+               "-lsynchronization -luserenv -lcrypt32 -static";
     if (os == EXT_OS_DARWIN)
         return "-lm -framework CoreFoundation -framework CoreServices";
     return "-lpthread -ldl -lrt -lm";
