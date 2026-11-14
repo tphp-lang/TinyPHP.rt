@@ -140,4 +140,25 @@ bench_one("prop_assign_int", function () use ($N, $w3) {
     return $w3->v;
 });
 
+// --- 8. A2 recon: str write WITHOUT ternary (isolate ternary vs prop-store) ---
+$w4 = new W2(0);
+bench_one("prop_str_direct", function () use ($N, $w4, $s1) {
+    for ($i = 0; $i < $N; $i++) { $w4->sv = $s1; }
+    return strlen($w4->sv);
+});
+
+// --- 9. A2 recon: int via ternary (isolate ternary cost with scalar value) ---
+$w5 = new W2(0);
+bench_one("prop_int_ternary", function () use ($N, $w5, $s1, $s2) {
+    for ($i = 0; $i < $N; $i++) { $w5->v = ($i & 1) ? 111 : 222; }
+    return $w5->v;
+});
+
+// --- 10. A2 recon: str to plain var (no prop at all) ---
+bench_one("var_str_assign", function () use ($N, $s1, $s2) {
+    $vv = "x";
+    for ($i = 0; $i < $N; $i++) { $vv = ($i & 1) ? $s1 : $s2; }
+    return strlen($vv);
+});
+
 echo "sink=", $sink, " gdc=", $GLOBALS['gdc'], " done\n";

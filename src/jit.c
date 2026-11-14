@@ -1902,6 +1902,7 @@ static bool dst_src_alias(TOp *op) {
 }
 
 static int mod_fast_enabled(void);      /* 定义在开关区（logstat 百菜），lower_binop 用 */
+static int bw_fast_enabled(void);       /* 定义在开关区（A2 位运算刀），lower_binop 用 */
 static int neg_fast_enabled(void);      /* 定义在开关区（object 刀），lower_un 用 */
 
 static void lower_binop(JitC *j, TOp *op) {
@@ -2068,6 +2069,49 @@ static void lower_binop(JitC *j, TOp *op) {
             call_slow_binop(j, op->op, da, ta, pa, tb, pb);
             ir_ref eS = ir_END();
         ir_MERGE_2(eT, eS);
+    } else if ((op->op == OP_BW_AND || op->op == OP_BW_OR ||
+                op->op == OP_BW_XOR || op->op == OP_SHL || op->op == OP_SHR)
+               && bw_fast_enabled()) {
+        /* A2 刀（11-14）：位运算 INT 快线——BW 族与 SHL/SHR 原恒落下方
+         * call_slow_binop（tval_band 族类型分发 ~28ns/次；ternary 剖面
+         * 20× 实锤）。AND/OR/XOR int64 全定义直出；SHL/SHR 镜像
+         * tval_shl/shr：shift 值 (uint64)pb<=63 守卫（负/≥64 落 slow
+         * 原行为——慢线 s>=64 分支 + 负 shift 语义原样保留），shl 为
+         * (uint64)x<<s 无 UB、shr 为算术右移，逐位一致。开关
+         * TPHP_BW_FAST=0 = 恒 slow（镜像 TPHP_MOD_FAST）。 */
+        ir_ref bothw = ir_AND(IR_BOOL,
+            ir_EQ(ta, ir_CONST_I32(JT_INT)),
+            ir_EQ(tb, ir_CONST_I32(JT_INT)));
+        ir_ref ifw = ir_IF(bothw);
+        ir_IF_TRUE(ifw);
+            ir_ref wv = 0;
+            if (op->op == OP_BW_AND || op->op == OP_BW_OR ||
+                op->op == OP_BW_XOR) {
+                wv = op->op == OP_BW_AND ? ir_AND_I64(pa, pb)
+                   : op->op == OP_BW_OR  ? ir_OR_I64(pa, pb)
+                   : ir_XOR_I64(pa, pb);
+                if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                    rel_dst_gate(j, da);   /* wtake；slow 分支自释放不发 */
+                store_imm(j, da, JT_INT, wv);
+            } else {
+                /* shift：值域守卫 (uint64)pb<=63，越界/负落 slow */
+                ir_ref uok = ir_LT(ir_BITCAST_U64(pb), ir_CONST_U64(64));
+                ir_ref ifs = ir_IF(uok);
+                ir_IF_TRUE(ifs);
+                    if (!dst_src_alias(op) && dst_gate_needed(j, op))
+                        rel_dst_gate(j, da);
+                    ir_ref sv = op->op == OP_SHL
+                        ? ir_SHL_I64(pa, pb) : ir_SHR_I64(pa, pb);
+                    store_imm(j, da, JT_INT, sv);
+                    ir_ref eSh = ir_END();
+                ir_IF_FALSE(ifs);
+                    ir_ref eSl = ir_END();
+                ir_MERGE_2(eSh, eSl);
+            }
+            ir_ref eW = ir_END();
+        ir_IF_FALSE(ifw);
+            ir_ref eWs = ir_END();
+        ir_MERGE_2(eW, eWs);
     } else {
         call_slow_binop(j, op->op, da, ta, pa, tb, pb);
     }
@@ -3242,6 +3286,19 @@ static int neg_fast_enabled(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("TPHP_NEG_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
+/* A2 刀（11-14）：位运算 INT 快线开关——默认开，TPHP_BW_FAST=0 关（同
+ * 二进制 A/B）= HEAD 行为（BW 族与 SHL/SHR 恒 CALL tval_band 族慢线）。
+ * 证据：ternary 剖面 20×（唯一无 & 段 0.78ms vs 含 & 段 4.3-4.4ms，
+ * recon4 prop_assign_str 16× 同源——$i&1 的 BW_AND 恒 28ns helper）。 */
+static int bw_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_BW_FAST");
         v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
     }
     return v;
