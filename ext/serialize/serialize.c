@@ -87,10 +87,6 @@ typedef struct {
     TVal *keys; uint32_t cap_keys;
 } SW;
 
-static void sw_put(SW *w, const void *d, size_t n) {
-    put_bytes(&w->buf, &w->len, &w->cap, d, n);
-}
-
 static void sw_put_str(SW *w, const char *s, uint32_t len) {
     /* 三段一次 grow（头+len+内容合并检查），免 3 次独立 put 的重复检查 */
     if (!grow(&w->buf, &w->cap, w->len + 1 + 4 + (size_t)len)) return;
@@ -123,33 +119,38 @@ static void sw_seen_grow(SW *w) {
     tm_free(w->seen);
     w->seen = nt; w->cap_seen = nc;
 }
+/* 复合值进入：-1 = 新值（先写内容后补完成），>=0 = backref 已有。
+ * 开址哈希（A1-a 接线刀：原实现线性扫 O(n_seen)——P0-17 剖面占
+ * serialize ~39%，哈希机器早已在但从未接入的死代码）。
+ * done 不删槽只改标记 ⇒ 探测链无墓碑断裂，无需删除标记。 */
 static int sw_seen_enter(SW *w, GCHead *h) {
-    for (uint32_t i = 0; i < w->n_seen; i++) {
-        if (w->seen[i].h == h) {
-            if (w->seen[i].state == 1)
+    if (w->cap_seen == 0 || w->n_seen * 4 >= w->cap_seen * 3)
+        sw_seen_grow(w);
+    uint32_t m = w->cap_seen - 1;
+    uint32_t j = sw_seen_hash(h) & m;
+    while (w->seen[j].h) {
+        if (w->seen[j].h == h) {
+            if (w->seen[j].state == 1)
                 tphp_raise("Error",
                            "serialize(): circular reference detected");
-            return (int)w->seen[i].idx;
+            return (int)w->seen[j].idx;
         }
+        j = (j + 1) & m;
     }
-    if (w->n_seen == w->cap_seen) {
-        uint32_t oc = w->cap_seen ? w->cap_seen : 16;
-        SWSeenEnt *nt = tm_malloc(sizeof(SWSeenEnt) * (size_t)(oc * 2));
-        memset(nt, 0, sizeof(SWSeenEnt) * (size_t)(oc * 2));
-        for (uint32_t i = 0; w->seen && i < oc; i++) nt[i] = w->seen[i];
-        tm_free(w->seen);
-        w->seen = nt;
-        w->cap_seen = oc * 2;
-    }
-    w->seen[w->n_seen] = (SWSeenEnt){ h, w->next_idx++, 1 };  /* 预留槽位号
-        （进入序 = reader 遇到 'A'/'O' 的登记序） */
+    /* 空槽插入；idx 按进入序分配（= reader 遇 'A'/'O' 的登记序） */
+    w->seen[j] = (SWSeenEnt){ h, w->next_idx++, 1 };
     w->n_seen++;
     return -1;
 }
 
 static void sw_seen_done(SW *w, GCHead *h) {
-    for (uint32_t i = 0; i < w->n_seen; i++)
-        if (w->seen[i].h == h) { w->seen[i].state = 0; return; }
+    uint32_t m = w->cap_seen - 1;
+    uint32_t j = sw_seen_hash(h) & m;
+    while (w->seen[j].h) {
+        if (w->seen[j].h == h) { w->seen[j].state = 0; return; }
+        j = (j + 1) & m;
+    }
+    /* 不可达：enter 必已插入同一 h */
 }
 
 static void sw_val(SW *w, TVal v);
