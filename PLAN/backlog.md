@@ -33,6 +33,23 @@
 
 按预期收益排序；全部已在 perf-roadmap/ir-jit/jsc-lessons 立过项。**P0-13/P0-14 为 2026-10-28 JSC 借鉴立项**（规格 PLAN/jsc-lessons.md，用户拍板"先搬知识、以后慢慢完成"）。
 
+**2026-11-14 用户拍板：M2 冲线火力重排（A 线序列，执行顺序以此为准）**
+> 依据 = CI run 43542317054 @ 7c21e6a 逐项 ln 杠杆归因：object −7.2% / logstat −6.6% / read −3.4% / fib −2.1%（带内口径）/ kv −2.5%（已收完）/ serialize −2.1%。kv 线（4a-4c）红利兑现完毕，object/logstat 为零火力区——"进度慢"主因是刀砍在权重最小项上。
+
+| # | 任务 | 预期 | 说明 |
+|---|---|---|---|
+| A0 | fib CI 1.73× 定伪 | ✓ 销账 | 本地三连 13.1/12.8/12.2ms 带内（M1 14.0）= runner 噪声；同轮 arm 1.25/1.31、mac 1.37 带内旁证。不立项 |
+| A1 | serialize/json C 层优化刀（**✓ 11-14 落地，未提交**）：a) serialize seen 表哈希接线——原线性扫且哈希机器是死代码（注释声称已哈希）；b) json encode：assoc 单遍逆映射（消原 arr_is_list/arr_key_by_off 每元素全桶扫 O(n·bcap)）+ enc_str 段拷（原逐字符 jb_ch）+ i64 快转（原 snprintf）；**min-of-6 双轮抑抖 A/B：serialize 77.8→75.9（−2.4%）、json 298.6→287.5（−3.7%）、kv/object 带内**；246 全绿 | ✓ | 教训：未抑抖高负载时段单轮 3 连曾全面虚涨 10-35%（stash 对照实验 + bench-rounds 抓出）；decode 半边/UTF-8 校验后置；大 assoc 数组场景收益远超 bench 值（结构病消除） |
+| A2 | object 线收尾（**✓ 11-14 第一刀落地，未提交——刀面被剖面修正**）：NEG 刀 recon 已证方法调用 ≈ 平（mcall_empty 0.579 vs 0.540，P0-4 旧定性推翻）、dtor 大头已砍——真凶 = **BW_AND/OR/XOR/SHL/SHR 恒 call_slow_binop（~28ns/次）**：recon4 prop_assign_str "16×" 与 ternary 探针 20× 同源（含 & 段 4.3-4.4ms vs 唯一无 & 段 0.78ms）。落地 = `TPHP_BW_FAST`（AND/OR/XOR int64 直出 + SHL/SHR shift≤63 守卫落 slow 保语义）；**探针 −80~87%（floor 4.25→0.56ms），recon4 prop_assign_str 4.86→1.32（−73%），小循环形态反超 PHP 4×**；bench 全表 min-of-6 双轮零回退（logstat 微改善）；247×3 全绿（默认/BW_FAST=0/JIT=0）+ 新测试 test-jit-bwfast-001.php 双端 diff=0 | ✓（geomean 直接受益小 ~−0.1%，真实代码价值项） | 顺带挖出：负 shift 异常类 tphp=ValueError vs PHP=ArithmeticError、float→int 隐式转换 PHP 打 Deprecated（均 B1 诊断通道域）；match_int 11ms 独立慢病记 P1 候选；SHL/SHR 动态移位拒编=既有；probe_tern_bw_recon.php 入库 |
+| A3 | **logstat 线（✓ 11-14 剖面收口，正刀立项）**：整函数变体分解（PHP strongest 对齐口径）——explode 族 **+2.4% 已平**（刀7 memchr 生效）、make_log 无 JIT 口径反超/strongest 口径 −22%、intval ≈0 差、errs +0.7ms。**真根因 = logstat 函数 JIT 三路全堵**：n_ops=176 > eager 96、单次调用 < hot127、foreach+if/else 体 OSR "not single backedge" 拒 → CI 2.13× = "JIT 化 make_log + 全解释器 logstat" vs PHP 全 JIT。**eager=200 实测**：单次 bench 口径 +8% 反亏（176 ops 编译 ~3ms 全额进计时）、5 次调用口径 −18% → **默认 96 维持**（刀18 结论复核有效）。kv 计数段 RMW 形态 154ns vs PHP 53ns（与 array-rmw 3.0× 同族）记 P1 候选 | 正刀 = **OSR foreach**（修单自然循环判定对 FE 形态的拒——规格先行补 PLAN/osr.md 节，A4 前置或并行） | tools/probe_object_recon4.php + /tmp 探针方法论；memory/2026-11-14.md |
+| A4 | ~~computed-goto 批1~~ **数据否决（✓ 11-14 实测）**：解释器 vs JIT 段差实测——v_explode 9.56→8.45（JIT 仅省 11.6%）、v_count 12.64→12.11（4%）——**混合负载下 JIT 化总收益仅 4-12%，dispatch 全头上限 ~12%**，computed-goto 可省部分 <0.5ms → clean11 影响 <0.1%；全宏化 = 数周级高风险。perf-roadmap 10-24 收口结论复核成立，**P2-16 回归"独立立项候选"原位，提级撤销**（防翻案：重开需先证 dispatch 占比 >30%） | ✗ 否决 | 证据：/tmp ls_fn 探针 JIT=0/1 对照；本日三起剖面证伪之三（方法调用、插值、dispatch） |
+| A5 | read 批3 / kv·jsonagg 余量 | −2% | 尾声收官 |
+| A6 | **kv 线封刀**：4d 触发制留档不动；kv 1.12-1.33 带内即停 | — | 防惯性续刀（本周 kv 已 −56% 兑现） |
+| A7 | **OSR foreach 升格为 P0 正刀**（11-14 从 A3 剖面升格——A4 否决后最大剩余杠杆）：修单自然循环判定对 FE_RESET/FE_FETCH+if/else 体的 "not single backedge" 拒，让"少次调用大函数"（n_ops>96 且调用 <127）的循环体 OSR 化——real-logstat 类 CLI 工具脚本系统性解；规格先行补 PLAN/osr.md 节（foreach 回边结构 + FE replay 已批3 准入的衔接） | −3~4% | 前置证据：logstat 三路全堵实锤（176 ops/1-5 次调用/foreach 拒）；JIT 化段差 explode −11.6% 兜底预期 |
+| A8 | **object 残差双小刀（✓ 11-14 剖面收口——均为深水区，无当天刀）**：recon3 双端段差——alloc_bare +0.55ms（mimalloc vs ZendMM，已知域）、alloc_ctor ≈平、alloc_ctor_get **反超**、**edtor 增量差 13ns/op = full 差 80%**（NEG 后仍 dtor 域）。edtor 构成 = gc_unregister 全局 registry 链摘除 + 完整 dtor 帧（vm_call_magic_method）+ pool 摆弄——**结构性成本无单点**；prop 写/循环底噪（loop_skeleton 5.4× 疑 PHP 空循环 DCE、prop 域 4-5× 底噪同源）= **RA 寄存器驻留域**（emit-ssa 批 C 证伪的重开条件域）。P0-20 pool/P0-4 单次分配已就位，进一步 = GC registry 结构或 RA 驻留，均非小刀 | 挂档 | dtor_global 2.34× = $GLOBALS 缺口域（B2）；CI linux object 2.20× vs local win 1.34× 的平台差待 CI 复核（疑 linux 侧 mimalloc/码布局） |
+
+**节奏纪律（同日拍板）**：预期 geomean ≥3% 大刀 = 全套 A/B min-of-6 双轮 + 专项测试；<2% 小刀 = 单轮 A/B + CI 复核；每周按最新 CI 表重算 ln 权重重排火力；M2 口径 = clean11 geomean **连续两轮 CI ≤1.0**。
+
 | # | 任务 | 验收 | 规格/落点 |
 |---|---|---|---|
 | P0-1 | **JIT v1.1 白名单扩容**（**已完成**）：helper 五件套/闭包/动态调用/数组 op/循环栈已落；三形态崩溃全修（SCCP 多槽 CALL、LLP64 bitset 回绕、急切编译恢复 n_ops≤96）；**收尾（10-28）**：T_STR 字面量 + `ARRAY_APPEND` 放行（`tphp_jit_lit_set`/`tphp_jit_array_append` helper），连带修 `OP_COPY` 裸 store 双重释放（`tphp_jit_tv_copy`）。array-read 21.97→**4.22×**、kv-read 19.69→**5.84×**、throw 30.78→**3.32×**，几何均值 ~5.3→**~3.5×** | array-read 进 2–5× ✓；几何均值 ≤3× 差 ~0.5×（余量见 P0-3/P0-4） | ir-jit §12.2；src/jit.c；deps/ir；memory/2026-10-27.md、2026-10-28.md |
@@ -90,6 +107,14 @@
 
 ## 3. P1 · 功能线（立项类先写规格再动手）
 
+> **2026-11-14 拍板（目标重申：性能追平/超越 PHP 最强态 + 语法语义尽量对齐原生；功能后置）**：语义类缺口改判 **B 线提级**——
+> **B1** `@` 抑制：**✓ 2026-11-14 用户明示翻案**（原 01 §9"错误双轨已废除"+ §12 引言"不翻案"、本文 §6 清单已同步改账）——**规格先行**：诊断通道规格（warning 类诊断恢复不抛异常双轨 + `@` 就地掩码，@unlink/@file_get_contents 类惯用法不再抛异常），B 线首个规格项，实施排 A 线大刀间隙；落地前解析器仍加载期报错（01 §9 行注）；
+> **B2** $GLOBALS 函数/方法/dtor 作用域补全（11-13 发现的整体缺失）；
+> **B3** stdClass 基建 + json_decode 默认对齐（= P1-11①）；
+> **B4** 小缺口批：json_encode float shortest、explode 负 limit（刀7B 存量）、concat 优先级（= P1-11③）、`C::$v(a:1)`（P1-8）、属性类型 FQCN（P1-9）、P2-11 date 时区 / P2-17 usort 异常语义两项拍板；
+> **B5** = P2-7 php-compat 加厚（17→100+ 例，tools/convert-phpt.ps1 现成）——语义一致目标的测量仪器。
+> **功能类冻结（"功能后续再说"）**：P1-1 / P1-2 / P1-3 / P1-6、P2-13 / P2-14 / P2-15。
+
 | # | 任务 | 规格/记录 | 备注 |
 |---|---|---|---|
 | P1-1 | 生成器 v2：`throw()`、`yield from`、dtor-跑-finally、一般 Iterator/Traversable foreach | generators.md §v2 表 | 独立批 |
@@ -111,6 +136,8 @@
 | P1-16 | **array_map 两条既有语义差异**（**✓ 11-06 刀12 对齐**）：①多数组短源——PHP 8 **null 填充至最长**、tphp 原 min 截断 → min_len 改 max_len + 游标耗尽 TV_NULL；②单数组**键保持**（assoc/holey/混合键原键保留）→ packed 快路（键恒 = i，append 等价免 sync/inv）+ 非 packed inv[val_off]=bucket_idx 反查（**bucket 物理序 ≠ 插入序**——首版 bucket 遍历翻车，顺序全乱 + 4.7→29.4ms 回退，教训沉淀日志）。**连带 filter O(n²) 修复（同族漏网）**：键反查每元素 O(bcap) 扫 = 50k **965.1ms vs PHP 2.9ms = 333×** → inv 反查 + packed 快路 = **22.5ms（-97.7%，7.8×）**。多数组键行为（PHP 重建 list）已一致 | tests/lang/test-map-cursor-001.php 13-19（tphp vs PHP diff 逐字一致）；memory/2026-11-06.md 刀12 节 | 253×4 全绿；map 快路 4.5ms 保持 |
 
 ## 4. P2 · 工程线
+
+> **2026-11-14 拍板**：P2-16 **提级进 P0 = A4**（原"非近期"排期作废）——属排期调整非路线翻案：它一直是 P0-9"第二层结构性反超"的 L4 行，§6/§8"用纯解释器追平 JIT"禁令不适用（computed-goto 只是 JIT miss/冷路径的地板，JIT 主线不变）。P2-7 提级 = B5；P2-9 ASAN CI job 保留待做（发射器手术密集期的回归保险）；P2-13/14/15 冻结。
 
 | # | 任务 | 记录 |
 |---|---|---|
@@ -141,7 +168,7 @@
 
 ## 6. 已决策不做（防翻案——改主意前先读原文）
 
-- 01 §12.3 与 §9：`&$ref`/`extract`/`eval`/`@`/错误处理器（warning→异常）、`${var}` 插值、`each()`、`declare(ticks/encoding)`、嵌套条件函数声明、引用捕获/引用传参、resource 类型。
+- 01 §12.3 与 §9：`&$ref`/`extract`/`eval`/错误处理器（warning→异常）、`${var}` 插值、`each()`、`declare(ticks/encoding)`、嵌套条件函数声明、引用捕获/引用传参、resource 类型。~~`@`~~ **已移出（2026-11-14 用户明示翻案 → B1，规格先行）**。
 - perf-roadmap §8：借壳 JSC/V8、PHP→JS/WASM 转译、用纯解释器追平 JIT、io_uring 抢先、为性能牺牲语义。
 - ir-jit §13：体内异常路径 JIT、v1 即做数组/字符串、自研 regalloc、与解释器分两套语义。
 - 其他：pc 类 `pack.include`… 见 pkg 边界表；FFI 相关项已随 2026-11-10 移除关闭。

@@ -73,7 +73,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
 ./build/tphp test tests/lib
 ```
 
-当前 **222 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
+当前 **247 项** 全绿（含 bench / php-compat 种子）。详见 [doc/testing.md](doc/testing.md)。
 
 ## 文档
 
