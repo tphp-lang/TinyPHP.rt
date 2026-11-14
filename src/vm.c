@@ -4675,6 +4675,12 @@ bool tphp_vm_call_bounded(VM *vm, TVal callable, TVal *args, int n, TVal *out) {
         bool escaped = false;
         vm_unwind_core(vm, floor, &escaped);
         if (escaped) {
+            /* 未消费异常：调用方（teb/FFI 等）已按契约兜底（warning/500）。
+             * 必须清 x.exception——否则残留指针让下一个进入 VM 的回调
+             * 立刻被 unwind 检查击落（2026-11-14 teb P0 冒烟：一次回调
+             * 异常后所有后续回调恒 500，进程退出段错误）。异常对象 rc=1
+             * 挂 GC 表，置 NULL 后由 sweep 正常回收。 */
+            vm->x.exception = NULL;
             memcpy(&vm->x.unwind, &outer, sizeof outer);
             return false;
         }

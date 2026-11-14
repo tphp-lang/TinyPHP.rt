@@ -15,6 +15,9 @@
 /* json.c C-level API（无 VM、静默失败；pkg 专用） */
 struct TVal;
 bool tphp_json_decode_c(const char *src, size_t len, struct TVal *out);
+/* encode：失败（非法 UTF-8 / 不支持类型 / 深度超限）返回 false 且不写 *out。
+ * v 为借用语义（调用方保证存活）；成功 *out = 新 TStr（+1 归调用方）。 */
+bool tphp_json_encode_c(struct TVal v, struct TStr **out);
 
 /* ---- 用户 ext 注册 API v1（init 内调用；进程生命周期）----
  * 名字带 FQ：函数 "Ns\\fn"、常量 "Ns\\CONST"（全局则裸名）。vm 侧查询口
