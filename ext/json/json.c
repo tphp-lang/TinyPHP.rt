@@ -31,12 +31,16 @@ static void jb_init(JBuf *b) {
     b->len = 0;
 }
 
-static void jb_put(JBuf *b, const char *s, size_t n) {
+static char *jb_reserve(JBuf *b, size_t n) {
     if (b->len + n + 1 > b->cap) {
         while (b->len + n + 1 > b->cap) b->cap *= 2;
         b->p = tm_realloc(b->p, b->cap);
     }
-    memcpy(b->p + b->len, s, n);
+    return b->p + b->len;
+}
+
+static void jb_put(JBuf *b, const char *s, size_t n) {
+    memcpy(jb_reserve(b, n), s, n);
     b->len += n;
     b->p[b->len] = 0;
 }
@@ -66,11 +70,50 @@ static bool utf8_valid(const char *s, size_t n) {
 }
 
 /* ---- encode ---- */
-static void enc_str(JBuf *b, const char *s, size_t n) {
+
+/* encode 上下文（A1-b）：keys 逆映射缓冲跨数组复用（serialize sw.keys 同款，
+ * 免每数组 malloc/free） */
+typedef struct {
+    VM *vm;
+    JBuf *b;
+    int options;
+    TVal *keys; uint32_t cap_keys;   /* off→key 逆映射缓冲（只增不减） */
+} ECtx;
+
+/* i64→ascii（A1-b：替代 snprintf("%lld")——bench 密度每轮 ~5 万次） */
+static size_t fmt_i64(char *out, int64_t v) {
+    char tmp[20];
+    size_t k = 0;
+    uint64_t u = (v < 0) ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+    do { tmp[k++] = (char)('0' + (u % 10)); u /= 10; } while (u);
+    size_t n = 0;
+    if (v < 0) out[n++] = '-';
+    while (k) out[n++] = tmp[--k];
+    return n;
+}
+
+/* 字符串编码段拷快路（A1-b）：原实现逐字符走 jb_ch（函数调用+检查+1 字节
+ * memcpy/字符）。危险集 = '"' '\\' <0x20，其余字节（含 UTF-8 全部续字节）
+ * 原样直写；安全段批量 memcpy。 */
+static void enc_str(ECtx *c, const char *s, size_t n) {
+    JBuf *b = c->b;
     jb_ch(b, '"');
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        switch (c) {
+    size_t i = 0;
+    while (i < n) {
+        size_t j = i;
+        while (j < n) {
+            unsigned char ch = (unsigned char)s[j];
+            if (ch < 0x20 || ch == '"' || ch == '\\') break;
+            j++;
+        }
+        if (j > i) {
+            memcpy(jb_reserve(b, j - i), s + i, j - i);
+            b->len += j - i;
+            b->p[b->len] = 0;
+        }
+        if (j == n) break;
+        unsigned char ch = (unsigned char)s[j];
+        switch (ch) {
         case '"':  jb_puts(b, "\\\""); break;
         case '\\': jb_puts(b, "\\\\"); break;
         case '\b': jb_puts(b, "\\b"); break;
@@ -78,63 +121,62 @@ static void enc_str(JBuf *b, const char *s, size_t n) {
         case '\n': jb_puts(b, "\\n"); break;
         case '\r': jb_puts(b, "\\r"); break;
         case '\t': jb_puts(b, "\\t"); break;
-        default:
-            if (c < 0x20) {
-                char tmp[8];
-                snprintf(tmp, sizeof tmp, "\\u%04x", c);
-                jb_puts(b, tmp);
-            } else {
-                jb_ch(b, (char)c);
-            }
+        default: {
+            /* <0x20 → \u00XX（hex 查表，免 snprintf） */
+            static const char hex[] = "0123456789abcdef";
+            char tmp[6] = { '\\', 'u', '0', '0', hex[(ch >> 4) & 0xF], hex[ch & 0xF] };
+            jb_put(b, tmp, 6);
+            break;
         }
+        }
+        i = j + 1;
     }
     jb_ch(b, '"');
 }
 
-static bool enc_val(VM *vm, JBuf *b, TVal v, int depth, int options);
+static bool enc_val(ECtx *c, TVal v, int depth);
 
-/* 数组是否连续 int 键 0..n-1 */
-static bool arr_is_list(TArr *a) {
-    if (a->packed) return true;   /* 不变量：packed ⇒ 键即 0..n-1 无洞 */
+/* 数组键单遍逆映射（A1-b：替代原 arr_is_list/arr_key_by_off 的每元素
+ * 全桶扫 O(n·bcap)——assoc 分支原为二次方桶探查；缓冲挂 ECtx 复用）。
+ * 返回 keys[dused]（T_UNDEF=空洞），packed 时返回 NULL；*is_list =
+ * 连续 int 键 0..n-1（语义与原 arr_is_list 一致：首个键失配即判否）。 */
+static TVal *arr_keys_map(ECtx *c, TArr *a, bool *is_list) {
+    if (a->packed) { *is_list = true; return NULL; }   /* 不变量：packed ⇒ 键即 0..n-1 无洞 */
     tarr_sync_buckets(a);
+    if (a->dused > c->cap_keys) {
+        uint32_t nc = c->cap_keys ? c->cap_keys : 16;
+        while (nc < a->dused) nc *= 2;
+        c->keys = tm_realloc(c->keys, sizeof(TVal) * (size_t)nc);
+        c->cap_keys = nc;
+    }
+    TVal *keys = c->keys;
+    for (uint32_t i = 0; i < a->dused; i++) keys[i].t = T_UNDEF;
+    for (uint32_t bk = 0; bk < a->bcap; bk++) {
+        if (a->buckets[bk].val_off != UINT32_MAX &&
+            a->buckets[bk].val_off < a->dused)
+            keys[a->buckets[bk].val_off] = a->buckets[bk].key;
+    }
     uint32_t idx = 0;
+    bool list = true;
     for (uint32_t i = 0; i < a->dused; i++) {
-        if (a->data[i].t == T_UNDEF) continue;
-        /* 找键 */
-        bool found = false;
-        for (uint32_t bk = 0; bk < a->bcap; bk++) {
-            if (a->buckets[bk].val_off == i && a->buckets[bk].key.t == T_INT) {
-                if (a->buckets[bk].key.u.i != (int64_t)idx) return false;
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
+        if (a->data[i].t == T_UNDEF || keys[i].t == T_UNDEF) continue;
+        if (keys[i].t != T_INT || keys[i].u.i != (int64_t)idx) { list = false; break; }
         idx++;
     }
-    return true;
+    *is_list = list;
+    return keys;
 }
 
-static TVal arr_key_by_off(TArr *a, uint32_t off) {
-    if (a->packed) return off < a->n ? TV_INT((int64_t)off) : TV_NULL;
-    tarr_sync_buckets(a);
-    for (uint32_t bk = 0; bk < a->bcap; bk++)
-        if (a->buckets[bk].val_off == off && a->buckets[bk].key.t != T_NULL)
-            return a->buckets[bk].key;
-    return TV_NULL;
-}
-
-static bool enc_val(VM *vm, JBuf *b, TVal v, int depth, int options) {
-    (void)options;
+static bool enc_val(ECtx *c, TVal v, int depth) {
+    JBuf *b = c->b;
     if (depth > 512) return false;
     switch (v.t) {
     case T_NULL:  jb_puts(b, "null"); return true;
     case T_FALSE: jb_puts(b, "false"); return true;
     case T_TRUE:  jb_puts(b, "true"); return true;
     case T_INT: {
-        char tmp[32];
-        snprintf(tmp, sizeof tmp, "%lld", (long long)v.u.i);
-        jb_puts(b, tmp);
+        char tmp[24];
+        jb_put(b, tmp, fmt_i64(tmp, v.u.i));
         return true;
     }
     case T_FLOAT: {
@@ -153,19 +195,21 @@ static bool enc_val(VM *vm, JBuf *b, TVal v, int depth, int options) {
     case T_STR: {
         TStr *s = (TStr *)v.u.p;
         if (!utf8_valid(s->c, s->len)) return false;
-        enc_str(b, s->c, s->len);
+        enc_str(c, s->c, s->len);
         return true;
     }
     case T_ARR: {
         TArr *a = (TArr *)v.u.p;
-        if (arr_is_list(a)) {
+        bool is_list;
+        TVal *keys = arr_keys_map(c, a, &is_list);
+        if (is_list) {
             jb_ch(b, '[');
             bool first = true;
             for (uint32_t i = 0; i < a->dused; i++) {
                 if (a->data[i].t == T_UNDEF) continue;
                 if (!first) jb_ch(b, ',');
                 first = false;
-                if (!enc_val(vm, b, a->data[i], depth + 1, options))
+                if (!enc_val(c, a->data[i], depth + 1))
                     return false;
             }
             jb_ch(b, ']');
@@ -173,20 +217,19 @@ static bool enc_val(VM *vm, JBuf *b, TVal v, int depth, int options) {
             jb_ch(b, '{');
             bool first = true;
             for (uint32_t i = 0; i < a->dused; i++) {
-                if (a->data[i].t == T_UNDEF) continue;
-                TVal k = arr_key_by_off(a, i);
+                if (a->data[i].t == T_UNDEF || keys[i].t == T_UNDEF) continue;
+                TVal k = keys[i];
                 if (!first) jb_ch(b, ',');
                 first = false;
                 if (k.t == T_INT) {
-                    char tmp[32];
-                    snprintf(tmp, sizeof tmp, "%lld", (long long)k.u.i);
-                    enc_str(b, tmp, strlen(tmp));
+                    char tmp[24];
+                    enc_str(c, tmp, fmt_i64(tmp, k.u.i));
                 } else {
                     TStr *ks = (TStr *)k.u.p;
-                    enc_str(b, ks->c, ks->len);
+                    enc_str(c, ks->c, ks->len);
                 }
                 jb_ch(b, ':');
-                if (!enc_val(vm, b, a->data[i], depth + 1, options))
+                if (!enc_val(c, a->data[i], depth + 1))
                     return false;
             }
             jb_ch(b, '}');
@@ -206,13 +249,16 @@ TVal bi_json_encode(VM *vm, TVal *args, int n) {
     int options = n >= 2 ? (int)tval_to_int(args[1]) : 0;
     JBuf b;
     jb_init(&b);
-    if (!enc_val(vm, &b, args[0], 0, options)) {
+    ECtx c = { vm, &b, options, NULL, 0 };
+    if (!enc_val(&c, args[0], 0)) {
         tm_free(b.p);
+        tm_free(c.keys);
         tphp_warn("PHP Warning:  json_encode(): Invalid UTF-8 or unsupported type\n");
         return TV_FALSE;
     }
     TStr *s = tstr_new(b.p, b.len);
     tm_free(b.p);
+    tm_free(c.keys);
     return TV_STR(s);
 }
 
@@ -508,5 +554,24 @@ bool tphp_json_decode_c(const char *src, size_t len, TVal *out) {
         tval_release(out);
         return false;
     }
+    return true;
+}
+
+/* ---- C-level encode (teb/ext 侧工厂用): no VM, silent on failure ----
+ * enc_val 不使用 vm（ECtx.vm 仅 bi 入口填充），NULL 安全。
+ * v 为借用语义；失败不写 *out。 */
+bool tphp_json_encode_c(TVal v, TStr **out) {
+    if (!out) return false;
+    JBuf b;
+    jb_init(&b);
+    ECtx c = { NULL, &b, 0, NULL, 0 };
+    if (!enc_val(&c, v, 0)) {
+        tm_free(b.p);
+        tm_free(c.keys);
+        return false;
+    }
+    *out = tstr_new(b.p, b.len);
+    tm_free(b.p);
+    tm_free(c.keys);
     return true;
 }
