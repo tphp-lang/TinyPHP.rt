@@ -46,13 +46,30 @@ foreach ($dir in @("lang", "oop", "async", "worker", "jit", "lib", "pkg", "bench
             continue
         }
         $expected = @()
+        $skipMarks = @()
         $wantExit = 0
         foreach ($line in Get-Content -Encoding UTF8 $_.FullName) {
             if ($line -match '^\s*//\s*EXPECT:\s?(.*)$') { $expected += $Matches[1] }
+            if ($line -match '^\s*//\s*EXPECT-SKIP:\s?(.*)$') { $skipMarks += $Matches[1] }
             if ($line -match '^\s*//\s*EXPECT-EXIT:\s?(\d+)') { $wantExit = [int]$Matches[1] }
         }
         $output = @(& $tphp run $_.FullName 2>$null | ForEach-Object { "$_" })
         $exit = $LASTEXITCODE
+        # EXPECT-SKIP: optional runtime skip — when the script's stdout
+        # contains every skip-mark line (exact match per line), the test
+        # counts as skipped instead of failing the EXPECT comparison
+        # (e.g. ext-dependent cases on builds without that ext linked).
+        if ($skipMarks.Count -gt 0) {
+            $allMarked = $true
+            foreach ($m in $skipMarks) {
+                if (-not ($output -ccontains $m)) { $allMarked = $false; break }
+            }
+            if ($allMarked) {
+                $skip++
+                Write-Host "SKIP $($_.Name) (runtime guard: $($skipMarks -join ', '))"
+                continue
+            }
+        }
         $ok = ($exit -eq $wantExit)
         if ($ok -and ($output.Count -ne $expected.Count)) { $ok = $false }
         if ($ok) {

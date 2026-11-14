@@ -3,7 +3,8 @@
 // 病史：teb Web::start() 原实现 addref 一次两用（g_teb 全局份 + 返回值转移份），
 // real_stop 释放 g_teb 时吃掉 main frame 返回值 TMP 槽的合法份额 → 自然退出
 // 二次 free（EXIT=139/0xC0000005）。teb.c 修复后本脚本应自然退出 EXIT=0。
-// 无 teb 链入时跳过（EXPECT: skip）。
+// 无 teb 链入时输出 skip → EXPECT-SKIP 计 skipped（CI 源码构建无本地 ext）。
+// EXPECT-SKIP: skip
 if (!class_exists("Tphp\\Teb\\Web")) {
     echo "skip\n";
     exit(0);
