@@ -6346,6 +6346,42 @@ static bool osr_body_ok(TFunc *fn, uint32_t header, uint32_t backedge) {
              * 已被 f97555a 证伪，本会话实测该阻塞是否同因：绿则落地，复现
              * 则再撤并转最小复现报 dstogov（PLAN/osr.md 批2-3 三态矩阵）。 */
             break;
+        case OP_FE_FETCH:
+            /* A7-1（PLAN/osr.md §8）：foreach 形态放行——compile.c S_FOREACH
+             * 的 back-edge 恰 patch 到 FE_FETCH pc，header 即 FE_FETCH（i==header
+             * 位置守卫：区域内出现即嵌套/异常形态，拒）。emit 走既有函数级
+             * case（jit.c FE 单 op pad，守卫在 OSR 入口自动成立：emit_seq 先压
+             * 循环上下文 loop_hdr[0]==pc 再派发 op）。fail=exception 论证同
+             * 批2-2a → 游标推进副作用（vm.c:921 cur->u.i=i+1）无 deopt 双推进
+             * 面（异常 unwind 不重跑；数组路径零 raise=infallible）。FE_RESET
+             * 不放行：恒在 header 之前（区域外），区域内出现即嵌套 foreach →
+             * 走既有挡板（批5 嵌套 loop×FE）拒编。 */
+            if (i != header) return false;
+            break;
+        case OP_ISSET_DIM:
+            /* A7-2（PLAN/osr.md §8）：isset($a[$k]) 放行——批4 单 op pad
+             *（lower_replay，真 handler raw read + wtake）零 raise；读操作
+             * 幂等 → 即使 deopt 重跑也无重复副作用（批2-1 论证同款）。
+             * 函数级 eligibility（jit.c:878）无形态守卫，此处对齐零守卫。 */
+            break;
+        case OP_ASSIGN_DIM: {
+            /* A7-2：数组写放行——形态守卫对齐函数级 eligibility
+             *（jit.c:772-782）：base 恒槽、key/val 字面量限标量/串。
+             * deopt 双写面论证：emit 无 deopt 路径——append 快线（P0-10）
+             * /keyed 快线（刀4）miss → emit_assign_dim_slow 完整语义兜底
+             *（非 OSR_RET_PC 重跑），快线命中即完整应用、快线前置零副作用
+             * → 任一路径写恰好一次；helper TypeError（串基/标量基等）
+             * raise = fail=exception（批2-2a）unwind 不重跑。 */
+            TOp *op = &fn->ops[i];
+            if (op->t1 == OPD_CONST || op->t1 == OPD_UNUSED) return false;
+            if (op->t2 != OPD_UNUSED && op->t2 == OPD_CONST &&
+                !lit_scalar(fn->lits[op->a2]) && fn->lits[op->a2].t != T_STR)
+                return false;
+            if (op->tr == OPD_CONST &&
+                !lit_scalar(fn->lits[op->ar]) && fn->lits[op->ar].t != T_STR)
+                return false;
+            break;
+        }
         default:
             if (getenv("TPHP_JIT_DEBUG") && getenv("TPHP_JIT_DEBUG")[0])
                 fprintf(stderr, "[jit] osr reject: pc=%u op=%s\n",

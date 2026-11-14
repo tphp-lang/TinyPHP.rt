@@ -125,7 +125,9 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **白名单**：osr_body_ok +9 op——prop 四 op（FETCH/ASSIGN/ISSET/UNSET_PROP）+ INIT_FCALL（用户 callee 递归准入/builtin ic|1）/SEND_VAL/SEND_VAR（const 源限标量串）/DO_FCALL/INIT_DYN；
 - **实测**：test-osr-004.php 6 场景三方一致（PHP 8.5 / JIT=0 / JIT=1）——c1 用户直调、c2 builtin、c3 prop 读写、c4 动态调用（捕获闭包→call_dyn trampoline）、c5 callee mid-loop raise（raises=1 证明无 deopt 重放）、c6 表达式实参；5 个 OSR chunk 全编译（header=2/23/47/78/124，ir_check 全 1）；**238/238**、bench all-ok；
 - **性能**：OSR×CALL 基准（main 顶层 20M 次调用 b1($i&255)，OSR 独占场景）3720→**1650ms（2.25×）**，PHP 8.5 JIT 1010ms（0.61×）；
-- **遗留（批 2-3 候选）**：INIT_MCALL/NEW_USER 方法与对象链循环形态（opseq replay 同构，白名单一行）；UNSET_CV 已在批 1 白名单；FE_RESET/FE_FETCH 循环形态。### 批 2-3 尝试与撤回记录（2026-10-31，INIT_MCALL/INIT_NEW/NEW_USER）
+- **遗留（批 2-3 候选）**：INIT_MCALL/NEW_USER 方法与对象链循环形态（opseq replay 同构，白名单一行）；UNSET_CV 已在批 1 白名单；FE_RESET/FE_FETCH 循环形态。
+
+### 批 2-3 尝试与撤回记录（2026-10-31，INIT_MCALL/INIT_NEW/NEW_USER）
 
 - **尝试**：osr_body_ok 加方法调用/对象链三 op（opseq replay 同构，fail=exception 论证同批 2-2a）——**c1 方法调用循环编译+执行全对**，c2（new+prop+COPY 组合）**段错误**；
 - **根因定位（三态实验矩阵）**：
@@ -188,104 +190,87 @@ OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85m
 - **测试6 前提勘误（原设计双重失效）**：原"~main try-loop OSR fold raise"不成立——~main `n_ex>0` 在 silent 门前拒 OSR（无 reject 日志）、`new`-invoked ctor 无解释器热门（编译只靠 enclosing jit_compile_callees）。重构为：`t3($b)` 单次 10020 长循环（**OSR 阈值 10000 backedge > 调用阈值 127——短循环多调用永远先函数级编译够不到 OSR**）+ 永不执行 new 站点拖住 defer_ic 急切 + `tw3` 暖机 ctor entry（OSR 编译不走 jit_compile_callees）→ **`fold new-ctor NC3 [osr]` 与 `[fn]` 双触发**，raise 走 ok==0 半成品路。
 - **实测**：**243/243**、JIT=0/1 逐字 identical；probe 背靠背 A/B min-of-5：fn-ctor **556.0→475.2（-14.5%）**，fn-mcall/fn-new 持平（emit 零回归）；bench object A/B 持平带内（BASE min30.9 vs FIX min30.8，当轮噪声期 spread 12-17%）；当轮 harness 绝对值普涨 20-60% = 环境噪声，跨轮不可比。详 memory/2026-11-03.md 批2-8 收口节。
 
-### 3.1 触发：back-edge 计数（解释器侧）
+## 8. A7 正刀规格：foreach（FE 形态）OSR 支持（2026-11-14 立项，规格稿待批）
 
-- 判定点：`op_jmp` 中 `target <= pc`（向后跳 = back-edge；JMPZ/JMPNZ 向后跳在 JIT 侧是 trap_fail 形态，不做计数点）；
-- 计数器：**`TOp.ic` 槽复用**（JMP 类 op 无 DimIC 占用，无冲突），**per-site** 三态编码（落地版，替代原"每函数最热 1 循环"设计——见 §3.2）：
-  `0..THRESHOLD-1` = 计数器；bit63 tag = 该位点 OSR chunk 入口（用户态代码指针 bit63 恒 0）；`UINTPTR_MAX` = 熔断；
-- **阈值**：`TPHP_JIT_OSR_THRESHOLD`，默认 **10000**（back-edge 次）——保守，理由：OSR 编译一次 ~10-85ms 塞进循环中间，阈值过低对短命循环纯亏（`n_ops × 编译成本/迭代收益` 盈亏平衡约 1e4 量级迭代）；函数级阈值 127 不适用（back-edge 每迭代一次）；
-- 成本：每 back-edge `load ++ cmp store` ≈ 1-2ns，占 dispatch 基线（67ns/轮）<3%；
-- **不递归计数**：内层循环 back-edge 只计内层；嵌套循环外层循环体内含内层 back-edge 跳转不误触（JMP 目标判定天然按 site 归属）。
+> 来源：11-14 A3 剖面收口升格 P0（backlog §2 A7 行）——A4 computed-goto 数据否决后 M2 冲线最大剩余单项（−3~4%）。本节 extends 批 2-2 遗留清单的 "FE_RESET/FE_FETCH 循环形态"。
+> 勘误（防混账）：11-14 A3 记账口径 "foreach+if/else 体 OSR 'not single backedge' 拒"——该字样实出自 `preguard_scan`（jit.c:3473，type-spec 外提/特化判据域）的扫描，**OSR 准入本身无单回边要求**（per-site 线性区间近似，§3.2 天然容忍多 back-edge site：continue 即独立 site，各自计数/编译）。foreach 循环的真实 OSR 拒因 = `osr_body_ok` 无 FE op（`[jit] osr reject: op=FE_FETCH`）。
 
-### 3.2 编译单元：单自然循环（v1 范围）
+### 8.1 病灶与目标
 
-- 循环识别（编译期，静态）：header = back-edge 目标 pc；循环体 = header → back-edge 的可达 op 区间（v1 用**线性区间近似**：`[header, back_edge_pc]` 内、且跳转目标不落在区间外的 op——多出口循环的额外出口视为 exit）；
-- **per-site 独立编译**（落地版，替代原"每函数最热 1 循环"）：每个 back-edge site 的 `TOp.ic` 自行计数/存自己的 chunk 入口（bit63 tag）/自行熔断。原设计（`TFunc` 增 `osr_entry/osr_header/osr_exit` 字段、每函数只编最热 1 循环）**已废弃**——实测踩坑：函数级入口被同函数第二个热循环复用，A 循环的 chunk 读 B 循环的槽，cond 常假立即返回 A 的出口 pc，A/B 间 ping-pong（4000 万圈，值全对但 B 永远到不了）；per-site 后每个循环独立计数独立编译，`TFunc` 零新增字段；
-- 白名单：循环体 op 集 = ir-jit §6 白名单 + P0 系列已落地扩展（IC 内联链 / prop 回放 / CONCAT helper 等，与函数级 eligibility **共用同一判定函数**，传 pc 区间参数）。批 1 白名单见 §7 批 1 落地记录。
+- `osr_body_ok`（jit.c:6286）白名单无 FE → foreach 循环 OSR 永拒 → "少次调用大函数"（n_ops>96 且调用 <127，函数级两路够不着）的 foreach 主循环全程解释器；
+- real-logstat 实锤（tools/real/logstat.php）：`logstat()` n_ops=176（不 eager）+ bench 调用 1-5 次（不 hot）+ foreach 主循环（不 OSR）→ 三路全堵，CI 2.14×；
+- 目标 = logstat 类 CLI 工具脚本循环体 JIT 化。 exploding 段已平（刀7），剩余大头 = kv RMW 段（`$counts[$ip] = $counts[$ip]+1`，FETCH_DIM_R+ADD+ASSIGN_DIM 三 op 154ns vs PHP 53ns）。
 
-### 3.3 OSR entry ABI
+### 8.2 foreach 形态分析（compile.c:2471-2496 S_FOREACH）
 
-```c
-/* OSR 版循环体；slots = 解释器当前帧（零拷贝，直读直写）。
- * 返回值 = resume pc（解释器应从该 op 继续）：正常 exit = 出口 op 的 pc；
- * deopt/fail 点 = 失败 op 自己的 pc（解释器重跑该 op，批 1 白名单幂等）。 */
-typedef int (*OsrEntry)(VM *vm, TVal *slots);
-```
+````
+FE_RESET arr → itmp            ← 循环外（OSR 区域外，留解释器）
+CONST 0 → ctmp                 ← 游标初始化
+Lstart（= FE_FETCH pc）:
+  FE_FETCH itmp, ctmp → htmp   ← header = back-edge 目标（jback patch 到 Lstart）
+  JMPZ htmp → Lend             ← 出口判定（osr_collect_exits 收集为 exit）
+  COPY ctmp+1 → val CV         ← 值绑定
+  [COPY ctmp+2 → key CV]       ← 键绑定（可选）
+  ... body ...                 ← break = 正向跳 Lend（exit）；continue = 回跳 header（独立 back-edge site）
+  JMP → Lstart                 ← back-edge（触发点，vm.c:585）
+Lend:
+````
 
-- IR 结构：`START → PARAM(vm=1/slots=2) → emit_seq(header, stops=exits)`——与函数级唯一区别：**入口 pc = header**、prologue 不做任何槽初始化（解释器帧现成）；所有 fail/deopt 点 `ir_RETURN(ir_CONST_I32(cur_pc))`（OSR_RET_PC 宏，函数级同点位返 0）；
-- **终端 END 收尾（落地时踩坑）**：`emit_seq` 命中 stop 返回 `TR_END(end, target)`——TR_END 仅 OSR 出现（函数级 stops=NULL 永远 TR_RET/FAIL/LOOPBACK），出口块必须 `ir_BEGIN(t.end) + ir_RETURN(t.target)` 终止，否则 codegen 落出代码缓冲（实测：垃圾 resume_pc → VM 跳飞挂死；ir_check 不查尾块 terminator）；
-- 循环回边：现有 `trap_lb` 机制原样复用；
-- **JIT→JIT 调用**（循环体内 do_fcall 直调 callee）：direct-slot 机制原样复用（callee slots 为 ALLOCA，与帧 slots 无关）——调用语义零新增；
-- code 管理：**per-site 挂 back-edge op 的 `TOp.ic`**（bit63 tag，一次写全局只读；线程模型同 §10 ir-jit）。
+关键结构事实：
 
-### 3.4 exit 与 deopt（复用 P0-12）
+1. **header 恰为 FE_FETCH pc**。函数级 FE_FETCH 守卫（jit.c:5557 `loop_sp==1 && loop_hdr[0]==pc`）在 OSR 入口**自动成立**：emit_seq 对入口 pc 先压循环上下文（jit.c:4124-4285：`is_backedge_target(header)` → push，`loop_hdr[0]=pc`）再派发 op → 守卫通过 → 走既有 `lower_replay` 单 op pad——**emit 侧零新代码**；
+2. **FE_RESET 恒在 header 之前（区域外）**——不进白名单；OSR 区域内出现 FE_RESET 即嵌套形态 → 走既有挡板拒编（批5 嵌套 loop×FE 同款，jit.c:5557 守卫 `loop_sp!=0` fail）；
+3. 白名单静态守卫：osr_body_ok 放行 FE_FETCH 时加 `i == header` 位置约束（FE_FETCH 必须是 chunk header 自身——与函数级 "FE_FETCH 必为自身循环头" 形态对齐，白名单自洽、fail-fast）。
 
-- **正常 exit**：循环条件不成立走主 exit path → `*resume_pc = osr_exit` → 解释器从循环后继续（循环体内已写的 slots 就是解释器状态——同布局免恢复）；
-- **deopt**：体内 helper fail / IC 链 miss 回退 / raise 不可能（封闭世界）——fail 点的**解释器 pc = 编译期已知**（emit 时记 op→pc 映射，helper 返回路径携带）→ 解释器从该 pc 重跑该 op（op 幂等性由现有 deopt 语义保证，P0-12 已验证同款）；
-- **协程/异常**：封闭世界无挂起点、无 raise——与函数级 JIT 同结论，无新增面。
+### 8.3 语义安全论证
 
-### 3.5 编译停顿治理
+1. **FE_FETCH 单 op pad 的 fail=exception 论证**（批 2-2a 同款）：`tphp_jit_opseq` 返 0 恒=exception（vm.c setjmp 唯一出口）→ 异常传播不重跑 → **游标推进副作用（`cur->u.i = i+1`，vm.c:921）无 deopt 双推进面**。数组路径零 raise = infallible；pad 无守卫分支 → 非 exception 的 resume 路径不存在；
+2. **Generator 分支**（foreach over Generator，vm.c:884-901）：`tphp_generator_fe_fetch` 可挂起——挂起冻结整段 C 栈（含 pad 帧），恢复后 pad 返回 IR 续跑，与批 2-2 bcall 挂起同机制；可 raise（误用已耗尽生成器等）→ opseq deopt 门 → unwind 不重跑。生成器函数本体仍拒（`is_generator` 既有门）；
+3. **状态全在帧槽**：itmp/ctmp/val(ctmp+1)/key(ctmp+2)/htmp 全为 VMFrame 槽（§2 零拷贝红利）→ OSR entry 直读直写；OSR entry 时刻游标已推进（解释器语义），chunk 从 FE_FETCH 起继续取下元素——续跑语义精确；f0 opseq 自框化保证 pad 拿对帧（OSR 场景 `frame->fn==fn && frame->slots==slots` → 零成本跳过）；
+4. **写者分析就位**：`jit_scan_slot_writers` 已显式处理 FE_FETCH 隐写（jit.c:6138-6143：SLOT_MARK(a2+1)/(a2+2)，ar=bool、a2 游标恒标量）；
+5. **exit/resume 语义**：JMPZ false → TR_END(Lend) → resume=Lend 解释器续跑；break 正向跳同款；continue site 与尾 JMP site 各自独立 chunk 共存（同 header），continue chunk 只加速 continue 快路迭代、其余路径 exit 回解释器（线性区间近似既定语义）。
 
-OSR 编译同步塞在循环中间（解释器循环跑到 1 万次时停 10-85ms）。v1 治理：
+### 8.4 实施批次
 
-1. **保守阈值 10000**（§3.1）；
-2. `n_ops ≤ 96`（急切编译同款上限，超限不编——大循环体编译成本失控风险）；
-3. **P2-13 异步编译**（后台线程，ir-jit §12.3 / jsc-lessons §5）作为批 3 联动项——v1 同步编译 + 保守阈值兜底；
-4. 编译失败熔断：`TOp.ic = UINTPTR_MAX` 永不再试（同函数级 `hot=UINT16_MAX` 语义）。
+| 批 | 内容 | 改动 | 验收 |
+|---|---|---|---|
+| A7-1 | **FE_FETCH 放行**（foreach 形态 OSR 化） | `osr_body_ok` +1 op（+ `i==header` 守卫）；emit 零新代码（复用 jit.c:5549 case） | `test-osr-006` 六场景三方对拍（PHP 8.5 / JIT=0 / JIT=1）全绿；osr ir_check=1；247 基线零回退；阈值关断对照证实 chunk 真执行 |
+| A7-2 | **ISSET_DIM + ASSIGN_DIM 放行**（logstat 主循环完整形态） | ISSET_DIM：函数级已 pad 化（批4，jit.c:5565）+ 纯读幂等（deopt 重跑安全）→ 白名单一行；ASSIGN_DIM：函数级已原生发射（P0-10，jit.c:4351 append 快线 + 慢路完整兜底）+ 形态守卫既有（jit.c:772-782）→ 白名单一行（emit 复用；fail=exception 论证同批 2-2a） | real-logstat OSR 化 DEBUG 实锤（osr compile 次数）；bench-vs-php logstat ratio 收窄记账（本地 min-of-6 + 首轮 CI 数据为准） |
 
-### 3.6 与函数级 JIT 的协同
+**A7-1 测试矩阵（test-osr-006）**：c1 packed foreach（val only）体 int 算术+INC——基础 chunk；c2 hash foreach（key=>val）体字符串键——COPY val/key 双绑定；c3 continue + break 混合体——多 back-edge per-site 双 chunk + exit（A3 挂账形态）；c4 体含调用（builtin explode/intval + 用户函数）——批 2-2 机制复用；c5 foreach over Generator——挂起/耗尽/误用 raise；c6 嵌套面——foreach in while（内层独立 chunk）+ foreach in foreach（外层拒内层编）+ 体调用 mid-loop raise（unwind 不重跑，元素计数对拍防双推进）。
 
-函数已 JIT'd（jit_entry 有值）→ 解释器不执行其循环 → back-edge 计数不增长（触发点在解释器 handler 内，天然互斥）；OSR 版函数不设函数级 jit_entry（两者独立、可共存）。
+### 8.5 性能验证与判读纪律
 
-## 4. 实施批次
+- **chunk 实益量化**：DEBUG 实锤 osr compile 次数 + `TPHP_JIT_OSR_THRESHOLD` 关断对照（阈值调大 → 解释器）——批 2-3 重验同款方法（防"只编译不进入"假绿）；
+- **logstat 判读**：A7-2 后 explode 段已平（刀7）、收益主体 = 主循环三段（kv RMW / intval 调用 / 字符串切分）进 JIT 形态；**首轮 CI 数据为准，本地 bench-rounds min-of-6 抑抖；对照旧产物是判回归的唯一可信法**（11-14 时段噪声教训）；
+- **停顿治理沿用 §3.5**：阈值 10000 + chunk 区域 n_ops≤96（logstat 主循环体 ~20 ops ✓——176 是全函数数，chunk 只编循环体）+ 编译失败熔断。
 
-| 批 | 内容 | 验收 |
-|---|---|---|
-| 批 1 ✅ | back-edge 计数基建 + 单循环 OSR（int 域封闭子集，白名单见 §7） | ✅ 2026-10-31：`tests/jit/test-osr-001.php` 6 用例（for/while/break+continue/INC/嵌套/while+if）TPHP_JIT=0/1 对拍全对；234/234；20M 迭代 int 循环 **2.6-2.8×**（2140→803ms） |
-| 批 2-1 ✅ | 循环体白名单加 **FETCH_DIM_R**（读操作幂等，deopt 重跑安全；形态守卫对齐函数级 eligibility） | ✅ 2026-10-31：`test-osr-002.php`（kv 双循环嵌套 dim/packed 直取/tmp 键）+ `test-osr-003.php`（undefined key/non-array/packed overrun 的 raise→deopt→解释器重跑边界，n_ex>0 拒编路径）对拍全对；**236/236**；顶层 kv 形态 195→**58ms（3.4×）**；归因修正见 §7 |
-| 批 2 | 循环体白名单扩到 IC 内联链（FETCH_DIM_R）/prop 回放/do_fcall 直调 | bench-vs-php **kv-read / array-read / real-logstat 进 JIT 形态**（今天全是解释器）；敏感簇数字 |
-| 批 3 | 多循环表 + P2-13 异步编译联动 + 阈值自调 | 编译停顿 <1ms 体感；M3 组合收官（多循环已随 per-site 落地，批 3 余异步编译+阈值自调） |
-
-## 5. 测试与验收（M3 判据）
-
-- `tests/jit/test-osr-*.php`：①正确性——单层/嵌套循环、循环内 break/continue、循环变量 int 溢出提升、循环体含调用、TPHP_JIT=0/1 对拍；②触发——计数精确性（差一次不触发）；③熔断——失败循环不反复编译；④deopt——循环中 deopt 后解释器续跑结果正确（含 deopt 后循环退出继续函数尾）；
-- 性能：`tools/perf-compare.ps1` 对比表——批 2 目标 kv-read / array-read 相对今天（恒解释器形态）显著下降；M3 = 敏感簇 ≤1.0×（与 P0-13/P0-14 合力）。
-
-## 6. 风险与不做清单（防翻案）
+### 8.6 防翻案/不做清单
 
 | 项 | 决策 |
 |---|---|
-| 多态/投机类型（JSC DFG 式 speculation） | **不做**——tphp 是 baseline 档，白名单静态封闭；类型投机属 P0-17③ 类型特化，另立项 |
-| OSR exit 的反向（JIT→解释器逐 op 精确恢复中间状态） | v1 只需 resume_pc + slots 同布局；不做 DFGOSRExit 921 行级逐 slot 物化（tphp 无需） |
-| 循环体含 raise/generator/（历史）FFI | 不做——封闭世界白名单排除，同 ir-jit §13 |
-| 编译停顿 | v1 同步 + 阈值 10000 + n_ops≤96；异步化归 P2-13 批 3 |
-| on-stack 值替换/逃逸分析 | P0-9/P0-17② 域，不混入 |
+| FE_RESET 进 OSR 白名单 | 不做——恒在区域外；区域内出现即嵌套形态，走既有挡板拒编 |
+| foreach in foreach 的外层 chunk | 不做——外层拒（挡板）、内层独立 chunk 编（与函数级行为一致） |
+| preguard/type-spec 对 foreach 特化 | 不做——spec_scan 批4a 明确 FE/foreach 不特化（原样）；foreach 循环 preguard nc=0 自动跳过 |
+| FE_FETCH 原生 IR 发射（替代 pad） | 不做 v2 候选——pad 黑盒已保语义零漂移；原生发射引入游标写点新面，收益待 A7-2 后 profile 再议 |
+| 生成器函数本体 OSR | 不做——`is_generator` 既有拒门不动 |
+| `pre_op_writes` 补 FE_FETCH 写点 | 不需要——该函数仅服务 preguard_scan（type-spec 域），foreach 恒 nc=0 |
 
-## 7. 批 1 落地记录（2026-10-31）
+### 8.7 A7 批次执行记录（2026-11-14 落地，规格稿批准后实施）
 
-- **白名单**（`osr_body_ok`，比规格 §4 批 1 行更宽但仍封闭）：CONST/COPY/ASSIGN/ADD/SUB/MUL/NEG/POS/INC/DEC/BW_*/SHL/SHR/BOOL_*/CAST/EQ/NE/SEQ/SNE/LT/LE/CMP/ISSET_CV/UNSET_CV/JMP/JMPZ/JMPNZ；CALL/DIM/ARRAY/RETURN/FE/EXTRACT 一律拒；
-- **拒编形态实测**：循环体内 `break` → loop-cond 处理器"body must back-edge or fail"→ 熔断回解释器（test-osr-001 case 3 走此路，值正确）；`while(1)` 无条件回边 → TR_LOOPBACK 顶层冒泡拒编；
-- **两个落地 bug**（均为首次运行暴露、已修）：
-  1. 终端 END 块无 terminator（§3.3）→ 垃圾 resume_pc → VM 跳飞挂死；
-  2. 函数级 osr_entry 复用 → 跨循环 ping-pong（§3.2）→ 改 per-site `TOp.ic` bit63 tag 编码；
-- **门槛**：`is_main` 允许（OSR 不走函数入口 ABI，顶层循环正是核心场景）；仍拒 is_global 别名槽/variadic/generator/异常表/n_cap>0/typed params；
-- **触发链**：`op_jmp`（`ar <= cur`）→ `tphp_osr_backedge`（计数→编译→bit63 tag 直进）→ `tphp_jit_compile_osr` 返回 entry（NULL 即熔断）。
+**落地内容**：A7-1 = `osr_body_ok` 放行 OP_FE_FETCH（`i==header` 位置守卫，emit 零新代码）；A7-2 = 放行 OP_ISSET_DIM（零守卫，批 4 pad 幂等读）+ OP_ASSIGN_DIM（形态守卫对齐 jit.c:772-782；emit 无 deopt 路径——append/keyed 快线 miss 走 emit_assign_dim_slow 完整兜底而非重跑，写恰一次）。test-osr-006（8 场景）三方对拍（JIT=0/JIT=1/PHP 8.5.1，基线按用户拍板从 dev 8.6 切 stable 8.5 后复核逐字节一致）全等 ×3 稳定；osr 002-005 零漂移；全量回归见 11-14 记账。
 
-### 批 2-1 落地记录（2026-10-31，FETCH_DIM_R）
+**chunk 实锤**：test-osr-006 编 9 chunk（main 7 位点 + osr6_c6loop 1 + c3 尾 site 含批C slice-1 MERGE_N 多回边汇合）；real-logstat `osr compile(logstat) header=11 size=26056`——主 foreach（isset/ASSIGN_DIM/explode/intval/||/continue）整块编译，输出三方全等。
 
-- **改动最小化**：仅 `osr_body_ok` 加 `OP_FETCH_DIM_R`（+ t2≠OPD_UNUSED 形态守卫对齐函数级 eligibility）——emit 复用 emit_seq 的函数级 case（packed 直取 + DimIC 链全内联），零新 emit 代码；
-- **语义安全论证**：读操作幂等（deopt 重跑安全）；helper raise_guarded 不穿 IR（P0-12），异常由解释器重跑该 op 时抛出，无重复副作用；IC 懒分配 emit 期单次（触发线程即执行线程，同步编译无并发执行）；dimic_take 先 addref 后 release，重跑时 dst 旧值同源，引用计数自平衡；
-- **n_ex 门槛注意**：main/函数里**任何 try/catch → n_ex>0 → 整函数拒编**（既有保守门）——test-osr-003 即走此路（拒编安全回退 + 异常语义对拍）。批 2 后续如要"循环体内 try + 循环体白名单内"形态，需 per-loop 异常区间检查，暂不立项；
-- **归因修正（批 C 定性更正，不影响当时决策）**：bench 闭包形态（kv-read/array-read）**在批 1 前已被函数级急切编译**（闭包 n_ops≤96），循环在函数级 JIT 里执行；批 C 的 avg_scan=4.48 插桩来自 **IC 链 miss → v1 helper 内部的 tarr_get_ic**，非纯解释器执行。因此 harness 的 kv-read 4.2×（195→46）非 OSR 增量（批 C 时已 ~47ms）；**OSR 批 2-1 的真实增量场景 = main 顶层循环 / n_ops>96 大函数内的循环**（函数级够不着的形态）：顶层 kv 形态 195→**58ms（3.4×）**，DEBUG 实锤 0 次函数级 compile、纯 OSR 贡献；
-- **real-logstat harness 顺序效应（与 OSR 无关，记录）**：完整 harness JIT=1 下 real-logstat 82-95ms vs JIT=0 43-54ms；但单跑该形态 64 vs 66ms 零回退，且 harness 全程 0 次 osr compile——归因前序项函数级 JIT 化后的内存/缓存状态连带 + 本机噪声（±10-20%）。验收以单项形态为准，CI（perf.yml）机器态干净待复核。
+**性能判读**（min-of-6 交替，bench-vs-php real-logstat 段）：JIT=1 29.6-29.9ms vs JIT=0 33.4ms → **−3.5~−3.8ms（−10.5%）**，六对全向一致——§8.1 目标（logstat 三路全堵 → OSR 化）命中。阈值关断对照未做临时编辑：logstat() n_ops>96 单次调用，函数级两路够不着 → JIT=1/0 差值逻辑上只能来自 OSR chunk（隔离成立）。
 
-### 批 2-2 落地记录（2026-10-31，折叠 CALL 序 + prop ops）
+**规格修正与过程发现**（§8.4 测试矩阵 vs 实况）：
 
-- **语义前提（关键论证）**：`tphp_jit_opseq` 返 0 **恒等于 exception**（vm.c setjmp 唯一出口，prop handler/builtin 错误全走 raise）→ 异常传播不重跑，prop 单 op pad（lower_replay）的 deopt resume=cur_pc 恒安全；
-- **折叠 CALL 的 resume 语义**：直调 guard fail（entry NULL / INT 契约 / callee deopt 未执行 / call_dyn ok=0）发生时 **INIT..SEND..DO 序未完整执行**——单独重跑 DO 语义断裂（args 栈/rec 缺 INIT）→ 新宏 `OSR_SEQ_PC(j)`（osr ? p_seq_pc : 0）：**从序起点重跑整序幂等**（SEND_VAL/SEND_VAR 源恒为槽；args 表达式在 seq 之外求值，不在重跑范围）；函数级=0 行为不变。**INIT_FCALL/INIT_DYN emit case 补设 `j->p_seq_pc`**（此前只有 INIT_NEW/INIT_MCALL 设——函数级不需要，OSR 需要）；
-- **坑 1（c4 段错误实锤）**：OSR 编译路径漏分配 `j.r_call_slots`——B 直调链读它得 ref 0 → **ir_check=0 照常出码 → 崩**（P0-13"ir_check 不 gate"铁律再犯；O0 下 ir_jit_compile 返 NULL 熔断反而安全）。修复 = OSR 路径补 ALLOCA（函数级 2384 行同款）；
-- **坑 2（测试构造）**：main 含任何 try/catch → n_ex>0 → main 全部循环拒 OSR（批 1 静态守卫）——异常传播 case 用"循环函数无 try + 顶层壳函数 catch"构造；osr_body_ok 补拒因日志（`[jit] osr reject: pc=N op=X`，对齐 eligibility 审计模式）；
-- **白名单**：osr_body_ok +9 op——prop 四 op（FETCH/ASSIGN/ISSET/UNSET_PROP）+ INIT_FCALL（用户 callee 递归准入/builtin ic|1）/SEND_VAL/SEND_VAR（const 源限标量串）/DO_FCALL/INIT_DYN；
-- **实测**：test-osr-004.php 6 场景三方一致（PHP 8.5 / JIT=0 / JIT=1）——c1 用户直调、c2 builtin、c3 prop 读写、c4 动态调用（捕获闭包→call_dyn trampoline）、c5 callee mid-loop raise（raises=1 证明无 deopt 重放）、c6 表达式实参；5 个 OSR chunk 全编译（header=2/23/47/78/124，ir_check 全 1）；**238/238**、bench all-ok；
-- **性能**：OSR×CALL 基准（main 顶层 20M 次调用 b1($i&255)，OSR 独占场景）3720→**1650ms（2.25×）**，PHP 8.5 JIT 1010ms（0.61×）；
-- **遗留（批 2-3 候选）**：INIT_MCALL/NEW_USER 方法与对象链循环形态（opseq replay 同构，白名单一行）；UNSET_CV 已在批 1 白名单；FE_RESET/FE_FETCH 循环形态。
+1. **jit_cfg_ok 是整函数静默门**（jit.c:646-661，>16 个不同回边头 → 该函数全部 OSR 拒）：test-osr-006 首稿 main 恰 17 头 → 所有 chunk 全灭（零 debug 行），二分（前缀逐段加）定位；c6a 复用 $arr1 省一 fill 头回 16。**测试/真实脚本过 16 个循环头即 OSR 全盲**——现状护栏，未扩容（记 backlog 刀候选）。
+2. **break-in-loop 两级全拒**（既有，非 OSR 特有）：emit_seq loop-cond 收尾只认 LOOPBACK 尾（jit.c:5828 "body must back-edge or fail"），体中 break 的前向 JMP → TR_END → 拒；函数级最小实证同拒（for+break 小函数 FAILED emit trap=3 L5828）。c3 改 continue-only，break 面留解释器（值仍对）。**循环体 break 是整个 JIT 的既有空白**，backlog 刀候选。
+3. **刀5C 嵌套调用 OSR 拒（设计内）**：`osr6_fn(intval($v))` 形态 OSR 必拒（jit.c:5688，门①仅函数级）→ c4 改独立序（`$x=intval($v); $s4+=osr6_fn($x);` 两语句）编 chunk 成功。
+4. **continue-site chunk 拒、trailing-site chunk 编**：if-continue 分支终端经 lb_push 转 TR_RET 后，合流走到 join（越过 backedge 落 exit stop）→ loop-cond 体以 TR_END 收尾 → L5828 拒；trailing site 的体尾是 back-edge → MERGE_N 正常编。c3 得单 chunk（continue-site 熔断回解释器，值全对）。emit 机制空白，backlog 刀候选。
+5. **eager 门 96 恰边界**：osr6_c6loop 首稿恰 96 ops = `n_ops<=96` 急切门边界 → 首调函数级编译吞掉循环 → OSR 零触发（raise 面假死）；填充至 98 ops 后正确走 OSR。**凡想保 OSR 路径的循环函数必须 n_ops>96**。
+
+**新发现刀候选（A7 范围外，backlog 已记）**：bench real-jsonagg（2000×5 恰 10000 回边）A7-2 后新编 29.5KB chunk 于**最后一条回边**触发 → 零迭代运行、纯编译成本 ≈+4ms（段内 +48%）；同形状拉长 50 轮（10 万边）**−7.4ms（−10.8%）**证 chunk 本体赢 → 属**阈值×单发摊销面**（刀18 单发测量同族），非 chunk 质量问题。净 bench（logstat −3.5 + jsonagg +4.0 ≈ 持平）说明"−3~4%"预测只覆盖 logstat 单段；阈值政策不动（§8.6），恰阈值单发形状的触发政策为独立刀。
+
