@@ -255,11 +255,11 @@ hello/
   "name": "acme/hello", "version": "0.1.0",
   "type": "ext",                          // 必填，安装时强校验（双段名，单段拒）
   "ext": {
-    "sources": "src",                     // 必填：目录/目录数组，递归仅 *.c，排除 build/，禁 ..
+    "sources": "src",                     // 必填：目录/目录数组，递归收 *.c/*.m，排除 build/，禁 ..
     "include": ["include/"],              // 包内 -I
     "defines": ["FOO=1"], "cflags": [], "libs": [], "ldflags": [],
-    "os": { "windows": { "libs": ["ws2_32"] },   // 与默认数组 append（先默认后 os）
-            "linux":   { "libs": ["m", "pthread"] } },
+    "os": { "windows": { "libs": ["ws2_32"], "sources": ["backend/win32"] },  // 与默认数组 append（先默认后 os）
+            "linux":   { "libs": ["m", "pthread"] } },                         // os.sources = 分平台追加源目录
     "tphp_abi": "0.0.2",                  // 与 tphp -v 比对，不匹配拒编（缺则 warning）
     "init": "tphp_ext_acme_hello_init"    // 链入后调用；缺省用约定名 tphp_ext_<v>_<p>_init
   }
@@ -267,6 +267,7 @@ hello/
 ```
 
 **禁写** `autoload` / PHP `deps` / `scripts`（直接 error）。`cflags/ldflags` 复杂条件用 C 内 `#ifdef`，`os` 只管命令行。
+`os.<平台>.sources`：只扫当前平台那份（其它平台目录缺失也不报错）——窗口后端这类「各平台编不同文件」的场景用它（实例：tui 包 win32/x11/cocoa 三选一；`.m` ObjC 源同规则收集，`-fobjc-arc` 放 `os.darwin.cflags`）。
 
 ## 5. 链入、换像与命令（2026-11-12 拍板）
 

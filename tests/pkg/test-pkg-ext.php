@@ -3,6 +3,7 @@
 // EXPECT: badtype-rej-ok
 // EXPECT: single-rej-ok
 // EXPECT: add-ok
+// EXPECT: ossources-ok
 // EXPECT: writeback-ok
 // EXPECT: nonproj-ok
 // EXPECT: rownp=tst/extcmd|y|y|-
@@ -61,10 +62,17 @@ foreach ([$src, $bad, $single, $app, $noproj, $exttst] as $d)
     if (file_exists($d)) ext_rm9($d);
 
 // --- 源 1：合法 ext 包 tst/extcmd（§2 契约） ---
+// os.<平台>.sources（§2.2，2026-11-14）双向锁定：
+//   正向：init 引用 tphp_ext_tst_extcmd_extra，符号只在「当前平台」源目录里
+//         → 没扫 os[当前].sources 就链接失败（add-FAIL）
+//   反向：各平台文件带 foreign #error → 误编外平台目录即编译失败（add-FAIL）
 // 注意：tphp mkdir 忽略第 3 参 recursive（记档缺口），逐层创建
 mkdir($src, 0777, true);
 mkdir($src . "/src", 0777, true);
 mkdir($src . "/include", 0777, true);
+mkdir($src . "/wsrc", 0777, true);
+mkdir($src . "/lsrc", 0777, true);
+mkdir($src . "/dsrc", 0777, true);
 file_put_contents($src . "/mod.json", json_encode([
     "name" => "tst/extcmd",
     "version" => "0.1.0",
@@ -72,12 +80,27 @@ file_put_contents($src . "/mod.json", json_encode([
     "ext" => [
         "sources" => "src",
         "include" => ["include/"],
+        "os" => [
+            "windows" => ["sources" => ["wsrc"]],
+            "linux" => ["sources" => ["lsrc"]],
+            "darwin" => ["sources" => ["dsrc"]],
+        ],
         "tphp_abi" => "0.0.2",
         "init" => "tphp_ext_tst_extcmd_init",
     ],
 ]));
 file_put_contents($src . "/src/extcmd.c",
-    "void tphp_ext_tst_extcmd_init(void) {}\n");
+    "void tphp_ext_tst_extcmd_extra(void);\n"
+    . "void tphp_ext_tst_extcmd_init(void) { tphp_ext_tst_extcmd_extra(); }\n");
+file_put_contents($src . "/wsrc/wextra.c",
+    "#ifndef _WIN32\n#error \"wsrc must only be scanned on windows\"\n#endif\n"
+    . "void tphp_ext_tst_extcmd_extra(void) {}\n");
+file_put_contents($src . "/lsrc/lextra.c",
+    "#if defined(_WIN32) || defined(__APPLE__)\n#error \"lsrc must only be scanned on linux\"\n#endif\n"
+    . "void tphp_ext_tst_extcmd_extra(void) {}\n");
+file_put_contents($src . "/dsrc/dextra.c",
+    "#ifndef __APPLE__\n#error \"dsrc must only be scanned on darwin\"\n#endif\n"
+    . "void tphp_ext_tst_extcmd_extra(void) {}\n");
 echo "src-ok\n";
 
 // --- 源 2：type=app → 拒（§2.1 type 必须 ext）；源 3：单段名拒 ---
@@ -111,6 +134,9 @@ $addok = true;
 try { pkg_ext_add($app, $src); }
 catch (Throwable $e) { echo "add-ex: ", $e->getMessage(), "\n"; $addok = false; }
 echo $addok ? "add-ok\n" : "add-FAIL\n";
+// add 成功即证明：os[当前].sources 被扫描编译（extra 符号链接成功）且
+// 外平台目录未被编译（foreign #error 未触发）
+echo $addok ? "ossources-ok\n" : "ossources-FAIL\n";
 
 $am = json_decode(file_get_contents($app . "/mod.json"), true);
 // 逐级守卫（3 维 isset 中间键缺失会 raise = tphp 缺口，记档待拍板）

@@ -11,7 +11,7 @@ CI artifact 导出 **tphp + libtphp.a + include/ + tcc/**，目的是：用户�
 
 | | PHP 包（`deps` / `vendor/`） | **C 扩展（`ext[]` / 运行时旁 `ext/`）** |
 |---|---|---|
-| 内容 | PHP 源码 + autoload | **仅 C**（`.c` + 头） |
+| 内容 | PHP 源码 + autoload | **仅 C/ObjC**（`.c`/`.m` + 头） |
 | 落盘 | 项目 `vendor/` | **`<tphp_root>/ext/<name>/`**（与 tphp 二进制同级） |
 | 生效 | 运行期 require/autoload | **编译 + 链入当前 tphp 后**才生效 |
 | 命令 | `tphp add/remove/install` | `tphp ext --add/--remove/--update/--list/--relink` |
@@ -57,7 +57,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
   "type": "ext",                   // 必填，load 时强校验
 
   "ext": {
-    "sources": "src",              // 必填：目录（string）或目录数组；递归收集 *.c
+    "sources": "src",              // 必填：目录（string）或目录数组；递归收集 *.c/*.m
     "include": ["include/"],       // 可选：包内 -I
     "defines": ["FOO=1"],          // 可选：-D
     "cflags": [],                  // 可选：默认平台 cflags
@@ -65,7 +65,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
     "ldflags": [],                 // 可选
 
     "os": {                        // 可选：按平台覆盖/追加（§2.2）
-      "windows": { "libs": ["ws2_32"], "cflags": [], "ldflags": [], "cc": null },
+      "windows": { "sources": ["backend/win32"], "libs": ["ws2_32"], "cflags": [], "ldflags": [], "cc": null },
       "linux":   { "libs": ["m", "pthread"] },
       "darwin":  { "ldflags": ["-framework", "CoreFoundation"] }
     },
@@ -83,7 +83,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
 | 规则 | 说明 |
 |---|---|
 | `type` 必须是 `"ext"` | 非 ext → 拒绝当扩展安装 |
-| `sources` 仅目录 + 仅收 `*.c` | 递归；忽略 `.h/.o` 等；**排除 `build/`**；禁 `..`/绝对路径 |
+| `sources` 仅目录 + 收 `*.c`/`*.m` | 递归；忽略 `.h/.o` 等；**排除 `build/`**；禁 `..`/绝对路径 |
 | 禁止 `autoload`、PHP `deps`、`scripts` | 写了 → **error**（尽早暴露误放） |
 | `tphp_abi` | 有则与当前版本比对；无则 warning 放行 |
 | `init` 符号 | 链接后须存在；缺 → 编译失败并提示 |
@@ -92,7 +92,10 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
 ### 2.2 `os` 合并语义
 
 - 键：`windows` | `linux` | `darwin`（mac 两 CI job 同 `darwin`）。
-- **`cflags` / `libs` / `ldflags`：默认数组与平台数组 append（先 default 再 os）**。
+- **`sources` / `cflags` / `libs` / `ldflags`：默认数组与平台数组 append（先 default 再 os）**。
+  `os.<平台>.sources` 为分平台追加源目录（同递归收集规则），典型用途 = 窗口后端
+  这类「同一套清单、各平台编不同文件」的场景（tui：win32/x11/cocoa 三选一）；
+  非当前平台的 `os.<平台>` 目录不扫描、缺失也不报错。
 - `cc`：`os[当前].cc` → 顶层（若有）→ 探测链：`TPHP_EXT_CC` → `<tphp_root>/tcc/tcc(.exe)` → PATH 上 clang → gcc。
 - 未知 os 键 → warning 忽略。
 
@@ -194,7 +197,7 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 
 ```text
 1. 读扩展包 mod.json（type/ext 字段/abi）
-2. 展开 sources 目录 → 递归 *.c（排除 build/）
+2. 展开 sources 目录 + `os[当前].sources` → 递归 *.c/*.m（排除 build/）
 3. 合并 cflags/libs/ldflags（default + os[当前]）
 4. 逐个 .c → <pkg>/build/<base>.o
      cc -c -I<tphp_root>/include -I<pkg>/include… [-D…] [cflags] src.c -o build/base.o
@@ -253,7 +256,7 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 | 1 | 源码根 = **`<tphp_root>/ext/<name>/`** |
 | 2 | 脚手架 = **`tphp new <name> --ext`**（无 `ext --new`） |
 | 3 | 扩展包 **无 `scripts`** |
-| 4 | `sources` = **目录**（仅 `*.c`） |
+| 4 | `sources` = **目录**（`*.c`；2026-11-14 扩展：收 `*.m` + `os.<平台>.sources` 分平台追加，tui 三平台窗口后端实证） |
 | 5 | **`os` 分平台**编译/链接指令；flags **append** 合并 |
 | 6 | **编译链入 + sync + lock 分栏同属第一批** |
 | 7 | 项目内 `--add` **写回** `ext[]`；非项目只装 |

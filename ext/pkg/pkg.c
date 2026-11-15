@@ -256,12 +256,13 @@ typedef struct { char *name; char *url; char *ref; } ModDep;
 /* 扩展编译契约（PLAN/ext-packages.md §2）；os 下标 windows=0 linux=1 darwin=2 */
 enum { EXT_OS_WIN = 0, EXT_OS_LINUX = 1, EXT_OS_DARWIN = 2, EXT_OS_N = 3 };
 typedef struct {
-    char **sources; int n_sources;     /* 必填：目录（string|string[]），仅收 *.c */
+    char **sources; int n_sources;     /* 必填：目录（string|string[]），收 .c 与 .m 源 */
     char **include; int n_include;     /* 包内 -I */
     char **defines; int n_defines;     /* -D */
     char **cflags; int n_cflags;
     char **libs; int n_libs;
     char **ldflags; int n_ldflags;
+    char **os_sources[EXT_OS_N]; int n_os_sources[EXT_OS_N]; /* 分平台追加源目录（§2.2） */
     char **os_cflags[EXT_OS_N]; int n_os_cflags[EXT_OS_N];
     char **os_libs[EXT_OS_N]; int n_os_libs[EXT_OS_N];
     char **os_ldflags[EXT_OS_N]; int n_os_ldflags[EXT_OS_N];
@@ -338,6 +339,7 @@ static void tmod_free(TMod *m) {
         tm_strlist_free(x->libs, x->n_libs);
         tm_strlist_free(x->ldflags, x->n_ldflags);
         for (int i = 0; i < EXT_OS_N; i++) {
+            tm_strlist_free(x->os_sources[i], x->n_os_sources[i]);
             tm_strlist_free(x->os_cflags[i], x->n_os_cflags[i]);
             tm_strlist_free(x->os_libs[i], x->n_os_libs[i]);
             tm_strlist_free(x->os_ldflags[i], x->n_os_ldflags[i]);
@@ -582,6 +584,7 @@ static bool tmod_from_json(TVal v, TMod *m, char *err, size_t errcap) {
                 TVal ovv = oa->data[bk->val_off];
                 if (ovv.t != T_ARR) continue;
                 TArr *oo = (TArr *)ovv.u.p;
+                ext_opt_strlist(oo, "sources", &x->os_sources[idx], &x->n_os_sources[idx]);
                 ext_opt_strlist(oo, "cflags", &x->os_cflags[idx], &x->n_os_cflags[idx]);
                 ext_opt_strlist(oo, "libs", &x->os_libs[idx], &x->n_os_libs[idx]);
                 ext_opt_strlist(oo, "ldflags", &x->os_ldflags[idx], &x->n_os_ldflags[idx]);
@@ -835,15 +838,16 @@ static int tmod_save(const char *path, const TMod *m, char *err, size_t errcap) 
         };
         bool os_any = false;
         for (int oi = 0; oi < EXT_OS_N; oi++)
-            if (x->n_os_cflags[oi] || x->n_os_libs[oi] || x->n_os_ldflags[oi] ||
-                x->os_cc[oi]) os_any = true;
+            if (x->n_os_sources[oi] || x->n_os_cflags[oi] || x->n_os_libs[oi] ||
+                x->n_os_ldflags[oi] || x->os_cc[oi]) os_any = true;
         if (os_any) {
             pb_puts(&b, ",\n    \"os\": {");
             bool firsto = true;
             for (size_t oi = 0; oi < sizeof oss / sizeof oss[0]; oi++) {
                 int idx = oss[oi].idx;
-                if (x->n_os_cflags[idx] == 0 && x->n_os_libs[idx] == 0 &&
-                    x->n_os_ldflags[idx] == 0 && !x->os_cc[idx]) continue;
+                if (x->n_os_sources[idx] == 0 && x->n_os_cflags[idx] == 0 &&
+                    x->n_os_libs[idx] == 0 && x->n_os_ldflags[idx] == 0 &&
+                    !x->os_cc[idx]) continue;
                 pb_puts(&b, firsto ? "\n" : ",\n");
                 firsto = false;
                 pb_puts(&b, "      ");
@@ -851,6 +855,7 @@ static int tmod_save(const char *path, const TMod *m, char *err, size_t errcap) 
                 pb_puts(&b, oss[oi].k);
                 pb_puts(&b, "\": {");
                 struct { const char *k; char **v; int n; } oo2[] = {
+                    { "sources", x->os_sources[idx], x->n_os_sources[idx] },
                     { "cflags", x->os_cflags[idx], x->n_os_cflags[idx] },
                     { "libs", x->os_libs[idx], x->n_os_libs[idx] },
                     { "ldflags", x->os_ldflags[idx], x->n_os_ldflags[idx] },
@@ -4012,7 +4017,7 @@ static bool ext_find_cc(const char *eroot, const TExtSpec *spec,
 #endif
 }
 
-/* 递归收集 *.c（跳过 build/ 与 '.' 开头条目） */
+/* 递归收集源文件 *.c / *.m（跳过 build/ 与 '.' 开头条目；.m = ObjC 后端） */
 static int ext_collect_cs(const char *dir, char ***out, int *n) {
     uv_fs_t req;
     if (uv_fs_scandir(NULL, &req, dir, 0, NULL) < 0) {
@@ -4030,7 +4035,9 @@ static int ext_collect_cs(const char *dir, char ***out, int *n) {
             if (ext_collect_cs(path, out, n) != 0) { rc = -1; break; }
         } else {
             size_t L = strlen(ent.name);
-            if (L > 2 && strcmp(ent.name + L - 2, ".c") == 0)
+            bool is_c = L > 2 && ent.name[L - 2] == '.' && ent.name[L - 1] == 'c';
+            bool is_m = L > 2 && ent.name[L - 2] == '.' && ent.name[L - 1] == 'm';
+            if (is_c || is_m)
                 strlist_push(out, n, path);
         }
     }
@@ -4128,17 +4135,22 @@ static int ext_compile_pkg(const char *eroot, const char *pkgdir,
 
     char **cs = NULL;
     int ncs = 0;
-    for (int i = 0; i < x->n_sources; i++) {
+    /* 公共 sources + os[当前].sources 追加（§2.2 append 语义，如分平台窗口后端） */
+    int os = ext_current_os();
+    int n_dirs = x->n_sources + x->n_os_sources[os];
+    for (int i = 0; i < n_dirs; i++) {
+        const char *rel = i < x->n_sources
+            ? x->sources[i] : x->os_sources[os][i - x->n_sources];
         char sdir[1500];
-        snprintf(sdir, sizeof sdir, "%s/%s", pkgdir, x->sources[i]);
+        snprintf(sdir, sizeof sdir, "%s/%s", pkgdir, rel);
         if (!fs_isdir(sdir)) {
             set_err(err, errcap, "%s: sources dir not found: %s",
-                    m->name, x->sources[i]);
+                    m->name, rel);
             tm_strlist_free(cs, ncs);
             return 1;
         }
         if (ext_collect_cs(sdir, &cs, &ncs) != 0) {
-            set_err(err, errcap, "%s: cannot scan %s", m->name, x->sources[i]);
+            set_err(err, errcap, "%s: cannot scan %s", m->name, rel);
             tm_strlist_free(cs, ncs);
             return 2;
         }
