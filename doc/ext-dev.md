@@ -2,7 +2,7 @@
 
 > 面向：想把某个 **PHP 能力**（函数 / 常量 / 类与方法）用 C 实现、链入 tphp 二进制的开发者。
 > 本文 = **步骤 + 可用 C 函数手册 + 完整配方**。权威规格：[../PLAN/ext-packages.md](../PLAN/ext-packages.md)（§2 manifest 契约 / §2.4 注册面 / §5 编译链入 / §6 lock）。
-> 分野：源码树 `ext/` 的**内置**扩展（贡献者工作）见 [../PLAN/05-extension-guide.md](../PLAN/05-extension-guide.md)；PHP 依赖包见 [package-manager.md](package-manager.md)；脚手架设计见 [../PLAN/scaffold.md](../PLAN/scaffold.md)。ext 包铁律：**不进 `vendor/`、不进 autoload、无 `scripts`**。
+> 分野：源码树 `ext/` 的**内置**扩展（贡献者工作）见 [../PLAN/05-extension-guide.md](../PLAN/05-extension-guide.md)；PHP 依赖包见 [package-manager.md](package-manager.md)；脚手架设计见 [../PLAN/scaffold.md](../PLAN/scaffold.md)。ext 包铁律：**不进 `vendor/`、不进 autoload**（`scripts` 生命周期钩子 2026-11-16 起支持，见 §4b）。
 
 ## 0. 三十秒跑通
 
@@ -266,8 +266,24 @@ hello/
 }
 ```
 
-**禁写** `autoload` / PHP `deps` / `scripts`（直接 error）。`cflags/ldflags` 复杂条件用 C 内 `#ifdef`，`os` 只管命令行。
+**禁写** `autoload` / PHP `deps`（直接 error）。`cflags/ldflags` 复杂条件用 C 内 `#ifdef`，`os` 只管命令行。
 `os.<平台>.sources`：只扫当前平台那份（其它平台目录缺失也不报错）——窗口后端这类「各平台编不同文件」的场景用它（实例：tui 包 win32/x11/cocoa 三选一；`.m` ObjC 源同规则收集，`-fobjc-arc` 放 `os.darwin.cflags`）。
+
+#### 4b. `scripts` 生命周期钩子（2026-11-16 翻案，与 lib/app 同款六键）
+
+```jsonc
+"scripts": {                          // 可选；执行/开关/env 全同 PHP 包（§2.1.1）
+  "preInstall":  "scripts/pre.php",   // 落盘前（cwd = 源/暂存目录）
+  "postInstall": "scripts/post.php",  // 落盘后、**编译链入前**（cwd = <tphp_root>/ext/<name>）
+  "preUpdate":   "scripts/pre.php",   // 覆盖前（cwd = 旧包目录）   "postUpdate": 同 postInstall
+  "preRemove":   "scripts/pre.php"    // 删除前（cwd = 包目录）
+  // "postRemove" 解析但不触发（包已删、脚本文件随包消失；清理放 preRemove）
+}
+```
+
+- **时机亮点**：`post*` 在编译前执行 → 钩子里生成的 `.c` 会直接参与本次链入（codegen 场景）。
+- **失败语义**（实证镜像 lib/app 现状）：pre 脚本退出非 0 = **警告 + 继续**（仅缺脚本/路径逃逸才中止）；post 退出非 0 = 警告 + 命令退出码非 0，**不回滚**已落盘状态。
+- `TPHP_PKG_SCRIPTS=0` / `--ignore-scripts` 跳过；项目侧 `ext[]` 不跑钩子。完整规格 [../PLAN/ext-packages.md](../PLAN/ext-packages.md) §7。
 
 ## 5. 链入、换像与命令（2026-11-12 拍板）
 

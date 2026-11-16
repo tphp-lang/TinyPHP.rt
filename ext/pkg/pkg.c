@@ -548,10 +548,8 @@ static bool tmod_from_json(TVal v, TMod *m, char *err, size_t errcap) {
             set_err(err, errcap, "ext package must not declare deps (PHP packages)");
             tmod_free(m); return false;
         }
-        if (mget(o, "scripts")) {
-            set_err(err, errcap, "ext package must not declare scripts (user decision §10.3)");
-            tmod_free(m); return false;
-        }
+        /* scripts 允许（2026-11-16 翻案 §10.3，六键对齐——执行见 ext_install /
+         * ext_remove，时机与失败语义见 PLAN/ext-packages.md §7） */
         if (!ev || ev->t != T_ARR) {
             set_err(err, errcap, "ext: contract object required for type=ext");
             tmod_free(m); return false;
@@ -1590,7 +1588,7 @@ int tphp_pkg_new_ext(const char *dir, const char *name, bool force, char *err, s
     char sym[600];
     ext_init_sym(name, sym, sizeof sym);
 
-    /* mod.json 编译契约（§2：无 scripts/autoload/deps） */
+    /* mod.json 编译契约（§2：无 autoload/deps；scripts 可选 §7，脚手架不生成） */
     TMod m;
     tmod_init(&m);
     m.name = xstrdup(name);
@@ -3349,7 +3347,8 @@ int tphp_pkg_verify_vendor(const char *proj_dir, char *err, size_t errcap) {
  * ext 命令组（PLAN/ext-packages.md §4）+ 编译链入（§5，切片 5-6 完成）
  * 落点 <tphp_root>/ext/<name>；项目模式写回 ext[]；add 恒编译重链（11-12
  * 拍板：改源再 add 即出新 tphp），sync/update 未链入时编译。
- * 铁律（§10.9）：不进 vendor/、不进 autoload、无 scripts。
+ * 铁律（§10.9）：不进 vendor/、不进 autoload；scripts 生命周期钩子 = §7
+ * （六键解析、5 键触发，postRemove 不触发——pre/post 挂点见 ext_install/remove）。
  * ================================================================ */
 
 typedef struct {
@@ -3447,6 +3446,46 @@ static int ext_install(const char *source, const char *ref,
 
     char dest[1400];
     snprintf(dest, sizeof dest, "%s/ext/%s", eroot, pkg.name);
+
+    /* lifecycle scripts pre（§7①③）：镜像 install_from_src——pre 在覆盖检查前。
+     * action 按目标已存在（同 PHP：dest/mod.json 在 = update）。
+     * 失败语义（2026-11-16 实证拍板）：脚本退出非 0 = 警告 + 继续（rc=3 放行，
+     * 与 lib/app 5 个 pre 调用点一致）；仅配置错误（缺脚本/逃逸/spawn → 1/2）
+     * 中止，dest/lock/ext[] 不动。 */
+    char dmj[1450];
+    snprintf(dmj, sizeof dmj, "%s/mod.json", dest);
+    bool existed = fs_exists(dmj);
+    const char *eff = (ref && ref[0]) ? ref
+                      : (urlref[0] ? urlref : resolved);
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = existed ? "update" : "install";
+        sc.phase = "pre";
+        sc.pkg_name = pkg.name;
+        sc.pkg_version = pkg.version;
+        sc.pkg_ref = eff ? eff : "";
+        sc.project_dir = proj_dir;
+        sc.is_root = 0;
+        char e2[512] = "";
+        int prc;
+        if (existed) {
+            /* update：旧 dest 的 preUpdate（PHP 同款：pre 用旧包清单） */
+            sc.pkg_dir = dest;
+            prc = run_scripts_from_dir(dest, SC_PRE_UPDATE, &sc,
+                                       e2, sizeof e2);
+        } else {
+            /* install：暂存/源目录里新包的 preInstall（PHP pre cwd=src 同款） */
+            sc.pkg_dir = root;
+            prc = run_script_slot(&pkg, SC_PRE_INSTALL, &sc, e2, sizeof e2);
+        }
+        if (prc != 0 && prc != 3) {
+            set_err(err, errcap, "%s", e2[0] ? e2 : "pre script failed");
+            tmod_free(&pkg); fs_rm_rf(staging);
+            return prc == 1 ? 1 : 2;
+        }
+    }
+
     const char *block = vendor_overwrite_blocked(dest, pkg.name);
     if (block) {
         set_err(err, errcap, "refusing to overwrite %s: %s", dest, block);
@@ -3479,16 +3518,43 @@ static int ext_install(const char *source, const char *ref,
         }
     }
 
+    /* lifecycle scripts post（§7①③）：落盘后、编译链入前（codegen 场景：
+     * 此处生成的 .c 会被本次 ext_compile_all 收集）。失败语义镜像
+     * install_from_src——退出非 0（rc=3）→ 记 err、返回 3（调用方继续
+     * 写回/编译，最终命令非 0 出口，不回滚）；配置错误（1/2）→ 仅警告。 */
+    int post_fail = 0;
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = existed ? "update" : "install";
+        sc.phase = "post";
+        sc.pkg_name = pkg.name;
+        sc.pkg_version = pkg.version;
+        sc.pkg_ref = eff ? eff : "";
+        sc.pkg_dir = dest;
+        sc.project_dir = proj_dir;
+        sc.is_root = 0;
+        char e2[512] = "";
+        int prc = run_scripts_from_dir(dest,
+            existed ? SC_POST_UPDATE : SC_POST_INSTALL, &sc, e2, sizeof e2);
+        if (prc == 3) {
+            set_err(err, errcap, "post script failed for %s (see warnings above)",
+                    pkg.name);
+            post_fail = 3;
+        } else if (prc != 0) {
+            tphp_warn("PHP Warning: pkg post script error for %s: %s\n",
+                      pkg.name, e2);
+        }
+    }
+
     if (out) {
         snprintf(out->name, sizeof out->name, "%s", pkg.name);
         snprintf(out->url, sizeof out->url, "%s", url_only);
-        const char *eff = (ref && ref[0]) ? ref
-                          : (urlref[0] ? urlref : resolved);
         snprintf(out->ref, sizeof out->ref, "%s", eff ? eff : "");
     }
     tmod_free(&pkg);
     fs_rm_rf(staging);
-    return 0;
+    return post_fail;   /* 0 = 完成；3 = 落盘完成但 post 钩子失败（不回滚） */
 }
 
 /* 项目 ext[] 写回（§4.1）：同 name 更新 url/ref，否则追加 */
@@ -3534,8 +3600,10 @@ int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
     int rc = ext_proj_mode(proj_dir, &is_proj, err, errcap);
     if (rc != 0) return rc;
     ExtInfo info;
+    int post_fail = 0;
     rc = ext_install(source, ref, NULL, is_proj ? proj_dir : NULL, false,
                      &info, err, errcap);
+    if (rc == 3) { post_fail = 3; rc = 0; }   /* 落盘完成、post 失败：继续链入 */
     if (rc != 0) return rc;
     if (is_proj) {
         rc = ext_writeback(proj_dir, &info, err, errcap);
@@ -3544,17 +3612,21 @@ int tphp_pkg_ext_add(const char *proj_dir, const char *source, const char *ref,
     /* 2026-11-12 拍板：add 恒编译重链——不再看 .built「已链入」跳过。
        改了源码再 add 立刻出新 tphp（重复 add 的代价 = 一次 relink，秒级）；
        Windows 换像机制不变：本次进程仍跑旧镜像，下次启动即新 tphp。 */
-    return ext_compile_all(err, errcap);
+    rc = ext_compile_all(err, errcap);
+    if (rc != 0) return rc;
+    return post_fail;   /* 3 = 完成但 post 钩子失败（err 已记，命令非 0 出口） */
 }
 
 /* ext[] [lo,hi) 落盘（sync/update 共用）：已装且非 force → skip 行；
  * 否则按 url/ref 安装（url 相对 proj 解析，声明名对账）。逐项结果进 sb。
- * *out_need_link：存在「新装/更新/有源未链入」任一 → 调用方随后 compile_all。 */
+ * *out_need_link：存在「新装/更新/有源未链入」任一 → 调用方随后 compile_all。
+ * *out_post_fail：任一项 post 钩子失败（rc=3）→ 非 0（§7③，不中断范围）。 */
 static int ext_fill_range(const char *proj_dir, const TMod *root,
                           const char *eroot, int lo, int hi, bool force,
-                          bool *out_need_link, PkgBuf *sb,
+                          bool *out_need_link, int *out_post_fail, PkgBuf *sb,
                           char *err, size_t errcap) {
     if (out_need_link) *out_need_link = false;
+    if (out_post_fail) *out_post_fail = 0;
     for (int i = lo; i < hi; i++) {
         const ModDep *d = &root->exts[i];
         char dest[1400], dmj[1450];
@@ -3577,7 +3649,14 @@ static int ext_fill_range(const char *proj_dir, const TMod *root,
         ExtInfo info;
         int irc = ext_install(absurl, d->ref, d->name, proj_dir, force,
                               &info, e2, sizeof e2);
-        if (irc != 0) {
+        if (irc == 3) {
+            /* 落盘完成、post 钩子失败：记账继续（后续项/编译照常），
+             * 出口由调用方以 rc=3 非 0 返回（§7③ 不回滚） */
+            if (out_post_fail) *out_post_fail = 3;
+            irc = 0;
+            set_err(err, errcap, "ext %s: %s", d->name,
+                    e2[0] ? e2 : "post script failed");
+        } else if (irc != 0) {
             set_err(err, errcap, "ext %s: %s", d->name,
                     e2[0] ? e2 : "install failed");
             return irc;
@@ -3619,8 +3698,9 @@ int tphp_pkg_ext_sync(const char *proj_dir, char **out_summary,
     PkgBuf sb;
     pb_init(&sb);
     bool need_link = false;
+    int post_fail = 0;
     rc = ext_fill_range(proj_dir, &root, eroot, 0, root.n_exts, false,
-                        &need_link, &sb, err, errcap);
+                        &need_link, &post_fail, &sb, err, errcap);
     tmod_free(&root);
     if (rc != 0) { tm_free(sb.p); return rc; }
     if (need_link) {
@@ -3629,7 +3709,7 @@ int tphp_pkg_ext_sync(const char *proj_dir, char **out_summary,
     }
     if (sb.p == NULL) pb_put(&sb, "", 0);
     if (out_summary) *out_summary = sb.p; else tm_free(sb.p);
-    return 0;
+    return post_fail;   /* 3 = 完成但某项 post 钩子失败（err 已记） */
 }
 
 int tphp_pkg_ext_update(const char *proj_dir, const char *name,
@@ -3669,8 +3749,9 @@ int tphp_pkg_ext_update(const char *proj_dir, const char *name,
     PkgBuf sb;
     pb_init(&sb);
     bool need_link = false;
+    int post_fail = 0;
     rc = ext_fill_range(proj_dir, &root, eroot, lo, hi, true,
-                        &need_link, &sb, err, errcap);
+                        &need_link, &post_fail, &sb, err, errcap);
     tmod_free(&root);
     if (rc != 0) { tm_free(sb.p); return rc; }
     if (need_link) {
@@ -3679,7 +3760,7 @@ int tphp_pkg_ext_update(const char *proj_dir, const char *name,
     }
     if (sb.p == NULL) pb_put(&sb, "", 0);
     if (out_summary) *out_summary = sb.p; else tm_free(sb.p);
-    return 0;
+    return post_fail;   /* 3 = 完成但某项 post 钩子失败（err 已记） */
 }
 
 int tphp_pkg_ext_remove(const char *proj_dir, const char *name,
@@ -3714,12 +3795,36 @@ int tphp_pkg_ext_remove(const char *proj_dir, const char *name,
     TMod m;
     if (!tmod_load(mj, &m, err, errcap)) return 2;
     bool mismatch = strcmp(m.name, name) != 0;
-    tmod_free(&m);
     if (mismatch) {
+        tmod_free(&m);
         set_err(err, errcap,
                 "refusing to delete %s: holds a different package name", dest);
         return 2;
     }
+    /* preRemove（§7）：删除前 cwd=包目录；postRemove 拍板不触发（§7②：
+     * 脚本文件随包删除、ext 无根面——与 PHP 包侧行为一致，清理放 pre）。
+     * 失败语义镜像 PHP 单包 remove：退出非 0 = 警告 + 继续（rc=3 放行），
+     * 仅配置错误（1/2）中止删除（目录/ext[]/lock 不动）。 */
+    {
+        ScriptCtx sc;
+        memset(&sc, 0, sizeof sc);
+        sc.action = "remove";
+        sc.phase = "pre";
+        sc.pkg_name = m.name;
+        sc.pkg_version = m.version;
+        sc.pkg_ref = "";
+        sc.pkg_dir = dest;
+        sc.project_dir = proj_dir;
+        sc.is_root = 0;
+        char e2[512] = "";
+        int prc = run_script_slot(&m, SC_PRE_REMOVE, &sc, e2, sizeof e2);
+        if (prc != 0 && prc != 3) {
+            set_err(err, errcap, "%s", e2[0] ? e2 : "preRemove failed");
+            tmod_free(&m);
+            return prc == 1 ? 1 : 2;
+        }
+    }
+    tmod_free(&m);
     fs_rm_rf(dest);
 
     if (is_proj) {

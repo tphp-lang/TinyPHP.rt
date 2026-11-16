@@ -48,7 +48,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
 
 ## 2. 扩展包 `mod.json`（编译契约）
 
-由 `tphp new <name> --ext` 生成；**无 `scripts`**（用户拍板：扩展不带生命周期钩子）。
+由 `tphp new <name> --ext` 生成；`scripts` **可选**（**2026-11-16 翻案 §10.3**，原「扩展不带生命周期钩子」废止——六键时机映射见 §7）。
 
 ```jsonc
 {
@@ -84,7 +84,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
 |---|---|
 | `type` 必须是 `"ext"` | 非 ext → 拒绝当扩展安装 |
 | `sources` 仅目录 + 收 `*.c`/`*.m` | 递归；忽略 `.h/.o` 等；**排除 `build/`**；禁 `..`/绝对路径 |
-| 禁止 `autoload`、PHP `deps`、`scripts` | 写了 → **error**（尽早暴露误放） |
+| 禁止 `autoload`、PHP `deps` | 写了 → **error**（尽早暴露误放）；`scripts` 允许（§7） |
 | `tphp_abi` | 有则与当前版本比对；无则 warning 放行 |
 | `init` 符号 | 链接后须存在；缺 → 编译失败并提示 |
 | `cflags/ldflags` 透传 | 文档标风险；复杂条件用 C 内 `#ifdef`，`os` 只管命令行 |
@@ -223,11 +223,36 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 - integrity 校验点：`ext --add` 覆盖前、（可选）`--relink` 前。
 - 与 PHP `deps` 分栏，禁止混表。
 
-## 7. 与 scripts / 其它
+## 7. scripts 生命周期钩子（2026-11-16 翻案 §10.3，拍板：六键对齐 lib/app）
 
-- **扩展包无 scripts**（已拍板）。
-- 项目 `ext[]` 也不跑 PHP 包那套 pre/post（无意义）。
-- `tphp build` 打包：`ext/` 源码默认**不**进 zip（已编进 exe）；`--with` 可显式带。
+扩展包 `mod.json` 可带 `scripts`——**六键、条目形态（string|string[]、`.php` 子进程、shell 需 `TPHP_PKG_SCRIPTS_SHELL=1`）、路径约束（相对包根、禁 `..`/绝对）、env（`TPHP_PKG_*`）、开关（`TPHP_PKG_SCRIPTS=0`/`--ignore-scripts`）全部复用 [pkg-manager.md](pkg-manager.md) §2.1.1，不另造机制**。差异 = 时机映射 + postRemove 触发面 + 失败语义按实证（见 ③）：
+
+**① 时机映射（ext 的 install = 落盘 + 编译链入，post 统一在「落盘后、编译前」）**
+
+| 键 | ext 时机 | cwd | 触发 |
+|---|---|---|---|
+| `preInstall` | 新装落盘前 | 暂存/源目录（与 PHP 包同） | ✓ |
+| `postInstall` | 落盘后、**编译链入前** | `<tphp_root>/ext/<name>/` | ✓ |
+| `preUpdate` | 覆盖已有扩展前 | **旧** `<tphp_root>/ext/<name>/` | ✓ |
+| `postUpdate` | 覆盖后、**重编前** | 新 `<tphp_root>/ext/<name>/` | ✓ |
+| `preRemove` | 删除前 | 即将删除的 `<tphp_root>/ext/<name>/` | ✓ |
+| `postRemove` | — | — | **✗ 不触发**（见 ②） |
+
+- action 判定与 PHP 同：按目标目录已存在（`ext --add` 已有 = update、`--update` = update）。
+- post 落在编译前 ⇒ **生成 `.c`/头文件可直接参与本次编译**（codegen 场景），与 PHP 包「post=落盘后」心智对齐。
+- 编译/链接失败的语义不归钩子管：照旧保留旧二进制、exit ≠ 0（§5.7）。
+
+**② postRemove 解析保留、不触发（2026-11-16 拍板）**：包删除后脚本文件随包删除，`.php` 条目无处可跑——**与 PHP 包侧行为完全一致**（PHP 的包声明 `postRemove` 也从不触发，该键在 pkg-manager §2.1.1 仅根项目可用；ext 无根面 → 域内无触发面）。清理类逻辑放 `preRemove`。六键全部解析接受、不报错，实际触发 5 键。
+
+**③ 失败语义按实证镜像 lib/app 现状（2026-11-16 拍板，与 §2.1.1 文字有出入处以此为准）**：
+- `pre*` 脚本**退出非 0** → **PHP Warning + 继续**（实测 lib/app 现状：add 照常完成、exit 0；§2.1.1「pre 非 0 → 中止」文字对退出非 0 不成立——lib/app 5 个 pre 调用点均放行 rc=3）。仅**配置类错误**（脚本缺失 / 路径逃逸 / spawn 失败 → rc 1/2）→ **中止**，不改 ext[]/lock/目录。
+- `post*` 脚本退出非 0 → 警告 + **命令退出码非 0**、不回滚（builtin 抛 RuntimeException、CLI 走非 0 出口）；post 配置类错误 → 仅警告（镜像 `install_from_src`）。
+
+**④ 仅扩展包自身**：项目 `mod.json` 的 `ext[]` 数组**不跑**钩子（维持原立场——声明表不是包，无生命周期可言；`TPHP_PKG_ROOT` 面在 ext 域不存在）。
+
+- 触发命令：`ext --add`（= install/update，按目标是否已有）、`--update`、`--remove`、无参 sync 补装缺失项；`--relink`/已存在 skip **不跑**（无落盘/删除事件）。
+- `new --ext` 脚手架不生成 scripts 段（用到再写）。
+- 安全同 §2.1.1：装包即信任；`tphp build` 打包：`ext/` 源码默认不进 zip（已编进 exe）；`--with` 可显式带。
 - `PLAN/05`：仍声明「无动态插件」；ext = 源码级并入。
 
 ## 8. 风险
@@ -255,7 +280,7 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 |---|---|
 | 1 | 源码根 = **`<tphp_root>/ext/<name>/`** |
 | 2 | 脚手架 = **`tphp new <name> --ext`**（无 `ext --new`） |
-| 3 | 扩展包 **无 `scripts`** |
+| 3 | ~~扩展包 **无 `scripts`**~~ **2026-11-16 翻案（用户明示）**：六键对齐 lib/app、post=落盘后编译前、仅扩展包自身——现行规格 §7 |
 | 4 | `sources` = **目录**（`*.c`；2026-11-14 扩展：收 `*.m` + `os.<平台>.sources` 分平台追加，tui 三平台窗口后端实证） |
 | 5 | **`os` 分平台**编译/链接指令；flags **append** 合并 |
 | 6 | **编译链入 + sync + lock 分栏同属第一批** |
