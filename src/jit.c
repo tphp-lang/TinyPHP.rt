@@ -941,6 +941,13 @@ typedef struct {
     enum { JIT_LB_MAX = 16 };
     ir_ref lb_pend[JIT_MAX_LOOPS][JIT_LB_MAX];
     int lb_np[JIT_MAX_LOOPS];
+    /* B1（osr.md §9）：if 内 break 的出口方向 END 暂存——镜像 lb_pend，
+     * loopcond IF_FALSE 后与出口 false 区 MERGE_N 合流（回边由体尾 JMP
+     * 保持，LOOP 结构合法）。同层 ≤2 与 lb 同界（≥3 输入 O1 值错域）。
+     * loop_exit = 该层出口 pc（loopcond JMPZ 的 T），stash 逃生门判据。 */
+    ir_ref bp_pend[JIT_MAX_LOOPS][JIT_LB_MAX];
+    int bp_np[JIT_MAX_LOOPS];
+    uint32_t loop_exit[JIT_MAX_LOOPS];
     /* P0-17③ 批B'：折叠 fast 线的前向汇合——packed 直取分支内直出
      * FETCH_DIM_R+ADD 两 op 效果（零 TMP 槽往返）后，fast 线 END 暂存于
      * fwd_end，emit_seq 主循环推进到 fwd_pc 时与主线 END 做 MERGE_2 汇合。
@@ -3907,6 +3914,20 @@ static Trap trap_ret(void)  { Trap x = { TR_RET, 0, 0 }; return x; }
 static Trap trap_fail(void) { Trap x = { TR_FAIL, 0, 0 }; return x; }
 static Trap trap_lb(void)   { Trap x = { TR_LOOPBACK, 0, 0 }; return x; }
 
+/* B1（osr.md §9）：if 分支 trap TR_END 恰跳本层出口（break 语义）→
+ * END 入 bp_pend、trap 转终端 RET——其余分支继续 emit、体尾回边保持。
+ * 裸 break/跨层（break N）/switch 出口均不满足判据 → 返回 0 维持既有拒。
+ * 返回 1 = 已转（*t 变为 TR_RET）。 */
+static int bp_escape(JitC *j, Trap *t) {
+    if (j->loop_sp <= 0) return 0;
+    int k = j->loop_sp - 1;
+    if (j->loop_exit[k] == 0 || t->target != j->loop_exit[k]) return 0;
+    if (j->bp_np[k] >= 2) return 0;
+    j->bp_pend[k][j->bp_np[k]++] = t->end;
+    *t = trap_ret();
+    return 1;
+}
+
 /* P0-14 批5: if 内 continue——分支回边 END 暂存当前层 pending。
  * 1 = 存入；0 = 挡板触发/无循环层/超上限（调用方 fail 回退解释器）。 */
 static int lb_push(JitC *j, ir_ref e) {
@@ -4276,6 +4297,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             j->loop_cond[j->loop_sp] = 1;
             j->lb_np[j->loop_sp] = 0;          /* 批5: 层复用前清 pending/||标记 */
             j->lb_jmpnz[j->loop_sp] = 0;
+            j->bp_np[j->loop_sp] = 0;          /* B1: 同上清 break pending */
+            j->loop_exit[j->loop_sp] = 0;
             j->acc_on = 0; j->acc_phi = j->acc_iter = 0; j->acc_slot = 0;
             if (acc) {
                 j->acc_on = 1;
@@ -5780,6 +5803,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             if (j->loop_sp > 0 && j->loop_cond[j->loop_sp - 1]) {
                 j->loop_cond[j->loop_sp - 1] = 0;
                 uint32_t E = T;
+                int lk = j->loop_sp - 1;
+                j->loop_exit[lk] = E;   /* B1: break 逃生门判据（bp_escape） */
                 ir_ref truthy = cond_truthy(j, pc, op);
                 /* JMPZ: truthy → body; JMPNZ at header: reverse (rare) */
                 ir_ref ifx;
@@ -5828,6 +5853,16 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);   /* body must back-edge or fail */
                 }
                 ir_IF_FALSE(ifx);
+                if (j->bp_np[lk] > 0) {
+                    /* B1: break 逃生块与出口 false 区合流（等价 if-join
+                     * MERGE 定位模式）；bp 空 = 路径逐字节不变 */
+                    ir_ref bin[JIT_LB_MAX + 1];
+                    int bn = j->bp_np[lk];
+                    for (int bi = 0; bi < bn; bi++) bin[bi] = j->bp_pend[lk][bi];
+                    bin[bn] = ir_END();            /* 关闭出口 false 区 */
+                    ir_MERGE_N((ir_ref)(bn + 1), bin);
+                    j->bp_np[lk] = 0;
+                }
                 /* exit path continues at E inside the false region */
                 j->loop_sp--;
                 j->acc_on = 0; j->acc_phi = j->acc_iter = 0; j->acc_slot = 0;
@@ -5836,13 +5871,28 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             }
 
             uint32_t join, else_start;
+            int jmp_on_true = (op->op == OP_JMPNZ);
             if (op->op == OP_JMPNZ && j->loop_sp > 0)
                 j->lb_jmpnz[j->loop_sp - 1] = 1;   /* || 求值标记（挡板因子） */
-            if (!find_join(j->fn, pc, T, &join, &else_start))
+            /* B1（osr.md §9）：then 体 = 裸 break（JMPZ 下一 op 恰为本层
+             * 出口前跳）——find_join 会把它误判成 else jend（join=出口、
+             * else=T，吞掉体尾回边）→ 直取 join=T、else=0，tA 端 bp_escape
+             * 照常转储；if-else（T=else_start）同一形态亦正确（FALSE 侧
+             * END@T 后 pc=T 续发 else 区）。多语句 then / 出口满 2 / ||
+             * 在场 → 落回 find_join 既有判（误判即 fail），保守不变。 */
+            if (!jmp_on_true && j->loop_sp > 0 &&
+                !j->lb_jmpnz[j->loop_sp - 1] &&
+                j->loop_exit[j->loop_sp - 1] != 0 &&
+                T != j->loop_exit[j->loop_sp - 1] &&
+                pc + 1 < j->fn->n_ops &&
+                j->fn->ops[pc + 1].op == OP_JMP &&
+                j->fn->ops[pc + 1].ar == j->loop_exit[j->loop_sp - 1] &&
+                j->bp_np[j->loop_sp - 1] < 2) {
+                join = T; else_start = 0;
+            } else if (!find_join(j->fn, pc, T, &join, &else_start))
                 do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
 
             ir_ref truthy = cond_truthy(j, pc, op);
-            int jmp_on_true = (op->op == OP_JMPNZ);
             /* P0-14 批5: ifx 恒 truthy。JMPNZ（||短路）原 NOT_B 极性反置
              * 且 tA=END@T 漏 emit 跳转目标体——该路径此前 100% fail 回退
              * （fail-safe 从未出错码），本次修正为对称两分支：
@@ -5862,7 +5912,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                     tA = trap_ret();
                 }
-                if (tA.kind == TR_END && tA.target != join)
+                if (tA.kind == TR_END && tA.target != join &&
+                    !bp_escape(j, &tA))       /* B1: break → bp stash 转 RET */
                     do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             } else {
                 uint32_t st[11]; int ns = nstops + 1;
@@ -5878,7 +5929,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     tA = trap_ret();
                 }
                 if (tA.kind == TR_END && tA.target != join &&
-                    !(else_start && tA.target == else_start))
+                    !(else_start && tA.target == else_start) &&
+                    !bp_escape(j, &tA))       /* B1: break → bp stash 转 RET */
                     do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 
@@ -5899,7 +5951,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         if (!lb_push(j, ir_END())) do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                         tB = trap_ret();
                     }
-                    if (tB.kind == TR_END && tB.target != join)
+                    if (tB.kind == TR_END && tB.target != join &&
+                        !bp_escape(j, &tB))   /* B1: break → bp stash 转 RET */
                         do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
                 }
             } else {
@@ -5917,7 +5970,8 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     tB = trap_ret();
                 }
                 if (tB.kind == TR_END && tB.target != join &&
-                    !(tB.target == T))
+                    !(tB.target == T) &&
+                    !bp_escape(j, &tB))       /* B1: break → bp stash 转 RET */
                     do { if (!j->fail_line) j->fail_line = __LINE__; return trap_fail(); } while (0);
             }
 

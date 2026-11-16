@@ -330,3 +330,15 @@ Lend:
 
 jit.c 单文件 ~60 行（帧字段 +1、if-handler 4 处 +loopcond 合并 + bp 数组）+ test-osr-007（9 场景三方对拍）+ 三态矩阵 + 探针——**约 1 个工作日含全套验证**。
 
+
+### 9.8 执行记录（2026-11-16 实施，拍板同日落地）
+
+- **实现超出规格的关键发现——find_join 误判才是第一病灶**：规格原设计（§9.2 loop_exit[] + 4 处 bp_escape 位点 + 出口 MERGE_N）全部落地后，冒烟（for+if+break  canon 形态）仍在 L5853 拒编。TPHP_JIT_DEBUG=3 逐 op 追踪定位：`find_join`（jit.c:3098）把 break 的 **depth-0 前跳**（target=循环出口>当前位置）误判成 **else jend**——返回 `join=出口 pc、else_start=ifjoin pc`，四处位点全被 `tA.target != join` 短路（trap 目标恰==join），且 FALSE 侧从 ifjoin 发射吞掉体尾回边（lb_push 误吞）。**修复 = if-handler 裸 break 前置识别**：`ops[pc+1]` 恰为本层出口前跳（`ar == loop_exit[sp-1]`）时直取 `join=T、else=0` 绕过 find_join；tA 端 bp_escape 照常转储。规格原 4 位点保留（else 侧 break `if(c) X; else break;` 走位点③天然工作）。
+- **形态面实测（TPHP_JIT_DEBUG=1 实锤）**：解锁编译 6 eager 形态——for+if+break（count() 在 cond，canon）、while+体顶 if break、continue+break 异 if 混合（lb/bp 双 pend 并存）、嵌套内层 break、kv fast-line+break、**foreach+if+break（B1-2 零新代码自动覆盖，规格预测兑现）**；单侧 if-else break（then-break+else-work）经前置识别的 if-else 形态同形正确。保守拒编 3 形态维持——**双侧 break（三侧形态）**（pc 续发 else 区 break JMP → 体尾 trap TR_END → L5853 fail-safe）、break 2、switch+break（switch 占 LoopPatches，位点域外）；多语句 then 落 find_join 旧判拒。全部 ≥2/层上限、|| 在场挡板接入前置识别判据。
+- **test-osr-007（tests/jit/test-osr-007.php，10 场景=规格 9 场景 + c10 OSR 面）**：c1 for+if+break / c2 while / c3 双侧 break（拒，值对）/ c4 continue+break / c5 嵌套 / c6 break2（拒，值对）/ c7 kv+break+循环后读 / c8 switch+break（拒，现状锁定）/ c9 foreach+if+break / **c10 OSR 面裸 break**（OP_POW 后置杀 eager → 解释器计数 → 10000 回边 OSR 编 chunk → break 在 JIT 内 i>50000 触发 → 出口 resume）。**三方对拍 PHP 8.5.1 / JIT=0 / JIT=1 十值逐字节一致**；编译面 6 eager + 1 OSR chunk 全 ir_check=1。
+- **OSR 面方法学**：OSR 不走 jit_eligible_inner（jit_cfg_ok + osr_body_ok 区域扫描），函数级白名单外 op（OP_POW）放循环**后**即可强制解释器路径；对照探针证 plain 循环 OSR 触发链正常，break 循环需 break 条件在阈值（10000）之后触发才有 chunk——首版探针 break@998 仅 1000 回边不触发（低级错误记档）。
+- **三态矩阵全过（LOOP+MERGE 族 deps/ir 风险门）**：O1+FOLDING（默认）/ O1 无 FOLDING（双 ir_init 摘 IR_OPT_FOLDING 临时构建）/ O0（ir_jit_compile(ctx,0) 临时构建）三态 osr-007 十值 + 形态矩阵全绿，事后还原 O1 默认重建。
+- **全量套件 251/251**（250 基线 + 新增 osr-007；osr-001..006 零漂移）。
+- **bench 零移动 A/B 定案（交替抑抖，base 臂 = git stash 摘 B1 jit.c 重建 vs B1 臂，各 3×2 轮交错）**：14 项 min 两臂 delta ≤2.3%（fib/call/rmw/read/kv/string/object/logstat/jsonagg 精确 0）→ **clean11 零影响实锤**（bench 零 break 预测兑现）。附注：本轮绝对值较 bench-rounds.ps1 头注历史（array-read 9.7-11.5）整体低 4×，**两臂等量同移 = 先于 B1 的环境/口径因子，与本立项无关**（harness 本身 HEAD 无改动）。
+- **B1-3 价值探针（tools/probe_break_cover.php，min-of-6 交替）**：早退搜索热循环（1e6 数组、break 在 142857 处触发=7×142857 取模像、20 rep）函数级 JIT=1 **min 15.0ms** vs JIT=0 **min 188.0ms** = **12.5×**——B1 覆盖面收益量化记账（非 clean11 口径）。
+- **规格偏差记录**：①c3 双侧 break 未解锁（规格三侧形态原预期位点③覆盖——实测 pre-scan 先于 find_join 拦截致 else 区漏发 → fail-safe，记 9.6 重开面）；②osr-001 c3（continue+break 主面循环）OSR chunk 前后均熔断（continue-if 的 find_join 深扫 fail，B1 不触该域）→ EXPECT 零漂移；③工作量 1 工日内完成（规格估计兑现）。
