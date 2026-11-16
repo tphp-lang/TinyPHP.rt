@@ -267,10 +267,66 @@ Lend:
 **规格修正与过程发现**（§8.4 测试矩阵 vs 实况）：
 
 1. **jit_cfg_ok 是整函数静默门**（jit.c:646-661，>16 个不同回边头 → 该函数全部 OSR 拒）：test-osr-006 首稿 main 恰 17 头 → 所有 chunk 全灭（零 debug 行），二分（前缀逐段加）定位；c6a 复用 $arr1 省一 fill 头回 16。**测试/真实脚本过 16 个循环头即 OSR 全盲**——现状护栏，未扩容（记 backlog 刀候选）。
-2. **break-in-loop 两级全拒**（既有，非 OSR 特有）：emit_seq loop-cond 收尾只认 LOOPBACK 尾（jit.c:5828 "body must back-edge or fail"），体中 break 的前向 JMP → TR_END → 拒；函数级最小实证同拒（for+break 小函数 FAILED emit trap=3 L5828）。c3 改 continue-only，break 面留解释器（值仍对）。**循环体 break 是整个 JIT 的既有空白**，backlog 刀候选。
+2. **break-in-loop 两级全拒**（既有，非 OSR 特有）：emit_seq loop-cond 收尾只认 LOOPBACK 尾（jit.c:5828 "body must back-edge or fail"），体中 break 的前向 JMP → TR_END → 拒；函数级最小实证同拒（for+break 小函数 FAILED emit trap=3 L5828）。c3 改 continue-only，break 面留解释器（值仍对）。**循环体 break 是整个 JIT 的既有空白**，backlog 刀候选。→ **§9 B1 立项规格（11-16）**。
 3. **刀5C 嵌套调用 OSR 拒（设计内）**：`osr6_fn(intval($v))` 形态 OSR 必拒（jit.c:5688，门①仅函数级）→ c4 改独立序（`$x=intval($v); $s4+=osr6_fn($x);` 两语句）编 chunk 成功。
 4. **continue-site chunk 拒、trailing-site chunk 编**：if-continue 分支终端经 lb_push 转 TR_RET 后，合流走到 join（越过 backedge 落 exit stop）→ loop-cond 体以 TR_END 收尾 → L5828 拒；trailing site 的体尾是 back-edge → MERGE_N 正常编。c3 得单 chunk（continue-site 熔断回解释器，值全对）。emit 机制空白，backlog 刀候选。
 5. **eager 门 96 恰边界**：osr6_c6loop 首稿恰 96 ops = `n_ops<=96` 急切门边界 → 首调函数级编译吞掉循环 → OSR 零触发（raise 面假死）；填充至 98 ops 后正确走 OSR。**凡想保 OSR 路径的循环函数必须 n_ops>96**。
 
 **新发现刀候选（A7 范围外，backlog 已记）**：bench real-jsonagg（2000×5 恰 10000 回边）A7-2 后新编 29.5KB chunk 于**最后一条回边**触发 → 零迭代运行、纯编译成本 ≈+4ms（段内 +48%）；同形状拉长 50 轮（10 万边）**−7.4ms（−10.8%）**证 chunk 本体赢 → 属**阈值×单发摊销面**（刀18 单发测量同族），非 chunk 质量问题。净 bench（logstat −3.5 + jsonagg +4.0 ≈ 持平）说明"−3~4%"预测只覆盖 logstat 单段；阈值政策不动（§8.6），恰阈值单发形状的触发政策为独立刀。
+
+## 9. B1 正刀规格：break-in-loop 放行（2026-11-16 立项，规格稿待批）
+
+> 来源：§8.7 发现②（A7 实施时撞出的既有空白）。11-16 CI 判读收尾后立项评估：-static 三臂 A/B 销案（三臂节表逐字节等价 = 纯引擎构建 no-op，memory/2026-11-16.md）→ 立项基线干净。
+
+### 9.1 病灶与定位
+
+- emit_seq 循环体收尾只认 LOOPBACK 尾（jit.c:5828 "body must back-edge or fail"）——**循环体含 break 的函数两级全拒**：函数级 eager（for+break 小函数 FAILED emit trap=3 实证）+ OSR chunk（test-osr-001 case 3、osr-006 c3 改 continue-only 的原因）。值仍对（fail-safe 熔断解释器），但该形态函数 **100% 解释器执行**——热循环早退（搜索/哨兵/bounded 扫描）是真实代码高频形态；
+- bench 14 项零 break（grep 实证）→ **clean11 影响 ≈ 0**：本刀属**覆盖面立项**（M2 口径外），价值 = 真实脚本 JIT 化覆盖，不入 clean11 主口径；
+- 编译器事实（compile.c:2306-2333）：break → OP_JMP patch 到 `loop_pop` brk_target（= 循环出口 E）；break N = 第 N 层出口；switch 占 LoopPatches（is_switch）→ switch 内 break 目标 = switch 出口 ≠ 循环 E；foreach 出口判定 = FE_FETCH 后 JMPZ 由同一 loopcond 分支消费（jit.c:5550 "形态零适配"）→ **while/for/foreach 三族共用同一出口合并点，一刀全覆盖**。
+
+### 9.2 机制设计（jit.c 单文件 ~60 行，零 deps/ir 改动）
+
+三面改动 + 保守边界：
+
+1. **循环帧 +loop_exit[]**：loopcond 分支（jit.c:5782 `uint32_t E = T`）设 `j->loop_exit[sp-1] = E`（帧 push 处初始化 0；与 loop_hdr/loop_cond/acc 同帧生命周期）；
+2. **if-handler 4 处逃生门（核心）**：分支 trap TR_END 且 `j->loop_sp > 0 && tX.target == j->loop_exit[sp-1]`（jit.c:5865/5880/5902/5919 四处既有 fail 检查前插）→ **bp_push 暂存 END 块 + 转 trap_ret()**——镜像 P0-14 批5 continue 的 lb_push 模式（jit.c:5861-5864/5874-5878）。**为什么 stash 而非直通**：trap 协议单值无 CFG，break 的 END 块只在该分支真时可达，直通会丢失"其余分支继续体 + 体尾回边"的结构；stash 后其余侧继续 emit → join → 体尾 JMP 恒编入 → LOOP 结构合法（回边必存在）；单侧 break 与既有 RET-join 逻辑（L5926-5941）自然复合：`if(c){break}` 无 else → tA=RET(stash)+tB=END@join → L5928 BEGIN 路径；`if(c){break}else{d}` → 同路径；`if(c){d}else{break}` → L5933 路径；
+3. **loopcond 出口合并**：IF_FALSE 后（jit.c:5830-5835）——`bp_np[k] > 0` 时关闭 false 区（ir_END）→ MERGE_N([bp…, false_end]) → pc=E 继续（builder 定位 = 既有 if-join MERGE_2 模式 L5938-5941）；bp 空则路径逐字节不变。continue 的 lb_pend 回边合并（L5801-5823）正交不受扰；双侧 break 溢出 cap（复用 JIT_LB_MAX 同款上限）→ fail 保守；
+4. **保守边界（v1 拒编面，全部维持现状 fail-safe）**：
+   - **体顶裸 break / continue-site chunk 的 TR_END@exit-stop** → 维持 L5828 拒——无回边 LOOP 是非法 IR（§8.7 发现④ continue-site 拒面同源，行为不变零回归）；
+   - **`if(c) continue; else break;` 双侧逃生** → 体 trap=TR_RET → L5793 else 既有 fail（退化形态循环 ≤1 迭代，罕见；重开面记 §9.6）；
+   - **break N≥2**（target=外层 E ≠ 内层 E）→ 既有 fail 检查不变；
+   - **switch 内 break**（target=switch 出口 ≠ E）→ 既有 fail 检查不变（switch 形态独立评估，不混入本刀）。
+
+### 9.3 语义安全论证
+
+1. **deopt/resume 无新点**：break 块并入出口 MERGE → 单一 RETURN(resume_pc=E)，与既有 fall-through 出口同 pc 同槽物化（§2 零拷贝红利）；解释器从 E 无缝续跑；
+2. **值正确性**：出口块读槽（权威值）——fast 线每迭代 store pay 至槽（批C slice-1 既有约定），mid-iteration break 时槽=当前值 ✓；acc_phi 不跨出口读（PHI 输入仅 iter/回边两输入，出口非回边）——出口读槽为 belt 规则（c7 测试锁定）；break 纯控制流不新增值消费/产生，rc 配平面不变；
+3. **fail-safe 铁律不变**：任何未预期形态 → trap_fail → 熔断解释器（值正确性由 §8.7 发现②现状背书：break 面留解释器值全对）。
+
+### 9.4 风险与验收门
+
+| 风险 | 缓解 |
+|---|---|
+| deps/ir O1 FOLDING/CSE × LOOP+出口 MERGE（批2-3 tv_copy src=0 同族域） | 三态矩阵（O1+FOLDING / O1 无FOLDING / O0）× break 形态作验收门；ir_check=1 铁律（不 gate 不出码） |
+| acc_phi/寄存器缓存跨出口 MERGE | c7 形态（kv fast-line + break + 循环后读 acc）；异常即出口读槽 belt |
+| 既有形态回归 | osr-001..006 零漂移 + 全量套件 + bench 全表——**bench 零 break → clean11 必零移动，移动即 bug** |
+
+### 9.5 实施批次
+
+| 批 | 内容 | 验收 |
+|---|---|---|
+| B1-1 | while/for break（loop_exit + 4 处 stash + 出口合并） | **test-osr-007** 八场景三方对拍（PHP 8.5.1 / JIT=0 / JIT=1）：c1 for+if+break（函数级 eager 实锤 DEBUG compile 0→1）；c2 while+体顶 if break；c3 if/else 双分支 break 组合（三侧形态）；c4 continue+break 异 if 混合（lb/bp 双 pend 并存）；c5 嵌套循环内层 break（外层不受扰）；c6 break N=2 保守拒（值对）；c7 kv fast-line + break + 循环后读 acc；c8 switch+break 现状行为锁定（无回归）；osr-001..006 零漂移；三态矩阵全过；全量套件绿；bench 全表零移动 |
+| B1-2 | foreach break（三族同点，预期 B1-1 机制自动覆盖零新代码） | osr-007 增 c9 foreach+if+break 三方对拍；real-logstat 回归（体无 break，双证不受扰） |
+| B1-3 | 价值探针 | tools/probe_break_cover.php：搜索早退热循环（1e6 迭代 if+break）函数级 JIT=1 vs JIT=0 min-of-6——覆盖面收益量化记账（预期 foreach/for 形态族量级，非 clean11 口径） |
+
+### 9.6 重开面（v1 拒编，待证据再议）
+
+- 体顶裸 break 收尾体（需无回边 LOOP 特殊形态，收益趋零）；
+- `if(c) continue; else break;` 双侧逃生（需 TR_RET+pend 回边路径，~10 行，罕见形态）；
+- continue-site chunk 拒（§8.7 发现④，site-entry 形态问题，与本刀出口逃生问题同域相邻不重叠）；
+- switch 内 break（switch 出口 merge 独立评估）。
+
+### 9.7 工作量估计
+
+jit.c 单文件 ~60 行（帧字段 +1、if-handler 4 处 +loopcond 合并 + bp 数组）+ test-osr-007（9 场景三方对拍）+ 三态矩阵 + 探针——**约 1 个工作日含全套验证**。
 
