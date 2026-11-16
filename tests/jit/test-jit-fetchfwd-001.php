@@ -63,9 +63,10 @@ $ov = function ($n) {
 $r4 = $ov(1);
 echo "b4=" . (is_float($r4) && $r4 == 9223372036854775808.0 ? "double ok" : "bad:$r4") . "\n";
 
-// 5) 溢出物化（OSR 热循环）：8e14/iter，第 ~11530 次迭代超 INT64_MAX 溢出
-// （>OSR 阈值 10000，若 chunk 已编译则走物化 resume）；溢出后 double 连加
-// 末值 9.6E+18——三模（默认/fwd=0/jit=0）逐位一致即证语义零漂移
+// 5) 溢出物化（热循环，实测走函数级 eager 编译非 OSR——n_ops=11 ≤96，
+//    首调即 eager，旧注释「OSR 阈值」系过时；T1-1 核读两臂均同路径）：
+//    8e14/iter，第 ~11530 次迭代超 INT64_MAX 溢出 → double 连加末值
+//    9.6E+18——三模（默认/fwd=0/jit=0）逐位一致即证语义零漂移
 $hot = function () {
     $s = 0;
     $i = 0;

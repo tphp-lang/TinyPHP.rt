@@ -48,6 +48,12 @@ int tphp_jit_eager_max_ops(void);
  * 从该 pc 继续。阈值现为硬编码 10000（11-02 勘察：本注释与 osr.md 曾称
  * TPHP_JIT_OSR env 可覆盖——代码从未接线，改阈值需动此宏）。 */
 #define TPHP_JIT_OSR_THRESHOLD 10000
+/* T1 触发延迟（osr.md §10.3，2026-11-16 拍板）：真正触发编译的点 =
+ * 阈值 + D，D 默认 2000（0.2×T）——保护 [T, T+D) 死亡的单发面（jsonagg
+ * 恰 T 形状零迭代编译），同时 logstat（N=20001）触发后仍剩 8001 次净
+ * 收益。TPHP_JIT_OSR_DELAY 覆盖（边数；=0 = 现状 T 直触发，A/B 对照/
+ * 回退面；进程启动前设定）。T 语义不动（§8.6 阈值政策）。 */
+#define TPHP_JIT_OSR_DELAY_DEFAULT 2000
 
 /* Process-wide availability (TPHP_JIT=0 disables) */
 bool tphp_jit_available(void);

@@ -6594,6 +6594,20 @@ void *tphp_jit_compile_osr(TFunc *fn, uint32_t header, uint32_t backedge,
  * （实测 4000 万圈，值全对但永远走不到第二个循环）。 */
 #define OSR_IC_TAG (((uintptr_t)1) << 63)
 
+/* T1 触发延迟（osr.md §10.3，2026-11-16 拍板 D=0.2×T=2000）：D 读 env
+ * 单次解析（同 tphp_jit_eager_max_ops 模式）；=0 = 现状 T 直触发。
+ * 每回边热路径调用（§3.1 预算 1-2ns）——static 单调用点 -O2 必内联，
+ * getenv/atoi 仅首个回边付一次。 */
+static inline int osr_delay_edges(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_JIT_OSR_DELAY");
+        if (e && e[0]) { v = atoi(e); if (v < 0) v = 0; }
+        else v = TPHP_JIT_OSR_DELAY_DEFAULT;
+    }
+    return v;
+}
+
 bool tphp_osr_backedge(VM *vm, TFunc *fn, void **ic_slot, uint32_t header,
                        uint32_t backedge_cur, TVal *slots,
                        uint32_t *resume_pc) {
@@ -6607,7 +6621,9 @@ bool tphp_osr_backedge(VM *vm, TFunc *fn, void **ic_slot, uint32_t header,
     if (!tphp_jit_available()) return false;
     /* 非原子竞态最坏计数漂移（少/多触发一次），同 P0-13 推理。 */
     v++;
-    if (v < (uintptr_t)TPHP_JIT_OSR_THRESHOLD) {
+    /* T1 触发点 = 阈值 + D（§10.3）：计数至 T 只认热度不编译，过 T+D 才编——
+     * 恰死在 [T, T+D) 的单发循环零成本，状态机/熔断/tag 语义原样。 */
+    if (v < (uintptr_t)(TPHP_JIT_OSR_THRESHOLD + osr_delay_edges())) {
         *ic_slot = (void *)v;
         return false;
     }
