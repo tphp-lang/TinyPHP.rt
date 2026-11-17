@@ -301,6 +301,60 @@ bool tarr_append(TArr *a, TVal val) {
     return tarr_set(a, TV_INT(a->next_idx), val);
 }
 
+/* ---- K1（A11 刀：ASSIGN/FETCH/ISSET_DIM 字符串键快线，2026-11-17）----
+ * 两个 JIT-facing helper（emit 侧 TVal 一律按指针传，避 by-value 结构
+ * 跨 ABI 风险——Win64 >8B 结构按指针传 vs SysV 双寄存器的分野）。 */
+
+/* 写命中快线：JIT gate 已验 base==T_ARR、rc<=1、key==T_STR、val 标量。
+ * 与 tarr_set 的差 = 只做「命中面」：免 tstr_intern（arr_find 桶 hash 首比
+ * + key_eq 内容比等价命中，省每操作 intern 表探——logstat fresh IP 键形态
+ * 每行新 TStr 全靠内容比）、无 packed 快路（str 键永不命中）、insert/grow/
+ * compact 归慢路（miss 即返 false，JIT 侧 ir_IF 双分支完整兜底）。
+ * 语义纪律：
+ *  - norm 单次于本地拷贝（键槽恒不写，kfwd 同款）；flagged NONNUM 跳过；
+ *    转 int/非法 → false 全语义走慢路（不复制 scan 规则防漂移）；
+ *  - 双清：命中写前 all_int=0（type-spec 批3）+ packed=false（str 写必破
+ *    packed，tarr_set:229 同款）——命中已隐含非 packed，仍镜像保不变量；
+ *  - 释放顺序 release→store 镜像 tarr_set:237（dtor 改槽敞口与 tarr_set
+ *    同族，非本刀面）；val 按值快照于本帧。 */
+bool tarr_set_hit(TArr *a, TVal *key, TVal *val) {
+    if (key->t != T_STR) return false;               /* gate 冗余防线 */
+    TVal k = *key;
+    if (!(((TStr *)k.u.p)->h.flags & GC_FLAG_NONNUM_KEY)) {
+        if (!tval_norm_key(&k)) return false;
+        if (k.t != T_STR) return false;               /* 数字串→int：慢路全语义 */
+    }
+    ABucket *b = arr_find(a, k, NULL);
+    if (!b) return false;                             /* miss：insert/grow 归慢路 */
+    a->all_int = 0;
+    a->packed = false;
+    uint32_t di = b->val_off;                         /* dtor 前缓存（防释放窗口 b 失效） */
+    tval_release(&a->data[di]);
+    a->data[di] = *val;
+    return true;
+}
+
+/* K1-F1/S1 读面 offset 化包装（JIT 侧 IR_U32 返回型，避 i64→地址转换面）：
+ * 返 data[] 元素下标（tarr_get_ic 恒返 &a->data[voff]，与 bucket val_off
+ * 同域），absent 返 UINT32_MAX（真实 slot 恒 < 该值）。
+ * **norm 于 C 本地拷贝（2026-11-17 崩溃修正）**：原设计在 IR 侧 ALLOCA 拷
+ * 贝再单独 CALL tval_norm_key——deps/ir 匹配规则 cfg_map==1（≤执行一次的
+ * 块）才转 STATIC_ALLOCA，**循环体块内的 ALLOCA = 运行期动态压栈且无
+ * AFREE，每迭代泄漏 → 1.2-2 万迭代压爆栈（0xC0000005 实测）**；移入 C 后
+ * 零 IR scratch、键槽零写（kfwd 纪律）、调用数 2→1。norm 仅限 T_STR/T_INT
+ * （此二型不 raise——F1 的 str 分派/S1 的 ifk 门双保险，float NaN 等 raise
+ * 型走 replay 由解释器正规抛，绝不跨 IR 帧 longjmp）；norm 失败 →
+ * UINT32_MAX = false，与 interp op_isset_dim「norm 失败 has 恒 false」逐位
+ * 同款。 */
+uint32_t tarr_get_ic_off_p(TArr *a, TVal *key, DimIC *ic) {
+    TVal k = *key;
+    if (k.t == T_STR || k.t == T_INT) {
+        if (!tval_norm_key(&k)) return UINT32_MAX;
+    }
+    TVal *v = tarr_get_ic(a, k, ic);
+    return v ? (uint32_t)(v - a->data) : UINT32_MAX;
+}
+
 TVal *tarr_get(TArr *a, TVal key) {
     if (!key_norm_fast(&key)) return NULL;
     /* packed 快路径（L2）：int 键直取 data[i]，跳过哈希探测 */

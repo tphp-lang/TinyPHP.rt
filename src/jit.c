@@ -1600,6 +1600,7 @@ static int ic_probe_enabled(void) {
     return v;
 }
 static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl);
+static int dim_str_fast_enabled(void);   /* K1 三面总闸（定义 3198 段） */
 
 static ir_ref dimic_linear_probe(DimIcCtx *g, ir_ref slot, ir_ref hm,
                                  ir_ref bk, int p) {
@@ -1698,9 +1699,36 @@ static ir_ref dimic_ic_chain(DimIcCtx *g, int lvl) {
             ir_IF_FALSE(ifm);
                 /* 刀6：probe0 miss → sequential probe 回退（同二进制 A/B
                  * 开关；关 = v3.2' 原行为直落 case 链） */
-                ir_ref emF = ic_probe_enabled()
-                    ? dimic_linear_probe(g, slot, hm, bk, 1)
-                    : dimic_ic_chain(g, 5);
+                /* K1-F1（A11 三面同批）：probe0 ptr-miss（fresh 键恒走此
+                 * ——键槽每行新 TStr 与 interned 桶键指针永不等，原 ptr 基
+                 * linear/chain 级联对它们恒 miss 纯烧）→ C 两级内容比
+                 * tarr_get_ic_off_p（快照门+单槽全值比+4 探 hash 直达域）
+                 * → 命中 dimic_take；absent → 原 dimic_miss（helper 补 norm
+                 * 重查 + absent warning + raise deopt 全语义）。开关关 =
+                 * 原刀6/链级联 HEAD 行为。 */
+                ir_ref emF;
+                if (dim_str_fast_enabled()) {
+                    ir_ref tg[3] = { g->a, g->key, g->ic };
+                    ir_ref vof = ir_CALL_N(IR_U32,
+                        ir_CONST_ADDR((uintptr_t)tarr_get_ic_off_p), 3, tg);
+                    ir_ref ifv = ir_IF(ir_NE(vof, ir_CONST_U32(0xFFFFFFFFu)));
+                    ir_IF_TRUE(ifv);
+                        ir_ref data = ir_LOAD_A(
+                            ir_ADD_A(g->a, ir_CONST_ADDR(offsetof(TArr, data))));
+                        dimic_take(g, ir_ADD_A(data,
+                            ir_SHL_U64(ir_ZEXT(IR_U64, vof), ir_CONST_U64(4))),
+                            g->thin);
+                        ir_ref ecT = ir_END();
+                    ir_IF_FALSE(ifv);
+                        dimic_miss(g, true);
+                        ir_ref ecF = ir_END();
+                    ir_MERGE_2(ecT, ecF);
+                    emF = ir_END();
+                } else {
+                    emF = ic_probe_enabled()
+                        ? dimic_linear_probe(g, slot, hm, bk, 1)
+                        : dimic_ic_chain(g, 5);
+                }
             ir_MERGE_2(emT, emF);
             ir_ref eStr = ir_END();
         ir_IF_FALSE(ifstr);
@@ -3192,6 +3220,18 @@ static int setdim_fast_enabled(void) {
     return v;
 }
 
+/* K1（A11 字符串键三面快线，2026-11-17）总闸：默认开，TPHP_DIM_STR_FAST=0
+ * 关（写 fork/F1 读层/S1 isset 三面同一开关 = 同二进制 A/B；关 = 三面全
+ * 不建 = HEAD 字节级行为）。 */
+static int dim_str_fast_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("TPHP_DIM_STR_FAST");
+        v = (!e || !e[0] || e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 /* 类型特化批1（PLAN/type-spec.md §5 批1）开关：默认开，
  * TPHP_TYPE_SPEC=0 关（同二进制 A/B）。关 = 无 guard 无检查点跳过
  * = HEAD 行为。 */
@@ -4489,6 +4529,40 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                     ir_ref kt = load_tag(j, key);
                     ir_ref kp = load_pay(j, key);
                     ir_ref vt = load_tag(j, val);
+                    /* K1 写面 fork（A11 三面同批）：T_STR 键 → array.c
+                     * tarr_set_hit（norm 单次/免 intern/单探命中；miss、值非
+                     * 标量、rc>1 → 本层慢路完整兜底）；非 T_STR → 原刀4 int
+                     * 链原位重挂（文本零改动零重复）。开关关 = 不建 fork =
+                     * HEAD 行为。 */
+                    ir_ref ifstr = IR_UNUSED, eStr = IR_UNUSED;
+                    int k1f = dim_str_fast_enabled();
+                    if (k1f) {
+                        ifstr = ir_IF(ir_EQ(kt, ir_CONST_I32(T_STR)));
+                        ir_IF_TRUE(ifstr);
+                            ir_ref oks = ir_AND(IR_BOOL,
+                                ir_LE(rc, ir_CONST_I32(1)),
+                                ir_LT(vt, ir_CONST_I32(T_STR)));
+                            ir_ref ifs = ir_IF(oks);
+                            ir_IF_TRUE(ifs);
+                                ir_ref t3[3] = { ap, key, val };
+                                ir_ref hit = ir_CALL_N(IR_I32,
+                                    ir_CONST_ADDR((uintptr_t)tarr_set_hit),
+                                    3, t3);
+                                ir_ref ifh = ir_IF(ir_NE(hit, ir_CONST_I32(0)));
+                                ir_IF_TRUE(ifh);
+                                    ir_ref eH = ir_END();   /* 命中：写毕 */
+                                ir_IF_FALSE(ifh);
+                                    emit_assign_dim_slow(j, base, key, val);
+                                    ir_ref eHM = ir_END();
+                                ir_MERGE_2(eH, eHM);
+                                ir_ref eT = ir_END();
+                            ir_IF_FALSE(ifs);
+                                emit_assign_dim_slow(j, base, key, val);
+                                ir_ref eTG = ir_END();
+                            ir_MERGE_2(eT, eTG);
+                            eStr = ir_END();
+                        ir_IF_FALSE(ifstr);                 /* 游标入 FALSE 臂 */
+                    }
                     ir_ref ok = ir_AND(IR_BOOL,
                         ir_AND(IR_BOOL, ir_LE(rc, ir_CONST_I32(1)),
                                ir_NE(pk, ir_CONST_U8(0))),
@@ -4512,6 +4586,10 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
                         emit_assign_dim_slow(j, base, key, val);
                         ir_ref eSK = ir_END();
                     ir_MERGE_2(eF, eSK);
+                    if (k1f) {                              /* K1 fork 收口 */
+                        ir_ref eInt = ir_END();             /* 关 ifstr-FALSE 臂 */
+                        ir_MERGE_2(eStr, eInt);
+                    }
                     ir_ref eArr = ir_END();
                 ir_IF_FALSE(ifa);
                     emit_assign_dim_slow(j, base, key, val);
@@ -5586,8 +5664,81 @@ static Trap emit_seq(JitC *j, uint32_t pc, const uint32_t *stops, int nstops) {
             break;
         }
         case OP_ISSET_DIM: {
-            /* P0-14 批4：单 op pad 执行——真 handler raw read 操作数
-             * （base/key 任意槽形态含 CONST 皆自读）写 dst bool 槽 */
+            JIT_CTX();
+            /* K1-S1（A11 三面同批）：P0-14 pad 回放 → 真 lowering。
+             * base==T_ARR && key∈{T_STR,T_INT}（此二型 norm 恒不 raise——
+             * 长跳保护，raise 型键如 float NaN 留 replay 由解释器正规抛）
+             * → 本地拷贝单次 norm（interp op_isset_dim 同款：norm 失败 =
+             * has 恒 false 不 raise；键槽恒不写 kfwd 纪律）→
+             * tarr_get_ic_off_p 两级内容比（fresh 键等价命中）→ bool 直出
+             * （absent=false 无 warning 无 deopt）。**释放顺序**：镜像 interp
+             * wtake = 查表全毕才释旧 dst——base/key 与 dst 可别名
+             * （`$c=isset($c[$c])`），故 rel_dst_gate 落各终端写臂内（每执行
+             * 恰一次、查表读 base 时其必存活）。非该形态（str offset/标量/
+             * UNDEF base、怪键型、t2 UNUSED、开关关）→ 原 pad 回放字节级兜底。 */
+            if (dim_str_fast_enabled() && op->t2 != OPD_UNUSED) {
+                ir_ref base = slot_addr(j, op->a1);
+                ir_ref key;
+                if (op->t2 == OPD_CONST) {
+                    /* const 键直取 lits 持久地址（读透传，helper 内本地拷贝
+                     * norm 零回写）——不走 ALLOCA：循环体块动态压栈会按迭代
+                     * 泄漏（崩溃修正详见 array.c tarr_get_ic_off_p 注）。 */
+                    key = ir_CONST_ADDR((uintptr_t)&j->fn->lits[op->a2]);
+                } else {
+                    key = slot_addr(j, op->a2);
+                }
+                if (!op->ic) {
+                    op->ic = tm_malloc(sizeof(DimIC));
+                    tphp_dim_ic_init(op->ic);
+                }
+                bool wr = (op->tr != OPD_UNUSED);
+                ir_ref da = wr ? slot_addr(j, op->ar) : IR_UNUSED;
+                ir_ref kt = load_tag(j, key);
+                bool gate = wr && dst_gate_needed(j, op);
+                ir_ref ifa = ir_IF(ir_EQ(load_tag(j, base), ir_CONST_I32(T_ARR)));
+                ir_IF_TRUE(ifa);
+                    ir_ref ifk = ir_IF(ir_OR(IR_BOOL,
+                        ir_EQ(kt, ir_CONST_I32(T_STR)),
+                        ir_EQ(kt, ir_CONST_I32(T_INT))));
+                    ir_IF_TRUE(ifk);
+                        /* norm 在 C helper 本地（2026-11-17 崩溃修正：原 IR
+                         * 侧 kc ALLOCA 循环内动态压栈爆栈）——键槽/const lits
+                         * 只读、tv_norm 单调用并入 helper。 */
+                        ir_ref ap = load_pay(j, base);
+                        ir_ref tg[3] = { ap, key,
+                                         ir_CONST_ADDR((uintptr_t)op->ic) };
+                        ir_ref vof = ir_CALL_N(IR_U32,
+                            ir_CONST_ADDR((uintptr_t)tarr_get_ic_off_p),
+                            3, tg);
+                        ir_ref ifh = ir_IF(ir_NE(vof,
+                            ir_CONST_U32(0xFFFFFFFFu)));
+                        ir_IF_TRUE(ifh);
+                            if (gate) rel_dst_gate(j, da);
+                            if (wr) store_imm(j, da, (int32_t)T_TRUE,
+                                              ir_CONST_I64(0));
+                            ir_ref ehT = ir_END();
+                        ir_IF_FALSE(ifh);
+                            if (gate) rel_dst_gate(j, da);
+                            if (wr) store_imm(j, da, (int32_t)T_FALSE,
+                                              ir_CONST_I64(0));
+                            ir_ref ehF = ir_END();
+                        ir_MERGE_2(ehT, ehF);
+                        ir_ref eK = ir_END();
+                    ir_IF_FALSE(ifk);
+                        /* 怪键型 → pad 回放（raise/怪语义全在解释器正规路径） */
+                        lower_replay(j, pc, pc + 1);
+                        ir_ref eKR = ir_END();
+                    ir_MERGE_2(eK, eKR);
+                    ir_ref eA = ir_END();
+                ir_IF_FALSE(ifa);
+                    /* 非 T_ARR（str offset/标量/UNDEF）→ pad 回放字节级 */
+                    lower_replay(j, pc, pc + 1);
+                    ir_ref eR = ir_END();
+                ir_MERGE_2(eA, eR);
+                pc++;
+                break;
+            }
+            /* HEAD 形态回退（开关关 / t2 UNUSED）：P0-14 单 op pad 执行 */
             lower_replay(j, pc, pc + 1);
             pc++;
             break;
