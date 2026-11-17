@@ -409,6 +409,74 @@ static TVal bi_putenv(VM *vm, TVal *args, int n) {
     return TV_TRUE;
 }
 
+/* shell_exec(string $command, ?string $cwd = null): string|false
+ * PHP 8 同名对齐（额外可选 $cwd）；捕获 stdout、stderr 透传控制台。
+ * rc≠0 也返回 stdout 原文（PHP 语义同）——成功判定由调用方做
+ * （输出内容 / 产物文件存在性）。false = 进程无法启动。
+ * 用途：包 scripts（postInstall）驱动 C++/构建工具产出中间产物。
+ * 阻塞：popen 读到 EOF，调度器同步等待——一次性构建脚本场景。 */
+static TVal bi_shell_exec(VM *vm, TVal *args, int n) {
+    if (n < 1 || args[0].t != T_STR)
+        RAISE(vm, "TypeError",
+              "shell_exec(): expects (string $command, ?string $cwd = null)");
+    const char *cmd0 = tstr_val((TStr *)args[0].u.p);
+    const char *cwd = NULL;
+    if (n >= 2 && args[1].t == T_STR)
+        cwd = tstr_val((TStr *)args[1].u.p);
+    else if (n >= 2 && args[1].t != T_NULL)
+        RAISE(vm, "TypeError", "shell_exec(): $cwd must be string or null");
+
+    /* cwd 经 cd && 前缀实现（不切进程工作目录；pkg.c run_script_entry 同款） */
+    char cmd[4096];
+    if (cwd && cwd[0]) {
+#ifdef _WIN32
+        snprintf(cmd, sizeof cmd, "cd /d \"%s\" && %s", cwd, cmd0);
+#else
+        snprintf(cmd, sizeof cmd, "cd \"%s\" && %s", cwd, cmd0);
+#endif
+    } else {
+        snprintf(cmd, sizeof cmd, "%s", cmd0);
+    }
+
+#ifdef _WIN32
+    FILE *f = _popen(cmd, "rb");
+#else
+    FILE *f = popen(cmd, "r");
+#endif
+    if (!f) return TV_FALSE;
+
+    size_t cap = 4096, len = 0;
+    char *buf = tm_malloc(cap);
+    if (!buf) {
+#ifdef _WIN32
+        _pclose(f);
+#else
+        pclose(f);
+#endif
+        return TV_FALSE;
+    }
+    for (;;) {
+        if (len + 4096 > cap) {
+            cap *= 2;
+            char *nb = tm_realloc(buf, cap);
+            if (!nb) break;
+            buf = nb;
+        }
+        size_t r = fread(buf + len, 1, cap - len, f);
+        if (r == 0) break;
+        len += r;
+    }
+#ifdef _WIN32
+    int rc = _pclose(f);
+#else
+    int rc = pclose(f);
+#endif
+    (void)rc;   /* rc 不回传（PHP shell_exec 同）；判定走输出/产物 */
+    TVal out = TV_STR(tstr_new(buf, len));
+    tm_free(buf);
+    return out;
+}
+
 static TVal bi_pkg_new(VM *vm, TVal *args, int n) {
     if (n < 2 || args[0].t != T_STR || args[1].t != T_STR)
         RAISE(vm, "ArgumentCountError",
@@ -3440,6 +3508,7 @@ const Builtin tphp_builtins[] = {
     { "pkg_ext_relink", bi_pkg_ext_relink },
     { "getenv", bi_getenv },
     { "putenv", bi_putenv },
+    { "shell_exec", bi_shell_exec },
     /* 正则（ext/pcre；PLAN/preg.md） */
     { "preg_match", bi_preg_match },
     { "preg_match_all", bi_preg_match_all },

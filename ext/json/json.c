@@ -78,6 +78,7 @@ typedef struct {
     JBuf *b;
     int options;
     TVal *keys; uint32_t cap_keys;   /* off→key 逆映射缓冲（只增不减） */
+    uint32_t used_keys;              /* 单调栈高：每层数组占独立段，递归不覆写父键 */
 } ECtx;
 
 /* i64→ascii（A1-b：替代 snprintf("%lld")——bench 密度每轮 ~5 万次） */
@@ -138,18 +139,24 @@ static bool enc_val(ECtx *c, TVal v, int depth);
 
 /* 数组键单遍逆映射（A1-b：替代原 arr_is_list/arr_key_by_off 的每元素
  * 全桶扫 O(n·bcap)——assoc 分支原为二次方桶探查；缓冲挂 ECtx 复用）。
- * 返回 keys[dused]（T_UNDEF=空洞），packed 时返回 NULL；*is_list =
- * 连续 int 键 0..n-1（语义与原 arr_is_list 一致：首个键失配即判否）。 */
+ * 每段从 c->used_keys 起、写完后推进（单调栈式）：enc_val 递归编码子数组
+ * 时子段在更高地址，不会覆写父数组尚未遍历的键（历史 bug：共享单一基址
+ * 导致顶层键被内层键名覆盖，如 "scripts" → "init"）。
+ * 返回本段基址 keys[dused]（T_UNDEF=空洞），packed 时返回 NULL；
+ * *is_list = 连续 int 键 0..n-1（语义与原 arr_is_list 一致：首个键失配即判否）。
+ * 注意：tm_realloc 可能移动 c->keys，调用方循环里必须重算 c->keys+base。 */
 static TVal *arr_keys_map(ECtx *c, TArr *a, bool *is_list) {
     if (a->packed) { *is_list = true; return NULL; }   /* 不变量：packed ⇒ 键即 0..n-1 无洞 */
     tarr_sync_buckets(a);
-    if (a->dused > c->cap_keys) {
+    uint32_t base = c->used_keys;
+    uint32_t need = base + a->dused;
+    if (need > c->cap_keys) {
         uint32_t nc = c->cap_keys ? c->cap_keys : 16;
-        while (nc < a->dused) nc *= 2;
+        while (nc < need) nc *= 2;
         c->keys = tm_realloc(c->keys, sizeof(TVal) * (size_t)nc);
         c->cap_keys = nc;
     }
-    TVal *keys = c->keys;
+    TVal *keys = c->keys + base;
     for (uint32_t i = 0; i < a->dused; i++) keys[i].t = T_UNDEF;
     for (uint32_t bk = 0; bk < a->bcap; bk++) {
         if (a->buckets[bk].val_off != UINT32_MAX &&
@@ -163,6 +170,7 @@ static TVal *arr_keys_map(ECtx *c, TArr *a, bool *is_list) {
         if (keys[i].t != T_INT || keys[i].u.i != (int64_t)idx) { list = false; break; }
         idx++;
     }
+    c->used_keys = need;                                 /* 推进栈高（不回退） */
     *is_list = list;
     return keys;
 }
@@ -201,7 +209,8 @@ static bool enc_val(ECtx *c, TVal v, int depth) {
     case T_ARR: {
         TArr *a = (TArr *)v.u.p;
         bool is_list;
-        TVal *keys = arr_keys_map(c, a, &is_list);
+        uint32_t base = c->used_keys;
+        arr_keys_map(c, a, &is_list);
         if (is_list) {
             jb_ch(b, '[');
             bool first = true;
@@ -217,8 +226,10 @@ static bool enc_val(ECtx *c, TVal v, int depth) {
             jb_ch(b, '{');
             bool first = true;
             for (uint32_t i = 0; i < a->dused; i++) {
-                if (a->data[i].t == T_UNDEF || keys[i].t == T_UNDEF) continue;
-                TVal k = keys[i];
+                /* 每次迭代重算本层段基址：递归编码子数组可能 tm_realloc
+                 * 移动 c->keys；段内内容不被子数组触碰（子段在更高地址）。 */
+                TVal k = c->keys[base + i];
+                if (a->data[i].t == T_UNDEF || k.t == T_UNDEF) continue;
                 if (!first) jb_ch(b, ',');
                 first = false;
                 if (k.t == T_INT) {
@@ -249,7 +260,7 @@ TVal bi_json_encode(VM *vm, TVal *args, int n) {
     int options = n >= 2 ? (int)tval_to_int(args[1]) : 0;
     JBuf b;
     jb_init(&b);
-    ECtx c = { vm, &b, options, NULL, 0 };
+    ECtx c = { vm, &b, options, NULL, 0, 0 };
     if (!enc_val(&c, args[0], 0)) {
         tm_free(b.p);
         tm_free(c.keys);
@@ -564,7 +575,7 @@ bool tphp_json_encode_c(TVal v, TStr **out) {
     if (!out) return false;
     JBuf b;
     jb_init(&b);
-    ECtx c = { NULL, &b, 0, NULL, 0 };
+    ECtx c = { NULL, &b, 0, NULL, 0, 0 };
     if (!enc_val(&c, v, 0)) {
         tm_free(b.p);
         tm_free(c.keys);

@@ -115,6 +115,7 @@
 
 ### 其他
 `exit`/`die` `spl_autoload_register`
+`shell_exec($cmd, $cwd = null)`（PHP 8 同名对齐 + 可选工作目录；捕获 stdout、stderr 透传，rc≠0 也返回输出原文，成功判定由调用方做；阻塞——包 scripts 驱动 C++/构建工具场景，见 ext-packages.md §2.2 `$PKG`）
 
 ## 透明异步 API（`Tphp\`）
 

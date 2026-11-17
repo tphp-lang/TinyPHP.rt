@@ -960,10 +960,18 @@ static int run_child(const char *exe, char *const args[], const char *cwd,
     uv_loop_t *loop = uv_default_loop();
     uv_process_t proc;
     uv_process_options_t opts;
+    /* stdio 继承父进程（console）：scripts 的诊断输出（编译错误、
+     * "请安装 C++ 环境"提示）必须直达用户，stdio_count=0 会静默吞掉 */
+    uv_stdio_container_t stdio[3];
+    stdio[0].flags = UV_INHERIT_FD; stdio[0].data.fd = 0;
+    stdio[1].flags = UV_INHERIT_FD; stdio[1].data.fd = 1;
+    stdio[2].flags = UV_INHERIT_FD; stdio[2].data.fd = 2;
     memset(&opts, 0, sizeof opts);
     opts.file = (char *)exe;
     opts.args = args;
     opts.cwd = (char *)cwd;
+    opts.stdio = stdio;
+    opts.stdio_count = 3;
     opts.exit_cb = on_child_exit;
     g_child_status = -1;
     int r = uv_spawn(loop, &proc, &opts);
@@ -4371,6 +4379,33 @@ static void rsp_put_tokens(PkgBuf *lb, const char *s) {
     }
 }
 
+/* 链接指令 token 下发：$PKG 前缀 → 展开为包目录绝对路径（正斜杠）。
+ * 用途：scripts（postInstall/postUpdate）把 C++ 等外部语言编译成中间产物
+ * 落在包内 build/，再由 libs/ldflags 以 "$PKG/build/xxx.o" 引用参与本次
+ * 链接（post 时机=落盘后编译前，生成物可直接进链接——PLAN/ext-packages.md
+ * §2.2 $PKG 与 §7 链锁）。展开后含空格则加引号（@rsp 逐行 token，
+ * 引擎对象路径同款处理）。 */
+static void ext_link_token(PkgBuf *b, const char *tok, const char *pkgdir) {
+    size_t n = strlen(pkgdir);
+    char tmp[1500];
+    if (strncmp(tok, "$PKG", 4) == 0 &&
+        (tok[4] == '/' || tok[4] == '\\' || tok[4] == '\0') &&
+        n + strlen(tok) < sizeof tmp) {
+        memcpy(tmp, pkgdir, n);
+        memcpy(tmp + n, tok + 4, strlen(tok) - 4 + 1);
+        ext_path_fwd(tmp);
+        tok = tmp;
+    }
+    if (strchr(tok, ' ')) {
+        pb_put(b, " \"", 2);
+        pb_puts(b, tok);
+        pb_put(b, "\"", 1);
+    } else {
+        pb_put(b, " ", 1);
+        pb_puts(b, tok);
+    }
+}
+
 /* Windows 8191 上限 → @response 文件（clang/lld 支持；路径用 /）。
  * extra_link：包契约声明的链接指令（libs + os.libs + ldflags + os.ldflags，
  * 空格分隔），追加在引擎库之后、-o 之前。 */
@@ -4408,7 +4443,7 @@ static int ext_write_link_rsp(const char *rsp, const char *reg_o,
 }
 
 /* 链接 all .o + registry.o + 引擎对象 → tphp.next，再原子替换。
- * 引擎对象：优先 <root>/obj/*.o（与 build.cmd 同款直链，避开
+ * 引擎对象：优先 <root>/obj 目录内的 .o（与 build.cmd 同款直链，避开
  * libtphp.a 的 pcre2 dllimport 归档语义）；否则解压 libtphp.a。 */
 static int ext_link_and_replace(const char *eroot, const char *cc,
                                 char **objs, int nobjs, const char *extra_link,
@@ -4675,10 +4710,8 @@ static int ext_compile_all(char *err, size_t errcap) {
                 { xs->os_ldflags[os_now], xs->n_os_ldflags[os_now] },
             };
             for (size_t g = 0; g < sizeof gl / sizeof gl[0]; g++)
-                for (int j = 0; j < gl[g].n; j++) {
-                    pb_put(&xlink, " ", 1);
-                    pb_puts(&xlink, gl[g].a[j]);
-                }
+                for (int j = 0; j < gl[g].n; j++)
+                    ext_link_token(&xlink, gl[g].a[j], dirs[i]);
         }
         tmod_free(&m);
     }

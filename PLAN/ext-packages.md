@@ -62,7 +62,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
     "defines": ["FOO=1"],          // 可选：-D
     "cflags": [],                  // 可选：默认平台 cflags
     "libs": [],                    // 可选：默认 -l
-    "ldflags": [],                 // 可选
+    "ldflags": [],                 // 可选；token 支持 $PKG 前缀（§2.2）
 
     "os": {                        // 可选：按平台覆盖/追加（§2.2）
       "windows": { "sources": ["backend/win32"], "libs": ["ws2_32"], "cflags": [], "ldflags": [], "cc": null },
@@ -97,6 +97,7 @@ my-project/                  ← 用户 PHP 项目（只声明，不存 C 源）
   这类「同一套清单、各平台编不同文件」的场景（tui：win32/x11/cocoa 三选一）；
   非当前平台的 `os.<平台>` 目录不扫描、缺失也不报错。
 - `cc`：`os[当前].cc` → 顶层（若有）→ 探测链：`TPHP_EXT_CC` → `<tphp_root>/tcc/tcc(.exe)` → PATH 上 clang → gcc。
+- **`$PKG` 路径前缀（libs/ldflags）**：token 以 `$PKG` 开头 → 链接时展开为包目录**绝对路径**（正斜杠；含空格自动加引号）。用途：`scripts` 把 **C++ 等外部语言**编译成中间产物落包内 `build/`（tphp 要求 C，webview/GUI 这类 C++ 库走此路），再以 `"$PKG/build/xxx.o"` 参与本次链接。`$PKG` 与 `os.ldflags` 同样生效；只做前缀展开，不做通配。
 - 未知 os 键 → warning 忽略。
 
 ### 2.3 `--ext` 脚手架生成物
@@ -239,7 +240,7 @@ tphp ext --relink                  # 用现存 ext/*/ 全量重链（remove 后�
 | `postRemove` | — | — | **✗ 不触发**（见 ②） |
 
 - action 判定与 PHP 同：按目标目录已存在（`ext --add` 已有 = update、`--update` = update）。
-- post 落在编译前 ⇒ **生成 `.c`/头文件可直接参与本次编译**（codegen 场景），与 PHP 包「post=落盘后」心智对齐。
+- post 落在编译前 ⇒ **生成 `.c`/头文件可直接参与本次编译**（codegen 场景），与 PHP 包「post=落盘后」心智对齐；配合 libs/ldflags 的 **`$PKG` 前缀**（§2.2），脚本也能产出**二进制中间产物**（`build/*.o`、静态库）直接进本次链接——C++ 依赖场景的固定打法：C 扩展面走 ext 正常编译，C++ 库由 scripts 用 `clang++`/`g++` 编成 `.o`，`ldflags: ["$PKG/build/xxx.o"]` 链入。
 - 编译/链接失败的语义不归钩子管：照旧保留旧二进制、exit ≠ 0（§5.7）。
 
 **② postRemove 解析保留、不触发（2026-11-16 拍板）**：包删除后脚本文件随包删除，`.php` 条目无处可跑——**与 PHP 包侧行为完全一致**（PHP 的包声明 `postRemove` 也从不触发，该键在 pkg-manager §2.1.1 仅根项目可用；ext 无根面 → 域内无触发面）。清理类逻辑放 `preRemove`。六键全部解析接受、不报错，实际触发 5 键。
