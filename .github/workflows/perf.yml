@@ -102,6 +102,26 @@ jobs:
         shell: pwsh
         run: ./tools/perf-compare.ps1 -Php php -MaxFibRatio ${{ inputs.fib_gate }} -Report perf-vs-php.md
 
+      # allocator dual-arm rounds (spec .trae/documents/allocator-platform-defaults-spec.md):
+      # default build = mimalloc+bins (build/tphp) -- zero dual-arm/raw evidence
+      # on record for this platform. NO_MIMALLOC=1 builds the CRT arm into
+      # build/tphp-crt (obj-crt isolated, main binary untouched). Judgment:
+      # same-run dual-arm clean11 geomean >=5% both rounds same direction ->
+      # flip default; <5% -> keep (epoch-comparable ONLY within this run).
+      - name: CRT variant build (NO_MIMALLOC=1 -> build/tphp-crt)
+        run: NO_MIMALLOC=1 ./build.sh
+
+      - name: multi-round mins (mimalloc main vs CRT, drop cold first round)
+        run: |
+          {
+            for b in tphp tphp-crt; do
+              for i in 1 2 3; do
+                echo "=== $b round $i ==="
+                ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH" || true
+              done
+            done
+          } 2>&1 | tee perf-extra-rounds.log
+
       - name: Export perf report
         if: always()
         shell: bash
@@ -188,6 +208,30 @@ jobs:
         env:
           TPHP_NO_BINS: "1"
         run: ./tools/perf-compare.ps1 -Php php -Report perf-vs-php-nobins.md
+
+      # allocator dual-arm rounds (spec .trae/documents/allocator-platform-defaults-spec.md):
+      # main build = CRT default (11-06 cluster-2, switched on RAW probe only --
+      # engine-level confirmation missing). Snapshot it, then USE_MIMALLOC=1
+      # builds the mimalloc+bins arm (overwrites build/tphp; same pattern as the
+      # macOS job). Judgment: same-run clean11 geomean >=5% both rounds same
+      # direction -> flip default; <5% -> keep. Note TPHP_NO_BINS above is a
+      # no-op on the CRT default (bins shim compiles only in the mimalloc branch).
+      - name: mimalloc variant build (USE_MIMALLOC=1 -> build/tphp-mi)
+        run: |
+          cp build/tphp build/tphp-crt-main    # snapshot CRT: the mi build overwrites build/tphp
+          USE_MIMALLOC=1 ./build.sh
+          mv build/tphp build/tphp-mi
+
+      - name: multi-round mins (CRT vs mimalloc, drop cold first round)
+        run: |
+          {
+            for b in tphp-crt-main tphp-mi; do
+              for i in 1 2 3; do
+                echo "=== $b round $i ==="
+                ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH" || true
+              done
+            done
+          } 2>&1 | tee perf-extra-rounds.log
 
       - name: Export perf report
         if: always()
@@ -293,7 +337,7 @@ jobs:
             for b in tphp-crt-main tphp-mi; do
               for i in 1 2 3; do
                 echo "=== $b round $i ==="
-                ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH (serialize|array-push|json|string|alloc-probe|object|real-logstat)" || true
+                ./build/$b run tools/bench-vs-php.php 2>&1 | grep -E "^BENCH" || true
               done
             done
           } 2>&1 | tee perf-extra-rounds.log
