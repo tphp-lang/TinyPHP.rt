@@ -393,6 +393,11 @@ void tphp_ic_stats_dump(void);       /* atexit 挂载；calls=0 时静默 */
 void  tarr_sync_buckets(TArr *a);
 bool  tarr_has(TArr *a, TVal key);
 bool  tarr_unset(TArr *a, TVal key);
+/* K1（A11）：JIT 字符串键快线 helpers——写命中（gate 契约：base T_ARR、
+ * rc<=1、key T_STR、val 标量；miss/非法返 false 走 JIT 慢路兜底）+ 读面
+ * offset 化（absent 返 UINT32_MAX，JIT IR_U32 返回型） */
+bool  tarr_set_hit(TArr *a, TVal *key, TVal *val);
+uint32_t tarr_get_ic_off_p(TArr *a, TVal *key, DimIC *ic);
 static inline uint32_t tarr_count(TArr *a) { return a->n; }
 /* normalize a prospective key in place (int / string); false = illegal key */
 bool tval_norm_key(TVal *key);
